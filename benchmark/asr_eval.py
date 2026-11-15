@@ -26,6 +26,7 @@ import aiohttp
 from benchmark.base import Model, ModelType, RequestType
 from benchmark.dataset import LibriSpeechEvalDataset
 from benchmark.request import RequestInput
+from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG
 
 _ASR_MODELS = {
     ModelType.WHISPER_LARGE, ModelType.WHISPER_LARGE_V3_TURBO, ModelType.QWEN3_ASR,
@@ -78,7 +79,9 @@ async def _transcribe(
                 if msg.get("modality") == "text":
                     text_chunks.append(base64.b64decode(msg["data"]))
 
-        transcript = b"".join(text_chunks).decode("utf-8", errors="replace").strip()
+        transcript = b"".join(text_chunks).decode("utf-8", errors="replace")
+        # Qwen3-ASR's raw text starts with "language X<asr_text>"; score only the transcript.
+        transcript = transcript.split(ASR_TEXT_TAG, 1)[-1].strip()
         return request_id, transcript, None
 
     except Exception as exc:

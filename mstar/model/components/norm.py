@@ -56,6 +56,13 @@ def add_rms_norm(
     return h.reshape(orig_shape), r.reshape(orig_shape)
 
 
+def rms_norm_no_weight(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """RMSNorm with no scale over the last dim: the variance in fp32, the
+    product promoted to fp32, then back to the input dtype."""
+    variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
+    return (x * torch.rsqrt(variance + eps)).to(x.dtype)
+
+
 class RMSNorm(nn.Module):
     """RMSNorm with optional Gemma-style ``(1 + weight)`` scaling.
 
@@ -74,12 +81,22 @@ class RMSNorm(nn.Module):
         self.hidden_size = hidden_size
         self.variance_epsilon = eps
         self.gemma_mode = gemma_mode
+        # the TP kernels scale by ``weight + weight_bias``
+        self._weight_bias = 1.0 if gemma_mode else 0.0
         # Llama-style starts at 1; Gemma-style starts at 0 because the
         # checkpoint stores (weight - 1).
         init = torch.zeros(hidden_size) if gemma_mode else torch.ones(hidden_size)
         self.weight = nn.Parameter(init)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, comm_group=None) -> torch.Tensor:
+        """With ``comm_group``, ``hidden_states`` is a row-parallel partial sum
+        that the norm's kernel reduces over the group."""
+        if comm_group is not None and comm_group.world_size > 1:
+            normed = comm_group.allreduce_rmsnorm(
+                hidden_states.reshape(-1, self.hidden_size), self.weight,
+                self.variance_epsilon, self._weight_bias,
+            )
+            return normed.reshape(hidden_states.shape)
         return rms_norm(hidden_states, self.weight, self.variance_epsilon, self.gemma_mode)
 
     def forward_residual(
@@ -108,8 +125,7 @@ class RMSNorm(nn.Module):
             normed, r = comm_group.allreduce_add_rmsnorm(
                 hidden_states.reshape(-1, orig_shape[-1]),
                 residual.reshape(-1, orig_shape[-1]),
-                self.weight, self.variance_epsilon,
-                weight_bias=1.0 if self.gemma_mode else 0.0,
+                self.weight, self.variance_epsilon, self._weight_bias,
             )
             return normed.reshape(orig_shape), r.reshape(orig_shape)
         return add_rms_norm(hidden_states, residual, self.weight, self.variance_epsilon, self.gemma_mode)
@@ -153,9 +169,11 @@ class AdaRMSNorm(nn.Module):
     """RMSNorm with adaRMS conditioning.
 
     A per-norm ``nn.Linear(cond_dim, hidden_size*3)`` maps a shared
-    condition vector to ``(scale, shift, gate)``. The normalization is
-    ``rmsnorm(x) * (1 + scale) + shift`` and the gate is returned for the
-    enclosing decoder layer to apply at the residual.
+    condition vector to the modulation ``(scale, shift, gate)``. The
+    normalization is ``rmsnorm(x) * (1 + scale) + shift`` and the gate is
+    returned for the enclosing decoder layer to apply at the residual. The
+    caller applies ``dense``, so a condition known ahead of a step can be
+    mapped once for every norm.
 
     The ``dense.weight`` and ``dense.bias`` are zero-initialized so the
     norm starts as the identity (matches HF Gemma / lerobot openpi).
@@ -171,22 +189,18 @@ class AdaRMSNorm(nn.Module):
         nn.init.zeros_(self.dense.bias)
 
     def forward(
-        self, x: torch.Tensor, cond: torch.Tensor,
+        self, x: torch.Tensor, modulation: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``modulation`` is ``dense(cond)``, ``[BS, 3 * hidden_size]`` for ``x`` of
+        ``[BS * rows, hidden_size]``."""
         # Lazy import keeps the Triton dependency narrow (only AdaRMSNorm
         # imports it).
         from mstar.utils.adarms_norm import adarms_norm_fused
 
-        BS = cond.shape[0]
-        x_flat = x.view(BS * (x.shape[0] // BS), -1).contiguous()
-
-        modulation = self.dense(cond)  # [BS, 3*H]
         H = self.hidden_size
-        scale = modulation[:, :H]
-        shift = modulation[:, H:2 * H]
-        gate = modulation[:, 2 * H:]
-
-        return adarms_norm_fused(x_flat, scale, shift, gate, self.variance_epsilon)
+        return adarms_norm_fused(
+            x, modulation[:, :H], modulation[:, H:2 * H], modulation[:, 2 * H:], self.variance_epsilon,
+        )
 
 
 class BiasFreeLayerNorm(nn.Module):

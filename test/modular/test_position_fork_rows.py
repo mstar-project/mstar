@@ -8,6 +8,8 @@ a later chunk, sharing a step with another prompt's first chunk, had its
 (PR #365 review: images shifted by 5-14/255).
 """
 
+import pytest
+
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.position.manager import RopeManager
@@ -60,3 +62,12 @@ def test_a_pre_fork_takes_the_same_rows():
     ctx = _ctx(KVPlanOutputs(pre_forks=FORK, fork_rids=frozenset({"later"})))
 
     assert RopeManager._forking_rids(ctx.plan_results["kv"], ctx) == ["later"]
+
+
+def test_a_request_the_resource_never_opened_has_no_position():
+    """Counters are keyed by the worker's handle (AGENTS.md invariant 14), so a
+    lookup by anything else, the wire id say, raises rather than reads 0."""
+    rope = _rope({7: {"main": 5}})
+    assert rope.position(7, "main") == 5 and rope.position(7, "cfg_text") == 0
+    with pytest.raises(KeyError):
+        rope.position("r", "main")

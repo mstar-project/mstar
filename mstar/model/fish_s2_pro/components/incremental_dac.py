@@ -10,9 +10,8 @@ overlapping transposed conv's last input sample, and the frame count (RoPE
 positions continue from it). Zeros are a fresh stream's state: the decoder's
 own left zero padding.
 
-``codec_state_blocks`` names that state as recurrent-state pool blocks; the
-codec node gathers its rows' blocks before the decode and scatters the new
-ones back after it.
+``codec_state_entry`` names that state as a Value's fields; the codec node
+reads its rows' fields before the decode and writes the new ones back after it.
 
 After the transformer the decode runs time-major (``[B, T, C]``), every conv a
 2-D conv on channels-last tensors and weights, so cuDNN's NHWC kernels need no
@@ -27,7 +26,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.engine.resources.recurrent import RecurrentBlockConfig
+from mstar.engine.state import Entry, TensorType
 from mstar.model.components.streaming_codec import (
     causal_conv,
     overlap_tconv,
@@ -71,12 +70,11 @@ def _state_width(module: nn.Module) -> int:
     return module.padding
 
 
-def codec_state_blocks(cfg: FishDACConfig) -> dict[str, RecurrentBlockConfig]:
-    """Pool blocks for one stream's decoder state (fp32, the codec's dtype),
-    from the codec config alone, so the model declares them before any weights
-    load; ``IncrementalDACDecoder`` checks them against the loaded modules."""
+def codec_state_entry(cfg: FishDACConfig) -> Entry:
+    """One stream's decoder state (fp32, the codec's dtype), from the codec config alone, so the model declares it
+    before any weights load; ``IncrementalDACDecoder`` checks it against the loaded modules."""
     with torch.device("meta"):
-        return IncrementalDACDecoder(FishDACDecoder(cfg)).state_blocks()
+        return IncrementalDACDecoder(FishDACDecoder(cfg)).state_entry()
 
 
 class IncrementalDACDecoder(nn.Module):
@@ -119,16 +117,15 @@ class IncrementalDACDecoder(nn.Module):
                 for tconv, _ in decoder.quantizer.upsample:
                     to_channels_last(tconv.conv)
 
-    def state_blocks(self) -> dict[str, RecurrentBlockConfig]:
+    def state_entry(self) -> Entry:
         dtype = torch.float32
-        blocks = {FRAMES: RecurrentBlockConfig(shape=(1,), dtype=torch.long)}
+        fields = {FRAMES: TensorType((1,), dtype=torch.long)}
         for layer in range(len(self.decoder.quantizer.post_module.layers)):
             for kv in "kv":
-                shape = (self.heads, self.cache, self.head_dim)
-                blocks[f"{kv}{layer}"] = RecurrentBlockConfig(shape=shape, dtype=dtype)
+                fields[f"{kv}{layer}"] = TensorType((self.heads, self.cache, self.head_dim), dtype=dtype)
         for name, module in self.convs:
-            blocks[name] = RecurrentBlockConfig(shape=(_state_width(module), module.conv.in_channels), dtype=dtype)
-        return blocks
+            fields[name] = TensorType((_state_width(module), module.conv.in_channels), dtype=dtype)
+        return Entry(fields)
 
     def _transformer(self, x, state, new, lengths):
         """``x [B, T, D]`` -> the post transformer's output, attending over the cached keys."""

@@ -1,0 +1,35 @@
+#!/usr/bin/env -S python3 -I
+"""The emulated driver's ``nvidia-cuda-mps-control`` (the launcher puts it on ``PATH``).
+
+``-f`` runs the control daemon in the foreground until SIGTERM, its pid in
+``$CUDA_MPS_PIPE_DIRECTORY/pid``. Without it, each line on stdin is a command to
+that daemon: ``get_server_list`` succeeds while it runs, ``quit`` stops it. With
+no daemon running, a command fails, as the real tool's does.
+"""
+
+import os
+import signal
+import sys
+
+PIDFILE = os.path.join(os.environ.get("CUDA_MPS_PIPE_DIRECTORY", "/tmp/nvidia-mps"), "pid")
+
+if sys.argv[1:] == ["-f"]:
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    with open(PIDFILE, "w") as f:
+        f.write(str(os.getpid()))
+    try:
+        while True:
+            signal.pause()
+    finally:
+        os.remove(PIDFILE)
+try:
+    with open(PIDFILE) as f:
+        daemon = int(f.read())
+    os.kill(daemon, 0)
+except (OSError, ValueError):
+    sys.exit(1)
+for command in sys.stdin.read().splitlines():
+    if command.strip() == "quit":
+        os.kill(daemon, signal.SIGTERM)
+    elif command.strip() != "get_server_list":
+        sys.exit(f"mstar_sim: the MPS control command {command!r} is not emulated")

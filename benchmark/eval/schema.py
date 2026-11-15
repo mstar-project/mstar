@@ -373,7 +373,8 @@ def git_info(repo: str | Path) -> dict[str, Any]:
     commit = _run(["git", "rev-parse", "HEAD"], repo)
     if commit is None:
         return {}
-    status = _run(["git", "status", "--porcelain", "--untracked-files=no"], repo)
+    # Don't write the refreshed index back: a git killed while it holds index.lock leaves the repo locked.
+    status = _run(["git", "--no-optional-locks", "status", "--porcelain", "--untracked-files=no"], repo)
     return {
         "commit": commit,
         "branch": _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo),

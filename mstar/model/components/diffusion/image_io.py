@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import struct
+import threading
 import zlib
 
 import numpy as np
@@ -81,6 +82,14 @@ def pixels_to_uint8(image: torch.Tensor) -> torch.Tensor:
     return (image * 255).round().to(torch.uint8)
 
 
+def truncate_to_uint8(pixels: torch.Tensor) -> torch.Tensor:
+    """VAE output in ``[-1, 1]`` -> uint8 in the input's layout, truncated rather
+    than rounded (the Wan-VAE video models' convention). Run eagerly, the
+    arithmetic is in the input's dtype; inside a compiled region Inductor keeps
+    fp32 intermediates."""
+    return (pixels / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8)
+
+
 def uint8_to_png(
     image: torch.Tensor, compress_level: int = 1, adaptive_filters: bool = False, workers: int | None = None,
 ) -> bytes:
@@ -113,36 +122,61 @@ def uint8_to_png(
     return b"".join((
         b"\x89PNG\r\n\x1a\n",
         _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)),  # 8-bit RGB
-        _png_chunk(b"IDAT", _zlib_parallel(raw.tobytes(), compress_level, workers or cpus.plan().png_threads)),
+        _png_chunk(b"IDAT", _zlib_parallel(
+            memoryview(raw).cast("B"), compress_level, workers or cpus.plan().png_threads,
+        )),
         _png_chunk(b"IEND", b""),
     ))
 
 
-def _zlib_parallel(data: bytes, level: int, workers: int, min_block: int = 1 << 18) -> bytes:
-    """One valid zlib stream from ``workers`` independently deflated blocks.
+def _zlib_parallel(data, level: int, workers: int, min_block: int = 1 << 18) -> bytes:
+    """One valid zlib stream from ``workers`` independently deflated blocks of the
+    bytes-like ``data``.
 
     Raw deflate blocks ended with ``Z_SYNC_FLUSH`` finish on a byte boundary, so their
     concatenation is one deflate stream once the last block carries the final bit; zlib
-    releases the GIL, so the blocks compress in parallel. Small inputs take the plain path.
+    releases the GIL, so the blocks compress in parallel, on the process's deflate pool
+    (:func:`_deflate_pool`). Small inputs take the plain path.
     """
     blocks = max(1, min(workers, len(data) // min_block))
     if blocks == 1:
         return zlib.compress(data, level)
     size = -(-len(data) // blocks)
-    parts = [data[i * size:(i + 1) * size] for i in range(blocks)]
+    view = memoryview(data)
 
-    def deflate(index: int, part: bytes) -> bytes:
+    def deflate(index: int) -> bytes:
         compressor = zlib.compressobj(level, zlib.DEFLATED, -zlib.MAX_WBITS)
-        out = compressor.compress(part)
+        out = compressor.compress(view[index * size:(index + 1) * size])
         return out + compressor.flush(zlib.Z_FINISH if index == blocks - 1 else zlib.Z_SYNC_FLUSH)
 
-    with ThreadPool(max_workers=blocks) as pool:
-        deflated = list(pool.map(deflate, range(blocks), parts))
+    futures = [_deflate_pool().submit(deflate, index) for index in range(blocks)]
+    adler = zlib.adler32(view) & 0xFFFFFFFF
     # zlib header: deflate, 32K window, no preset dictionary, "fastest" level hint (FCHECK ok)
-    return b"\x78\x01" + b"".join(deflated) + struct.pack(">I", zlib.adler32(data) & 0xFFFFFFFF)
+    return b"\x78\x01" + b"".join(future.result() for future in futures) + struct.pack(">I", adler)
+
+
+_deflate_threads: ThreadPool | None = None
+_deflate_lock = threading.Lock()
+
+
+def _deflate_pool() -> ThreadPool:
+    """The threads every PNG of this process deflates its blocks on, the CPU plan's
+    ``deflate_threads``. Images encoded at once queue their blocks here instead of
+    each starting threads of its own, and the images the data worker encodes at
+    once still deflate all their blocks together."""
+    global _deflate_threads
+    if _deflate_threads is None:
+        with _deflate_lock:
+            if _deflate_threads is None:
+                _deflate_threads = ThreadPool(
+                    max_workers=cpus.plan().deflate_threads, thread_name_prefix="mstar-deflate",
+                )
+    return _deflate_threads
 
 
 OUTPUT_FORMATS = ("png", "jpeg", "webp")
+# the request keys image_output_format and encode_image read, for a model's request_kwargs
+OUTPUT_FORMAT_KWARGS = ("output_format", "output_compression", "png_compress_level")
 
 
 def image_output_format(request_kwargs: dict | None) -> str:

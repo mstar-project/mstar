@@ -54,14 +54,14 @@ def test_an_input_it_cannot_cut_is_refused(thinker):
 
 @pytest.mark.parametrize("chunk_start,advance", [(0, 0), (6, ADVANCE)])
 def test_only_the_final_vision_chunk_advances_positions(thinker, chunk_start, advance):
-    from mstar.model.qwen3_omni.config import THINKER_POS
+    from mstar.model.qwen3_omni.config import THINKER_KV
 
     cut = thinker.split_inputs("prefill_vision", None, _vision(), chunk_start, chunk_start + 4)
     cut = replace(cut, chunk_start=chunk_start, chunk_total=N)
 
     step = thinker.declare_step("prefill_vision", [0], [cut])
 
-    assert step.steps[THINKER_POS].advance == (advance,)
+    assert step.state[THINKER_KV].advance == (advance,)
 
 
 # ── audio ───────────────────────────────────────────────────────────────
@@ -81,7 +81,7 @@ def _audio():
 def test_a_cut_audio_row_moves_past_its_whole_clip_once_on_its_final_chunk(thinker, start, end, advance):
     """Each chunk's positions are cut from the whole clip's, so moving the
     counter per chunk as well would count the clip twice."""
-    from mstar.model.qwen3_omni.config import THINKER_POS
+    from mstar.model.qwen3_omni.config import THINKER_KV
 
     cut = thinker.split_inputs("prefill_audio", None, _audio(), start, end)
     cut = replace(cut, chunk_start=start, chunk_total=N)
@@ -89,16 +89,16 @@ def test_a_cut_audio_row_moves_past_its_whole_clip_once_on_its_final_chunk(think
     step = thinker.declare_step("prefill_audio", [0], [cut])
 
     assert cut.custom_pos_ids[0].tolist() == list(map(float, range(start, end)))
-    assert step.steps[THINKER_POS].advance == (advance,)
+    assert step.state[THINKER_KV].advance == (advance,)
 
 
 def test_an_uncut_audio_row_advances_by_its_span(thinker):
-    from mstar.model.qwen3_omni.config import THINKER_POS
+    from mstar.model.qwen3_omni.config import THINKER_KV
 
     step = thinker.declare_step("prefill_audio", [0], [_audio()])
 
     # None: the runner's default, the span it ran
-    assert step.steps[THINKER_POS].advance is None
+    assert step.state[THINKER_KV].advance is None
 
 
 def test_a_non_final_chunk_still_streams_its_own_states_to_the_talker():
@@ -114,7 +114,7 @@ def test_a_non_final_chunk_still_streams_its_own_states_to_the_talker():
     # tokens 0-1 multimodal (layer N), 2 kept text (layer 0), 3 dropped
     mask = torch.tensor([[1, 1, 0, 0], [0, 0, 1, 0]])
     outputs = {"new_token": [torch.tensor([7])], "thinker_states": [states], "thinker_mask": [mask]}
-    info = SimpleNamespace(graph_walk="prefill_audio", step_metadata={"is_last_prefill": False})
+    info = SimpleNamespace(graph_walk="prefill_audio", step_metadata={})
 
     thinker.postprocess(0, info, outputs)
 

@@ -20,13 +20,15 @@ no fused params) just call ``load_weights_into(module, weights)``.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
 import torch
 from torch import nn
+
+from mstar.model.loader.quantization import UnservedQuantizationError, is_quantized_part
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +172,7 @@ def load_weights_into(
     stacked_params: list[StackedParamRule] | None = None,
     name_remapper: Callable[[str], str | None] | None = None,
     skip_predicate: Callable[[str], bool] | None = None,
+    strict: bool = False,
 ) -> set[str]:
     """Walk a ``(name, tensor)`` stream and load each into the matching
     parameter of ``module``.
@@ -186,29 +189,45 @@ def load_weights_into(
             ``None`` to drop the key entirely.
         skip_predicate: optional ``(name) -> bool``; returning ``True``
             skips the key. Applied before ``name_remapper``.
+        strict: raise ``ValueError`` if a key that is neither skipped nor
+            dropped names no parameter, or if a parameter gets no tensor (a
+            stacked one, a tensor for each of its shards).
 
     Returns: set of parameter paths that received a tensor.
     """
-    match_stacked = _StackedMatcher(stacked_params or [])
+    stacked = stacked_params or []
+    match_stacked = _StackedMatcher(stacked)
     params_dict = dict(module.named_parameters())
     loaded: set[str] = set()
+    # each stacked parameter's shards that got a tensor
+    shards: dict[str, set[str | int]] = {}
+    unmatched: list[str] = []
     dropped: list[str] = []
     num_dropped = 0
 
-    for name, tensor in weights:
-        if skip_predicate is not None and skip_predicate(name):
+    for key, tensor in weights:
+        if skip_predicate is not None and skip_predicate(key):
             continue
+        name = key
         if name_remapper is not None:
-            mapped = name_remapper(name)
-            if mapped is None:
+            name = name_remapper(key)
+            if name is None:
                 continue
-            name = mapped
 
         target, shard_id = match_stacked(name)
         if target not in params_dict:
-            # Not an error: the checkpoint may carry extra keys (lm_head
-            # ties, kv-scale, etc.). Caller can verify completeness via
-            # the returned set.
+            if is_quantized_part(target):
+                # its values would load without it, unscaled or still packed
+                raise UnservedQuantizationError(
+                    f"{type(module).__name__}: checkpoint key {name!r} is part of a quantized "
+                    "weight, and none of this model's parameters loads it: the model holds "
+                    "unquantized weights here. Serve an unquantized checkpoint of the model."
+                )
+            # Not an error unless strict: the checkpoint may carry extra
+            # keys (lm_head ties, kv-scale, etc.). Caller can verify
+            # completeness via the returned set.
+            if strict:
+                unmatched.append(key)
             num_dropped += 1
             if len(dropped) < 3:
                 dropped.append(target)
@@ -216,7 +235,21 @@ def load_weights_into(
 
         _dispatch_loader(params_dict[target], tensor, shard_id)
         loaded.add(target)
+        if strict and shard_id is not None:
+            shards.setdefault(target, set()).add(shard_id)
 
+    if strict:
+        if unmatched:
+            raise ValueError(
+                f"{len(unmatched)} checkpoint tensor(s) have no parameter here, e.g. {unmatched[:5]}"
+            )
+        missing = sorted(params_dict.keys() - loaded) + sorted(
+            f"{target} shard {shard!r}"
+            for target, got in shards.items()
+            for shard in {r.shard_id for r in stacked if r.target_suffix in target} - got
+        )
+        if missing:
+            raise ValueError(f"{len(missing)} parameter(s) got no weight, e.g. {missing[:5]}")
     if num_dropped:
         # Dropped keys are fine while every parameter got a weight. Both at
         # once usually means the key layout drifted from the module's.
@@ -293,6 +326,7 @@ def load_weights(
     model: nn.Module,
     source: str | Path,
     device: torch.device | str = "cpu",
+    quant_methods: Collection[str] = (),
     **kwargs,
 ) -> set[str]:
     """Top-level driver.
@@ -303,7 +337,9 @@ def load_weights(
     ``model.safetensors``).
 
     Calls ``model.load_weights(iter)`` with the resolved iterator. Extra
-    kwargs are forwarded to ``model.load_weights``.
+    kwargs are forwarded to ``model.load_weights``. ``quant_methods`` names
+    the quantized formats the model loads itself; any other quantized
+    checkpoint is refused.
     """
     from mstar.model.loader.iterators import (
         iter_safetensors_file,
@@ -312,9 +348,9 @@ def load_weights(
 
     source = Path(source)
     if source.is_file():
-        weights = iter_safetensors_file(source, device=device)
+        weights = iter_safetensors_file(source, device=device, quant_methods=quant_methods)
     elif source.is_dir():
-        weights = iter_safetensors_shards(source, device=device)
+        weights = iter_safetensors_shards(source, device=device, quant_methods=quant_methods)
     else:
         raise FileNotFoundError(source)
     return model.load_weights(weights, **kwargs)

@@ -5,15 +5,23 @@ state lives in a ``RecurrentStatePool`` (as `kv/` is to `attn/`), and head
 geometry is read off its blocks rather than declared here.
 """
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
+    from mstar.engine.resources.recurrent.config import RecurrentStateConfig
+    from mstar.engine.resources.sequence_shard import SeqShardSpec
+
+
+def bf16_gdn_state_fits(head_k_dim: int, head_v_dim: int) -> bool:
+    """Whether FlashInfer's bf16 GDN decode kernel takes a state of these head dims: K = V = 128 only."""
+    return head_k_dim == head_v_dim == 128
 
 
 class LinearAttnVariant(Enum):
@@ -26,7 +34,8 @@ class LinearAttnVariant(Enum):
 
 
 class LinearAttnBackend(Enum):
-    FLASHINFER = "flashinfer"
+    FLASHINFER = "flashinfer"  # GDN: FlashInfer's kernels
+    TRITON = "triton"  # KDA: the fused kernels in kda_triton.py
 
 
 @dataclass
@@ -39,12 +48,8 @@ class LinearAttnConfig:
     # own default does.
     sm_scale: float | None = None
 
-    # GLM-5.3 sets this (`gate_lower_bound: -5.0`), selecting a different gate
-    # formula in the KDA kernel. None keeps the softplus one.
-    gate_lower_bound: float | None = None
-
     # L2-normalise q and k for the delta rule: in the kernel where it can, by
-    # `GDNManager.run` where it cannot (the SM90 chunked prefill). Qwen3.5 needs
+    # `GDNManager.run` where it cannot (any unstaged chunked prefill). Qwen3.5 needs
     # it (the HF reference passes it) and skipping it diverges silently.
     qk_l2norm: bool = True
 
@@ -57,12 +62,79 @@ class LinearAttnConfig:
     splits: tuple[CombinedSplit, ...] = ()
 
 
+# How a split step's prompt rows reach the recurrence (`linear_attn.base`): "ulysses" trades tokens
+# for heads, "state_passing" hands each rank's state on to the next. The spec picks, from the
+# pool's head counts (`LinearAttnSpec.split_exchange`)
+LinearSpExchange = Literal["ulysses", "state_passing"]
+
+
 @dataclass
 class LinearAttnSpec(NodeResourceSpec):
     config: LinearAttnConfig
+    # the sequence shard over its nodes, if any (`derive`)
+    shard_key: str | None = field(default=None, init=False, repr=False)
 
     def depends_on(self) -> set[str]:
-        return {self.config.recurrent_state}
+        keys = {self.config.recurrent_state}
+        if self.shard_key is not None:
+            keys.add(self.shard_key)
+        return keys
+
+    def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
+        from mstar.engine.resources.sequence_shard import take_shard_edge
+
+        return take_shard_edge(self, specs)
+
+    def resolve_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> str:
+        """``none`` where the node's shard never splits, else ``ulysses``: the shard reads only
+        whether this resource takes split steps, and which exchange they take needs the ranks
+        (``split_exchange``)."""
+        from mstar.engine.resources.sequence_shard import shard_exchange
+
+        return "none" if shard_exchange(self, specs) == "none" else "ulysses"
+
+    def splits_eagerly(self, specs: Mapping[str, NodeResourceSpec]) -> bool:
+        # both exchanges plan their conv halo and hand-off per rank on the host
+        return self.resolve_exchange(specs) != "none"
+
+    def split_exchange(self, pool: "RecurrentStateConfig", tp: int, sp: int) -> LinearSpExchange:
+        """How a split step's prompt rows reach the recurrence, from the head counts the model
+        declared: ``ulysses`` where each TP rank's heads split ``sp`` ways (Mamba-2's B/C groups may
+        also be fewer a TP rank than SP ranks: each SP rank's heads then read one group, repeated
+        to it), ``state_passing`` where they don't. Alike on every rank."""
+        uneven = any(
+            (n // tp) % sp and not (what == "B/C groups" and sp % (n // tp) == 0)
+            for what, n in _unsharded_heads(pool, self.config.variant).items()
+        )
+        return "state_passing" if uneven else "ulysses"
+
+    def split_step_refusals(
+        self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, "NodeResourceSpec"],
+    ) -> list[str]:
+        pool = specs[self.config.recurrent_state].config
+        name = f"linear attention {self.resource_key!r}"
+        if self.config.variant is LinearAttnVariant.KDA:
+            # KDAManager sets no supports_split_steps, which the engine refuses at build; a spec can't
+            # see the built class (`resource_class` is LinearAttnManager for every variant), so this
+            # names the variant. Both change together if KDA gains split steps
+            return [
+                f"{name} is Kimi delta attention, which takes no split steps, so node {node!r} can't split them: "
+                "run it on TP ranks alone, or store its KV by position (context_parallel) with its sequence "
+                "shard's exchange at auto, so its steps run copied"
+            ]
+        if shard.axis == 1 or shard.stripe_pool is not None:
+            how = "each row (axis 1)" if shard.axis == 1 else f"by KV {shard.stripe_pool!r}'s stored positions"
+            return [f"{name} splits a step's rows into contiguous pieces, and node {node!r}'s shard splits {how}"]
+        hands_state = self.split_exchange(pool, tp, sp) == "state_passing"
+        if hands_state and sp >= 3 and self.config.variant is not LinearAttnVariant.MAMBA2:
+            dk, dv = _unsharded_head_dims(pool)
+            if dk != dv:
+                return [
+                    f"{name}'s heads don't split {sp} ways per TP rank, so it hands state on over {sp} SP ranks "
+                    f"(state_passing), whose middle pieces' transition needs equal key and value head dims; "
+                    f"they are {dk} and {dv}"
+                ]
+        return []
 
     def combined_splits(self) -> tuple[CombinedSplit, ...]:
         return self.config.splits
@@ -83,12 +155,26 @@ class LinearAttnSpec(NodeResourceSpec):
 
         return LinearAttnManager
 
-    def apply_yaml_overrides(
-        self, backend: str | LinearAttnBackend | None = None,
-    ):
+    def apply_yaml_overrides(self, backend: str | LinearAttnBackend | None = None):
         """Let the deployment pick the backend; slot capacity is tuned on the pool."""
         if backend is not None:
             self.config.backend = LinearAttnBackend(backend)
+
+
+def _unsharded_heads(pool: "RecurrentStateConfig", variant: LinearAttnVariant) -> dict[str, int]:
+    """The pool's head counts as the model declared them, before any rank shards them."""
+    if variant is LinearAttnVariant.MAMBA2:
+        heads, head_dim, state_size = pool.blocks["ssm"]._unsharded_shape
+        conv_dim = pool.blocks["conv"]._unsharded_shape[0]
+        return {"heads": heads, "B/C groups": (conv_dim - heads * head_dim) // (2 * state_size)}
+    v_heads, v_dim, k_dim = pool.blocks["state"]._unsharded_shape
+    conv_dim = pool.blocks["conv"]._unsharded_shape[0]
+    return {"key heads": (conv_dim - v_heads * v_dim) // (2 * k_dim), "value heads": v_heads}
+
+
+def _unsharded_head_dims(pool: "RecurrentStateConfig") -> tuple[int, int]:
+    _, v_dim, k_dim = pool.blocks["state"]._unsharded_shape
+    return k_dim, v_dim
 
 
 @dataclass(frozen=True)
@@ -98,4 +184,10 @@ class LinearAttnStep(ResourceStep):
     Carries no state semantics: the segments give the rows and spans, and the
     pool's own step says what becomes of the slots. The walk is derived from
     the spans.
+
+    ``speculative``: every row is a verify block of a speculating node, which
+    first replays the accepted part of the row's last block (the pool's
+    speculative blocks); the span is the block's length, the same for every row.
     """
+
+    speculative: bool = False

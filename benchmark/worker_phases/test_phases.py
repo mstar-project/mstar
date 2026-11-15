@@ -6,7 +6,7 @@ together, so it is asserted against hand-written logs rather than trusted.
 from phases import Record, parse_line, parse_log, render, segment
 
 LINE = (
-    "2026-09-23 02:15:01,123 INFO [worker_0] mstar.worker.worker: "
+    "2026-09-23 02:15:01,123 INFO [worker_0] mstar.worker.phase_timer: "
     "Worker worker_0 phase-timing iter=300 bs=15.94: "
     "await_gpu: p50=0.00ms p95=0.01ms mean=0.00ms n=100 | "
     "iter_total: p50=6.55ms p95=7.99ms mean=6.68ms n=100"
@@ -120,11 +120,11 @@ def test_request_steps_is_bs_times_iters():
     of bs x iter_total samples, which is what makes phase cost comparable
     between runs whose iteration mix differs (e.g. orpheus' snac decoder)."""
     log = (
-        "2026-09-23 21:17:31,409 INFO [worker_0] mstar.worker.worker: "
+        "2026-09-23 21:17:31,409 INFO [worker_0] mstar.worker.phase_timer: "
         "Worker worker_0 phase-timing iter=100 bs=10.00: "
         "iter_total: p50=1.00ms p95=1.00ms mean=1.00ms n=100 | "
         "foo: p50=0.50ms p95=0.50ms mean=0.50ms n=100\n"
-        "2026-09-23 21:17:32,409 INFO [worker_0] mstar.worker.worker: "
+        "2026-09-23 21:17:32,409 INFO [worker_0] mstar.worker.phase_timer: "
         "Worker worker_0 phase-timing iter=200 bs=10.00: "
         "iter_total: p50=1.00ms p95=1.00ms mean=1.00ms n=100 | "
         "foo: p50=0.50ms p95=0.50ms mean=0.50ms n=100\n"
@@ -142,7 +142,7 @@ def test_us_per_1k_is_zero_without_bs():
     """A log from a worker predating the bs field still parses; the work
     column is simply absent rather than wrong."""
     log = (
-        "2026-09-23 21:17:31,409 INFO [worker_0] mstar.worker.worker: "
+        "2026-09-23 21:17:31,409 INFO [worker_0] mstar.worker.phase_timer: "
         "Worker worker_0 phase-timing iter=100: "
         "iter_total: p50=1.00ms p95=1.00ms mean=1.00ms n=100\n"
     )

@@ -6,12 +6,14 @@ from mstar.engine.resources.attn.config import AttentionStep, refuse_context_onl
 from mstar.engine.resources.attn.ragged.base import (
     RaggedBlockCausalAttnManager,
     _RaggedCrossManagerBase,
+    _RaggedKeyPrefixManagerBase,
     _RaggedManagerBase,
     _RaggedSelfManagerBase,
 )
 from mstar.engine.resources.attn.ragged.block_causal import RaggedBlockCausalWrapper
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig
 from mstar.engine.resources.attn.ragged.wrappers import (
+    FlashInferKeyPrefixPrefillWrapper,
     FlashInferRaggedCrossPrefillWrapper,
     FlashInferRaggedPrefillWrapper,
     _RaggedPrefillBase,
@@ -23,7 +25,7 @@ from mstar.engine.resources.step import StepContext
 
 class _FlashInferRaggedManagerBase(_RaggedManagerBase):
     """FlashInfer extras on top of the shared manager: the kernel backend, and a
-    workspace per (label, slot) shared by that slot's eager and captured wrappers."""
+    workspace per (label, slot) shared by every wrapper on that slot."""
 
     def __init__(
         self,
@@ -31,15 +33,17 @@ class _FlashInferRaggedManagerBase(_RaggedManagerBase):
         dtype: torch.dtype,
         config: RaggedAttentionConfig,
         key: str,
+        **kwargs,
     ):
-        super().__init__(device=device, dtype=dtype, config=config, key=key)
+        super().__init__(device=device, dtype=dtype, config=config, key=key, **kwargs)
         self._workspaces = WorkspacePool(device, config.workspace_mb, owner=key)
-        self._kwargs["backend"] = config.flashinfer_backend
+        self._flashinfer_backend = "auto" if config.flashinfer_backend is None else config.flashinfer_backend
 
-    def _build_wrapper(self, label: str, slot: int, **graph_kwargs) -> _RaggedPrefillBase:
-        return super()._build_wrapper(
-            label, slot, workspace_buffer=self._workspaces.get(label, slot), **graph_kwargs,
-        )
+    def _build_wrapper(self, label: str, slot: int, **wrapper_kwargs) -> _RaggedPrefillBase:
+        return super()._build_wrapper(label, slot, **{
+            "workspace_buffer": self._workspaces.get(label, slot), "backend": self._flashinfer_backend,
+            **wrapper_kwargs,
+        })
 
     def run(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -66,6 +70,10 @@ class FlashInferRaggedCrossManager(_FlashInferRaggedManagerBase, _RaggedCrossMan
     wrapper_class = FlashInferRaggedCrossPrefillWrapper
 
 
+class FlashInferRaggedKeyPrefixManager(_FlashInferRaggedManagerBase, _RaggedKeyPrefixManagerBase):
+    wrapper_class = FlashInferKeyPrefixPrefillWrapper
+
+
 class FlashInferRaggedBlockCausalManager(_FlashInferRaggedManagerBase, RaggedBlockCausalAttnManager):
     """Block-causal self-attention: every label in the step is its own layout,
     each segment attending block-causally within itself."""
@@ -87,7 +95,8 @@ class FlashInferRaggedBlockCausalManager(_FlashInferRaggedManagerBase, RaggedBlo
         refuse_context_only(step, type(self).__name__)
         super().plan(step, ctx)
 
-    def _plan_layouts(self, step: AttentionStep, ctx: StepContext, plan_states) -> None:
+    def _plan_layouts(self, step: AttentionStep, ctx: StepContext, plan_states, shard_plan) -> None:
+        # takes no split steps (`supports_split_steps`), so has no shard to read
         if step.causal:
             raise ValueError(
                 "block-causal attention is its own mask; declare it with "

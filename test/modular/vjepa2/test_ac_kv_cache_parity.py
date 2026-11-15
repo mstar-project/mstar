@@ -1,6 +1,6 @@
 """Parity test: VisionTransformerPredictorAC cached vs non-cached forward.
 
-The KV-cached path (forward under a plan label, one frame at a time) must
+The KV-cached path (forward with cached=True, one frame at a time) must
 produce the same output per frame as the non-cached path (all T frames at once
 with a causal block attention mask).
 
@@ -9,16 +9,19 @@ Why they must match:
   Cached:     at step t_0 the cache holds K/V for frames 0..t_0 exactly, so
               full (non-causal) attention over the cache equals the masked result.
 
-Uses a fake KV + attention resource pair backed by
+Uses a fake array handle backed by
 F.scaled_dot_product_attention — no FlashInfer or GPU required.
 """
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.config import VJepa2ACPredictorConfig
+from mstar.model.vjepa2.submodules import VJepa2ACRolloutPredictorSubmodule
 
 from .fake_resources import bind_fake_resources
 
@@ -81,7 +84,7 @@ class TestKVCacheParity:
                 act_t = actions[:, t_0 : t_0 + 1, :]
                 st_t  = states[:, t_0 : t_0 + 1, :]
 
-                out_t = model(x_t, act_t, st_t, t_0=t_0, label="main")
+                out_t = model(x_t, act_t, st_t, t_0=t_0, cached=True)
                 # [B, N, embed_dim]
 
                 expected = out_full[:, t_0 * N : (t_0 + 1) * N, :]
@@ -118,7 +121,7 @@ class TestKVCacheParity:
 
                 out_t = model(
                     x_t, act_t, st_t, extrinsics=ext_t,
-                    t_0=t_0, label="main",
+                    t_0=t_0, cached=True,
                 )
 
                 expected = out_full[:, t_0 * N : (t_0 + 1) * N, :]
@@ -160,7 +163,7 @@ class TestKVCacheParity:
 
                 # Mirror what preprocess does in production.
                 cache.plan(seq_lens=[tokens_per_req] * B)
-                out_t = model(x_t, act_t, st_t, t_0=t_0, label="main")
+                out_t = model(x_t, act_t, st_t, t_0=t_0, cached=True)
 
                 expected = out_full[:, t_0 * N : (t_0 + 1) * N, :]
                 torch.testing.assert_close(
@@ -181,7 +184,7 @@ class TestKVCacheParity:
 
         cache = bind_fake_resources(model)
         with torch.no_grad():
-            out = model(x, act, st, t_0=0, label="main")
+            out = model(x, act, st, t_0=0, cached=True)
 
         assert out.shape == (B, N, cfg.embed_dim)
 
@@ -221,7 +224,7 @@ class TestKVCacheParity:
                     x_t   = x_seq[:, t_0 * N : (t_0 + 1) * N, :]
                     act_t = actions[:, t_0 : t_0 + 1, :]
                     st_t  = states[:, t_0 : t_0 + 1, :]
-                    outs.append(model(x_t, act_t, st_t, t_0=t_0, label="main"))
+                    outs.append(model(x_t, act_t, st_t, t_0=t_0, cached=True))
             return outs
 
         base_outs = _run_cached(x_base, act_base, st_base)
@@ -237,3 +240,36 @@ class TestKVCacheParity:
         # Last frame output must differ.
         assert not torch.allclose(base_outs[-1], pert_outs[-1], atol=1e-3), \
             "last-frame perturbation had no effect"
+
+
+class TestBlockLoopRegion:
+    """A region replays what `make_block_loop_fn` records, so a capture that took the SDPA path would return wrong
+    hidden states on every replay, with no error, while the eager path stayed right."""
+
+    @torch.no_grad()
+    def test_the_captured_block_loop_attends_the_array_as_the_eager_path_does(self):
+        torch.manual_seed(5)
+        cfg = _tiny_ac_config()
+        model = VisionTransformerPredictorAC(cfg).eval()
+        node = VJepa2ACRolloutPredictorSubmodule(model, None)
+        T = cfg.num_frames // cfg.tubelet_size
+        N = (cfg.img_size[0] // cfg.patch_size) ** 2
+        x = torch.randn(1, T * N, cfg.embed_dim)
+        actions, states = torch.randn(1, T, cfg.action_embed_dim), torch.randn(1, T, cfg.action_embed_dim)
+        frames = [(x[:, t * N:(t + 1) * N], actions[:, t:t + 1], states[:, t:t + 1]) for t in range(T)]
+
+        bind_fake_resources(model)
+        eager = [model(*frame, t_0=t, cached=True) for t, frame in enumerate(frames)]
+
+        handle = bind_fake_resources(model)
+        for t, frame in enumerate(frames):
+            sequence, cond_tokens, b, frames_in_step = model._prepare_sequence(*frame)
+            d_pos, h_pos, w_pos, time_pos = model._compute_rope_positions(
+                t, model.grid_height, model.grid_width, cond_tokens, sequence.device, sequence.dtype,
+            )
+            static_inputs = {"x": sequence, "d_pos": d_pos, "h_pos": h_pos, "w_pos": w_pos, "time_pos": time_pos}
+            region_inputs = SimpleNamespace(static_inputs=static_inputs, kwargs={"cond_tokens": cond_tokens})
+            captured = node._block_loop_capture(region_inputs)
+            out = model._decode_sequence(captured["x"], cond_tokens, b, frames_in_step)
+            torch.testing.assert_close(out, eager[t], msg=f"frame {t} differs from the eager path")
+        assert sorted(handle._kv) == list(range(cfg.depth)), "each block keeps its K/V under its own layer id"

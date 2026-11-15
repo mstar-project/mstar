@@ -125,16 +125,25 @@ def main(argv: list[str] | None = None) -> None:
     from transformers.models.whisper.english_normalizer import EnglishTextNormalizer
 
     sentences = load_sentences(args.sentences)
-    audio_paths = sorted(Path(args.audio_dir).glob("*.wav"))
-    if not audio_paths:
+    # Every sentence the run sent is scored: a request that failed left no WAV
+    # and counts as an empty transcript, not as a skipped sentence. The run's
+    # report next to the WAVs says how many it sent.
+    record = Path(args.audio_dir) / "report.json"
+    if not record.exists():
+        sys.exit(f"no report.json in {args.audio_dir} (written by tts_speech_bench --save-audio-dir)")
+    expected = sorted(sentences)[: json.loads(record.read_text(encoding="utf-8"))["num_sentences"]]
+    audio = {int(p.stem): p for p in Path(args.audio_dir).glob("*.wav")}
+    present = [sid for sid in expected if sid in audio]
+    if not present:
         sys.exit(f"no WAV files in {args.audio_dir}")
-    hypotheses = transcribe(audio_paths, args.asr_model, args.device, args.batch_size)
+    transcripts = transcribe([audio[sid] for sid in present], args.asr_model, args.device, args.batch_size)
+    hypotheses = dict(zip(present, transcripts, strict=True))
     normalize = EnglishTextNormalizer({})
 
     rows = []
     total_errors = total_words = 0
-    for path, hypothesis in zip(audio_paths, hypotheses, strict=True):
-        sid = int(path.stem)
+    for sid in expected:
+        hypothesis = hypotheses.get(sid, "")
         reference = sentences[sid]
         ref_words = normalize(reference).split()
         hyp_words = normalize(hypothesis).split()
@@ -147,7 +156,8 @@ def main(argv: list[str] | None = None) -> None:
     report = {
         "audio_dir": str(Path(args.audio_dir).resolve()),
         "asr_model": args.asr_model,
-        "files": len(rows),
+        "files": len(present),
+        "missing": [sid for sid in expected if sid not in audio],
         "wer_percent": wer,
         "total_words": total_words,
         "total_errors": total_errors,
@@ -156,7 +166,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print(f"WER {wer:.2f}% over {len(rows)} files ({total_errors}/{total_words} words)")
+    print(f"WER {wer:.2f}% over {len(rows)} sentences, {len(rows) - len(present)} without audio "
+          f"({total_errors}/{total_words} words)")
 
 
 if __name__ == "__main__":

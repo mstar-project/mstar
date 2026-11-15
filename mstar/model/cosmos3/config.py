@@ -368,9 +368,9 @@ class Cosmos3Config:
     # it to bf16 rounding. Costs the cache per live stream, freed when the
     # stream's last window is decoded or the request goes away: 1.33 GiB of
     # tensors at 832x480 in bf16 (the Wan2.2 VAE), growing with the frame
-    # area, and twice that when the decode runs in fp32 (cuDNN before 9.16,
-    # or COSMOS3_VAE_DECODE_FP32). Sessions still store only latents. False
-    # re-decodes the context ahead of every window.
+    # area, and twice that when the decode runs in fp32 (cuDNN before 9.16).
+    # Sessions still store only latents. False re-decodes the context ahead
+    # of every window.
     windowed_decode_warm_cache: bool = True
     # At most this many streams per decoder copy hold a warm cache (0: no cap).
     # A stream that starts while the cap is reached takes the stateless
@@ -420,7 +420,7 @@ class Cosmos3Config:
     # never evicted, and a second request on it is refused.
     session_store_size: int = 8
     # Idle sessions expire after this many seconds unless the request set
-    # ``session_timeout_s`` (capped at the max); ``end_session`` drops one early.
+    # ``session_timeout_s`` (at most the max); ``end_session`` drops one early.
     session_timeout_s: float = 600.0
     session_timeout_max_s: float = 3600.0
     # A generation step whose requests total more vision tokens than this runs
@@ -436,7 +436,7 @@ class Cosmos3Config:
     # Number of denoise model evaluations. The per-mode cookbook defaults are
     # t2i 50, t2v/i2v 35, action fd/id 30, DROID policy ~4. ``num_inference_steps``
     # is the image default; ``num_inference_steps_video`` is the video default.
-    # A request may override either; the value is clamped to ``max_inference_steps``.
+    # A request may override either; a value above ``max_inference_steps`` is a 400.
     num_inference_steps: int = 50
     num_inference_steps_video: int = 35
     # Upper bound on the denoise loop's iteration count. The loop is built with
@@ -524,6 +524,11 @@ class Cosmos3Config:
     # Empty = no video capture. COSMOS3_GEN_CAPTURE_VIDEO ("480x832x29,...",
     # height x width x frames) overrides.
     gen_capture_video: tuple[tuple[int, int, int], ...] = ()
+    # Image denoise steps to capture, as (height, width) pixel tiers. None
+    # keeps the submodule's defaults (192x320, 480x832, 720x1280); a tier
+    # above graph_max_latent_area is still skipped. COSMOS3_GEN_CAPTURE_RES
+    # ("1024x1024,...", height x width) overrides.
+    gen_capture_image: tuple[tuple[int, int], ...] | None = None
     # torch.compile the denoise compute (the generation-layer stack around the
     # attention op). Always a win in serving; the parity tests set False to keep
     # their bit-exact bounds on the eager step.
@@ -537,31 +542,26 @@ class Cosmos3Config:
     # options (-O2: max-autotune).
     denoise_compile_mode: str = "deterministic"
     # Compile the cross-request denoise step (two or more requests in one
-    # forward) too, with the same mode: the video, image and sound steps; the
-    # action step (``denoise_step_action_batched``) runs eager. Eager, the
-    # norms, rotary and residuals cost about 80 ms of GPU per extra row at
-    # 832x480x121 on a B300. Only its layer stack compiles, once, at startup,
-    # with the pack length dynamic, so no batch size or mix of resolutions
+    # forward) too, with the same mode: the video, image, sound and action
+    # steps share one compiled layer stack. Eager, the norms, rotary and
+    # residuals cost about 80 ms of GPU per extra row at
+    # 832x480x121 on a B300. Only its layer stack compiles, at startup, with
+    # only the pack length dynamic, so no batch size or mix of resolutions
     # compiles mid-traffic; the per-request patchify, rotary tables and
     # unpatchify run eager.
     compile_denoise_batched: bool = True
-    # torch.compile the reasoner's captured decode step before the CUDA-graph
-    # capture: at bs=1 the eager step is ~1240 kernels, ~1000 of them the
-    # norms', rotary's and residuals' pointwise pieces; fused, the step runs
-    # at the weight-streaming floor (H100: 4.2 -> 2.05 ms/token). Env override
-    # COSMOS3_REASONER_COMPILE=0/1 for A/B.
-    compile_reasoner_decode: bool = True
-    # torch.compile the reasoner's eager prefill (text and vision prompts; the
-    # decode step has its own captured graph). The eager prefill of a ~300-token
-    # image prompt is ~1250 kernels for ~5 ms of GPU work (24 ms wall on an
-    # H100, launch-bound), so the fusion would take a third of that. Off by
-    # default: with dynamic shapes (one compile for every prompt length) torch
-    # 2.11's inductor fails in its joint-graph noop pass ("'SymInt' object has
-    # no attribute 'size'"), and a static compile recompiles per prompt length
-    # until automatic dynamic shapes route it into the same failure. Env
-    # override COSMOS3_REASONER_PREFILL_COMPILE=0/1 for the A/B once fixed
-    # upstream; the padded prefill graph (like the DiT's) is the real answer.
-    compile_reasoner_prefill: bool = False
+    # torch.compile the captured understanding-tower prefill (one compile per
+    # token bucket), in ``denoise_compile_mode``. Its eager norms, rotary and
+    # copies are about a third of the prefill's GPU time on Super; off by
+    # default, since it changes the prefix K/V's low bits.
+    compile_prefill: bool = False
+    # [width, height] of the one-frame conditioning encode the vae_encoder node
+    # compiles, in Inductor's deterministic mode on channels-last encoder
+    # weights: a policy server's observation size, warmed at startup (a 736x544
+    # one encodes in 4.6 ms instead of 9.3 ms on an H200). Every other encode
+    # runs eager, so no request compiles mid-traffic; eager on channels-last
+    # weights is ~9% slower than stock. None (the default) keeps them all eager.
+    compile_vae_encode_size: tuple[int, int] | None = None
     # Which attention backends the DiT node declares (see
     # Cosmos3Model.get_node_resources). "dense_gen" (the default) declares the
     # paged FlashInfer backend the understanding prefill and the captured
@@ -615,10 +615,16 @@ class Cosmos3Config:
     def check_compile(self) -> None:
         """Reject compile settings that would be read as something else: a
         non-boolean switch (a yaml ``"false"`` is truthy) or an unknown mode."""
-        for name in ("compile_denoise", "compile_denoise_batched"):
+        for name in ("compile_denoise", "compile_denoise_batched", "compile_prefill"):
             value = getattr(self, name)
             if not isinstance(value, bool):
                 raise ValueError(f"Cosmos3 {name} must be true or false, got {value!r}.")
+        size = self.compile_vae_encode_size
+        if size is not None and not (
+            isinstance(size, (list, tuple)) and len(size) == 2
+            and all(isinstance(x, int) and not isinstance(x, bool) and x > 0 for x in size)
+        ):
+            raise ValueError(f"Cosmos3 compile_vae_encode_size must be [width, height] or null, got {size!r}.")
         if self.denoise_compile_mode not in DENOISE_COMPILE_MODES:
             raise ValueError(
                 f"Cosmos3 denoise_compile_mode must be one of {DENOISE_COMPILE_MODES}, "
@@ -639,6 +645,11 @@ class Cosmos3Config:
     @property
     def serves_reasoner(self) -> bool:
         return self.reasoner is not None
+
+    @property
+    def stop_token_ids(self) -> frozenset[int]:
+        """The reasoner's stop ids: its end of turn."""
+        return frozenset({self.reasoner.eos_token_id}) if self.reasoner is not None else frozenset()
 
     @classmethod
     def from_transformer_dict(cls, d: dict[str, Any]) -> "Cosmos3Config":

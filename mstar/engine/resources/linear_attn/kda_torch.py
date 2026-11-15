@@ -1,0 +1,339 @@
+"""Kimi delta attention in plain torch, and ``TorchKDAKernels``, the ``KDAManager`` bundle
+that runs it on the pool's slots: the default where the fused kernels don't run, and their
+test oracle. Its prefill loops over the spans on the host, so it cannot be captured.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+
+
+def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    """``x / sqrt(sum(x^2) + eps)``, eps inside the root as in FLA; fp32 inputs."""
+    inv_norm = torch.sqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+    return x / inv_norm
+
+
+def causal_conv1d_prefill(mixed_qkv: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Depthwise causal conv + SiLU over ``(B, channels, L)``, fp32 compute."""
+    seq_len = mixed_qkv.shape[-1]
+    num_channels = mixed_qkv.shape[1]
+    out = F.conv1d(
+        mixed_qkv.to(weight.dtype),
+        weight=weight,
+        bias=None,
+        padding=weight.shape[-1] - 1,
+        groups=num_channels,
+    )[:, :, :seq_len]
+    return F.silu(out).to(mixed_qkv.dtype)
+
+
+def causal_conv1d_update(
+    mixed_qkv: torch.Tensor, conv_state: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """Single/multi-token conv step against a rolled state, fp32 compute."""
+    seq_len = mixed_qkv.shape[-1]
+    num_channels = mixed_qkv.shape[1]
+    state_len = conv_state.shape[-1]
+    window = torch.cat([conv_state, mixed_qkv], dim=-1).to(weight.dtype)
+    conv_state.copy_(window[:, :, -state_len:])
+    out = F.conv1d(window, weight=weight, bias=None, padding=0, groups=num_channels)
+    out = out[:, :, -seq_len:]
+    return F.silu(out).to(mixed_qkv.dtype)
+
+
+def chunk_kda(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    chunk_size: int = 64,
+    initial_state: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Chunked gated delta rule (reference ``chunk_kimi_delta_attention``)."""
+    initial_dtype = query.dtype
+    query, key, value, beta, g = [
+        x.transpose(1, 2).contiguous().to(torch.float32)
+        for x in (query, key, value, beta, g)
+    ]
+
+    # in fp32 and before the scale, as FLA does
+    query = l2norm(query)
+    key = l2norm(key)
+
+    batch_size, num_heads, sequence_length, k_head_dim = key.shape
+    v_head_dim = value.shape[-1]
+    scale = 1 / (query.shape[-1] ** 0.5)
+    if initial_state is not None:
+        # a continue shorter than a chunk runs as one chunk of its own length
+        chunk_size = min(chunk_size, sequence_length)
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+    total_sequence_length = sequence_length + pad_size
+
+    query = F.pad(query, (0, 0, 0, pad_size)) * scale
+    key = F.pad(key, (0, 0, 0, pad_size))
+    value = F.pad(value, (0, 0, 0, pad_size))
+    g = F.pad(g, (0, 0, 0, pad_size))
+    beta = F.pad(beta, (0, pad_size))
+    v_beta = value * beta.unsqueeze(-1)
+    k_beta = key * beta.unsqueeze(-1)
+
+    # (B, H, num_chunks, chunk_size, D)
+    query, key, value, g, k_beta, v_beta = [
+        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
+        for x in (query, key, value, g, k_beta, v_beta)
+    ]
+    beta = beta.reshape(beta.shape[0], beta.shape[1], -1, chunk_size)
+
+    # decay per head and per key channel, where KDA differs from GDN
+    g = g.cumsum(dim=-2)
+    upper_incl_diag = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+        diagonal=0,
+    )
+    strict_upper = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+        diagonal=1,
+    )
+    # The decay exp(g_i - g_j) is (B, H, C, C, D) per chunk; the reference builds it for every
+    # chunk at once, gigabytes for one long span, after the KV pool is sized. Per chunk here.
+    num_chunks = total_sequence_length // chunk_size
+    attn = query.new_empty(batch_size, num_heads, num_chunks, chunk_size, chunk_size)
+    attn_intra = torch.empty_like(attn)
+    for n in range(num_chunks):
+        k_n = key[:, :, n]
+        decay = (g[:, :, n].unsqueeze(-2) - g[:, :, n].unsqueeze(-3)).exp()
+        attn[:, :, n] = -(k_beta[:, :, n].unsqueeze(-2) * k_n.unsqueeze(-3) * decay).sum(dim=-1)
+        # intra chunk, diagonal included: token i reads its own write
+        attn_intra[:, :, n] = (query[:, :, n].unsqueeze(-2) * k_n.unsqueeze(-3) * decay).sum(dim=-1)
+    attn = attn.masked_fill(upper_incl_diag, 0)
+    attn_intra = attn_intra.masked_fill(strict_upper, 0)
+    # T = (I - A)^-1 by forward substitution over the strictly-lower A.
+    for i in range(1, chunk_size):
+        row = attn[..., i, :i].clone()
+        sub = attn[..., :i, :i].clone()
+        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    t_mat = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+
+    u = t_mat @ v_beta  # (B, H, N, C, D)
+    w = t_mat @ (k_beta * g.exp())
+
+    last_recurrent_state = (
+        torch.zeros(
+            batch_size, num_heads, k_head_dim, v_head_dim,
+            dtype=u.dtype, device=u.device,
+        )
+        if initial_state is None
+        else initial_state.to(torch.float32)
+    )
+    core_attn_out = torch.zeros_like(u)
+    for i in range(num_chunks):
+        q_i = query[:, :, i]
+        k_i = key[:, :, i]
+        g_i = g[:, :, i]
+
+        # inter chunk: the decayed read of the carried-in state
+        attn_inter = (q_i * g_i.exp()) @ last_recurrent_state
+        v_prime = w[:, :, i] @ last_recurrent_state
+        v_new = u[:, :, i] - v_prime
+
+        core_attn_out[:, :, i] = attn_inter + attn_intra[:, :, i] @ v_new
+        # exp(g_C) decays S along its key dim
+        last_recurrent_state = (
+            last_recurrent_state * g_i[:, :, -1].exp().unsqueeze(-1)
+            + (k_i * (g_i[:, :, -1:] - g_i).exp()).transpose(-1, -2) @ v_new
+        )
+
+    core_attn_out = core_attn_out.reshape(
+        core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
+    )
+    core_attn_out = core_attn_out[:, :, :sequence_length]
+    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+
+    return core_attn_out, last_recurrent_state
+
+
+def recurrent_kda_step(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+) -> torch.Tensor:
+    """One recurrent delta-rule token (reference ``recurrent_kimi_delta_attention``)."""
+    if state.dtype != torch.float32:
+        raise ValueError(f"KDA recurrent state must be fp32, got {state.dtype}")
+    initial_dtype = query.dtype
+    query, key, value, g, beta = [
+        x.to(torch.float32) for x in (query, key, value, g, beta)
+    ]
+
+    query = l2norm(query)
+    key = l2norm(key)
+    scale = 1 / (query.shape[-1] ** 0.5)
+    query = query * scale
+
+    q_t = query[:, 0]  # (B, H, D)
+    k_t = key[:, 0]
+    v_t = value[:, 0]
+    decay_t = g[:, 0].unsqueeze(-1).exp()  # (B, H, D, 1): decay along the key dim
+    beta_t = beta[:, 0].unsqueeze(-1)  # (B, H, 1)
+
+    state.mul_(decay_t)
+    kv_mem = (state * k_t.unsqueeze(-1)).sum(dim=-2)  # (B, H, D_v)
+    delta = (v_t - kv_mem) * beta_t
+    state.add_(k_t.unsqueeze(-1) * delta.unsqueeze(-2))
+    core_attn_out = (state * q_t.unsqueeze(-1)).sum(dim=-2)
+
+    return core_attn_out.unsqueeze(1).to(initial_dtype)
+
+
+def forget_gate(
+    f: torch.Tensor, dt_bias: torch.Tensor, a_log: torch.Tensor, lower_bound: float,
+) -> torch.Tensor:
+    """Log forget gate ``(..., H, D)`` fp32 in (lower_bound, 0) from the up-projected
+    ``f (..., H, D)``: ``lower_bound * sigmoid(exp(A) * (f + dt_bias))``."""
+    g = f.float() + dt_bias.float().view(f.shape[-2:])
+    decay_rate = torch.exp(a_log.float()).view(-1, 1)
+    return lower_bound * torch.sigmoid(decay_rate * g)
+
+
+def gated_rms_norm(
+    x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float,
+) -> torch.Tensor:
+    """RMSNorm over the last dim times ``sigmoid(gate)``, strict fp32, in ``x``'s dtype."""
+    input_dtype = x.dtype
+    x = x.to(torch.float32)
+    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+    x = weight.to(torch.float32) * x * torch.sigmoid(gate.to(torch.float32))
+    return x.to(input_dtype)
+
+
+class TorchKDAKernels:
+    """The reference bundle. Slots are read and written on device at the plan's slot ids,
+    so no step waits on the host. The pool's state is V-first, ``[H, V, K]``; the math runs
+    on K-first copies. Takes the fused bundle's arguments, or a full-rank forget gate.
+    """
+
+    # the prefill loops over the spans on the host
+    prefill_capturable = False
+
+    def layout(self, spans, num_tokens, fixed):
+        return None
+
+    @torch.compiler.disable
+    def run_paged(self, qkv, g, beta, plan, conv_state, rec_state, p, gate=None):
+        h, d = p.num_heads, p.head_dim
+        t = qkv.shape[0]
+        f = F.linear(g, p.f_b) if p.f_b is not None else g
+        g_log = forget_gate(f.reshape(t, h, d), p.dt_bias, p.A_log, p.lower_bound)
+        beta = torch.sigmoid(beta)
+        weight = p.conv_weight.unsqueeze(1)  # the depthwise conv's [3P, 1, W]
+        if plan.is_decode:
+            out = self._decode(qkv, g_log, beta, plan, conv_state, rec_state, weight, h, d)
+        else:
+            out = self._prefill(qkv, g_log, beta, plan, conv_state, rec_state, weight, h, d)
+        if gate is None or p.g_b is None:
+            return out
+        gate = F.linear(gate, p.g_b).view(t, h, d)
+        return gated_rms_norm(out, gate, p.norm_weight, p.norm_eps).reshape(t, h * d)
+
+    @staticmethod
+    def _decode(qkv, g_log, beta, plan, conv_state, rec_state, weight, h, d):
+        slots = plan.slot_ids.long()
+        conv = conv_state.index_select(0, slots)
+        rec = rec_state.index_select(0, slots).transpose(-1, -2).contiguous()
+        y = causal_conv1d_update(qkv.unsqueeze(-1), conv, weight).squeeze(-1)
+        q, k, v = (x.reshape(-1, 1, h, d) for x in y.split(h * d, dim=-1))
+        out = recurrent_kda_step(q, k, v, g_log.unsqueeze(1), beta.unsqueeze(1), rec)
+        conv_state.index_copy_(0, slots, conv)
+        rec_state.index_copy_(0, slots, rec.transpose(-1, -2))
+        return out.squeeze(1)
+
+    @staticmethod
+    def _prefill(qkv, g_log, beta, plan, conv_state, rec_state, weight, h, d):
+        out = torch.empty(qkv.shape[0], h, d, dtype=qkv.dtype, device=qkv.device)
+        slots = plan.slot_ids.long()
+        start = 0
+        for i, n in enumerate(plan.spans):
+            rows = slice(start, start + n)
+            start += n
+            if n == 0:
+                continue
+            # the slot as a device index: reading it back would wait on the step's queued
+            # work. A fresh slot is zeros.
+            slot = slots[i:i + 1]
+            conv = conv_state.index_select(0, slot)
+            rec = rec_state.index_select(0, slot).transpose(-1, -2).contiguous()
+            extended = torch.cat([conv, qkv[rows].t().unsqueeze(0)], dim=-1)
+            y = causal_conv1d_prefill(extended, weight)[:, :, -n:].transpose(1, 2)
+            conv_state.index_copy_(0, slot, extended[:, :, -conv.shape[-1]:].to(conv_state.dtype))
+            q, k, v = (x.reshape(1, n, h, d) for x in y.split(h * d, dim=-1))
+            core, final = chunk_kda(
+                q, k, v, g_log[rows].unsqueeze(0), beta[rows].unsqueeze(0),
+                initial_state=rec,
+            )
+            rec_state.index_copy_(0, slot, final.transpose(-1, -2))
+            out[rows] = core[0]
+        return out
+
+    @torch.compiler.disable
+    def run_verify(self, qkv, g, beta, plan, conv_state, rec_state, spec, p, gate=None):
+        """``kda_triton.kda_verify``'s scheme with the decode math: replay each row's accepted
+        prefix from the checkpoint, store the state there, run the block and cache its inputs
+        on the side the step does not read."""
+        h, d = p.num_heads, p.head_dim
+        t = qkv.shape[0]
+        f = F.linear(g, p.f_b) if p.f_b is not None else g.reshape(t, h * d)
+        out = self._verify(qkv, f, beta, plan, conv_state, rec_state, spec, p)
+        if gate is None or p.g_b is None:
+            return out
+        gate = F.linear(gate, p.g_b).view(t, h, d)
+        return gated_rms_norm(out, gate, p.norm_weight, p.norm_eps).reshape(t, h * d)
+
+    @staticmethod
+    def _verify(qkv, f, beta, plan, conv_state, rec_state, spec, p):
+        """All rows at once: a mask, where the kernel branches, advances a row through its
+        accepted prefix only, so nothing is read back and a graph captures it."""
+        h, d = p.num_heads, p.head_dim
+        n, block = plan.num_rows, plan.block
+        weight = p.conv_weight.unsqueeze(1)  # the depthwise conv's [3P, 1, W]
+        slots = plan.slot_ids[:n].long()
+        kmax = spec.prefix.shape[2]
+        plen = spec.prefix_len[:, 0].index_select(0, slots).clamp(0, kmax)
+        side = spec.side[:, 0].index_select(0, slots).long() & 1
+        other = 1 - side
+
+        def token(x, f_t, b_t, win, rec):
+            """One token of every row, on copies of the window and the K-first state."""
+            win, rec = win.clone(), rec.clone()
+            y = causal_conv1d_update(x.unsqueeze(-1), win, weight).squeeze(-1)
+            q, k, v = (z.reshape(n, 1, h, d) for z in y.split(h * d, dim=-1))
+            g_log = forget_gate(f_t.reshape(n, h, d), p.dt_bias, p.A_log, p.lower_bound)
+            b_t = torch.sigmoid(b_t)
+            out = recurrent_kda_step(q, k, v, g_log.unsqueeze(1), b_t.unsqueeze(1), rec)
+            return out.squeeze(1), win, rec
+
+        # the conv window before the prefix: the pool's before a request's first verify
+        win = torch.where((plen == 0)[:, None, None], conv_state.index_select(0, slots),
+                          spec.conv[slots, side])
+        rec = rec_state.index_select(0, slots).transpose(-1, -2).contiguous()
+        for i in range(kmax):
+            _, w, r = token(spec.prefix[slots, side, i], spec.g[slots, side, i],
+                            spec.beta[slots, side, i], win, rec)
+            live = plen > i
+            win = torch.where(live[:, None, None], w, win)
+            rec = torch.where(live[:, None, None, None], r, rec)
+        rec_state.index_copy_(0, slots, rec.transpose(-1, -2))
+        spec.conv[slots, other] = win.to(spec.conv.dtype)
+        outs = []
+        for j in range(block):
+            x, f_j, b_j = qkv[j::block], f[j::block], beta[j::block]
+            o, win, rec = token(x, f_j, b_j, win, rec)
+            outs.append(o)
+            spec.prefix[slots, other, j] = x.to(spec.prefix.dtype)
+            spec.g[slots, other, j] = f_j.reshape(n, h, d).to(spec.g.dtype)
+            spec.beta[slots, other, j] = b_j.to(spec.beta.dtype)
+        return torch.stack(outs, 1).reshape(n * block, h, d)

@@ -24,6 +24,8 @@ from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionConfig, PosScheme
 from mstar.engine.resources.position.manager import RopeManager
+from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateConfig
+from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.model.base import Model
 
 
@@ -118,6 +120,27 @@ def test_a_kv_fingerprint_changes_with_the_world_size():
 def test_a_kv_fingerprint_ignores_how_many_pages_the_pool_has():
     assert _kv().fingerprint() == _kv(max_num_pages=64).fingerprint(), (
         "pool size cannot change what a page holds, so it must not split the root"
+    )
+
+
+# ── the recurrent pool ──────────────────────────────────────────────────
+
+
+def _recurrent(dtype: torch.dtype | None, kv_dtype: torch.dtype) -> RecurrentStatePool:
+    blocks = {"conv": RecurrentBlockConfig(shape=(2, 3), dtype=dtype)}
+    return RecurrentStatePool(torch.device("cpu"), RecurrentStateConfig(num_layers=1, max_slots=4, blocks=blocks),
+                              kv_dtype=kv_dtype)
+
+
+def test_a_recurrent_fingerprint_changes_with_the_dtype_a_block_resolves_to():
+    assert _recurrent(None, torch.bfloat16).fingerprint() != _recurrent(None, torch.float32).fingerprint(), (
+        "the stored dtype changes what the recurrent layers output, and so every KV page written after them"
+    )
+
+
+def test_a_recurrent_fingerprint_is_the_same_for_a_block_that_resolves_to_a_dtype_and_one_declaring_it():
+    assert _recurrent(None, torch.bfloat16).fingerprint() == _recurrent(torch.bfloat16, torch.float32).fingerprint(), (
+        "both pools store bf16, so their pages can be shared"
     )
 
 

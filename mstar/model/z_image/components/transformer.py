@@ -15,7 +15,7 @@ fp32, cast to the weight dtype, then multiply — reproduced by :class:`ScaledRM
 Rotary embeddings are 3-axis tables (theta 256, kept as fp32 (cos, sin) pairs) applied as a
 complex product in fp32; the compiled forward fuses them with the q/k norms (``qk_norm_rope``)
 where that kernel fits, unless ``compile_exact_ops`` keeps the norms.
-Attention runs through :func:`joint_attention` (SDPA or the ragged FlashInfer resource);
+Attention runs through the read of the array a layer binds (SDPA or the ragged FlashInfer resource);
 batching happens only at identical padded lengths, so no key mask is needed.
 """
 
@@ -23,17 +23,18 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from typing import Any
 
 import torch
 from torch import nn
 
-from mstar.model.components.diffusion.attention import RaggedAttentionFn, joint_attention
+from mstar.model.components.diffusion.attention import attend
 from mstar.model.components.diffusion.compile_utils import kept_exact
 from mstar.model.components.linear import FusedColumnLinear
 from mstar.model.components.quant_linear import QuantizableLinears
 from mstar.model.z_image.components.qk_norm_rope import fits as qk_norm_rope_fits
 from mstar.model.z_image.components.qk_norm_rope import qk_norm_rope
-from mstar.model.z_image.config import ZImageTransformerConfig
+from mstar.model.z_image.config import CAPTION_TOKENS, IMAGE_TOKENS, JOINT_TOKENS, ZImageTransformerConfig
 
 # Sinusoidal timestep feature width (diffusers ``TimestepEmbedder.frequency_embedding_size``).
 TIMESTEP_FREQ_DIM = 256
@@ -94,15 +95,20 @@ def apply_rotary_complex(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tens
 
 
 class ZImageAttention(nn.Module):
-    def __init__(self, config: ZImageTransformerConfig):
+    def __init__(self, config: ZImageTransformerConfig, array: str, layer: int):
         super().__init__()
         dim, self.head_dim = config.dim, config.head_dim
+        self.array, self.layer = array, torch.tensor(layer, device="cpu")
+        self.state = None
         self.qkv = FusedColumnLinear(dim, {"q": dim, "k": dim, "v": dim}, bias=False)
         self.q_norm = ScaledRMSNorm(self.head_dim, 1e-5) if config.qk_norm else None
         self.k_norm = ScaledRMSNorm(self.head_dim, 1e-5) if config.qk_norm else None
         self.out = nn.Linear(dim, dim, bias=False)
 
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, ragged: RaggedAttentionFn | None) -> torch.Tensor:
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.state = handles.get(self.array)
+
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         q, k, v = (t.unflatten(-1, (-1, self.head_dim)) for t in self.qkv(x).chunk(3, dim=-1))
         dtype = q.dtype
         # compile_exact_ops [norms] keeps the norms exact: no fusion then
@@ -114,7 +120,7 @@ class ZImageAttention(nn.Module):
                 q, k = self.q_norm(q), self.k_norm(k)
             q = apply_rotary_complex(q, freqs_cis).to(dtype)
             k = apply_rotary_complex(k, freqs_cis).to(dtype)
-        out = joint_attention(q, k, v, ragged).flatten(2, 3).to(dtype)
+        out = attend(self.state, self.layer, q, k, v).flatten(2, 3).to(dtype)
         return self.out(out)
 
 
@@ -157,14 +163,13 @@ QUANTIZABLE_LINEARS = QuantizableLinears(
 # alone, the context refiner over the caption alone, the main layers over both. Each needs
 # its own ragged plan; the owning submodule declares them under these labels.
 IMAGE_SPAN, CAPTION_SPAN, MAIN_SPAN = "image", "caption", "main"
-ATTENTION_SPANS = (IMAGE_SPAN, CAPTION_SPAN, MAIN_SPAN)
 
 
 class ZImageBlock(nn.Module):
-    def __init__(self, config: ZImageTransformerConfig, modulation: bool):
+    def __init__(self, config: ZImageTransformerConfig, modulation: bool, array: str, layer: int):
         super().__init__()
         dim, eps = config.dim, config.norm_eps
-        self.attn = ZImageAttention(config)
+        self.attn = ZImageAttention(config, array, layer)
         self.ff = ZImageFeedForward(dim, config.ffn_hidden)
         self.attn_norm1 = ScaledRMSNorm(dim, eps)
         self.attn_norm2 = ScaledRMSNorm(dim, eps)
@@ -177,15 +182,14 @@ class ZImageBlock(nn.Module):
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         adaln_input: torch.Tensor | None,
-        ragged: RaggedAttentionFn | None,
     ) -> torch.Tensor:
         if self.adaln is not None:
             scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaln(adaln_input).unsqueeze(1).chunk(4, dim=2)
             gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
             scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
-            x = x + gate_msa * self.attn_norm2(self.attn(self.attn_norm1(x) * scale_msa, freqs_cis, ragged))
+            x = x + gate_msa * self.attn_norm2(self.attn(self.attn_norm1(x) * scale_msa, freqs_cis))
             return x + gate_mlp * self.ffn_norm2(self.ff(self.ffn_norm1(x) * scale_mlp))
-        x = x + self.attn_norm2(self.attn(self.attn_norm1(x), freqs_cis, ragged))
+        x = x + self.attn_norm2(self.attn(self.attn_norm1(x), freqs_cis))
         return x + self.ffn_norm2(self.ff(self.ffn_norm1(x)))
 
 
@@ -210,9 +214,10 @@ class ZImageDiT(nn.Module):
         self.cap_proj = nn.Linear(config.cap_feat_dim, dim, bias=True)
         self.x_pad_token = nn.Parameter(torch.zeros(1, dim))
         self.cap_pad_token = nn.Parameter(torch.zeros(1, dim))
-        self.noise_refiner = nn.ModuleList(ZImageBlock(config, True) for _ in range(config.n_refiner_layers))
-        self.context_refiner = nn.ModuleList(ZImageBlock(config, False) for _ in range(config.n_refiner_layers))
-        self.layers = nn.ModuleList(ZImageBlock(config, True) for _ in range(config.n_layers))
+        noise, context, joint = config.layer_ids()
+        self.noise_refiner = nn.ModuleList(ZImageBlock(config, True, IMAGE_TOKENS, i) for i in noise)
+        self.context_refiner = nn.ModuleList(ZImageBlock(config, False, CAPTION_TOKENS, i) for i in context)
+        self.layers = nn.ModuleList(ZImageBlock(config, True, JOINT_TOKENS, i) for i in joint)
         self.final_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.final_mod = nn.Linear(config.adaln_dim, dim, bias=True)
         self.final_act = nn.SiLU()
@@ -237,31 +242,25 @@ class ZImageDiT(nn.Module):
         t: torch.Tensor,
         image_freqs: torch.Tensor,
         caption_freqs: torch.Tensor,
-        ragged: Mapping[str, RaggedAttentionFn] | None = None,
     ) -> torch.Tensor:
         """``image_tokens [B, Lx, patch_dim]`` (padded to a multiple of 32), ``caption [B, Lc,
         cap_feat_dim]`` (padded likewise), boolean pad masks ``[B, Lx]`` / ``[B, Lc]`` (True at
         pad positions), ``t [B]`` fp32, rotary tables ``[Lx, D/2, 2]`` / ``[Lc, D/2, 2]`` (:class:`ZImageRoPE`).
-        ``ragged``: one attention kernel per span in :data:`ATTENTION_SPANS`, or None for SDPA
-        throughout. Returns the velocity for the image tokens ``[B, Lx, patch_dim]`` (pads
-        included)."""
-        if ragged is not None and set(ragged) != set(ATTENTION_SPANS):
-            raise KeyError(f"ragged attention needs one kernel per span {ATTENTION_SPANS}; got {sorted(ragged)}")
-        attn = ragged or {}
+        Returns the velocity for the image tokens ``[B, Lx, patch_dim]`` (pads included)."""
         adaln_input = self.embed_time(t).type_as(image_tokens)
         x = self.x_embedder(image_tokens)
         x = torch.where(image_pad_mask[..., None], self.x_pad_token.to(x.dtype), x)
         for block in self.noise_refiner:
-            x = block(x, image_freqs, adaln_input, attn.get(IMAGE_SPAN))
+            x = block(x, image_freqs, adaln_input)
         cap = self.cap_proj(self.cap_norm(caption))
         cap = torch.where(caption_pad_mask[..., None], self.cap_pad_token.to(cap.dtype), cap)
         for block in self.context_refiner:
-            cap = block(cap, caption_freqs, None, attn.get(CAPTION_SPAN))
+            cap = block(cap, caption_freqs, None)
         num_image = x.shape[1]
         unified = torch.cat([x, cap], dim=1)
         freqs = torch.cat([image_freqs, caption_freqs], dim=0)
         for block in self.layers:
-            unified = block(unified, freqs, adaln_input, attn.get(MAIN_SPAN))
+            unified = block(unified, freqs, adaln_input)
         scale = 1.0 + self.final_mod(self.final_act(adaln_input))
         out = self.final_norm(unified) * scale.unsqueeze(1)
         return self.final_proj(out)[:, :num_image]

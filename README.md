@@ -68,7 +68,7 @@ mstar serve bagel          # one command — launch a server (default: http://lo
 
 The PyPI package is `mstar-ai` (`mstar-project` and `mstar-serve` install the same thing); the import package
 and the CLI are `mstar`. Working from a checkout instead: `uv pip install --torch-backend=auto -e .[all]`,
-then build the [Rust extension](#rust-extension).
+then build the [Rust extension and HTTP frontend](#rust-extension).
 Qwen3-TTS also needs `uv pip install --no-deps "qwen-tts==0.1.1"` (see `docs/installation.rst`).
 
 To enable flash-attn support (recommended for BAGEL),
@@ -118,6 +118,7 @@ _Note_: The **first request(s) on a fresh environment can be slow** — often te
 | [BAGEL](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) | Unified multimodal | text, image → text, image | `/v1/chat/completions`, `/v1/images/generations` |
 | [Qwen3-Omni](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) | Omni | text, image, audio, video → text, speech | `/v1/chat/completions` |
 | [Qwen3.5 0.8B–27B](https://huggingface.co/Qwen/Qwen3.5-4B) / [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | Vision-language model | text, image → text (hybrid gated-DeltaNet attention) | `/v1/chat/completions`, `/generate` |
+| [Muse Glimmer 30B](https://huggingface.co/meta-models/Muse-Glimmer-30B) *(Beta)* | Vision-language model | text, image → text (sliding-window and NoPE attention layers 3:1) | `/v1/chat/completions`, `/generate` |
 | [Nemotron VoiceChat](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-VoiceChat-11B) *(Beta)* | Full-duplex speech LM | speech → text, speech (streamed) | `/generate` |
 | [Orpheus](https://huggingface.co/canopylabs/orpheus-3b-0.1-ft) | Speech LM | text → speech | `/v1/audio/speech` |
 | [Fish Audio S2-Pro](https://huggingface.co/fishaudio/s2-pro) | Speech LM | text, reference audio → speech (streamed; weights under the Fish Audio Research License, non-commercial use only) | `/v1/audio/speech` |
@@ -167,7 +168,9 @@ Serving needs the `mstar_rust` extension (vendored in [`rust/`](rust/)): the gra
 Rust, and every process sends its control messages on the extension's ZeroMQ transport. Each
 process logs it at startup (`control mesh transport: rust <version> from <path>`).
 From a checkout, build it with [maturin](https://www.maturin.rs): `uv pip install maturin && maturin develop --release -m rust/Cargo.toml`.
-The Linux wheels of `mstar-ai` on PyPI carry it, with libzmq 4.3.4 statically linked under
+`mstar serve` serves HTTP from the `mstar-server` binary ([`rust/server/`](rust/server/)); from a checkout, build it too:
+`cargo build --release --manifest-path rust/server/Cargo.toml`.
+The Linux wheels of `mstar-ai` on PyPI carry both, the extension with libzmq 4.3.4 statically linked under
 LGPL-3.0-or-later and its static-linking exception ([PACKAGING.md](PACKAGING.md) has where its source is).
 See the [installation docs](https://m-star.org/mstar/installation.html) and
 [environment variables](https://m-star.org/mstar/environment_variables.html).

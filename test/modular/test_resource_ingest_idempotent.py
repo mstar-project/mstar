@@ -93,7 +93,7 @@ def test_remove_then_ingest_still_starts_fresh():
 
     assert _step(runner, 2) == [0, 1]
 
-    res = SamplerResource(vocab_size=16, enable_repetion_penalty=True, device=CPU)
+    res = SamplerResource(vocab_size=16, enable_repetition_penalty=True, device=CPU)
     res.ingest_request(RID, SamplingReqConfig(repetition_penalty=1.3))
     _sampled(res._sampler)
     res.remove_request(RID)

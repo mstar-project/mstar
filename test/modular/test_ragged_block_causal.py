@@ -177,6 +177,7 @@ def test_graph_replay_matches_reference_across_changing_layouts():
         graph.replay()
         torch.cuda.synchronize()
         close(out[:total], ref(q, k, v, seg_lens))
+        assert (out[total:] == 0).all()  # zeroed in the graph: the next layer reads it
 
 
 @cuda

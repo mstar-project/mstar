@@ -28,12 +28,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.engine.resources.convenience import AttentionCallable
+from mstar.engine.state import add_read, positions
 from mstar.model.components import RMSNorm
 from mstar.model.components.masking import length_mask
 from mstar.model.components.mlp import GatedMLP
 from mstar.model.nemotron_duplex.components._util import RawWeight, param
-from mstar.model.nemotron_duplex.config import TALKER_ATTN, TALKER_KV, TALKER_POS, EarTTSConfig
+from mstar.model.nemotron_duplex.config import TALKER_KV, EarTTSConfig
 
 # Fixed table cardinalities that are NOT model hyperparameters in EarTTSConfig
 # (tokenizer / vocabulary sizes baked into the checkpoint's flag tables).
@@ -156,7 +156,7 @@ class _Attn(nn.Module):
 
     lora_unservable = dict.fromkeys(("q_proj", "k_proj", "v_proj", "o_proj"), _RUN_FUNCTIONALLY)
 
-    def __init__(self, config: EarTTSConfig, qk_norm: bool):
+    def __init__(self, config: EarTTSConfig, qk_norm: bool, layer: int | None = None):
         super().__init__()
         h = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -172,23 +172,19 @@ class _Attn(nn.Module):
         if qk_norm:
             self.q_norm = RMSNorm(self.head_dim)
             self.k_norm = RMSNorm(self.head_dim)
-        # Engine resources (paged KV, planned attention, positions), resolved
-        # at load by ``NodeSubmodule.bind_node_resources``; None standalone.
-        self.attend: AttentionCallable | None = None
-        self.pos = None
+        # the talker's layer id and its handle on TALKER_KV, None standalone
+        self.layer = layer
+        self.state = None
 
-    def bind_resources(self, resources: dict) -> None:
-        kv, attn, pos = resources.get(TALKER_KV), resources.get(TALKER_ATTN), resources.get(TALKER_POS)
-        self.attend = AttentionCallable(kv=kv, attn=attn) if kv is not None and attn is not None else None
-        self.pos = pos
+    def bind_state(self, handles: dict) -> None:
+        self.state = handles.get(TALKER_KV)
 
     def forward_pooled(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         """Self-attention over this step's packed tokens ``[total_tokens, H]``
         through the engine's paged KV: Gemma3 QK-norm, RoPE from ``cos``/``sin``
-        ``[total_tokens, hd]`` (built by the caller from the positions the
-        position resource planned, with this layer's theta; in torch, because
-        FlashInfer's RoPE kernel takes no head dim of 72), the KV write and the
-        planned attention. The pool's head dim is ``kv_head_dim`` (FlashInfer
+        ``[total_tokens, hd]`` (built by the caller from the step's positions,
+        with this layer's theta; in torch, because FlashInfer's RoPE kernel takes
+        no head dim of 72), the add and the read. The pool's head dim is ``kv_head_dim`` (FlashInfer
         computes 64/128/256 exactly and returns wrong values for 72, see
         ``EarTTSConfig.kv_head_dim``): q/k/v are zero-padded to it and the
         output sliced back, which is exact since the padded dims add nothing to
@@ -210,7 +206,7 @@ class _Attn(nn.Module):
         q = q * (self.scaling * kd ** 0.5)
         if kd != hd:
             q, k, v = (F.pad(t, (0, kd - hd)) for t in (q, k, v))
-        out = self.attend(q, k, v)[..., :hd].reshape(n, nh * hd)
+        out = add_read(self.state, self.layer, q, k=k, v=v)[..., :hd].reshape(n, nh * hd)
         return F.linear(out, self.o_proj.weight)
 
     def forward(
@@ -274,12 +270,12 @@ class _Attn(nn.Module):
 class TalkerLayer(nn.Module):
     """Gemma3 decoder layer: input/post-attn/pre-ff/post-ff norms + QK-norm attn + gated MLP."""
 
-    def __init__(self, config: EarTTSConfig):
+    def __init__(self, config: EarTTSConfig, layer: int):
         super().__init__()
         h = config.hidden_size
         self.eps = config.rms_norm_eps
         self.input_layernorm = RMSNorm(h)
-        self.self_attn = _Attn(config, qk_norm=True)
+        self.self_attn = _Attn(config, qk_norm=True, layer=layer)
         self.post_attention_layernorm = RMSNorm(h)
         self.pre_feedforward_layernorm = RMSNorm(h)
         self.mlp = GatedMLP(h, config.intermediate_size, activation="gelu_tanh", bias=False)
@@ -615,7 +611,7 @@ class MogHead(nn.Module):
 class _Backbone(nn.Module):
     def __init__(self, config: EarTTSConfig):
         super().__init__()
-        self.layers = nn.ModuleList([TalkerLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([TalkerLayer(config, i) for i in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size)
 
 
@@ -780,22 +776,18 @@ class EarTTSTalker(nn.Module):
             cnt += k
         return code
 
-    def backbone_pooled(self, x: torch.Tensor, label: str) -> torch.Tensor:
+    def backbone_pooled(self, x: torch.Tensor) -> torch.Tensor:
         """Gemma3 stack over this step's packed tokens ``[total_tokens, H]`` with
-        the attention through the engine's paged KV under ``label`` (the label
-        and layer index are cursors on the shared resources, as in
-        ``Attention.forward``). Returns the normed hidden ``[total_tokens, H]``.
-        """
+        the attention through the engine's paged KV. Returns the normed hidden
+        ``[total_tokens, H]``."""
         cfg = self.config
         layers = self.backbone.layers
-        layers[0].self_attn.attend.bind_step(label)
-        # the planned absolute positions of this step's tokens, one RoPE table
-        # per theta (full-attention layers vs sliding-window layers)
-        pos_ids = layers[0].self_attn.pos.pos_ids(label)[: x.shape[0]]
+        # the absolute positions of this step's tokens, one RoPE table per theta
+        # (full-attention layers vs sliding-window layers)
+        pos_ids = positions(layers[0].self_attn.state)[: x.shape[0]]
         cos_g, sin_g = _rope_cos_sin(pos_ids, cfg.rope_theta_full, cfg.head_dim)
         cos_l, sin_l = _rope_cos_sin(pos_ids, cfg.rope_theta_local, cfg.head_dim)
         for i, layer in enumerate(layers):
-            layer.self_attn.attend.set_layer_idx(i)
             full = (i + 1) % cfg.sliding_window_pattern == 0
             x = layer.forward_pooled(x, cos_g if full else cos_l, sin_g if full else sin_l)
         return _gemma_rmsnorm(x, self.backbone.norm.weight, cfg.rms_norm_eps)

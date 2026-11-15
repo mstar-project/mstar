@@ -14,8 +14,8 @@ Each send is timed at the sender from the first byte of work to the ack, so ever
 |---|---|
 | `control` | Serialize the tensor to bytes (a side-stream copy for a GPU tensor), send them in a control message, rebuild the tensor at the receiver, ack. What a tensor costs if it rides in the message itself |
 | `tcp`, `rdma` | M\*'s Mooncake path: store, `register_for_send`, an `INPUT_SIGNALS` descriptor, `start_read_tensors` at the receiver, `get_ready_tensors` (which sends the real `TENSOR_RECEIVED` ack), and the sender's dereference and cleanup (unregister) |
-| `shm` | M\*'s same-host file transport, same flow (file write, read, unlink) |
-| `arena` | M\*'s same-host Rust shared-memory arena (`MSTAR_SHM_ARENA=1`), same flow |
+| `shm` | M\*'s per-tensor file protocol on its own (the arena's spill path), same flow (file write, read, unlink) |
+| `arena` | M\*'s same-host Rust shared-memory arena (the SHM transport), same flow |
 | `tcp-pool`, `rdma-pool` | Mooncake reads from a buffer registered once at startup, copied into per send (`--pool-mode copy`) or produced there (`--pool-mode zerocopy`). Not an M\* path today; next to `tcp` it shows what per-tensor registration costs |
 
 M\* has no CUDA IPC path: same-host tensors go through host shared memory (`shm`, `arena`). `--device cuda:N` puts the sender's tensors on a GPU (and `--receiver-device` the receiver's), so the device copies each path makes are included. RDMA paths are skipped when `/sys/class/infiniband` is empty.

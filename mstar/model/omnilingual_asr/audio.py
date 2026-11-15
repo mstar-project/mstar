@@ -12,6 +12,7 @@ bit-identical to the reference's input.
 
 from __future__ import annotations
 
+import logging
 import struct
 from pathlib import Path
 
@@ -26,7 +27,10 @@ from mstar.api_server.media_io import (
     check_resample_rate,
     torchcodec_samples_capped,
 )
+from mstar.model.media_limits import decoding_upload
 from mstar.model.omnilingual_asr.config import MAX_AUDIO_SECONDS, MIN_AUDIO_SAMPLES, SAMPLE_RATE
+
+logger = logging.getLogger(__name__)
 
 
 def decode_file(path: str) -> tuple[torch.Tensor, int]:
@@ -36,11 +40,12 @@ def decode_file(path: str) -> tuple[torch.Tensor, int]:
     libsndfile through ``soundfile`` first; then, for a WAV file, a reader here
     that scales samples as libsndfile does, so a server without soundfile still
     decodes WAV exactly; then FFmpeg through ``torchcodec`` for the containers
-    neither reads. The two library decoders stop just past
+    neither reads. Only FFmpeg refusing the file blames the upload (a 400, see
+    :func:`decoding_upload`); no torchcodec, no FFmpeg or a failed allocation
+    is the server's error. The two library decoders stop just past
     ``MAX_AUDIO_SECONDS`` and refuse a longer file with
     :class:`~mstar.api_server.media_io.AudioTooLongError`, whatever its header
     declares."""
-    errors = []
     try:
         import soundfile as sf
 
@@ -60,26 +65,19 @@ def decode_file(path: str) -> tuple[torch.Tensor, int]:
     except AudioRefusedError:
         raise
     except Exception as exc:  # noqa: BLE001 (missing, or not a libsndfile container)
-        errors.append(f"soundfile: {exc}")
+        logger.debug("soundfile could not decode %s (%s); trying the next decoder", path, exc)
     with open(path, "rb") as f:
         head = f.read(12)
     if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
         try:
             return _decode_pcm_wav(path)
         except ValueError as exc:
-            errors.append(f"wav: {exc}")
-    try:
+            logger.debug("the WAV reader could not decode %s (%s); trying torchcodec", path, exc)
+    with decoding_upload(path, "the audio", ffmpeg=True):
         samples = torchcodec_samples_capped(path, MAX_AUDIO_SECONDS)
-        data = samples.data  # (channels, time)
-        data = data[0] if data.shape[0] == 1 else data.transpose(0, 1).contiguous()
-        return data.float(), int(samples.sample_rate)
-    except AudioRefusedError:
-        raise
-    except Exception as exc:  # noqa: BLE001 (missing, or FFmpeg cannot read it)
-        errors.append(f"torchcodec: {exc}")
-    # the decoders name the file; the client only needs to know it was theirs
-    detail = "; ".join(errors).replace(str(path), "<upload>").replace(repr(str(path))[1:-1], "<upload>")
-    raise ValueError(f"cannot decode the audio file ({detail}); install soundfile (mstar-ai[audio])")
+    data = samples.data  # (channels, time)
+    data = data[0] if data.shape[0] == 1 else data.transpose(0, 1).contiguous()
+    return data.float(), int(samples.sample_rate)
 
 
 _WAVE_PCM, _WAVE_FLOAT, _WAVE_EXTENSIBLE = 1, 3, 0xFFFE

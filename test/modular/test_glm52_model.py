@@ -1,6 +1,6 @@
-"""Glm52Model contract on the resource-pools engine: registry, graph walks, the prefill ->
-decode transition, the node's resource declaration, the per-request sampling config, and
-the submodule's stop / preprocess guards.
+"""Glm52Model contract on the resource-pools engine: registry, graph walks, the node's
+resource declaration, the per-request sampling config, and the submodule's stop /
+preprocess guards.
 """
 import dataclasses
 import sys
@@ -31,10 +31,7 @@ def _force_cpu_flashinfer(monkeypatch):
     monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
 
 
-from mstar.conductor.request_info import (  # noqa: E402
-    CurrentForwardConductorMetadata,
-    CurrentForwardPassInfo,
-)
+from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.engine.resources import (  # noqa: E402
     AttentionSpec,
     AttnBackend,
@@ -63,6 +60,12 @@ def _make_model(config: Glm52ModelConfig | None = None) -> Glm52Model:
     model = object.__new__(Glm52Model)
     model.config = config or Glm52ModelConfig()
     return model
+
+
+def _make_model_k(k: int) -> Glm52Model:
+    cfg = Glm52ModelConfig()
+    cfg.mtp_num_draft_tokens = k
+    return _make_model(cfg)
 
 
 def test_glm52_registered():
@@ -121,6 +124,14 @@ def test_glm52_resources_absorbed_is_mla_latent_layout():
     assert sampler.vocab_size == cfg.vocab_size
 
 
+def test_glm52_resources_mtp_adds_the_plane_layer():
+    # the draft module's KV is one more layer plane on the trunk's page table
+    kv, _, _ = _specs(_make_model_k(2).config)
+    assert kv.config.num_layers == 79
+    kv0, _, _ = _specs(_make_model_k(0).config)
+    assert kv0.config.num_layers == 78
+
+
 def test_glm52_resources_flag_off_is_naive():
     cfg = Glm52ModelConfig.reduced()  # mla_absorb False
     kv, attn, _ = _specs(cfg)
@@ -133,40 +144,7 @@ def test_glm52_resources_flag_off_is_naive():
     assert attn.config.kv_cache == KV_RESOURCE
 
 
-# ── conductor state machine ──
-
-
-def test_glm52_initial_forward_pass_args_seed_prefill_from_the_prompt():
-    signals = {"text_inputs": ["PROMPT"]}
-    args = _make_model().get_initial_forward_pass_args(
-        "default", ["text"], ["text"], signals)
-    assert args.full_metadata.graph_walk == "prefill"
-    assert args.full_metadata.is_prefill is True
-    assert args.step_metadata == {"is_prefill": True}
-    (edge,) = args.inputs
-    assert (edge.next_node, edge.name) == ("LLM", "text_inputs")
-    assert edge.tensor_info == ["PROMPT"]
-    assert args.unpersist_tensors == ["PROMPT"]
-
-
-def test_glm52_prefill_transitions_to_decode():
-    model = _make_model()
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["text"],
-        output_modalities=["text"],
-        graph_walk="prefill",
-        is_prefill=True,
-    )
-
-    result = model.get_partition_forward_pass_args(
-        partition_name="default",
-        partition_metadata=metadata,
-        persist_signals={"new_token": []},
-    )
-
-    assert result.full_metadata.graph_walk == "decode"
-    assert result.step_metadata["is_prefill"] is False
-    assert result.request_done is False
+# ── walks ──
 
 
 def test_glm52_prefill_emits_only_the_new_token():
@@ -176,23 +154,6 @@ def test_glm52_prefill_emits_only_the_new_token():
     (edge,) = prefill.outputs
     assert edge.name == "new_token" and edge.next_node == EMIT_TO_CLIENT
     assert edge.persist is True
-
-
-def test_glm52_decode_seeds_from_the_new_token_not_the_prompt():
-    """Decode must be seeded from the emitted token, never from the prompt
-    signal, and must unpersist it so no per-request tensor outlives the
-    transition."""
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["text"], output_modalities=["text"],
-        graph_walk="prefill", is_prefill=True,
-    )
-    res = _make_model().get_partition_forward_pass_args(
-        partition_name="default", partition_metadata=metadata,
-        persist_signals={"text_inputs": ["PROMPT"], "new_token": ["tok"]},
-    )
-    assert res.inputs[0].name == "text_inputs"
-    assert res.inputs[0].tensor_info == ["tok"]
-    assert res.unpersist_tensors == ["tok"]
 
 
 def test_glm52_decode_loop_cap_stays_below_the_context_guard():
@@ -211,50 +172,34 @@ def test_glm52_decode_loop_cap_stays_below_the_context_guard():
     assert not any(e.conductor_new_token for e in decode.section.outputs)
 
 
-def test_glm52_decode_completion_marks_done():
-    model = _make_model()
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["text"],
-        output_modalities=["text"],
-        graph_walk="decode",
-        is_prefill=False,
-    )
-
-    result = model.get_partition_forward_pass_args(
-        partition_name="default",
-        partition_metadata=metadata,
-        persist_signals={},
-    )
-
-    assert result.request_done is True
-    assert result.full_metadata.kwargs["decode_finished"] is True
-
-
 # ── per-request sampling config ──
 
 
 def test_glm52_request_config_is_the_sampler_config():
     model = _make_model()
     cfg = model.config
-    configs = model.get_request_resource_configs({})
+    configs = model.get_request_resource_configs([], [], {})
     assert set(configs) == {SAMPLER_RESOURCE}
     sampling = configs[SAMPLER_RESOURCE]
     assert isinstance(sampling, SamplingReqConfig)
-    # the config's generation defaults, unless the request overrides them
-    assert sampling.temperature == cfg.temperature
-    assert sampling.top_p == cfg.top_p
-    assert sampling.repetition_penalty == cfg.repetition_penalty
-    assert sampling.ignore_eos is cfg.ignore_eos
+    # the checkpoint's generation defaults, unless the request overrides them
+    assert (sampling.temperature, sampling.top_p) == (1.0, 0.95)
+    assert (sampling.repetition_penalty, sampling.ignore_eos) == (1, False)
     over = model.get_request_resource_configs(
-        {}, {"top_p": 0.5, "ignore_eos": True, "repetition_penalty": 1.1})[SAMPLER_RESOURCE]
+        [], [], {"top_p": 0.5, "ignore_eos": True, "repetition_penalty": 1.1})[SAMPLER_RESOURCE]
     assert (over.top_p, over.ignore_eos, over.repetition_penalty) == (0.5, True, 1.1)
-    assert over.temperature == cfg.temperature
+    assert over.temperature == 1.0
 
 
-def test_glm52_mtp_is_refused_until_it_lands():
-    with pytest.raises(ValueError, match="mtp_num_draft_tokens"):
-        Glm52Model(model_path_hf="", tokenizer_mode="byte", mtp_num_draft_tokens=2)
-    Glm52Model(model_path_hf="", tokenizer_mode="byte", mtp_num_draft_tokens=0)
+@pytest.mark.parametrize("kwargs, match", [
+    (dict(mtp_num_draft_tokens=2, num_hidden_layers=10), "num_hidden_layers"),
+    (dict(mtp_num_draft_tokens=-1), "mtp_num_draft_tokens"),
+], ids=["shallower-trunk", "negative-k"])
+def test_glm52_refuses_an_mtp_config_it_cannot_serve(kwargs, match):
+    """Every checkpoint layer past a shallower trunk would load as the MTP layer, and a
+    negative draft count reads as off to some checks and on to others."""
+    with pytest.raises(ValueError, match=match):
+        Glm52Model(model_path_hf="", **kwargs)
 
 
 # ── config ──
@@ -512,6 +457,7 @@ def test_glm52_a_chat_the_template_refuses_is_a_400():
 
 def test_glm52_postprocess_byte_mode_never_touches_tokenizer():
     m = object.__new__(Glm52Model)
+    m.config = Glm52ModelConfig.reduced()
     m._tokenizer_mode = "byte"
     m._tokenizer = None
     out = m.postprocess(torch.tensor([72, 105]), "text")
@@ -544,6 +490,13 @@ def test_indexer_exists_only_on_the_dsa_path():
     assert on.model.layers[0].self_attn.indexer is not None  # FULL
     assert on.model.layers[1].self_attn.indexer is None      # SHARED
     assert all(n.startswith("model.layers.0.") for n in _indexer_params(on))
+
+    # the MTP layer's indexer follows the same flag (drafting is flag-off
+    # only, so it never carries one in practice)
+    cfg = Glm52ModelConfig.reduced()
+    cfg.num_hidden_layers = 4  # MTP position lands FULL
+    cfg.mtp_num_draft_tokens = 2
+    assert Glm52ForCausalLM(cfg).mtp.transformer_layer.self_attn.indexer is None
 
 
 def test_load_weights_skips_indexer_keys_flag_off_and_demands_them_flag_on():
@@ -694,7 +647,7 @@ def test_fallback_tokenizer_keeps_turn_tokens_special(tmp_path):
 
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 
-    from mstar.model.utils import ByteLevelDetokenizer
+    from mstar.model.utils import ByteLevelDetokenizer, fast_tokenizer_from_snapshot
 
     alphabet = pre_tokenizers.ByteLevel.alphabet()
     raw = Tokenizer(models.BPE(vocab={c: i for i, c in enumerate(sorted(alphabet))}, merges=[]))
@@ -708,7 +661,7 @@ def test_fallback_tokenizer_keeps_turn_tokens_special(tmp_path):
         "eos_token": "<|endoftext|>", "pad_token": "<|endoftext|>",
         "extra_special_tokens": turns, "tokenizer_class": "TokenizersBackend"}))
 
-    tok = Glm52Model._fast_tokenizer_fallback(str(tmp_path))
+    tok = fast_tokenizer_from_snapshot(str(tmp_path))
     assert len(tok) == raw.get_vocab_size()
     assert set(tok.convert_tokens_to_ids(turns)) <= set(tok.all_special_ids)
     think, user = tok.convert_tokens_to_ids(["</think>", "<|user|>"])

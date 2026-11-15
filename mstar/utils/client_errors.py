@@ -29,6 +29,7 @@ def scrub_paths(text: str) -> str:
 def client_error_text(
     exc: BaseException, what: str, *,
     log: logging.Logger = logger, type_name: bool = True, traceback: bool = True,
+    refusal: bool | None = None,
 ) -> tuple[str, str]:
     """Return ``(text, error_id)``: what a client may see for ``exc``.
 
@@ -38,15 +39,38 @@ def client_error_text(
     ``internal error (error id <id>)``. Either way the full error and its
     traceback (left out when ``traceback`` is False, for an error already
     logged where it happened) go to ``log`` as ``<what> [error id <id>]``.
+    ``refusal`` overrides that type check, for a caller that knows whether
+    the request was refused.
     """
     error_id = secrets.token_hex(6)
     log.error(
         "%s [error id %s]: %s: %s", what, error_id, type(exc).__name__, exc,
         exc_info=exc if traceback else None,
     )
-    if isinstance(exc, (ValueError, TypeError)):
+    if refusal is None:
+        refusal = isinstance(exc, (ValueError, TypeError))
+    if refusal:
         text = scrub_paths(str(exc))
         if type_name:
             text = f"{type(exc).__name__}: {text}"
         return text, error_id
     return f"internal error (error id {error_id})", error_id
+
+
+def exception_status_text(exc: BaseException, what: str, *, log: logging.Logger = logger) -> tuple[int, str]:
+    """``(status, text)`` an OpenAI route answers ``exc`` with: an exception that
+    carries its own ``status_code`` and ``detail`` (an ``HTTPException``) keeps
+    both; a ``ValueError`` is a refusal, a 400 (or its own status) with server
+    paths cut to base names, logged as one INFO line; anything else goes through
+    :func:`client_error_text` (a ``TypeError`` a 400 that keeps its traceback,
+    any other a 500 showing only an error id). ``what`` names the route."""
+    status, detail = getattr(exc, "status_code", None), getattr(exc, "detail", None)
+    if isinstance(status, int) and detail is not None:
+        return status, str(detail)
+    if isinstance(exc, ValueError):
+        log.info("%s request refused: %s", what, exc)
+        return (status if isinstance(status, int) else 400), scrub_paths(str(exc))
+    text, _ = client_error_text(exc, f"{what} request failed", log=log, type_name=False)
+    if not isinstance(status, int):
+        status = 400 if isinstance(exc, TypeError) else 500
+    return status, text

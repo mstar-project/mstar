@@ -16,8 +16,9 @@ import pytest
 import mstar.model
 from mstar.model.submodule_base import NodeSubmodule
 
-# The package walk below imports every model, and some import flashinfer.
-pytest.importorskip("flashinfer")
+# The package walk below imports every model; some import these optional packages at module level.
+for _name in ("diffusers", "einops", "transformers"):
+    pytest.importorskip(_name)
 
 
 def _all_subclasses(cls: type) -> set[type]:
@@ -34,10 +35,12 @@ def _overriding_subclasses() -> list[type]:
     for info in pkgutil.walk_packages(mstar.model.__path__, mstar.model.__name__ + "."):
         importlib.import_module(info.name)
     base_fn = NodeSubmodule.get_piecewise_accelerator_graph_configs
-    return [
-        cls for cls in _all_subclasses(NodeSubmodule)
-        if cls.get_piecewise_accelerator_graph_configs is not base_fn
-    ]
+    # Sorted: a set of classes iterates in id order, which differs between xdist
+    # workers, and xdist aborts when workers collect different test orders.
+    return sorted(
+        (cls for cls in _all_subclasses(NodeSubmodule) if cls.get_piecewise_accelerator_graph_configs is not base_fn),
+        key=lambda c: (c.__module__, c.__qualname__),
+    )
 
 
 @pytest.mark.parametrize("cls", _overriding_subclasses(), ids=lambda c: c.__name__)

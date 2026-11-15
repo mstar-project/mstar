@@ -10,15 +10,23 @@ from types import SimpleNamespace
 
 import torch
 
-from mstar.api_server.data_worker import InlineTokens, PreprocessWorker, PreprocessWorkerThread, ResultQueue
+from mstar.api_server.data_worker import (
+    InlineTokens,
+    PreprocessWorker,
+    PreprocessWorkerThread,
+    RequestOutputState,
+    ResultQueue,
+)
 from mstar.api_server.request_types import APIServerMessage, ResultChunk, ResultTokens
 from mstar.communication import wire
 from mstar.communication.event import EventWakeup
 from mstar.engine.resources.sampler.config import SAMPLED_LOGPROB
+from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
-from mstar.model.base import Model
 from mstar.model.submodule_base import HostRows
-from mstar.worker.worker import Worker
+from mstar.testing_utils.model import StubModel
+from mstar.testing_utils.worker import make_worker
+from mstar.worker.step_executor import StepExecutor
 
 # -- wire --------------------------------------------------------------------
 
@@ -53,14 +61,7 @@ def test_result_tokens_round_trips_through_the_codec():
 # -- api server --------------------------------------------------------------
 
 
-class _Model:
-    def get_partition_topology(self):
-        from mstar.streaming.topology import PartitionTopology
-        return PartitionTopology(partitions=["default"])
-    # the inline path's per-value default, over the stub's postprocess
-    postprocess_inline = Model.postprocess_inline
-    text_output = Model.text_output
-
+class _Model(StubModel):
     def postprocess(self, output, modality, request_kwargs=None):
         assert modality == "text"
         return f"<{int(output[0])}>".encode()
@@ -150,6 +151,60 @@ def test_inline_tokens_are_detokenized_in_order_without_a_read():
     assert state.next_sequence == 3 and state.next_emit == 3 and not state.pending
 
 
+def test_turn_tokens_mark_their_text_chunks():
+    """A model's declared turn tokens mark the chunks they arrive in, though
+    postprocess may drop the tokens themselves; other chunks are unmarked.
+    Every chunk carries its loop iteration as its step."""
+    worker, stop = _thread()
+    worker.model.turn_tokens = (1, 2)
+    for i, v in enumerate((12, 1, 13, 2, 12)):
+        worker.result_tensor_queue.put(InlineTokens(["req"], [v], "text", loop_indices=[_loop(i)]))
+    chunks = _run_until(worker, stop, 5)
+    assert [c.metadata.get("turn") for c in chunks] == [None, ["start"], None, ["end"], None]
+    assert [c.metadata["step"] for c in chunks] == [0, 1, 2, 3, 4]
+    # a chunk of several tokens keeps every mark, in order
+    assert worker._turn_metadata([2, 12, 1], None) == {"turn": ["end", "start"]}
+
+
+def test_turn_tokens_stamp_read_text_and_audio_with_their_step():
+    """Chunks read as tensors (text without inline tokens, and all audio)
+    carry their loop step as the inline path's do."""
+    class _ReadModel(_Model):
+        turn_tokens = (1, 2)
+
+        def postprocess(self, output, modality, request_kwargs=None):
+            return b"pcm" if modality == "audio" else super().postprocess(output, modality)
+
+        def get_output_sample_rate(self, modality="audio"):
+            return 24000
+
+        def get_output_audio_channels(self, modality="audio"):
+            return 1
+
+    tensors = {"t": torch.tensor([1]), "a": torch.zeros(4, dtype=torch.int16)}
+
+    class _ReadTM(_TM):
+        def get_ready_tensors(self):
+            return {"req": [GraphEdge(next_node="api", name=f"{modality}_output", tensor_info=[SimpleNamespace(uuid=u)])
+                            for modality, u in (("text", "t"), ("audio", "a"))]}
+
+        def get_tensor(self, uuid):
+            return tensors[uuid]
+
+        def dereference(self, uuid):
+            pass
+
+    worker, _ = _thread()
+    worker.model, worker.tensor_manager = _ReadModel(), _ReadTM()
+    worker.request_output_state = {"req": RequestOutputState(order={"t": (0, _loop(3)), "a": (1, _loop(5))},
+                                                             next_sequence=2)}
+    worker.tensor_uuid_to_metadata_per_request = {"req": {"t": {}, "a": {}}}
+    assert worker._process_read_tensors() is True
+    text, audio = worker.out_queue.get_nowait(), worker.out_queue.get_nowait()
+    assert text.metadata == {"step": 3, "turn": ["start"]}
+    assert audio.modality == "audio" and audio.metadata["step"] == 5
+
+
 def test_a_draining_request_drops_its_inline_tokens():
     worker, stop = _thread()
     worker._draining_rids.add("gone")
@@ -166,8 +221,9 @@ def test_a_row_that_fails_postprocessing_fails_only_its_request():
     worker.result_tensor_queue.put(InlineTokens(["bad", "good"], [13, 2], "text"))
     chunks = {c.request_id: c for c in _run_until(worker, stop, 2)}
     assert chunks["good"].modality == "text" and chunks["good"].data == b"<2>"
-    assert chunks["bad"].modality == "error" and b"bad token" in chunks["bad"].data
-    assert chunks["bad"].metadata["status"] == 400
+    # past intake a ValueError is a server bug: a 500 that keeps its text in the log
+    assert chunks["bad"].modality == "error" and b"internal error (error id " in chunks["bad"].data
+    assert chunks["bad"].metadata["status"] == 500
 
 
 def test_inline_logprobs_land_in_their_chunks_metadata():
@@ -225,7 +281,7 @@ class _Engine:
         self._signals = signals
         self._walks = walks
 
-    def inline_client_signals(self, node_name, graph_walk):
+    def inline_signals(self, node_name, graph_walk):
         # as the submodule: a walk it does not inline, and a combined label, get none
         return self._signals if graph_walk in self._walks else {}
 
@@ -259,33 +315,54 @@ class _Batch:
         self.node_batch = SimpleNamespace(withheld_outputs=withheld or {})
 
 
-def _worker(runtime=_Runtime()):
-    w = Worker.__new__(Worker)
-    w._graph_runtime = runtime
-    return w
+def _executor(runtime=_Runtime(), **layout):
+    return make_worker(graph_runtime=runtime, **layout).executor
 
 
 def test_inline_values_follow_the_batch_order_off_the_host_rows():
     rows = HostRows((7, 8, 9), {"new_token": torch.tensor([[70], [80], [90]])})
-    sig, vals = _worker()._inline_emit_values(
+    sigs, vals = _executor()._inline_emit_values(
         _Engine({"text_inputs": "new_token"}), _Batch(), rows, [9, 7, 8], ["text_inputs", "kv"],
     )
-    assert sig == "text_inputs" and vals == [90, 70, 80]
+    assert sigs == ("text_inputs",) and vals == [90, 70, 80]
 
 
-def test_inline_values_fall_back_when_a_rid_has_no_row_or_nothing_applies():
+def test_signals_reading_one_buffer_ride_one_column():
+    """Every inline signal the step outputs off the first one's buffer rides
+    its column; one off another buffer, or not output, does not."""
+    rows = HostRows((7, 8), {"new_token": torch.tensor([70, 80]), "other": torch.tensor([1, 2])})
+    engine = _Engine({"text_inputs": "new_token", "codes": "other", "speech_ids": "new_token", "x": "new_token"})
+    sigs, vals = _executor()._inline_emit_values(
+        engine, _Batch(), rows, [7, 8], ["speech_ids", "codes", "text_inputs"],
+    )
+    assert sigs == ("text_inputs", "speech_ids") and vals == [70, 80]
+
+
+def test_a_row_that_ran_no_forward_takes_the_tensor_path_alone():
+    # 8 ran no forward (the cache served it, or it declined its stream's final
+    # chunk), so it has no host row; on a rows-only step the tensor path has
+    # nothing for 7 and 9, so they must still go inline
+    rows = HostRows((7, 9), {"new_token": torch.tensor([[70], [90]])})
+    sigs, vals = _executor()._inline_emit_values(
+        _Engine({"text_inputs": "new_token"}), _Batch(), rows, [7, 8, 9], ["text_inputs"],
+    )
+    assert sigs == ("text_inputs",) and vals == [70, None, 90]
+
+
+def test_inline_values_fall_back_when_nothing_applies():
     rows = HostRows((7, 8), {"new_token": torch.tensor([70, 80])})
-    w = _worker()
+    w = _executor()
     eng = _Engine({"text_inputs": "new_token"})
-    none = (None, [])
-    assert w._inline_emit_values(eng, _Batch(), rows, [7, 8, 9], ["text_inputs"]) == none
+    none = ((), [])
     assert w._inline_emit_values(eng, _Batch(), rows, [7], ["other"]) == none
     assert w._inline_emit_values(_Engine({}), _Batch(), rows, [7], ["text_inputs"]) == none
     assert w._inline_emit_values(eng, _Batch(), None, [7], ["text_inputs"]) == none
+    # the step's first inline signal names a buffer the step has no rows of
+    assert w._inline_emit_values(_Engine({"text_inputs": "absent"}), _Batch(), rows, [7], ["text_inputs"]) == none
 
     class _NoInline:
         supports_inline_emit = False
-    assert _worker(_NoInline())._inline_emit_values(
+    assert _executor(_NoInline())._inline_emit_values(
         eng, _Batch(), rows, [7, 8], ["text_inputs"],
     ) == none
 
@@ -295,23 +372,30 @@ def test_a_mixed_step_inlines_its_decode_rows():
     # decode rows still go inline, and the prefill row carries its own token
     rows = HostRows((7, 8, 9), {"new_token": torch.tensor([[70], [80], [90]])})
     batch = _Batch({7: "decode", 8: "prefill_text", 9: "decode"}, label="mixed")
-    sig, vals = _worker()._inline_emit_values(
+    sigs, vals = _executor()._inline_emit_values(
         _Engine({"text_inputs": "new_token"}), batch, rows, [7, 8, 9], ["text_inputs"],
     )
-    assert sig == "text_inputs" and vals == [70, 80, 90]
+    assert sigs == ("text_inputs",) and vals == [70, 80, 90]
 
 
-def test_a_mixed_step_falls_back_when_a_decode_row_has_no_value():
+def test_a_mixed_step_carries_every_signal_on_its_column():
+    """A stored mixed step's column is the walks' signals off one buffer: the
+    spoken walk's stream rides beside the token both walks emit."""
+    rows = HostRows((7, 8), {"new_token": torch.tensor([70, 80])})
+    batch = _Batch({7: "decode", 8: "decode_spoken"}, label="mixed")
+    engine = _Engine({"text_inputs": "new_token", "speech_ids": "new_token"}, walks=("decode", "decode_spoken"))
+    assert _executor()._inline_emit_values(engine, batch, rows, [7, 8], ["speech_ids", "text_inputs"]) == (
+        ("text_inputs", "speech_ids"), [70, 80],
+    )
+
+
+def test_a_mixed_step_row_with_no_value_takes_the_tensor_path():
     rows = HostRows((7,), {"new_token": torch.tensor([[70]])})
-    batch = _Batch({7: "prefill_text", 9: "decode"}, label="mixed")
-    assert _worker()._inline_emit_values(
-        _Engine({"text_inputs": "new_token"}), batch, rows, [7, 9], ["text_inputs"],
-    ) == (None, [])
-    # a row of a walk that sends no inline value needs none
-    batch = _Batch({7: "decode", 9: "prefill_text"}, label="mixed")
-    assert _worker()._inline_emit_values(
-        _Engine({"text_inputs": "new_token"}), batch, rows, [7, 9], ["text_inputs"],
-    ) == ("text_inputs", [70, 0])
+    for walks in ({7: "prefill_text", 9: "decode"}, {7: "decode", 9: "prefill_text"}):
+        assert _executor()._inline_emit_values(
+            _Engine({"text_inputs": "new_token"}), _Batch(walks, label="mixed"), rows, [7, 9],
+            ["text_inputs"],
+        ) == (("text_inputs",), [70, None])
 
 
 def test_row_logprobs_follow_the_batch_order():
@@ -321,32 +405,31 @@ def test_row_logprobs_follow_the_batch_order():
         "new_token": torch.tensor([70, 80, 90, 0]),
         SAMPLED_LOGPROB: torch.tensor([-0.5, nan, -0.25, nan]),
     })
-    assert Worker._row_logprobs(rows, [9, 7, 8]) == [-0.25, -0.5, None]
-    assert Worker._row_logprobs(rows, [7, 6]) == [-0.5, None], "a rid with no row has none"
+    assert StepExecutor._row_logprobs(rows, [9, 7, 8]) == [-0.25, -0.5, None]
+    assert StepExecutor._row_logprobs(rows, [7, 6]) == [-0.5, None], "a rid with no row has none"
     # empty when no row has one
-    assert Worker._row_logprobs(None, [7]) == []
-    assert Worker._row_logprobs(HostRows((7,), {"new_token": torch.tensor([70])}), [7]) == []
-    assert Worker._row_logprobs(HostRows((7,), {SAMPLED_LOGPROB: torch.tensor([nan])}), [7]) == []
+    assert StepExecutor._row_logprobs(None, [7]) == []
+    assert StepExecutor._row_logprobs(HostRows((7,), {"new_token": torch.tensor([70])}), [7]) == []
+    assert StepExecutor._row_logprobs(HostRows((7,), {SAMPLED_LOGPROB: torch.tensor([nan])}), [7]) == []
 
 
-def _inline_step(withheld=None):
-    """A one-row device-loopback decode step whose token rides inline, as
+def _inline_step(withheld=None, signals=("text_inputs",), inline=None, rids=(7,), **layout):
+    """A device-loopback decode step whose token rides inline, as
     `_get_postprocess_request` sees it."""
-    w = _worker()
-    w._stop_token_signal, w._device_loopback, w._innermost_loop_by_node = {}, {}, {}
-    w.enable_prof = False
+    w = _executor(**layout)
+    inline = inline or {"text_inputs": "new_token"}
     engine = SimpleNamespace(
         device_loopback_signals=lambda node, walk: ("text_inputs",),
-        inline_client_signals=lambda node, walk: {"text_inputs": "new_token"},
+        inline_signals=lambda node, walk: inline,
     )
     batch = _Batch()
     batch.partition = "p"
-    batch.batch.output_signals = ["text_inputs"]
-    batch.batch.request_to_worker_graph = {7: 0}
+    batch.batch.output_signals = list(signals)
+    batch.batch.request_to_worker_graph = dict.fromkeys(rids, 0)
     batch.node_batch = SimpleNamespace(
         final_stream_rids=(), partition_done_rids=(), withheld_outputs=withheld or {},
     )
-    batch.batch.rids_by_walk = lambda: {"decode": [7]}
+    batch.batch.rids_by_walk = lambda: {"decode": list(rids)}
     return w, engine, batch
 
 
@@ -356,14 +439,38 @@ def test_a_step_with_logprobs_routes_through_the_store():
     w, engine, batch = _inline_step()
     tokens = torch.tensor([70])
     plain = w._get_postprocess_request(batch, HostRows((7,), {"new_token": tokens}), engine, False, None, None)
-    assert plain.inline is not None and plain.inline.signal == "text_inputs"
+    assert plain.inline is not None and plain.inline.signals == ("text_inputs",)
     rows = HostRows((7,), {"new_token": tokens, SAMPLED_LOGPROB: torch.tensor([-0.5])})
     assert w._get_postprocess_request(batch, rows, engine, False, None, None).inline is None
 
 
-def test_a_withheld_output_routes_through_the_store():
-    """An inline route carries every row's outputs, so a step whose stop check
-    withheld one stores, and the store leaves the withheld output out."""
+SPOKEN = {"text_inputs": "new_token", "speech_ids": "new_token"}
+
+
+def test_a_withheld_output_rides_inline_and_names_its_rows():
+    """The inline route sends nothing for what the stop check withheld, so a
+    step that withheld an output still routes inline, naming the withheld rows
+    per signal."""
+    rows = HostRows((7, 8), {"new_token": torch.tensor([70, 80])})
+    w, engine, batch = _inline_step(
+        withheld={8: ("speech_ids",)}, signals=("text_inputs", "speech_ids"), inline=SPOKEN, rids=(7, 8),
+        inline_carried={("LLM", "decode"): frozenset({"speech_ids"})},
+    )
+    request = w._get_postprocess_request(batch, rows, engine, False, None, None)
+    assert request.inline is not None and request.inline.signals == ("text_inputs", "speech_ids")
+    assert request.withheld == {"speech_ids": [8]}
+    _, _, plain = _inline_step(rids=(7, 8))
+    assert w._get_postprocess_request(plain, rows, engine, False, None, None).withheld is None
+
+
+def test_a_stream_riding_the_column_lets_the_step_route_inline():
+    """A step whose outputs are a loop-back signal and a stream the column
+    carries routes inline; one whose stream keeps its tensors stores."""
     rows = HostRows((7,), {"new_token": torch.tensor([70])})
-    w, engine, batch = _inline_step(withheld={7: ("text_inputs",)})
+    spoken = dict(signals=("text_inputs", "speech_ids"), inline=SPOKEN)
+    w, engine, batch = _inline_step(**spoken, inline_carried={("LLM", "decode"): frozenset({"speech_ids"})})
+    assert w._get_postprocess_request(batch, rows, engine, False, None, None).inline.signals == (
+        "text_inputs", "speech_ids",
+    )
+    w, engine, batch = _inline_step(**spoken)
     assert w._get_postprocess_request(batch, rows, engine, False, None, None).inline is None

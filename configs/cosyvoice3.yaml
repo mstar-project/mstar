@@ -23,3 +23,5 @@ node_groups:
 #   llm_weights: llm.rl.pt             # the checkpoint's RL-tuned LM
 #   flow_estimator_dtype: float32      # the reference's flow precision (default bfloat16: more throughput)
 #   flow_capture_frame_buckets: []     # capture no flow solve (faster startup, less GPU memory, eager solves)
+#   hift_capture_frame_buckets: []     # capture no vocoder step (faster startup, less GPU memory, eager steps)
+#   flow_cache_frames: 0               # re-solve every frame each hop (saves resources.flow_kv: about 41 GiB here)

@@ -18,6 +18,18 @@ def divide(numerator, denominator):
     return numerator // denominator
 
 
+def kv_head_replicas(num_kv_heads: int, tp_size: int) -> tuple[int, int]:
+    """KV heads each TP rank holds, and TP ranks holding each one. With more ranks than heads,
+    each head is replicated over a block of consecutive ranks: TP rank ``r`` holds KV head
+    ``r // replicas``, which is how the K/V projections load and how context parallelism
+    picks the ranks sharing a head."""
+    if max(tp_size, num_kv_heads) % min(tp_size, num_kv_heads):
+        raise ValueError(f"{num_kv_heads} heads do not split evenly over {tp_size} TP ranks")
+    if tp_size >= num_kv_heads:
+        return 1, tp_size // num_kv_heads
+    return num_kv_heads // tp_size, 1
+
+
 def split_tensor_along_last_dim(
     tensor: torch.Tensor,
     num_partitions: int,

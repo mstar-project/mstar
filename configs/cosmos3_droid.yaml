@@ -2,6 +2,9 @@ model: "cosmos3_droid"
 # Sequence-length hint for the scheduler. The conductor only asserts its
 # presence; the real per-request capacity is the KV pool below.
 max_seq_len: 8192
+# A robot sends one request at a time, so there is nothing for the data
+# worker's prepare pool to overlap (Cosmos3 declares PREPROCESS_PARALLEL).
+preprocess_workers: 1
 # KV pool sizing, matching the Nano config: the checkpoint is Nano-sized and
 # still serves the full video paths (forward dynamics decodes a rollout
 # video), so it keeps the pool that covers single-request video at every tier.
@@ -33,6 +36,9 @@ model_kwargs:
   policy_action_chunk_size: 32
   policy_conditioning_fps: 15.0
   policy_domain_name: droid_lerobot
+  # The observation size NVIDIA's RoboLab server sends: its one-frame encode
+  # compiles once, in the warmup below; other encodes run eager.
+  compile_vae_encode_size: [736, 544]
 node_groups:
   - node_names: ["dit"]
     ranks: [0]
@@ -40,3 +46,17 @@ node_groups:
   # (the only consumer of that node) is never built.
   - node_names: ["vae_encoder", "vae_decoder"]
     ranks: [0]
+# The first policy request of a fresh server compiles the action denoise step
+# and the observation encode; this warms both at startup with an observation in
+# the 736x544 bucket NVIDIA's RoboLab server sends (this checkpoint ships no
+# example frame; the Edge model card's is used).
+warmup_requests:
+  - text: warmup
+    files: [hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg]
+    output_modalities: [action]
+    model_kwargs: {size: 736x544, robot_state: [0, 0, 0, 0, 0, 0, 0, 0]}
+  # guidance 1 runs the conditional branch alone, a step the guided request doesn't build
+  - text: warmup
+    files: [hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg]
+    output_modalities: [action]
+    model_kwargs: {size: 736x544, robot_state: [0, 0, 0, 0, 0, 0, 0, 0], guidance_scale: 1.0}

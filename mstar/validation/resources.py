@@ -5,6 +5,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+from mstar.engine.resources.lora.config import LoraSpec
 from mstar.engine.resources.position.config import PositionSpec, PosScheme
 from mstar.engine.resources.recurrent.config import RecurrentStateSpec
 from mstar.engine.resources.runner import topo_sort
@@ -17,7 +18,7 @@ from mstar.engine.resources.spec import (
 )
 from mstar.graph.base import GraphEdge, GraphSection
 from mstar.graph.special_destinations import EMPTY_DESTINATION, SPECIAL_DESTINATIONS
-from mstar.model.base import Model, keyed_labels
+from mstar.model.base import Model, keyed_labels, node_moe_parallel_configs
 from mstar.model.submodule_base import chunk_loop_name
 from mstar.streaming.topology import StreamingGraphEdge
 
@@ -38,6 +39,7 @@ def check_resources(
         except ValueError as e:
             problems.append(str(e))
     problems += _apply_overrides(specs, config)
+    problems += _expert_lora_split_by_ep(specs, config)
     problems += _uncacheable_positions(specs, model)
     problems += _unskippable_resources(specs, model)
     problems += _unknown_prefix_walks(model)
@@ -79,6 +81,30 @@ def _apply_overrides(
     # after the overrides, so a page size from the YAML is checked against the pool's window
     for key, message in derive_specs(by_key):
         yield f"resources.{key}: {message}"
+
+
+def _expert_lora_split_by_ep(specs: Sequence[NodeResourceSpec], config: Mapping[str, Any]) -> Iterator[str]:
+    """LoRA on MoE experts a node splits over its ranks by expert parallelism, which
+    binding refuses (it is served under TP only)."""
+    groups = config.get("node_groups") or []
+    try:
+        ep = {node for node, c in node_moe_parallel_configs(groups).items() if c.parallel == "ep"}
+        split = {node for ng in groups if ng.get("tp_size", 1) > 1 for node in ng["node_names"] if node in ep}
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return  # a malformed node group is reported with the placement
+    for spec in specs:
+        if not isinstance(spec, LoraSpec):
+            continue
+        split_targets = sorted(
+            name for name, t in spec.targets.items()
+            if t.experts > 1 and split & ({t.node} if t.node else spec.nodes)
+        )
+        if split_targets:
+            yield (
+                f"resources.{spec.resource_key}: targets {split_targets} are LoRA on MoE experts, which "
+                f"{sorted(split & spec.nodes)} split by expert parallelism (`ep_config: parallel: ep`); serve them "
+                "with `parallel: tp`, or leave the experts targets out of `targets:`"
+            )
 
 
 def _uncacheable_positions(
@@ -126,6 +152,7 @@ def _unskippable_resources(
         node for spec in specs if spec.resource_key in declared
         for node in spec.nodes
     }
+    by_key = {spec.resource_key: spec for spec in specs}
     pools = {spec.resource_key for spec in specs if isinstance(spec, RecurrentStateSpec)}
     readers = {key: [spec for spec in specs if key in spec.depends_on()] for key in pools}
     for spec in specs:
@@ -136,7 +163,10 @@ def _unskippable_resources(
             reader.writes_prefix_snapshots for reader in readers[spec.resource_key]
         ):
             continue
-        if spec.depends_on() and spec.depends_on() <= pools and spec.writes_prefix_snapshots:
+        # a dependency that plans from the step a hit trimmed (a sequence shard) holds nothing to restore
+        # (an undeclared one is reported apart, by `spec_dependency_problems`)
+        held = {dep for dep in spec.depends_on() if dep in by_key and not by_key[dep].resource_class.prefix_skip_safe}
+        if held and held <= pools and spec.writes_prefix_snapshots:
             continue
         yield (
             f"resource {spec.resource_key!r} cannot serve a request whose "

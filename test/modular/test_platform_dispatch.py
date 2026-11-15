@@ -18,6 +18,7 @@ from mstar.engine.engine import Engine
 from mstar.platforms import CpuPlatform, CudaPlatform, Platform, RocmPlatform, XpuPlatform
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.platforms.dispatch import PlatformDispatch
+from mstar.testing_utils.engine import make_mgmt
 
 
 @pytest.fixture
@@ -224,6 +225,7 @@ def fake_compile(monkeypatch):
 
 class _GraphRunner:
     _forward_for = AcceleratorGraphRunner._forward_for
+    recompile_limit = None
 
     def __init__(self):
         self._submodule = _Submodule()
@@ -233,7 +235,7 @@ class _GraphRunner:
 def _bucket(num_tokens: int):
     return SimpleNamespace(
         config=SimpleNamespace(
-            compile=True, compile_mode=None, capture_forward_method="forward_batched",
+            compile=True, compile_mode=None, inductor_options=None, capture_forward_method="forward_batched",
         ),
         config_idx=0,
         num_tokens=num_tokens,
@@ -267,7 +269,7 @@ def test_compiled_submodule_forwards_take_overrides_for_any_token_count(
     platform = on_platform(_EverythingOnAten() if overrides else CudaPlatform())
     engine = Engine(graph_runtime=None, device_capability=SimpleNamespace(is_available=True))
     engine._submodules = {
-        "node": SimpleNamespace(submodule=_Submodule(), forward=None, forward_batched=None),
+        "node": make_mgmt(submodule=_Submodule(), forward=None, forward_batched=None),
     }
     engine._item_encoders = set()
     engine._compile_submodules()

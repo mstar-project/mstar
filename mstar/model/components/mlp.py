@@ -21,6 +21,35 @@ from torch import nn
 from mstar.model.components.linear import FusedColumnLinear
 
 
+@torch.library.custom_op("mstar::silu_and_mul", mutates_args=())
+def silu_and_mul(gate_up: torch.Tensor) -> torch.Tensor:
+    """``silu(gate) * up`` for ``gate_up`` = ``[..., 2 * d]`` (gate first). Portable
+    fallback: the two ops."""
+    gate, up = gate_up.chunk(2, dim=-1)
+    return F.silu(gate) * up
+
+
+@torch.library.register_kernel(silu_and_mul, "cuda")
+def _silu_and_mul_cuda(gate_up: torch.Tensor) -> torch.Tensor:
+    """FlashInfer's one kernel, half precision on NVIDIA only: it rounds once, where
+    the pair rounds after the SiLU too. The op, rather than its Python wrapper,
+    keeps the kernel behind a graph boundary Dynamo doesn't trace into (see
+    ``mstar::fused_add_rms_norm``)."""
+    from mstar.platforms import current_platform
+
+    if gate_up.dtype not in (torch.bfloat16, torch.float16) or current_platform.is_rocm():
+        gate, up = gate_up.chunk(2, dim=-1)
+        return F.silu(gate) * up
+    from flashinfer.activation import silu_and_mul as fused
+
+    return fused(gate_up.contiguous())
+
+
+@silu_and_mul.register_fake
+def _silu_and_mul_fake(gate_up: torch.Tensor) -> torch.Tensor:
+    return gate_up.new_empty(*gate_up.shape[:-1], gate_up.shape[-1] // 2)
+
+
 def _resolve_activation(activation: str | Callable) -> Callable:
     """Resolve an activation name to a callable. Accepts the canonical
     HF names (``silu``, ``gelu``, ``gelu_tanh``, ``relu``, ``relu2``) or a

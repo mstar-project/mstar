@@ -18,14 +18,15 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from mstar.model.components.mrope import layout_position_ids
 from mstar.model.cosmos3.components.reasoner import (
     MediaGrid,
-    mrope_position_ids,
     patchify,
     preprocess_image,
     preprocess_video,
     sample_frame_indices,
     smart_resize,
+    vision_layout,
 )
 from mstar.model.cosmos3.components.transformer import (
     Cosmos3OmniTransformer,
@@ -169,11 +170,10 @@ def test_fused_gen_attends_to_normed_und_k() -> None:
     out_u, out_g = attn(und, gen, (cos_u, sin_u, cos_g, sin_g))
 
     H, Hkv, D = attn.num_attention_heads, attn.num_key_value_heads, attn.head_dim
-    q_u = attn._apply_rope(attn.to_q(und).view(-1, H, D), cos_u, sin_u)
-    k_raw = attn.to_k(und).view(-1, Hkv, D)
+    q_u, k_raw, v_u = attn._und_qkv(und)
+    q_u = attn._apply_rope(q_u, cos_u, sin_u)
     k_u = attn._apply_rope(k_raw, cos_u, sin_u)
     k_u_gen = attn._apply_rope(attn.k_norm_und_for_gen(k_raw), cos_u, sin_u)
-    v_u = attn.to_v(und).view(-1, Hkv, D)
     q_g = attn._apply_rope(attn.norm_added_q(attn.add_q_proj(gen).view(-1, H, D)), cos_g, sin_g)
     k_g = attn._apply_rope(attn.norm_added_k(attn.add_k_proj(gen).view(-1, Hkv, D)), cos_g, sin_g)
     v_g = attn.add_v_proj(gen).view(-1, Hkv, D)
@@ -270,7 +270,7 @@ def test_cached_prefill_writes_gen_facing_k() -> None:
     attn0 = model.layers[0].self_attn
     und_norm = model.layers[0].input_layernorm(model.embed_tokens(static["input_ids"]))
     cos, sin = model._rotary(static["text_mrope_ids"], und_norm.device, und_norm.dtype)
-    k_raw = attn0.to_k(und_norm).view(-1, attn0.num_key_value_heads, attn0.head_dim)
+    _, k_raw, _ = attn0._und_qkv(und_norm)
     expected = attn0._apply_rope(attn0.k_norm_und_for_gen(k_raw), cos, sin)
     assert torch.allclose(res.committed[0][0], expected, atol=1e-5)
 
@@ -296,7 +296,7 @@ def test_text_forward_keeps_raw_k() -> None:
     attn0 = model.layers[0].self_attn
     und_norm = model.layers[0].input_layernorm(embeds)
     cos, sin = model._rotary(pos, embeds.device, embeds.dtype)
-    k_raw = attn0._apply_rope(attn0.to_k(und_norm).view(-1, attn0.num_key_value_heads, attn0.head_dim), cos, sin)
+    k_raw = attn0._apply_rope(attn0._und_qkv(und_norm)[1], cos, sin)
     assert torch.allclose(res.committed[0][0], k_raw, atol=1e-6)
 
 
@@ -403,12 +403,18 @@ def test_sample_frame_indices() -> None:
         sample_frame_indices(10, 24.0, cfg, num_frames=2, fps=1.0)
 
 
+def _positions(ids, cfg, image_grids, video_grids):
+    """The served path: the intake's layout, then the reasoner's positions from it."""
+    layout = vision_layout(ids, cfg, image_grids, video_grids, "vision_embeds")
+    return layout_position_ids(layout, cfg.vision.spatial_merge_size, len(ids))
+
+
 def test_mrope_positions_image_then_text() -> None:
     cfg = Cosmos3ReasonerConfig()
     # [text x3][image 2x4 merged grid = 8 pads][text x2]
     ids = torch.tensor([5, 6, 7] + [cfg.image_token_id] * 8 + [8, 9])
     grid = MediaGrid(1, 4, 8)  # merged 2 x 4
-    pos, nxt = mrope_position_ids(ids, cfg, [grid], [])
+    pos, nxt = _positions(ids, cfg, [grid], [])
     assert pos[:, :3].tolist() == [[0, 1, 2]] * 3
     assert pos[0, 3:11].tolist() == [3] * 8                      # temporal: the cursor
     assert pos[1, 3:11].tolist() == [3, 3, 3, 3, 4, 4, 4, 4]     # height
@@ -417,14 +423,14 @@ def test_mrope_positions_image_then_text() -> None:
     assert pos[:, 11:].tolist() == [[7, 8]] * 3
     assert nxt == 9
     with pytest.raises(ValueError, match="does not match"):
-        mrope_position_ids(ids, cfg, [MediaGrid(1, 4, 4)], [])
+        vision_layout(ids, cfg, [MediaGrid(1, 4, 4)], [], "vision_embeds")
 
 
 def test_mrope_positions_video_frames() -> None:
     cfg = Cosmos3ReasonerConfig()
     grid = MediaGrid(2, 2, 2, timestamps=(0.0, 0.5))  # 1 merged token per frame
     ids = torch.tensor([1, cfg.video_token_id, 2, cfg.video_token_id, 3])
-    pos, nxt = mrope_position_ids(ids, cfg, [], [grid])
+    pos, nxt = _positions(ids, cfg, [], [grid])
     assert pos[:, 1].tolist() == [1, 1, 1] and pos[:, 2].tolist() == [2, 2, 2]
     assert pos[:, 3].tolist() == [3, 3, 3] and pos[:, 4].tolist() == [4, 4, 4]
     assert nxt == 5
@@ -464,6 +470,8 @@ def test_edge_transformer_key_and_shape_coverage() -> None:
         cosmos3_name_remapper,
         read_transformer_weight_keys,
         read_transformer_weight_shapes,
+        stacked_param_name,
+        stacked_param_shapes,
     )
 
     cfg = Cosmos3Config.from_pretrained(EDGE_DIR)
@@ -471,12 +479,12 @@ def test_edge_transformer_key_and_shape_coverage() -> None:
         model = Cosmos3OmniTransformer(cfg)
     model_keys = set(model.state_dict())
     index_keys = read_transformer_weight_keys(EDGE_DIR)
-    # A reasoner backbone keeps lm_head; every key maps one-to-one.
-    mapped = {cosmos3_name_remapper(k, with_lm_head=True) for k in index_keys}
+    # A reasoner backbone keeps lm_head; every key maps to its parameter (q / k / v to the fused one).
+    mapped = {stacked_param_name(cosmos3_name_remapper(k, with_lm_head=True)) for k in index_keys}
     assert mapped == model_keys, (sorted(model_keys - mapped)[:5], sorted(mapped - model_keys)[:5])
     assert len(index_keys) == 549
     try:
-        shapes = read_transformer_weight_shapes(EDGE_DIR)
+        shapes = stacked_param_shapes(read_transformer_weight_shapes(EDGE_DIR))
     except Exception as exc:  # noqa: BLE001 — LFS pointers / missing shards
         pytest.skip(f"transformer shards unreadable: {exc}")
     mismatched = {k: (tuple(v.shape), shapes.get(k)) for k, v in model.state_dict().items()
@@ -501,7 +509,8 @@ def test_edge_vision_encoder_key_and_shape_coverage() -> None:
     unexpected = sorted(set(ckpt) - set(model_shapes))[:5]
     assert set(model_shapes) == set(ckpt), (missing, unexpected)
     assert {k for k, s in model_shapes.items() if s != ckpt[k]} == set()
-    assert len(ckpt) == 443
+    # 443 checkpoint tensors, each layer's q / k / v weight and bias fused into one pair
+    assert len(ckpt) == 443 - 27 * 2 * 2
 
 
 @needs_edge
@@ -522,7 +531,7 @@ def test_edge_prompt_rendering_matches_reference_layout() -> None:
     expanded = expand_placeholders(text, tok, cfg.reasoner, [grid], [])
     ids = torch.tensor(tok(expanded, add_special_tokens=False)["input_ids"])
     assert int((ids == cfg.reasoner.image_token_id).sum()) == 176
-    pos, nxt = mrope_position_ids(ids, cfg.reasoner, [grid], [])
+    pos, nxt = _positions(ids, cfg.reasoner, [grid], [])
     start = int((ids == cfg.reasoner.vision_start_token_id).nonzero()[0]) + 1
     assert pos[0, start:start + 176].unique().tolist() == [start]
     assert pos[1, start:start + 176].max().item() == start + 10 and pos[2, start:start + 176].max().item() == start + 15
@@ -557,26 +566,30 @@ def test_edge_reasoner_video_prompt() -> None:
     from transformers import AutoTokenizer
 
     from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
-    from mstar.model.multimodal import PromptPart
+    from mstar.model.multimodal import MEDIA_LAYOUT, PromptPart
 
     model = Cosmos3Model(model_path_hf=str(EDGE_DIR), skip_weight_loading=True)
     model.tokenizer = AutoTokenizer.from_pretrained(str(EDGE_DIR))
     r = model.config.reasoner
     video = torch.rand(30, 3, 96, 160)  # 30 frames at 10 fps -> 3 s -> 6 frames at 2 fps
-    out = model.process_prompt(
+    prompt = model.process_prompt(
         None, ["video", "text"], ["text"], tensors={"video_inputs": [video]},
         prompt_parts=[PromptPart("video", None, 0), PromptPart("text", "What happens?")],
         input_metadata={"video_inputs": [{"average_fps": 10.0, "num_frames": 30}]},
         enable_thinking=False,
-    ).new_input_tensors
+    )
+    out = prompt.new_input_tensors
     ids = out["text_inputs"][0]
-    grid = out["vision_grid_thw"][0]
-    assert grid.shape == (1, 3) and int(grid[0, 0]) == 6
-    per_frame = int(grid[0, 1] * grid[0, 2]) // 4
+    # one layout run per frame, each with its (1, h, w) patch grid
+    layout = prompt.metadata[MEDIA_LAYOUT]
+    assert len(layout["grid"]) == 6 and len({tuple(g) for g in layout["grid"]}) == 1
+    _, h, w = layout["grid"][0]
+    per_frame = h * w // 4
+    assert layout["tokens"] == [per_frame] * 6
     assert int((ids == r.video_token_id).sum()) == 6 * per_frame
     assert int((ids == r.vision_start_token_id).sum()) == 6
-    assert out["pixel_values"][0].shape[0] == int(grid[0].prod())
-    pos = out["position_ids"][0]
+    assert out["pixel_values"][0].shape[0] == 6 * h * w
+    pos, _ = layout_position_ids(layout, r.vision.spatial_merge_size, len(ids))
     starts = (ids == r.vision_start_token_id).nonzero().flatten().tolist()
     # Frame k's tokens sit at one temporal position; successive frames are
     # separated by the timestamp text plus the merged grid's longer side.
@@ -589,8 +602,8 @@ def test_edge_reasoner_video_prompt() -> None:
         None, ["video", "text"], ["text"], tensors={"video_inputs": [video]},
         prompt_parts=[PromptPart("video", None, 0), PromptPart("text", "What happens?")],
         input_metadata={"video_inputs": [{"average_fps": 10.0}]}, video_num_frames=4,
-    ).new_input_tensors
-    assert int(out2["vision_grid_thw"][0][0, 0]) == 4
+    )
+    assert len(out2.metadata[MEDIA_LAYOUT]["grid"]) == 4
 
 
 @needs_edge

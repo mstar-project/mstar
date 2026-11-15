@@ -34,16 +34,14 @@ POLICY = StopPolicy(StopKind.AR, token_signal="new_token", eos_tokens=(EOS,), sa
 
 # no signal stays on the device, so nothing rides inline
 _ENGINE = SimpleNamespace(
-    device_loopback_signals=lambda node, walk: (), inline_client_signals=lambda node, walk: {},
+    device_loopback_signals=lambda node, walk: (), inline_signals=lambda node, walk: {},
 )
 
 
 def _declared_worker(policy=POLICY):
     w = _worker()
     w._graph_runtime.set_stop_policies(NODE, WALK, {LOOP: policy})
-    w._stop_token_signal = {(NODE, WALK): policy.token_signal}
-    w._device_loopback = {}
-    w._innermost_loop_by_node = {}
+    w.executor._stop_token_signal = {(NODE, WALK): policy.token_signal}
     return w
 
 
@@ -74,7 +72,7 @@ def test_the_runtime_stops_what_the_policy_does_through_a_speculated_loop(seed, 
     for _ in range(8):
         spec = _speculate(w, pending, rows=True, monkeypatch=monkeypatch)
         assert spec is not None
-        w._thread_outputs_to_speculative(spec, _rows_only(pending))
+        w.speculator.thread_outputs(spec, _rows_only(pending))
         # postprocess N: N+1 is speculated, N is not routed yet
         nb = pending.node_batch
         # host rows in another order than the step's, and sometimes one row
@@ -83,9 +81,9 @@ def test_the_runtime_stops_what_the_policy_does_through_a_speculated_loop(seed, 
         order = rng.permutation(len(ids))[: len(ids) - int(rng.random() < 0.5)]
         tokens = torch.tensor(rng.choice([EOS, 1, 2], size=len(order)))[:, None]
         host_rows = HostRows(tuple(ids[i] for i in order), {"new_token": tokens})
-        runtime_stops, tokens = w._runtime_stop_column(pending, host_rows)
+        runtime_stops, tokens = w.executor._runtime_stop_column(pending, host_rows)
         assert runtime_stops
-        req = w._get_postprocess_request(pending, host_rows, _ENGINE, runtime_stops, tokens, None)
+        req = w.executor._get_postprocess_request(pending, host_rows, _ENGINE, runtime_stops, tokens, None)
         assert req.inline is None
         got = w._graph_runtime.check_stops(
             req.partition, req.node_name, req.graph_walk, list(req.wg_ids.keys),

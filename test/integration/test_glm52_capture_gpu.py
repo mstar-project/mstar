@@ -37,29 +37,32 @@ PROMPTS = {"a": list(range(3, 12)), "b": list(range(40, 45))}
 # prefill bucket and eager and replay run the same shapes
 BUCKET_PROMPTS = {"a": list(range(3, 19)), "b": list(range(40, 56))}
 MAX_TOKENS = 12
+# the one prefill capture, which BUCKET_PROMPTS fill
+PREFILL_BUCKET = 16
 # the scale block fused_experts_fp8 compiles for
 FP8_BLOCK = (128, 128)
 
 
-def _latent_cfg(fp8: bool) -> Glm52ModelConfig:
+def _latent_cfg(fp8: bool, **overrides) -> Glm52ModelConfig:
     """The reduced model at the real latent shape: absorbed MLA with
     kv_lora_rank 512 / rope 64, which FlashInfer's MLA kernel serves. The
-    fp8 variant's experts are one scale block wide, so the fused kernel
-    takes them."""
+    fp8 variant's experts and q_lora_rank are one scale block wide, so the fused
+    kernel takes the experts and q_a's scales stack on kv_a's."""
     if fp8:
         base = dataclasses.replace(
-            Glm52ModelConfig.reduced_fp8(block=FP8_BLOCK), moe_intermediate_size=FP8_BLOCK[0])
+            Glm52ModelConfig.reduced_fp8(block=FP8_BLOCK), moe_intermediate_size=FP8_BLOCK[0],
+            q_lora_rank=FP8_BLOCK[0])
     else:
         base = Glm52ModelConfig.reduced()
     cfg = dataclasses.replace(
         base, mla_absorb=True, kv_lora_rank=512, qk_rope_head_dim=64,
-        prefill_token_buckets=[16], prefill_capture_batch_sizes=[1],
+        prefill_capture_batch_sizes=[1], **overrides,
     )
     assert flashinfer_mla_supports(cfg.kv_lora_rank, cfg.qk_rope_head_dim)
     return cfg
 
 
-def _load(tmp_path, monkeypatch, fp8: bool, **model_kwargs):
+def _load(tmp_path, monkeypatch, fp8: bool, cfg_overrides=None, **model_kwargs):
     """fp8: through a written checkpoint and the model's own loader; bf16:
     the randomized reference itself."""
     import test_glm52_serve_e2e as serve_e2e
@@ -75,7 +78,8 @@ def _load(tmp_path, monkeypatch, fp8: bool, **model_kwargs):
         model_path_hf="", config_variant="reduced_fp8" if fp8 else "reduced",
         checkpoint_path=str(tmp_path), tokenizer_mode="byte", **model_kwargs,
     )
-    cfg = dataclasses.replace(_latent_cfg(fp8), moe_quant_kernel=model.config.moe_quant_kernel)
+    cfg = dataclasses.replace(_latent_cfg(fp8, **(cfg_overrides or {})),
+                              kernels=model.config.kernels)
     model.config = cfg
     ref = _build_reference(dataclasses.replace(cfg, quantization_config=None))
     if fp8:
@@ -105,7 +109,8 @@ class _Node:
         specs = model.get_node_resources()
         apply_yaml_overrides(specs, KV_YAML)
         by_key = resolve_spec_dependencies(specs)
-        self.groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
+        trivial = CommGroup.trivial()
+        self.groups = JointGroups(tp_group=trivial, sp_group=trivial, instance=trivial)
         transfer = TransferEngineInfo(
             my_entity_id="glm52_capture", my_session_id="glm52_capture",
             transfer_engine=LocalTransferEngine("localhost"),
@@ -124,14 +129,16 @@ class _Node:
         self.runner = StepRunner(self.resources, node_resources={NODE: list(self.resources)})
         submodule.bind_node_resources(self.resources)
         self.overrides = model.get_request_resource_configs(
-            {}, model_kwargs={"temperature": 0.0, "ignore_eos": True},
+            [], [], model_kwargs={"temperature": 0.0, "ignore_eos": True},
         )
         self.cg = None
         if capture:
             self.cg = AcceleratorGraphRunner(
                 submodule_name=NODE, submodule=submodule, resources=self.resources,
                 step_runner=self.runner, device=DEVICE, autocast_dtype=DTYPE,
-                joint_comm_group=self.groups, num_slots=1,
+                joint_comm_group=self.groups, num_slots=1, head_shards=self.groups.world_size,
+                # the serving config's prefill_token_buckets, as the engine hands it over
+                token_ladders={"prefill": [PREFILL_BUCKET]},
             )
             with torch.no_grad():
                 self.cg.warmup_and_capture(None)
@@ -200,6 +207,8 @@ class _Node:
             self.sub.postprocess(rid, infos[rid], out)
             streams[rid].append(int(out["new_token"][0].item()))
             texts[rid] = out["text_inputs"][0].clone()
+        # check_stop stops on EOS only; the token budget is the loop's cap, which the runtime enforces
+        cap = self.model.get_loop_caps(max_output_tokens=MAX_TOKENS)["decode_loop"]
         live = list(self.prompts)
         for it in range(MAX_TOKENS + 2):
             if not live:
@@ -213,7 +222,7 @@ class _Node:
                 streams[rid].append(int(out["new_token"][0].item()))
                 texts[rid] = out["text_inputs"][0].clone()
                 infos[rid].dynamic_loop_iter_counts["decode_loop"] = it
-                if self.sub.check_stop(rid, infos[rid], out):
+                if self.sub.check_stop(rid, infos[rid], out) or it + 1 >= cap:
                     live.remove(rid)
         return streams
 
@@ -248,3 +257,38 @@ def test_capture_at_real_latent_dims_matches_eager(tmp_path, monkeypatch, fp8):
         assert len(stream) == MAX_TOKENS, (rid, stream)
         assert len(set(stream)) > 2, (rid, stream)
         assert captured_streams[rid] == stream, (rid, captured_streams[rid], stream)
+
+
+def _fused_prep(submodule, on: bool) -> None:
+    """The fused MLA prep on every layer, or the op-by-op path."""
+    for layer in submodule.language_model.model.layers:
+        layer.self_attn.mla_fused_prep = on
+
+
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+def test_capture_with_fused_mla_prep_matches_eager_and_unfused(tmp_path, monkeypatch, fp8):
+    """Captured with the fused MLA prep == eager == captured op by op. The bf16 arm runs
+    kernels: reference otherwise, since under auto its captured stream leaves the eager one
+    (undiagnosed); the fp8 arm needs auto's fused MoE to capture."""
+    monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
+    prompts = BUCKET_PROMPTS if fp8 else PROMPTS
+    kernels = {} if fp8 else {"kernels": "reference"}
+    streams = {}
+    for fused_prep in (False, True):
+        ckpt = tmp_path / f"fused{int(fused_prep)}"
+        ckpt.mkdir()
+        model, submodule = _load(ckpt, monkeypatch, fp8, cfg_overrides=dict(q_lora_rank=256), **kernels)
+        _fused_prep(submodule, fused_prep)
+        if fused_prep:
+            eager = _Node(model, submodule, capture=False, prompts=prompts)
+            streams["eager"] = eager.generate()
+            eager.close()
+        node = _Node(model, submodule, capture=True, prompts=prompts)
+        assert node.cg.any_graphs and node.cg.dropped_buckets == []
+        streams[fused_prep] = node.generate()
+        node.close()
+
+    for rid, stream in streams[True].items():
+        assert len(stream) == MAX_TOKENS and len(set(stream)) > 2, (rid, stream)
+        assert stream == streams["eager"][rid], (rid, stream, streams["eager"][rid])
+        assert stream == streams[False][rid], (rid, stream, streams[False][rid])

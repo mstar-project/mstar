@@ -21,7 +21,8 @@ from mstar.engine.accelerator_graph_config import (
     PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources import Segment, SlotLease, SubmoduleStep
+from mstar.engine.state import ArrayStep, kernel_setting
 from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
@@ -48,18 +49,23 @@ class AuTEncoderSubmodule(NodeSubmodule):
     # MAX_BATCH_SIZE). 4096 tokens is 8 requests of ~39 s.
     ENCODE_TOKEN_BUCKETS = [64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096]
     ENCODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
+    # The stack's region once declared, whose ``total_tokens`` the engine sets
+    # to the serving config's ladder before it captures; None until then.
+    _encode_region: PiecewisePackedConfig | None = None
 
     @classmethod
     def max_windows_per_replay(cls, config: AuTEncoderConfig) -> int:
         """Attention windows per request a captured replay can be handed, to
-        size the node's ragged resource: the largest bucket's tokens make at
-        most this many full windows, and each request adds one partial."""
+        size the node's ragged resource: the class's largest bucket's tokens
+        make at most this many full windows, and each request adds one
+        partial. A step with more takes no lease (`_fits_replay`)."""
         return cls.ENCODE_TOKEN_BUCKETS[-1] // config.window_tokens + 1
 
-    def __init__(self, encoder: AuTEncoder, attn_key: str):
+    def __init__(self, encoder: AuTEncoder, array: str):
+        """``array`` is what the windows' attention reads."""
         super().__init__()
         self.encoder = encoder
-        self.attn_key = attn_key
+        self.array = array
 
     def _param_dtype(self) -> torch.dtype:
         return self.encoder.conv2d1.weight.dtype
@@ -91,7 +97,10 @@ class AuTEncoderSubmodule(NodeSubmodule):
             for rid, inp in zip(request_ids, inputs, strict=True)
             for window in self.encoder.config.window_lengths(inp.input_seq_len)
         ]
-        return SubmoduleStep(segments=segments, steps={self.attn_key: AttentionStep(causal=False)})
+        return self._windows_step(segments)
+
+    def _windows_step(self, segments: list[Segment]) -> SubmoduleStep:
+        return SubmoduleStep(segments=segments, state={self.array: ArrayStep()})
 
     def preprocess(
         self,
@@ -110,9 +119,9 @@ class AuTEncoderSubmodule(NodeSubmodule):
         count. At ASR clip lengths (13 tokens a second) its GEMMs are a few
         dozen rows, so eager it is launch-bound: a 7 s clip's 24-layer stack
         is ~6.3 ms eager and ~1.9 ms replayed. The conv frontend before it
-        runs eagerly. A clip past the largest bucket runs eagerly, alone."""
+        runs eagerly. A clip past the largest bucket runs eagerly, alone, as
+        does a step with more windows than a replay's attention plan holds."""
         d_model = self.encoder.config.d_model
-        attn_key = self.attn_key
 
         def make_static_inputs(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
             return {"hidden": torch.zeros(shape.total_tokens, d_model, dtype=autocast_dtype, device=device)}
@@ -121,21 +130,34 @@ class AuTEncoderSubmodule(NodeSubmodule):
             # Every window of every request is a segment; the kernel needs
             # only the boundaries, so they all name the first row's id.
             # Zero-length rows pad the batch to the bucket.
-            return SubmoduleStep(
-                segments=[Segment(request_id=request_ids[0], label=WINDOW_LABEL, span=n) for n in seq_lens],
-                steps={attn_key: AttentionStep(causal=False)},
+            return self._windows_step(
+                [Segment(request_id=request_ids[0], label=WINDOW_LABEL, span=n) for n in seq_lens],
             )
 
-        return {
-            AUT_ENCODE: PiecewisePackedConfig(
-                capture_fn=self._capture_encode,
-                make_static_inputs=make_static_inputs,
-                declare_step=declare_step,
-                lease_before_step=True,
-                total_tokens=self.ENCODE_TOKEN_BUCKETS,
-                capture_batch_sizes=self.ENCODE_CAPTURE_BATCH_SIZES,
-            )
-        }
+        self._encode_region = PiecewisePackedConfig(
+            capture_fn=self._capture_encode,
+            make_static_inputs=make_static_inputs,
+            declare_step=declare_step,
+            lease_before_step=True,
+            can_lease=self._fits_replay,
+            total_tokens=self.ENCODE_TOKEN_BUCKETS,
+            capture_batch_sizes=self.ENCODE_CAPTURE_BATCH_SIZES,
+        )
+        return {AUT_ENCODE: self._encode_region}
+
+    def max_segments_per_request(self) -> int:
+        """The ceiling on windows per row of the array's read."""
+        handle = self.state_handles[self.array]
+        (read,) = handle.array.reads
+        return kernel_setting(handle, read, "max_segments_per_request")
+
+    def _fits_replay(self, inputs: list[NodeInputs]) -> bool:
+        """Whether a step's windows fit a replay's attention plan: the resource
+        holds ``max_segments_per_request`` a row, and the replay pads to at
+        least as many rows as the step has. Read from the resource, so a YAML
+        override holds."""
+        windows = sum(len(self.encoder.config.window_lengths(inp.input_seq_len)) for inp in inputs)
+        return windows <= len(inputs) * self.max_segments_per_request()
 
     def _capture_encode(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
         """The captured region: reads the runner's buffer, never rebinds."""
@@ -182,11 +204,14 @@ class AuTEncoderSubmodule(NodeSubmodule):
         return {"audio_embeds": [self._encode(audio_features, engine_inputs)[0]]}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
-        # A packed step holds at most the largest capture's tokens. Past it the
-        # clips run one by one, each replayed if it fits a bucket, so an eager
-        # step's activations are one clip's rather than the whole batch's.
+        # A packed step holds at most the largest capture's tokens (of the
+        # ladder the region takes) and the windows a replay's attention plan
+        # holds. Past either the clips run one by one, each replayed if it
+        # fits, so an eager step's activations are one clip's rather than the
+        # whole batch's.
+        buckets = self.ENCODE_TOKEN_BUCKETS if self._encode_region is None else self._encode_region.total_tokens
         tokens = sum(inp.input_seq_len for inp in model_inputs)
-        return len(model_inputs) <= 1 or tokens <= self.ENCODE_TOKEN_BUCKETS[-1]
+        return len(model_inputs) <= 1 or (tokens <= max(buckets) and self._fits_replay(model_inputs))
 
     def max_batch_size(self, graph_walk: str) -> int | None:
         del graph_walk

@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
+from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import (
     CachedPrefix,
     CGSlotKey,
@@ -31,6 +32,7 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStep,
 )
 from mstar.engine.resources.resident import gather_column
+from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -94,10 +96,12 @@ class SnapshotLease(NamedTuple):
 
 class SnapshotWrite(NamedTuple):
     """A snapshot slot that admit reserved for a prefill row's state at
-    ``offset`` tokens into the row. Commit files it under ``key``."""
+    ``offset`` tokens into the row. Commit files it under ``key``. ``row_end``
+    marks the row's last boundary, which a later chunk's supersedes."""
     slot: int
     offset: int
     key: bytes
+    row_end: bool = False
 
 
 class SnapshotTarget(NamedTuple):
@@ -129,6 +133,8 @@ class RecurrentAddressing:
     # kernels by them must not read the device copies back
     host_slot_indices: Sequence[int] | None = None
     host_has_state: Sequence[bool] | None = None
+    # whether every row has saved state, so `gather` has no start to select
+    every_row_has_state: bool = False
     # The prefill states to save into snapshot slots, and the checkpoint
     # interval they sit on: a page or a multiple of one, or 0 while the pool
     # keeps no snapshots.
@@ -139,6 +145,11 @@ class RecurrentAddressing:
 
 
 class RecurrentStatePool(Resource):
+    # it reads the KV pool only to key prefix snapshots, which are off above one rank. Its heads
+    # shard over TP alone, so every SP replica of a slot holds the same state, which a split step
+    # leaves alike on every one (`linear_attn.base`)
+    supports_context_parallel = True
+    supports_split_steps = True
     # the node's planner and this pool's table of slots, once bound
     _resident: "ResidentPlanner | None" = None
     _resident_table: "ResidentTable | None" = None
@@ -155,12 +166,13 @@ class RecurrentStatePool(Resource):
             config = replace(config, prefix_slots=0)
         # resolved here, not written back: the config is the model's, shared by its specs
         return cls(
-            device=info.device, config=config, name=spec.resource_key, kv_dtype=info.kv_dtype,
-            world_size=world_size,
+            device=info.device, config=config, comm_group=info.joint_comm_group,
+            name=spec.resource_key, kv_dtype=info.kv_dtype, world_size=world_size,
         )
 
     def __init__(
-        self, device: torch.device, config: RecurrentStateConfig, name: str = "recurrent_state",
+        self, device: torch.device, config: RecurrentStateConfig,
+        comm_group: JointGroups | None = None, name: str = "recurrent_state",
         kv_dtype: torch.dtype | None = None, world_size: int = 1,
     ):
         """``kv_dtype`` (the engine's) stands in for a block's ``dtype=None``."""
@@ -171,15 +183,20 @@ class RecurrentStatePool(Resource):
             )
         self._device = device
         self.config = config
+        self._comm_group = comm_group
         # the resource key, for errors
         self._name = name
+        # the start `set_start` gave, by block and layer, or None before it is called
+        self._start: dict[tuple[str, int | None], torch.Tensor] | None = None
 
         # One [num_layers, max_slots + prefix_slots, *shape] tensor per block. Layer-major so
         # `blocks[name][layer]` is contiguous: FlashInfer's pool paths assert
-        # the slot-major view is K-contiguous (stride(-1) == 1).
+        # the slot-major view is K-contiguous (stride(-1) == 1). A block that
+        # is not per layer is [max_slots + prefix_slots, *shape].
         self._blocks: dict[str, torch.Tensor] = {
             name: torch.zeros(
-                (config.num_layers, config.max_slots + config.prefix_slots, *block.shape),
+                (*((config.num_layers,) if block.per_layer else ()),
+                 config.max_slots + config.prefix_slots, *block.shape),
                 dtype=block.resolved_dtype(kv_dtype),
                 device=device,
             )
@@ -202,6 +219,8 @@ class RecurrentStatePool(Resource):
         # `KVManager._admit_reserved_pages`, and handle-keyed the same way, so a
         # released request's entries are purged with it.
         self._admit_taken: dict[tuple[str, str], tuple[int, bool]] = {}
+        # the part of it the pre-plan pass took: all `clear_preplan` gives back
+        self._preplan_taken: set[tuple[str, str]] = set()
         # Admission, as `KVManager` decides it: only at one rank, since a
         # reservation held on rank 0 alone would make the ranks refuse different
         # allocations. `_reserved` holds, per admitted request, the slots kept
@@ -212,7 +231,8 @@ class RecurrentStatePool(Resource):
         # Bumped by every change to which slot a (rid, label) holds or to its
         # `has_state`: a step's addressing depends on nothing else, so the
         # last one built is reused while this and the step's rows are unchanged
-        # (a steady decode batch). See `_build_addressing`.
+        # (a steady decode batch), and an eager step then stages nothing. See
+        # `_build_addressing`.
         self._version = 0
         self._addressing_memo: dict[str, tuple] = {}
 
@@ -239,7 +259,9 @@ class RecurrentStatePool(Resource):
         # `_snap_meta` maps a filed slot to its key and whether it is a decode snapshot (a reply's),
         # least recently filed or restored first. Eviction takes a reply's first.
         # `_snap_refs` counts the leases and restores holding a slot, which eviction skips.
+        # `filed` counts the snapshots ever filed, which can lower what a request waiting for KV pages needs.
         self._kv: KVManager | None = None
+        self.filed = 0
         first = config.max_slots
         self._snap_free = list(reversed(range(first, first + config.prefix_slots)))
         self._snap_by_key: dict[bytes, int] = {}
@@ -253,12 +275,15 @@ class RecurrentStatePool(Resource):
         # by (rid, label, boundary), until commit files them.
         # `_decode` holds each stream's newest decode snapshot, and `_unkeyed`
         # those whose page the KV chain doesn't key yet.
+        # `_chunk_ends` holds each stream's last filed row-end snapshot (slot, key),
+        # which the stream's next chunk supersedes; purged by `reset_request`.
         self._keyed: set[tuple[str, str]] = set()
         self._leases: dict[str, SnapshotLease] = {}
         self._restores: dict[tuple[str, str], SnapshotLease] = {}
         self._snap_writes: dict[tuple[str, str, int], SnapshotWrite] = {}
         self._decode: dict[tuple[str, str], DecodeSnapshot] = {}
         self._unkeyed: set[tuple[str, str]] = set()
+        self._chunk_ends: dict[tuple[str, str], tuple[int, bytes]] = {}
         # what admits took for prefix reuse, for `rollback_admit`
         self._admit_restores: list[tuple[str, str]] = []
         self._admit_snaps: list[tuple[str, str, int]] = []
@@ -276,30 +301,62 @@ class RecurrentStatePool(Resource):
 
     # Storage access
 
-    def block(self, name: str, layer_idx: int) -> torch.Tensor:
-        """One layer's contiguous slot-major view of a block: ``[max_slots + prefix_slots, *shape]``."""
-        return self._blocks[name][layer_idx]
+    def block(self, name: str, layer_idx: int | None = None) -> torch.Tensor:
+        """One layer's contiguous slot-major view of a block: ``[max_slots + prefix_slots, *shape]``.
+        A block that is not per layer takes no ``layer_idx``."""
+        per_layer = self.config.blocks[name].per_layer
+        if per_layer == (layer_idx is None):
+            raise ValueError(
+                f"recurrent block {name!r} is "
+                f"{'per layer' if per_layer else 'per slot'}; got layer_idx={layer_idx}"
+            )
+        tensor = self._blocks[name]
+        return tensor[layer_idx] if per_layer else tensor
+
+    def _slot_rows(self, index: int):
+        """Every block's rows of slot ``index``, all layers."""
+        for name, tensor in self._blocks.items():
+            yield tensor[:, index] if self.config.blocks[name].per_layer else tensor[index]
+
+    def set_start(self, start: Mapping[tuple[str, int | None], torch.Tensor]) -> None:
+        """What `gather` reads for a row with no saved state, by block and layer, each in the block's layout and
+        dtype. A block or layer it doesn't name reads zeros."""
+        if self._start is None:
+            self._start = dict(start)
+        elif start.keys() != self._start.keys() or not all(torch.equal(self._start[k], v) for k, v in start.items()):
+            raise ValueError(f"recurrent pool {self._name!r}: a start that differs from the one it holds, which every "
+                             "row of the pool reads")
 
     def gather(
-        self, name: str, layer_idx: int = 0, *, label: str = "main", start: torch.Tensor | None = None,
+        self, name: str, layer_idx: int | None = 0, *, label: str = "main",
     ) -> torch.Tensor:
         """Block ``name`` of this step's rows under ``label``, ``[rows, *shape]``
         (a copy), in the order the step declared them.
 
         It addresses rows through the step's plan, so a captured and an eager
         forward read the same slots. A row with no saved state (a request's
-        first step, or a padding row on the sink) reads ``start``, zeros when
-        none is given. A row must declare span >= 1 to reach its own slot; a
-        zero-span row addresses the sink, so it reads ``start``. A pool without
-        a sink refuses (``_need_sink``)."""
+        first step, or a padding row on the sink) reads the start, zeros when
+        none is set. A row must declare span >= 1 to reach its own slot; a
+        zero-span row addresses the sink, so it reads the start. A resident
+        step's graph reads every row's slot instead (`resident_gather`). A pool
+        without a sink refuses (``_need_sink``). A block that is not per layer
+        takes ``layer_idx=None``."""
         if self.config.disable_sink_slot:
             self._need_sink("gather")
         rows = self.addressing(label)
-        out = self._blocks[name][layer_idx].index_select(0, rows.slot_indices[: rows.num_rows])
+        out = self.block(name, layer_idx).index_select(0, rows.slot_indices[: rows.num_rows])
+        # Every row reads its own slot, so the select would change nothing. A
+        # capture addresses every row to the sink, so its graph keeps the
+        # select a replay's fresh rows need.
+        if rows.every_row_has_state:
+            return out
         fresh = ~rows.has_state[: rows.num_rows].view(-1, *(1,) * (out.dim() - 1))
+        start = None if self._start is None else self._start.get((name, layer_idx))
         return torch.where(fresh, 0 if start is None else start, out)
 
-    def scatter_(self, name: str, value: torch.Tensor, layer_idx: int = 0, *, label: str = "main") -> None:
+    def scatter_(
+        self, name: str, value: torch.Tensor, layer_idx: int | None = 0, *, label: str = "main",
+    ) -> None:
         """Write ``value [rows, *shape]`` into block ``name`` of this step's rows
         under ``label``, in the order ``gather`` reads them; padding rows write
         the sink, which a pool without one refuses."""
@@ -317,7 +374,7 @@ class RecurrentStatePool(Resource):
         index = rows.scatter_index.get(capturing)
         if index is None:
             index = rows.scatter_index[capturing] = rows.slot_indices[: rows.num_rows].long()
-        self._blocks[name][layer_idx].index_copy_(0, index, value)
+        self.block(name, layer_idx).index_copy_(0, index, value)
 
     def _need_sink(self, op: str) -> None:
         # Without a sink, rows with no slot address NO_SLOT, which index_select
@@ -367,6 +424,13 @@ class RecurrentStatePool(Resource):
             self._forget_prefix_admit(lambda key: key[0] == rid)
             self._version += 1
 
+    supports_drop = True
+
+    def drop(self, rid: str, tokens: int) -> int:
+        # zeroed in place, so recomputing the state never waits for a free slot
+        self.reset_request(rid)
+        return 0
+
     def reset_request(self, rid: str, free: bool = False):
         """Drop a request's slots. ``free`` hands them back to the pool.
 
@@ -375,6 +439,8 @@ class RecurrentStatePool(Resource):
         """
         with self._lock:
             self._forget_taken(lambda r: r == rid)
+            for key in [k for k in self._chunk_ends if k[0] == rid]:
+                del self._chunk_ends[key]
             labels = self._slots.get(rid)
             if not labels:
                 return
@@ -402,8 +468,8 @@ class RecurrentStatePool(Resource):
         groups = self._slot_views.get(index)
         if groups is None:
             by_dtype: dict[torch.dtype, list[torch.Tensor]] = {}
-            for tensor in self._blocks.values():
-                by_dtype.setdefault(tensor.dtype, []).append(tensor[:, index])
+            for rows in self._slot_rows(index):
+                by_dtype.setdefault(rows.dtype, []).append(rows)
             groups = self._slot_views[index] = list(by_dtype.values())
         for views in groups:
             torch._foreach_zero_(views)
@@ -438,6 +504,7 @@ class RecurrentStatePool(Resource):
         taken = self._admit_taken
         for key in [k for k in taken if is_mine(k[0])]:
             del taken[key]
+            self._preplan_taken.discard(key)
 
     # Admission: a slot for each declared label, for a request that holds none
 
@@ -450,9 +517,17 @@ class RecurrentStatePool(Resource):
         return ASKS
 
     def reserve(self, rid: str, node_name: str, graph_walk: str, published: None) -> int | None:
+        return self._reserve(rid, 1)
+
+    def reserve_past(self, rid: str, node_name: str, graph_walk: str, published: None) -> int | None:
+        """`reserve`, leaving the first waiting request its slots."""
+        return self._reserve(rid, 2)
+
+    def _reserve(self, rid: str, requests: int) -> int | None:
+        """Reserve ``rid``'s slots when there is room for ``requests`` requests' slots."""
         with self._lock:
             need, room = len(self.config.labels), len(self._free) - self._kept
-            if need > room:
+            if need * requests > room:
                 return room
             self._reserved[rid] = need
             self._kept += need
@@ -481,7 +556,11 @@ class RecurrentStatePool(Resource):
         every: dict[str, int] = {}
         # one critical section for the batch, not one per row
         with self._lock:
-            if self._admit_taken or self._admit_restores or self._admit_snaps:
+            # A pre-planned step was reserved on its pre-plan pass, and a refusal
+            # after this no-op must still find that reservation.
+            if (self._admit_taken or self._admit_restores or self._admit_snaps) and not (
+                self._preplanned and not ctx.is_preplan
+            ):
                 self._forget_taken(ctx.is_real_row)
                 self._forget_prefix_admit(lambda key: ctx.is_real_row(key[0]))
             for segment in step.segments or ():
@@ -501,7 +580,10 @@ class RecurrentStatePool(Resource):
                         every[label] = self._checkpoint_every(
                             [seg for seg in step.segments if seg.label == label], ctx,
                         )
-                    self._admit_prefix(segment.request_id, label, segment.span, every[label], ctx.is_preplan)
+                    self._admit_prefix(
+                        segment.request_id, label, segment.span, every[label], ctx.is_preplan,
+                        segment.request_id in ctx.chunk_tokens_after,
+                    )
 
         for rid in self._fork_rids(step):
             if ctx.is_padding_row(rid):
@@ -509,6 +591,9 @@ class RecurrentStatePool(Resource):
             for _, to_label in (*step.pre_forks, *step.post_forks):
                 if self._alloc(rid, to_label) is None:
                     return self._refused(rid, to_label)
+        if ctx.is_preplan:
+            with self._lock:
+                self._preplan_taken = {k for k in self._admit_taken if ctx.is_real_row(k[0])}
         return ADMIT_OK
 
     def rollback_admit(self, step: RecurrentStep, ctx: StepContext) -> None:
@@ -521,20 +606,27 @@ class RecurrentStatePool(Resource):
             return
         with self._lock:
             self._undo_prefix_admit(lambda key: ctx.is_real_row(key[0]))
-            taken = self._admit_taken
-            for rid, label in [k for k in taken if ctx.is_real_row(k[0])]:
-                index, reserved = taken.pop((rid, label))
-                labels = self._slots.get(rid)
-                slot = labels.get(label) if labels else None
-                if slot is None or slot.index != index:
-                    continue  # reset or removed under us; the slot went with it
-                del labels[label]
-                self._zero_slot(index)
-                self._free.append(index)
-                if reserved:
-                    self._reserved[rid] = self._reserved.get(rid, 0) + 1
-                    self._kept += 1
-                self._version += 1
+            self._release([k for k in self._admit_taken if ctx.is_real_row(k[0])])
+
+    def _release(self, keys: list[tuple[str, str]]) -> None:
+        """Free the slots ``keys`` took, zeroed like every free slot, and give back the
+        reservation a slot took. Newest first, so the free list is back in its old order
+        and every rank of a TP group hands out the same slots next. Caller holds the
+        lock."""
+        for rid, label in reversed(keys):
+            index, reserved = self._admit_taken.pop((rid, label))
+            self._preplan_taken.discard((rid, label))
+            labels = self._slots.get(rid)
+            slot = labels.get(label) if labels else None
+            if slot is None or slot.index != index:
+                continue  # reset or removed under us; the slot went with it
+            del labels[label]
+            self._zero_slot(index)
+            self._free.append(index)
+            if reserved:
+                self._reserved[rid] = self._reserved.get(rid, 0) + 1
+                self._kept += 1
+            self._version += 1
 
     def _refused(self, rid: str, label: str) -> AdmitOutcome:
         """Why `_alloc` gave ``rid`` no slot for ``label``."""
@@ -608,6 +700,7 @@ class RecurrentStatePool(Resource):
             self._current = self._cached_plan_output
             self._maybe_apply_forks(step, ctx)
             self._drop_stage()
+            self._preplan_taken = set()  # the live step's now: commit or roll back
             return self._current
 
         # Forks run ahead of the addressing, which records `has_state`; staging
@@ -630,8 +723,15 @@ class RecurrentStatePool(Resource):
         return self._current
 
     def clear_preplan(self):
-        """Drop the staged plan; staging touched no live state, so nothing to rewind."""
+        """Drop the staged plan and give back the slots its pre-plan pass took.
+
+        Staging builds addressing only (forks apply at promotion); a live step's
+        reservation is the runner's to commit or roll back.
+        """
         self._drop_stage()
+        with self._lock:
+            # in the order the pre-plan pass took them, so `_release` goes newest first
+            self._release([k for k in self._admit_taken if k in self._preplan_taken])
 
     def _drop_stage(self) -> None:
         self._preplanned = False
@@ -647,7 +747,7 @@ class RecurrentStatePool(Resource):
             if self._admit_restores or self._admit_snaps:
                 self._forget_prefix_admit(lambda key: ctx.is_real_row(key[0]))
             page = self._kv.config.tokens_per_page if self._kv is not None else 0
-            slots, is_pad = self._slots, ctx.is_padding_row
+            slots, is_pad, repeats = self._slots, ctx.is_padding_row, ctx.repeats
             for segment in step.segments or ():
                 if segment.span <= 0 or is_pad(segment.request_id):
                     continue
@@ -658,7 +758,8 @@ class RecurrentStatePool(Resource):
                         # the backend already wrote the pool; a later step resumes
                         slot.has_state = True
                         self._version += 1
-                    slot.tokens += segment.span
+                    # a step that repeats ran its span once a replay
+                    slot.tokens += segment.span * repeats
                     # a row too short to checkpoint that ends on a page (a decode step) is saved here, after its forward
                     if page and segment.span < page and not slot.tokens % page:
                         self._save_decode(segment.request_id, segment.label, slot)
@@ -691,8 +792,10 @@ class RecurrentStatePool(Resource):
                 f"fork target {rid}/{to_label} was never reserved; admit "
                 "should have allocated it"
             )
-            for tensor in self._blocks.values():
-                tensor[:, dst.index].copy_(tensor[:, src.index])
+            for to, from_ in zip(
+                self._slot_rows(dst.index), self._slot_rows(src.index), strict=True,
+            ):
+                to.copy_(from_)
             dst.has_state = src.has_state
             dst.tokens = src.tokens
             dst.generation += 1
@@ -712,15 +815,23 @@ class RecurrentStatePool(Resource):
         """Key snapshots by the page chains of ``kv``, the cache `config.kv_cache` names.
         A pool with no snapshot slots keys none."""
         self._kv = kv if self.config.prefix_slots else None
+        if self._kv is not None:
+            kv.bind_snapshots(self)
 
     def close_prefix_cache(self) -> None:
         self._kv = None
+
+    @property
+    def chunk_alignment(self) -> int:
+        """A page while snapshots are kept: checkpoints fall every page from a segment's
+        start, so only a chunk that starts on a page can keep its boundaries."""
+        return self._kv.config.tokens_per_page if self._kv is not None else 1
 
     def fingerprint(self) -> bytes:
         """The blocks' shapes and dtypes. The state's dtype changes what the
         recurrent layers output, and so every KV page written after them."""
         return fingerprint(sorted(
-            (name, block.shape, str(block.dtype)) for name, block in self.config.blocks.items()
+            (name, block.shape, str(self._blocks[name].dtype)) for name, block in self.config.blocks.items()
         ))
 
     def resolve_cached_prefix(
@@ -759,12 +870,23 @@ class RecurrentStatePool(Resource):
             if lease is not None and lease.tokens <= prefix.tokens:
                 return self._cut(prefix, lease.tokens)
             self._drop_lease(rid)
-            pages = next((n for n in range(len(keys), 0, -1) if keys[n - 1] in self._snap_by_key), 0)
+            pages = self.restorable(keys)
             snap = self._snap_by_key[keys[pages - 1]] if pages else None
             if snap is not None:
                 self._snap_refs[snap] = self._snap_refs.get(snap, 0) + 1
             self._leases[rid] = SnapshotLease(label, snap, pages * page, prefix.tokens)
         return self._cut(prefix, pages * page)
+
+    def restorable(self, keys: Sequence[bytes]) -> int:
+        """How many of ``keys``' leading pages a hit can skip: up to the longest prefix this pool holds a
+        snapshot for, or all of them while snapshots are off.
+
+        Takes no lock, since this pool calls into the KV cache with its lock held, and the KV cache asks
+        with its own held.
+        """
+        if self._kv is None:
+            return len(keys)
+        return next((n for n in range(len(keys), 0, -1) if keys[n - 1] in self._snap_by_key), 0)
 
     @staticmethod
     def _cut(prefix: CachedPrefix, tokens: int) -> CachedPrefix:
@@ -820,14 +942,19 @@ class RecurrentStatePool(Resource):
             every += page
         return every
 
-    def _admit_prefix(self, rid: str, label: str, span: int, every: int, preplan: bool) -> None:
+    def _admit_prefix(
+        self, rid: str, label: str, span: int, every: int, preplan: bool, mid_prefill: bool = False,
+    ) -> None:
         """Turn a hit's lease into a restore for plan to copy in, and reserve
         snapshot slots for the boundaries a prefill row keeps: the row's last
         boundary, and the KV hit's last boundary when the hit runs past the
-        restored length, both on the step's checkpoint interval ``every``. A row
-        that starts past token 0 and restores nothing keeps none. A pre-plan
-        stages only an unprepared speculative step, which takes neither, and
-        `clear_preplan` gives nothing back."""
+        restored length, both on the step's checkpoint interval ``every``. A
+        later chunk of a prompt keeps its last boundary too, when it starts on a
+        page (`chunk_alignment`); a decode row keeps none here. A prompt's last
+        boundary is before its last token, which a resend of it runs again; a
+        chunk with more of its prompt to come (``mid_prefill``) keeps its own end.
+        A pre-plan stages only an unprepared speculative step, which takes
+        neither, and `clear_preplan` gives nothing back."""
         page = self._kv.config.tokens_per_page
         with self._lock:
             start = hit = 0
@@ -841,22 +968,26 @@ class RecurrentStatePool(Resource):
                     self._admit_restores.append((rid, label))
                     start = lease.tokens
             elif self._slots[rid][label].has_state:
-                return
+                # a later chunk: its checkpoints sit on pages only from a page
+                start = self._slots[rid][label].tokens
+                if preplan or start % page:
+                    return
             if span < page or (rid, label) not in self._keyed:
                 return
-            for boundary in sorted({start + (span - 1) // every * every, start + (hit - start) // every * every}):
+            end = start + (span if mid_prefill else span - 1) // every * every
+            for boundary in sorted({end, start + (hit - start) // every * every}):
                 if start < boundary <= start + span:
                     assert not preplan, "a pre-plan reserved a snapshot write"
-                    self._reserve_write(rid, label, boundary, boundary - start)
+                    self._reserve_write(rid, label, boundary, boundary - start, boundary == end)
 
-    def _reserve_write(self, rid: str, label: str, boundary: int, offset: int) -> None:
+    def _reserve_write(self, rid: str, label: str, boundary: int, offset: int, row_end: bool = False) -> None:
         """Caller holds the lock."""
         key = self._kv.chain_key(rid, label, boundary // self._kv.config.tokens_per_page)
         if key is None or key in self._snap_by_key or (rid, label, boundary) in self._snap_writes:
             return
         snap = self._reserve_snapshot()
         if snap is not None:
-            self._snap_writes[(rid, label, boundary)] = SnapshotWrite(snap, offset, key)
+            self._snap_writes[(rid, label, boundary)] = SnapshotWrite(snap, offset, key, row_end)
             self._admit_snaps.append((rid, label, boundary))
 
     def _file_writes(self, step: RecurrentStep) -> None:
@@ -870,7 +1001,17 @@ class RecurrentStatePool(Resource):
                     f"recurrent state: the snapshot of {key[0]}/{key[1]} at {key[2]} tokens is keyed "
                     "apart from the KV chain's key there"
                 )
-            self._index(write.slot, write.key)
+            if self._index(write.slot, write.key) and write.row_end:
+                self._supersede(key[:2], write)
+
+    def _supersede(self, stream: tuple[str, str], write: SnapshotWrite) -> None:
+        """Make ``stream``'s previous row-end snapshot, an earlier chunk's, the
+        first to evict, as a reply's is: a resend restores the later one. Caller
+        holds the lock."""
+        previous = self._chunk_ends.get(stream)
+        if previous is not None and self._snap_by_key.get(previous[1]) == previous[0]:
+            self._snap_meta[previous[0]] = (previous[1], True)
+        self._chunk_ends[stream] = (write.slot, write.key)
 
     def _apply_restores(self, step: RecurrentStep) -> None:
         """Copy each restore's snapshot into its slot before the step reads it,
@@ -885,8 +1026,10 @@ class RecurrentStatePool(Resource):
                 restore = self._restores.pop(key)
                 slot = self._slots.get(key[0], {}).get(key[1])
                 if slot is not None:
-                    for tensor in self._blocks.values():
-                        tensor[:, slot.index].copy_(tensor[:, restore.slot])
+                    for to, from_ in zip(
+                        self._slot_rows(slot.index), self._slot_rows(restore.slot), strict=True,
+                    ):
+                        to.copy_(from_)
                     slot.has_state = True
                     slot.tokens = restore.tokens
                     self._version += 1
@@ -921,6 +1064,7 @@ class RecurrentStatePool(Resource):
             return False
         self._snap_by_key[key] = snap
         self._snap_meta[snap] = (key, reply)
+        self.filed += 1
         return True
 
     def _save_decode(self, rid: str, label: str, slot: SlotState) -> None:
@@ -937,8 +1081,8 @@ class RecurrentStatePool(Resource):
             if previous is not None:
                 self._decode[(rid, label)] = previous
             return
-        for tensor in self._blocks.values():
-            tensor[:, snap].copy_(tensor[:, slot.index])
+        for to, from_ in zip(self._slot_rows(snap), self._slot_rows(slot.index), strict=True):
+            to.copy_(from_)
         # a filed `previous` stays until this one is filed: a step whose token never
         # reaches the chain (the one speculated past the reply's end) never is
         self._decode[(rid, label)] = DecodeSnapshot(snap, slot.tokens, replaces=previous)
@@ -1017,7 +1161,14 @@ class RecurrentStatePool(Resource):
             )
             memo = self._addressing_memo.get(label)
             if memo is not None and memo[0] == memo_key:
-                return self._stage_addressing(label, segments, ctx, memo[1], memo[2])
+                if self._holds_staged(label, memo[3], ctx):
+                    # a capture records its own cast of the index (`scatter_`)
+                    memo[3].scatter_index.pop(True, None)
+                    return memo[3]
+                return self._stage_memoized(label, segments, ctx, *memo[:3])
+        else:
+            # staged over the memo's buffers with the forks pending, which is no later step's addressing
+            self._addressing_memo.pop(label, None)
         pending_forks = pending_forks or {}
         indices = []
         has_state = []
@@ -1036,9 +1187,27 @@ class RecurrentStatePool(Resource):
                 has_state.append(
                     pending_forks.get((seg.request_id, label), slot.has_state)
                 )
-        if memo_key is not None:
-            self._addressing_memo[label] = (memo_key, indices, has_state)
-        return self._stage_addressing(label, segments, ctx, indices, has_state)
+        if memo_key is None:
+            return self._stage_addressing(label, segments, ctx, indices, has_state)
+        return self._stage_memoized(label, segments, ctx, memo_key, indices, has_state)
+
+    def _stage_memoized(
+        self, label: str, segments: list[Segment], ctx: StepContext, memo_key: tuple,
+        indices: list[int], has_state: list[bool],
+    ) -> RecurrentAddressing:
+        """Stage the addressing and keep it with its memo, for the next step addressed the same way."""
+        staged = self._stage_addressing(label, segments, ctx, indices, has_state)
+        # Only an eager buffer holds what its last staging wrote: a resident replay fills a captured one itself.
+        kept = staged if ctx.slot_lease is None and not ctx.capture and not staged.snapshots else None
+        self._addressing_memo[label] = (memo_key, indices, has_state, kept)
+        return staged
+
+    def _holds_staged(self, label: str, staged: RecurrentAddressing | None, ctx: StepContext) -> bool:
+        """Whether this step's buffers are ``staged``'s, as the memo's staging left them, with no snapshot to add."""
+        if staged is None or ctx.slot_lease is not None or self._snap_writes:
+            return False
+        held = self._eager_addressing.get(label)
+        return held is not None and held.slot_indices is staged.slot_indices
 
     def _stage_addressing(
         self, label: str, segments: list[Segment], ctx: StepContext,
@@ -1077,6 +1246,7 @@ class RecurrentStatePool(Resource):
             # a later step with the same addressing hands out the same ones
             host_slot_indices=indices,
             host_has_state=has_state,
+            every_row_has_state=all(has_state),
             snapshots=snapshots,
             snapshot_every=(
                 self._checkpoint_every(segments, ctx) if snapshots
@@ -1133,9 +1303,27 @@ class RecurrentStatePool(Resource):
 
     # Resident planning
 
+    def max_repeats(self, step, ctx) -> int:
+        """A row's state is updated in place, at its slot. While prefix snapshots
+        are on, a run ends on each keyed row's next page boundary, where commit
+        snapshots it: a replay can't stop to copy the state mid-run."""
+        if self._kv is None:
+            return ANY_REPEATS
+        page = self._kv.config.tokens_per_page
+        room = ANY_REPEATS
+        with self._lock:
+            for segment in step.segments or ():
+                labels = self._slots.get(segment.request_id)
+                slot = labels.get(segment.label) if labels else None
+                if slot is not None and (segment.request_id, segment.label) in self._keyed:
+                    room = min(room, page - slot.tokens % page)
+        return room
+
     def resident_refusal(self) -> str | None:
         if self.config.disable_sink_slot:
             return "a pool with no sink slot has nowhere for a padding row"
+        if self._start:
+            return "a row with nothing written reads the pool's start, and a resident step reads each row's slot"
         return None
 
     def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
@@ -1154,6 +1342,10 @@ class RecurrentStatePool(Resource):
         table = self._resident_table
         # a padding row reads the trash row's zero, which is SINK_SLOT
         gather_column(self._resident.store, step.slots, table.stride, table.col, self._cg_addressing[key].slot_indices)
+        # A replay never writes `has_state`, which the capture left False on every row. A resident row reads its own
+        # slot, which holds zeros until its first write, as the default start does, so the capture's `gather` selects
+        # no start.
+        self._current[stream.label] = replace(self._current[stream.label], every_row_has_state=True)
 
     # Engine lifecycle
 
@@ -1165,6 +1357,21 @@ class RecurrentStatePool(Resource):
         # keep the largest
         self._cg_max_bs = max(self._cg_max_bs, max_bs)
         self._cg_max_tokens = max(self._cg_max_tokens, max_seq_len)
+
+    def post_warmup_validate(self):
+        """Every rank of the instance must hold the same free slots after warmup:
+        each rank admits from its own pool. See ``KVManager.post_warmup_validate``."""
+        if self._comm_group is None or self._comm_group.world_size == 1:
+            return
+        free = self.num_free_slots
+        lo, neg_hi = self._comm_group.agree([free, -free])
+        if lo != -neg_hi:
+            raise RuntimeError(
+                f"recurrent state pool has asymmetric free slots across the "
+                f"ranks of its instance: min {lo}, max {-neg_hi}. Check the YAML "
+                "for a per-rank max_slots, and any code that admits before "
+                "warmup completes."
+            )
 
     def cleanup(self):
         self._blocks.clear()

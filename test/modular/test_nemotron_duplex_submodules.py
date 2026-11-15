@@ -12,13 +12,10 @@ import pytest
 import torch
 from torch import nn
 
-from mstar.engine.resources import AttentionStep, KVStep, SamplerStep
-from mstar.engine.resources.linear_attn.config import LinearAttnStep
-from mstar.engine.resources.recurrent import RecurrentStep
+from mstar.engine.state import ArrayStep, SampleStep
+from mstar.model.nemotron_duplex import submodules
 from mstar.model.nemotron_duplex.config import (
-    MAMBA,
     MAMBA_STATE,
-    NANO_ATTN,
     NANO_KV,
     NANO_SAMPLER,
     NemotronDuplexConfig,
@@ -64,15 +61,16 @@ def test_nano_never_stops_on_a_token():
 
 
 def _decode_engine(rids):
-    sampler = SimpleNamespace(sample=lambda rids, logits: logits.argmax(dim=-1))
-    return SimpleNamespace(request_ids=rids, resources={NANO_SAMPLER: sampler}, per_request_states=None)
+    return SimpleNamespace(request_ids=rids, resources={}, per_request_states=None)
 
 
-def test_nano_forward_hands_over_row_outputs_and_nothing_for_the_stop_check():
+def test_nano_forward_hands_over_row_outputs_and_nothing_for_the_stop_check(monkeypatch):
     """One batch tensor per output name, row i = request i (the engine clones
     it once and hands out views), the consumed-prompt sentinel on every row,
     and an empty stop-check set: no per-request device-to-host copy per step."""
+    monkeypatch.setattr(submodules, "sample", lambda sampler, logits: logits.argmax(dim=-1))
     nano = _make_nano()
+    nano.sampler = None
     nano.language_model.forward = lambda x, label=None: x
     torch.manual_seed(0)
     x = torch.randn(3, H)
@@ -103,18 +101,15 @@ def test_nano_prepare_inputs_is_host_only_and_fusion_runs_in_preprocess():
     assert torch.allclose(pre["input_embeds"], expected)
 
 
-def test_nano_fuse_frame_handles_empty_audio_frame():
-    """The terminal audio_frame stream chunk (producer_done race) arrives with the
-    key present but an empty tensor list: run a no-audio step instead of
-    IndexError-ing on ``inputs["audio_frame"][0]``; missing carry-ins default to BOS / PAD."""
+def test_nano_declines_the_empty_terminal_audio_chunk():
+    """The terminal audio_frame chunk (producer_done race) arrives with the key
+    present but an empty tensor list. The nano declines it, which still ends its
+    loop; missing carry-ins on a real frame default to BOS / PAD."""
     nano = _make_nano()
-    inp, pre = _fuse(nano, "decode", {"audio_frame": []})
-    assert "audio_frame" not in inp.tensor_inputs
+    assert nano.prepare_inputs("decode", None, {"audio_frame": []}, is_final_stream_chunk=True) is None
+    inp, _ = _fuse(nano, "decode", {"audio_frame": [torch.ones(H)]})
     assert int(inp.tensor_inputs["prev_text"]) == nano.config.text_bos_id
     assert int(inp.tensor_inputs["prev_func"]) == nano.config.text_pad_id
-    assert pre["input_embeds"].shape == (1, H)
-    _, with_audio = _fuse(nano, "decode", {"audio_frame": [torch.ones(H)]})
-    assert not torch.allclose(with_audio["input_embeds"], pre["input_embeds"])
 
 
 def test_nano_prompt_rides_the_first_frame_step():
@@ -145,38 +140,39 @@ def test_nano_prompt_rides_the_first_frame_step():
     assert torch.allclose(pre2["input_embeds"], frame_row)
 
 
-STATE_KEYS = {NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA}
+STATE_KEYS = {NANO_KV, MAMBA_STATE}
+
+
+def _info(prompt_pending: bool, iteration: int) -> SimpleNamespace:
+    return SimpleNamespace(step_metadata={"prompt_pending": prompt_pending},
+                           dynamic_loop_iter_counts={"decode_loop": iteration})
 
 
 def test_nano_declare_step_per_walk():
-    """Every walk steps the KV + attention and the Mamba pool + resource; only
-    decode steps the text sampler (the prompt region is never sampled). One
-    'main' segment per request, spanning its token count — padding rows
-    included (strict zip)."""
+    """Every walk steps the KV and the Mamba Value; only decode steps the text
+    sampler (the prompt region is never sampled). One 'main' segment per
+    request, spanning its token count — padding rows included (strict zip)."""
     nano = _make_nano()
     p_inp = nano.prepare_inputs("decode", None, {"text_inputs": [torch.arange(4)], "audio_frame": [torch.ones(H)]})
     step = nano.declare_step("decode", ["a"], [p_inp])
-    assert set(step.keys()) == STATE_KEYS | {NANO_SAMPLER}
-    assert isinstance(step.get(NANO_KV), KVStep) and isinstance(step.get(NANO_ATTN), AttentionStep)
-    assert isinstance(step.get(MAMBA_STATE), RecurrentStep) and isinstance(step.get(MAMBA), LinearAttnStep)
-    assert step.get(NANO_ATTN).causal is True
+    assert set(step.state) == STATE_KEYS | {NANO_SAMPLER}
+    assert step.state[NANO_KV] == ArrayStep() and step.state[MAMBA_STATE] == ArrayStep()
     assert [(s.request_id, s.label, s.span) for s in step.segments] == [("a", "main", 5)]
     assert step.cg_key_info is None                       # prompt + frame: no fixed-shape capture fits
 
     d_inp = nano.prepare_inputs("decode", None, {"audio_frame": [torch.ones(H)]})
     step = nano.declare_step("decode", ["a", "b"], [d_inp, d_inp])
-    assert set(step.keys()) == STATE_KEYS | {NANO_SAMPLER}
-    assert isinstance(step.get(NANO_SAMPLER), SamplerStep)
+    assert set(step.state) == STATE_KEYS | {NANO_SAMPLER}
+    assert step.state[NANO_SAMPLER] == SampleStep(apply_penalty=True)
     assert [(s.request_id, s.span) for s in step.segments] == [("a", 1), ("b", 1)]
     assert step.cg_key_info == nano.DECODE_KEY
-    # the engine asks before the inputs exist: the routing's step_metadata answers
-    pending = {"a": SimpleNamespace(step_metadata={"prompt_pending": True}), "b": SimpleNamespace(step_metadata={})}
+    # the engine asks before the inputs exist: the routing's step_metadata and the loop's count answer
+    pending = {"a": _info(True, 0), "b": _info(False, 0)}
     assert nano.cg_key_info("decode", pending, per_request_input_metadata={}) is None
     assert nano.cg_key_info("decode", {"b": pending["b"]}) == nano.DECODE_KEY
-    # the mark stays on the routing for the whole loop: once the request's first
-    # step (prompt + frame) has run, its later steps take the capture
-    nano.postprocess("a", None, {"new_token": [torch.tensor([7])]})
-    assert nano.cg_key_info("decode", pending) == nano.DECODE_KEY
+    # the mark stays on the routing for the whole loop: past the loop's first
+    # step (prompt + frame), its later steps take the capture
+    assert nano.cg_key_info("decode", {"a": _info(True, 1)}) == nano.DECODE_KEY
 
 
 def test_nano_captures_the_decode_step():
@@ -209,8 +205,8 @@ def test_nano_captures_the_decode_step():
 @pytest.mark.parametrize("done_before_last_pop", [True, False])
 def test_nano_emits_one_token_per_frame_however_the_stream_ends(done_before_last_pop):
     """The audio stream's end can reach the LLM's buffer after its last frame was
-    taken; the buffer then releases an empty final chunk, whose step only ends
-    the loop. Either way the call gets one token per frame, as offline."""
+    taken; the buffer then releases an empty final chunk, which the nano
+    declines. Either way the call gets one token per frame, as offline."""
     from mstar.streaming.chunk_policy import FixedChunkPolicy
     from mstar.streaming.stream_buffer import StreamBuffer
 
@@ -231,27 +227,17 @@ def test_nano_emits_one_token_per_frame_however_the_stream_ends(done_before_last
         inputs = {"audio_frame": [] if data is None else [data], "prev_text": [torch.tensor([3])],
                   "prev_func": [torch.tensor([4])], "text_inputs": [torch.tensor([NO_PROMPT])]}
         ni = nano.prepare_inputs("decode", None, inputs, resources={}, is_final_stream_chunk=chunk.is_final)
+        finals += chunk.is_final
+        if ni is None:  # declined: no forward, and the loop still ends
+            assert chunk.is_final
+            break
         out = {"new_token": [torch.tensor([7])], "new_func": [torch.tensor([8])],
                "text_inputs": [torch.tensor([NO_PROMPT])]}
         nano.postprocess("r", None, out, inputs=ni)
         emitted += out.get("new_token", [])
-        finals += chunk.is_final
         if chunk.is_final:
             break
     assert finals == 1 and len(emitted) == 3
-
-
-@pytest.mark.parametrize("final", [True, False])
-def test_nano_drops_the_token_of_an_empty_chunk_only_when_it_is_final(final):
-    """The engine's final flag, not a missing frame, marks the step that only
-    ends the loop."""
-    nano = _make_nano()
-    inputs = {"audio_frame": [], "prev_text": [torch.tensor([3])], "prev_func": [torch.tensor([4])],
-              "text_inputs": [torch.tensor([NO_PROMPT])]}
-    ni = nano.prepare_inputs("decode", None, inputs, resources={}, is_final_stream_chunk=final)
-    out = {"new_token": [torch.tensor([7])], "new_func": [torch.tensor([8])]}
-    nano.postprocess("r", None, out, inputs=ni)
-    assert ("new_token" in out) is not final
 
 
 def test_nano_postprocess_feeds_tokens_back():
@@ -308,11 +294,8 @@ def test_nano_frame_batch_fuses_rows_exactly_like_the_per_request_path():
         })
         for i in range(3)
     ]
-    # a session past the end of its audio has no frame in the same batch
-    inputs.append(ARNodeInputs(input_seq_len=1, kwargs={"mode": _MODE_FRAME},
-                               tensor_inputs={"prev_text": torch.tensor([7]), "prev_func": torch.tensor([2])}))
-    eng = SimpleNamespace(request_ids=["a", "b", "c", "d"], resources={}, per_request_states=None)
+    eng = SimpleNamespace(request_ids=["a", "b", "c"], resources={}, per_request_states=None)
     pre = nano.preprocess("decode", eng, inputs)
     per_request = torch.cat([nano._fuse(inp, torch.device("cpu")) for inp in inputs])
-    assert pre["seq_lens"] == [1, 1, 1, 1]
+    assert pre["seq_lens"] == [1, 1, 1]
     torch.testing.assert_close(pre["input_embeds"], per_request)

@@ -9,6 +9,7 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.testing_utils.model import StubModel
 from mstar.worker.engine_manager import EngineManager
 
 
@@ -36,8 +37,8 @@ class _OptedOut(_Override):
 _NODES = {"inherit": _Node, "override": _Override, "opted_out": _OptedOut}
 
 
-class _Model:
-    """What ``EngineManager.build`` reads off a model, with no resources."""
+class _Model(StubModel):
+    """Builds each node from ``_NODES``, under the dtype the test gives."""
 
     def __init__(self, dtype):
         self._dtype = dtype
@@ -48,34 +49,13 @@ class _Model:
     def get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None):
         return _NODES[node_name]()
 
-    def get_node_resources(self):
-        return []
 
-    def kv_labels(self):
-        return {}
-
-    def get_graph_walk_graphs(self):
-        return {}
-
-    def combined_walk_of(self):
-        return {}
-
-    def chunking_policy_of(self):
-        return {}
-
-    def checkpoint_path(self):
-        return None
-
-    def preprocess_fingerprint(self):
-        return ""
-
-
-def _build(model) -> EngineManager:
+def _build(model, parallel_groups: WorkerParallelGroups | None = None) -> EngineManager:
     return EngineManager.build(
         node_names=set(_NODES),
         device=torch.device("cpu"),
         model_config={"node_groups": [{"node_names": sorted(_NODES), "ranks": [0]}]},
-        parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
+        parallel_groups=parallel_groups or WorkerParallelGroups(num_workers=1, global_rank=0),
         transfer_engine_info=TransferEngineInfo(
             my_entity_id="test", my_session_id="test", transfer_engine=None,
         ),

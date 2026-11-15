@@ -258,6 +258,28 @@ def test_a_declared_node_its_keys_never_reach_warns_once(caplog):
     )
 
 
+def test_a_declared_node_whose_requests_lost_their_keys_warns_once(caplog):
+    """The layout keys the prompt, but the keys never arrived. Intake took that for a request keyed over none of its
+    spans on purpose, so the cache stayed empty and the log quiet."""
+    kv = _manager(walks=DECLARED)
+
+    with caplog.at_level(logging.INFO, logger=manager_mod.__name__):
+        for n in range(10):
+            rid, config = f"r{n}", KVReqConfig()
+            # as the conductor sends a layout, here without the keys that go with it
+            layout = [[[64, 64, WALK]], [["decode_loop", 1]], 0, None, 1]
+            config.apply_conductor_config(kv_layout={"main": layout}, loop_caps={"decode_loop": 0})
+            kv.ingest_request(rid, config)
+            kv.resolve_cached_prefix(rid, NODE, WALK, ARNodeInputs(input_seq_len=64))
+            _run(kv, rid, 64)
+            kv.remove_request(rid)
+
+    warnings = _warnings(caplog)
+    assert len(warnings) == 1 and "no keys for main" in warnings[0], (
+        f"ten requests that lost their keys gave these warnings, not one about the keys: {warnings}"
+    )
+
+
 def test_a_declared_node_that_receives_its_keys_never_warns(caplog):
     kv = _manager(walks=DECLARED)
 

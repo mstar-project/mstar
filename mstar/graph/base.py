@@ -31,9 +31,9 @@ class TensorPointerInfo:
     source_tp_size: int = 1
     source_tp_rank: int = 0
 
-    # SHM-arena transport (MSTAR_SHM_ARENA): the producer wrote this tensor's
-    # bytes at `shm_offset` inside the named arena segment. None for the
-    # other transports (per-uuid files, Mooncake).
+    # SHM arena: the producer wrote this tensor's bytes at `shm_offset` inside
+    # the named arena segment. None for a tensor the arena spilled to a
+    # per-uuid file, and for Mooncake.
     shm_segment: str | None = None
     shm_offset: int = 0
 
@@ -235,7 +235,7 @@ class GraphNode(GraphSection):
     input_names: set[str]
     outputs: list[GraphEdge]
     consumes_stream: bool = False
-    # When False, the worker's speculation gate (``_can_speculate``) refuses to
+    # When False, the worker's speculation gate (``Speculator.can_speculate``) refuses to
     # build a speculative N+1 batch for this node. Models opt out of spec for
     # nodes whose forward pass mutates global state in ways the spec path
     # doesn't account for — e.g. BAGEL's flow-loop LLM / combine_cfg, where

@@ -83,7 +83,7 @@ def _processed_reference(logits, tokens, temperature, top_k, top_p, penalty=1.0,
 
 def _resource(processed=False):
     res = SamplerResource(
-        vocab_size=None, enable_repetion_penalty=False, device=DEV, enable_logprobs=True,
+        vocab_size=None, enable_repetition_penalty=False, device=DEV, enable_logprobs=True,
         enable_processed_logprobs=processed,
     )
     res.build_accelerator_graph_buffers([SimpleNamespace(slot=0)], max_bs=BS, max_seq_len=1)
@@ -140,7 +140,7 @@ def test_replayed_logprobs_match_log_softmax_with_padding_and_quiet_rows():
 def test_captured_and_eager_agree_on_a_greedy_row():
     """Greedy draws the same token on both paths, so the scores must match."""
     logits = _logits(7)[:2]
-    eager = SamplerResource(vocab_size=None, enable_repetion_penalty=False, device=DEV, enable_logprobs=True)
+    eager = SamplerResource(vocab_size=None, enable_repetition_penalty=False, device=DEV, enable_logprobs=True)
     for rid in (0, 1):
         eager.ingest_request(rid, SamplingReqConfig(temperature=0.0, return_logprobs=True))
     step = SamplerStep(apply_penalty=False)
@@ -216,7 +216,7 @@ def test_the_two_renorm_shortcut_matches_the_full_filter(vocab):
 
 def test_processed_rows_see_the_repetition_penalty():
     res = SamplerResource(
-        vocab_size=V, enable_repetion_penalty=True, device=DEV,
+        vocab_size=V, enable_repetition_penalty=True, device=DEV,
         enable_logprobs=True, enable_processed_logprobs=True,
     )
     res.ingest_request(0, SamplingReqConfig(

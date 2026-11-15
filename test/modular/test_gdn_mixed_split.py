@@ -23,8 +23,10 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnVariant,
 )
 from mstar.engine.resources.linear_attn.gdn import GDNManager
+from mstar.engine.resources.linear_attn.gdn_stage import gdn_stage_applies
 from mstar.engine.resources.linear_attn.wrappers import GDNMixedWrapper, GDNPrefillWrapper
 from mstar.engine.resources.recurrent.config import (
+    DeltaNetGeometry,
     RecurrentBlockConfig,
     RecurrentStateConfig,
     RecurrentStateSpec,
@@ -32,6 +34,7 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.engine.resources.recurrent.pool import NO_SLOT, SINK_SLOT
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import BucketKey, SlotLease
+from mstar.platforms import current_platform
 from mstar.utils.causal_conv1d import PAD_SLOT_ID
 
 requires_gpu = pytest.mark.skipif(
@@ -129,7 +132,8 @@ def _reference(device, x, weight, inputs, layout, null_slot=SINK_SLOT):
     return conv_out, out, state, conv
 
 
-def _mixed(device, x, weight, inputs, accelerator_graph, layout, decode_rows=None, null_slot=SINK_SLOT):
+def _mixed(device, x, weight, inputs, accelerator_graph, layout, decode_rows=None, null_slot=SINK_SLOT,
+           stage_inputs=False):
     SPANS, SLOT_IDS, HAS_STATE = _cols(layout)
     state, conv = _pools(device)
     tokens = x.shape[0]
@@ -153,7 +157,7 @@ def _mixed(device, x, weight, inputs, accelerator_graph, layout, decode_rows=Non
         device=device, pad_slot_id=PAD_SLOT_ID, null_slot_id=null_slot,
         num_tokens=bucket_tokens, bs=decode_rows or bucket_bs,
         accelerator_graph=accelerator_graph, max_prefill_rows=MAX_PROMPTS,
-        has_sink_state=null_slot != NO_SLOT,
+        has_sink_state=null_slot != NO_SLOT, stage_inputs=stage_inputs,
     )
     w.plan(spans, tuple(slots), tuple(has))
     conv_out = w.run_conv(x, conv, weight)[:tokens]
@@ -213,6 +217,23 @@ def test_mixed_split_matches_the_chunked_path(null_slot, layout, accelerator_gra
     x, weight, inputs = _step(device, layout)
     ref = _reference(device, x, weight, inputs, layout, null_slot=null_slot)
     mixed = _mixed(device, x, weight, inputs, accelerator_graph, layout, null_slot=null_slot)
+    _check(layout, mixed, ref, null_slot=null_slot)
+
+
+@requires_gpu
+@pytest.mark.parametrize("null_slot,layout,accelerator_graph", list(_split_cases()))
+def test_a_staged_mixed_split_matches_the_chunked_path(null_slot, layout, accelerator_graph):
+    """The one-launch input stage in the chunked half: the same result, on any GPU it applies to."""
+    device = torch.device("cuda")
+    if not current_platform.has_cuda_capability(9, 0, device):
+        pytest.skip("the stage applies from Hopper up")
+    geometry = DeltaNetGeometry(
+        num_k_heads=HEADS, num_v_heads=HEADS, head_k_dim=DIM, head_v_dim=DIM, conv_kernel_size=WIDTH,
+    )
+    assert gdn_stage_applies(device, geometry)
+    x, weight, inputs = _step(device, layout)
+    ref = _reference(device, x, weight, inputs, layout, null_slot=null_slot)
+    mixed = _mixed(device, x, weight, inputs, accelerator_graph, layout, null_slot=null_slot, stage_inputs=True)
     _check(layout, mixed, ref, null_slot=null_slot)
 
 

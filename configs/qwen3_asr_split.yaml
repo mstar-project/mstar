@@ -6,8 +6,9 @@ max_seq_len: 65536
 # Requests past the cap queue in the conductor. A 20 min file holds about 122
 # pages of 128 tokens for its prompt and up to 32 for its transcript, so 2048
 # pages hold about 13 of them; at 12 a burst of long files queues instead of
-# filling the pool and stalling. A deployment that only serves short audio can
-# raise it (64 roughly doubles throughput there; see docs/asr.rst).
+# filling the pool and stalling. The transcription route's 30 s windows hold about
+# 4 pages each, so a deployment that sends only those could raise it, as
+# qwen3_asr.yaml does; this layout hasn't been measured at a higher cap.
 max_concurrent_requests: 12
 resources:
   kv_cache:

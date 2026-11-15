@@ -33,7 +33,6 @@ from mstar.integrations.dynamo.bridges import (
     TensorBridge,
     get_tensor_spec,
 )
-from mstar.utils import cpus
 from mstar.utils.socket_prefix import per_launch_socket_prefix
 
 if TYPE_CHECKING:
@@ -58,8 +57,6 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
     # Engine imports live here so importing this module (registration
     # mapping, --help) never loads the model stacks.
     from mstar.api_server.auth import keep_api_key_from_children
-    from mstar.api_server.entrypoint import APIServer, _conductor_process_target, deployment_cpu_plan
-    from mstar.communication.communicator import CommProtocol
 
     # Dynamo's frontend serves HTTP here; this worker never checks a key, so
     # an exported one must not reach the conductor and workers either.
@@ -68,6 +65,9 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
+    if config.get("openpi") is not None:
+        logger.warning("The openpi WebSocket (`openpi:` in the config) is served by mstar-serve's Python frontend "
+                       "only; the Dynamo worker serves without it")
     model_name = config.get("model", "dummy")
     yaml_model_kwargs = config.get("model_kwargs", {}) or {}
 
@@ -75,12 +75,19 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
         cache_dir=args.cache_dir,
         **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
+    from mstar.api_server.entrypoint import (
+        APIServer,
+        _conductor_process_target,
+        _set_preprocess_threads,
+        install_deployment_cpus,
+    )
+    from mstar.communication.communicator import CommProtocol
 
     # before the workers exist: under ``auto`` this takes the GPUs' locks
-    try:
-        cpus.install(deployment_cpu_plan(config))
-    except cpus.CpuPlanError as e:
-        raise SystemExit(f"mstar: {e}") from None
+    install_deployment_cpus(config)
+    _set_preprocess_threads(model, config)
+    # the deployment config, as the native server passes it: prefix-cache keys,
+    # LoRA adapters and request limits all come from it
     server = APIServer(
         socket_path_prefix=args.socket_path_prefix,
         upload_dir=args.upload_dir,
@@ -88,6 +95,7 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
         tensor_comm_protocol=CommProtocol(args.tensor_comm_protocol),
         model=model,
         model_name=model_name,
+        model_config=config,
     )
 
     ctx = mp.get_context("spawn")
@@ -104,6 +112,8 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
             CommProtocol(args.tensor_comm_protocol),
             "",     # tcp_transfer_device
         ),
+        # the config every process reads (``resolve_lora_spec``)
+        kwargs={"model_config": config},
     )
     conductor_proc.start()
     logger.info("Conductor process started (pid=%d, model=%s)", conductor_proc.pid, model_name)
@@ -235,13 +245,14 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    from mstar.utils.logging_config import log_off_thread, quiet_noisy_loggers
+    from mstar.utils.logging_config import configure_request_log, log_off_thread, quiet_noisy_loggers
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s [dynamo_worker] %(name)s: %(message)s",
     )
     quiet_noisy_loggers()
+    configure_request_log()
     log_off_thread()
 
     # No HTTP port to key the prefix on, and replicas of one endpoint
@@ -260,6 +271,8 @@ def main(argv: list[str] | None = None) -> None:
 def _serve_until_shutdown(args) -> None:
     from mstar.api_server.entrypoint import (
         DeadConductorError,
+        _data_parallel_replicas,
+        _run_warmup_requests,
         _shutdown_conductor_process,
     )
 
@@ -269,6 +282,11 @@ def _serve_until_shutdown(args) -> None:
         # Same gate the native server binds behind: every worker has loaded
         # weights, warmed up, and captured CUDA graphs.
         server.finalize_setup()
+        # before Dynamo can route here, as the native server runs them before it binds
+        warmups = (server.model_config or {}).get("warmup_requests") or []
+        if warmups:
+            _run_warmup_requests(server, warmups, _data_parallel_replicas(server.model, args.config),
+                                 cache_dir=args.cache_dir)
         serve(server, model_name, args)
     except KeyboardInterrupt:
         pass

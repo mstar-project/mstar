@@ -60,7 +60,7 @@ def test_processed_logprobs_need_their_own_capability():
     processed.validate(spec)
     # processed log-probs are CUDA-only, so this CPU node refuses even with it
     res = SamplerResource(
-        vocab_size=None, enable_repetion_penalty=False, device=torch.device("cpu"),
+        vocab_size=None, enable_repetition_penalty=False, device=torch.device("cpu"),
         enable_logprobs=True, enable_processed_logprobs=True,
     )
     with pytest.raises(ValueError, match="CUDA-only"):
@@ -86,7 +86,7 @@ def _argmax_draw(monkeypatch):
 
 def _resource(graph: bool = False, enable: bool = True) -> SamplerResource:
     res = SamplerResource(
-        vocab_size=None, enable_repetion_penalty=False, device=torch.device("cpu"),
+        vocab_size=None, enable_repetition_penalty=False, device=torch.device("cpu"),
         enable_logprobs=enable,
     )
     if graph:

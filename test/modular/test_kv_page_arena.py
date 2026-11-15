@@ -175,3 +175,63 @@ def test_a_page_a_release_leaves_to_the_index_is_queued_for_the_host(backend):
     assert queued == [b"key0"]
     arena.release(pages)  # page 0 freed, page 1 left to its one owner
     assert queued == [b"key0", b"key1"]
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_pages_given_back_go_out_again_first_and_in_their_order(backend):
+    """An undone acquire leaves the free list as the acquire found it, even after a release behind it. A rank
+    that never ran the acquire then hands out the same pages next."""
+    arena = new_page_arena(6, backend)
+    arena.acquire(1)
+    taken = arena.acquire(2)
+    arena.release([0])
+    arena.give_back(taken)
+    assert arena.free_pages() == [1, 2, 3, 4, 5, 0], "the pages went back somewhere other than where they came from"
+    held = arena.acquire(1)
+    arena.retain(held)
+    with pytest.raises(AssertionError):
+        arena.give_back(held)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_the_change_count_moves_with_every_owner_count_and_page_list_change(backend):
+    """The KV pool keeps what moving its preemptible requests would free until this count moves. A change the
+    count missed would let the pool admit a guaranteed request against pages no move frees anymore."""
+    arena = new_page_arena(8, backend)
+    stream = arena.new_stream()
+    pages = arena.acquire(3)
+    changes = [
+        lambda: arena.acquire(1),
+        lambda: arena.retain(pages[:1]),
+        lambda: arena.release(pages[:1]),
+        lambda: arena.give_back(pages[2:]),
+        lambda: stream.extend(pages[:2]),
+        lambda: stream.assign(pages[:1]),
+        lambda: stream.__delitem__(0),
+        lambda: stream.extend(pages[:1]),
+        stream.clear,
+        stream.free,
+    ]
+    for at, change in enumerate(changes):
+        before = arena.changes
+        change()
+        assert arena.changes > before, f"change {at} left the count where it was"
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_a_stream_refuses_list_changes_the_change_count_doesnt_see(backend):
+    """Only extend, assign, clear and del move the arena's change count, and a Rust stream has nothing else, so the
+    Python one refuses the other list methods rather than change its pages unseen."""
+    arena = new_page_arena(8, backend)
+    stream = arena.new_stream()
+    stream.extend(arena.acquire(2))
+    changes = [
+        ("append", 0), ("insert", 0, 0), ("pop",), ("remove", stream[0]), ("sort",), ("reverse",),
+        ("__setitem__", 0, 0),
+    ]
+    for name, *args in changes:
+        with pytest.raises((AttributeError, TypeError, NotImplementedError)):
+            getattr(stream, name)(*args)
+        assert stream.n == 2, f"{name} moved the pages"
+    with pytest.raises(TypeError):
+        stream += [0]

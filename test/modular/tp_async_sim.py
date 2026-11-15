@@ -1,7 +1,7 @@
 """CPU lockstep simulator for the TP async-scheduling protocol.
 
 Models the leader/follower worker protocol for speculative scheduling on
-lockstep-parallel (TP) nodes — the case ``_can_speculate`` currently refuses
+lockstep-parallel (TP) nodes — the case ``Speculator.can_speculate`` currently refuses
 — as an explicit-state model checker: every interleaving of
 {follower message processing, per-rank GPU progress, leader spec build, leader
 post-step} is explored by DFS over a small scripted workload, and the design's

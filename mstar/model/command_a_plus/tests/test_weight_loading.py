@@ -141,10 +141,10 @@ class WeightLoadingTests(unittest.TestCase):
         x = torch.eye(self.config.hidden_size)[:3]
         with torch.no_grad():
             expected = x @ self.weights[PREFIX + "embed_tokens.weight"].T * self.config.logit_scale
-            torch.testing.assert_close(model.compute_logits(x), expected)
+            torch.testing.assert_close(model.logits(x), expected)
             model.model.embed_tokens.weight[0].add_(2)
             expected[:, 0] += 1
-            torch.testing.assert_close(model.compute_logits(x), expected)
+            torch.testing.assert_close(model.logits(x), expected)
 
     def test_missing_duplicate_unknown_and_misshaped_weights_fail(self):
         name, tensor = next(iter(self.weights.items()))

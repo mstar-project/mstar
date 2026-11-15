@@ -16,6 +16,7 @@ pytest.importorskip("diffusers")
 from diffusers import AutoencoderKLWan  # noqa: E402
 
 from mstar.model.components import wan_vae  # noqa: E402
+from mstar.model.wan22 import submodules as wan22_submodules  # noqa: E402
 from mstar.model.wan22.config import Wan22Config  # noqa: E402
 from mstar.model.wan22.submodules import Wan22VaeDecoderSubmodule  # noqa: E402
 from mstar.model.wan22.wan22_model import Wan22Model  # noqa: E402
@@ -57,8 +58,8 @@ LISTED = ("96x64",)
 
 
 def _decoder(monkeypatch, vae, *, fast: bool, dtype=torch.float32, tiling: str = "untiled", sizes=LISTED):
-    monkeypatch.setenv("WAN22_VAE_DECODE_FP32", "1" if dtype == torch.float32 else "0")
-    cfg = Wan22Config(vae_z_dim=Z_DIM, vae_decode_tiling=tiling, vae_decode_fast=fast, vae_decode_fast_sizes=sizes)
+    monkeypatch.setattr(wan22_submodules, "wan_vae_decode_dtype", lambda: dtype)
+    cfg = Wan22Config(vae_decode_tiling=tiling, vae_decode_fast=fast, vae_decode_fast_sizes=sizes)
     return Wan22VaeDecoderSubmodule(copy.deepcopy(vae), cfg)
 
 

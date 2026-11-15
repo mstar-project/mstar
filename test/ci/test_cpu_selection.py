@@ -1,11 +1,13 @@
 """Check the CPU test selection without requiring PyTorch or Docker."""
 
 import fnmatch
+import re
 import runpy
 import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -16,6 +18,7 @@ CPU_TEST_PATHS = SELECTOR_NS["CPU_TEST_PATHS"]
 NOT_CPU_CORE = SELECTOR_NS["NOT_CPU_CORE"]
 EXPANDED_PATHS = SELECTOR_NS["expand_paths"](REPO_ROOT)
 IS_COLLECTED = SELECTOR_NS["is_collected"]
+SHARDS = runpy.run_path(str(REPO_ROOT / "scripts/ci/shard_plugin.py"))  # the CPU Core shards (MSTAR_CI_SHARD)
 # pytest's default python_files
 TEST_MODULE_PATTERNS = ("test_*.py", "*_test.py")
 # runs in its own CPU Core shard, beside the rest
@@ -190,6 +193,10 @@ FROZEN_CPU_CORE = (
 )
 RETIRED = {
     "test/modular/test_cpu_core_list.py": "checked test/cpu-core.txt and was deleted with it",
+    "test/modular/test_send_prep_entries.py": (
+        "tested the send stage's stream-consumption report, dropped with stream_tokens_consumed"
+    ),
+    "test/modular/test_kv_decode_plan_cache.py": "tested the KV decode-plan cache, deleted with it",
 }
 
 
@@ -250,6 +257,58 @@ class CpuSelectionTests(unittest.TestCase):
         )
         unused = [path for path in NOT_CPU_CORE if not any(IS_COLLECTED(m, [path]) for m in modules)]
         self.assertEqual(unused, [], "NOT_CPU_CORE entries that cover no test module")
+
+    def test_cpu_core_shards_run_every_module_exactly_once(self):
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text()
+        job = workflow[workflow.index("\n  cpu-tests:\n"):]
+        job = job[:re.search(r"\n  [\w-]+:\n", job[1:]).start() + 1].splitlines()
+        def value(text):  # a value as YAML reads it here: without a trailing comment or quotes
+            return re.sub(r"\s+#.*$", "", text).strip().strip("'\"")
+
+        # the matrix legs, each as its keys (a "- name:" line at 10 spaces, then keys at 12)
+        include = job[job.index("        include:") + 1:]
+        legs = []
+        for line in include[:next(i for i, x in enumerate(include) if x.strip() and not x.startswith(" " * 10))]:
+            key, _, text = line.strip().removeprefix("- ").partition(": ")
+            if line.startswith(" " * 10 + "- "):
+                legs.append({})
+            if text and not line.strip().startswith("#"):
+                legs[-1][key] = value(text)
+        listed = [leg["shard"] for leg in legs if "shard" in leg]
+        total = {spec.split("/")[1] for spec in listed}
+        self.assertEqual(len(total), 1, f"the cpu-tests shards don't agree on how many there are: {listed}")
+        total = int(total.pop())
+        self.assertEqual(sorted(listed), [f"{i}/{total}" for i in range(1, total + 1)],
+                         "a CPU Core shard would be missing or run twice")
+        self.assertEqual([leg for leg in legs if ("shard" in leg) == ("args" in leg)], [],
+                         "a leg needs exactly one of shard (the shared CPU_CORE) and args (its own)")
+        # what the shards run: the job's CPU_CORE, through the run step's `matrix.args || env.CPU_CORE`
+        cpu_core = job[job.index("      CPU_CORE: >-") + 1:]
+        cpu_core = " ".join(x.strip() for x in cpu_core[:next(i for i, x in enumerate(cpu_core)
+                                                              if not x.startswith(" " * 8))])
+        tokens = cpu_core.split()
+        self.assertIn(("-p", "shard_plugin"), list(zip(tokens, tokens[1:], strict=False)),
+                      "the shards wouldn't load the plugin")
+        step = job[job.index("      - name: Run CPU tests"):]
+        step = step[:next(i for i, x in enumerate(step[1:], 1) if x.startswith("      - "))]
+        keys = [x.strip() for x in step if x.startswith(" " * 10) and not x.startswith(" " * 11)]
+        env = {key: value(text) for key, _, text in (x.partition(": ") for x in keys if ": " in x and x[0] != "#")}
+        self.assertEqual((env.get("MSTAR_CI_SHARD"), env.get("PYTHONPATH")), ("${{ matrix.shard }}", "scripts/ci"),
+                         "the shards wouldn't pick their files, or -p wouldn't find the plugin")
+        self.assertTrue(any(value(x).endswith("${{ matrix.args || env.CPU_CORE }}") for x in step
+                            if not x.strip().startswith("#")),
+                        "the shards would run without the shared CPU_CORE arguments")
+        modules = [path for path in repo_test_modules() if IS_COLLECTED(path, EXPANDED_PATHS)]
+        config = unittest.mock.Mock(rootpath=REPO_ROOT)
+        for shards in sorted({total, 3}):
+            kept = {}
+            for shard in range(1, shards + 1):
+                with unittest.mock.patch.dict("os.environ", {"MSTAR_CI_SHARD": f"{shard}/{shards}"}):
+                    kept[shard] = [path for path in modules
+                                   if SHARDS["pytest_ignore_collect"](REPO_ROOT / path, config) is None]
+            runs = sorted(path for paths in kept.values() for path in paths)
+            self.assertEqual(runs, modules, f"over {shards} shards a module would run twice or not at all")
+            self.assertTrue(all(kept.values()), f"a shard of {shards} would run nothing")
 
     def test_selected_modules_outside_packages_have_unique_basenames(self):
         # pytest's default import mode imports these by basename, so two of them stop

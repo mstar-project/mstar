@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
+from mstar.testing_utils.worker import make_worker
 from mstar.worker.micro_scheduler import ScheduledBatch
-from mstar.worker.worker import Worker
 
 
 def test_a_mixed_batch_flags_each_worker_graph():
@@ -16,10 +16,11 @@ def test_a_mixed_batch_flags_each_worker_graph():
     graphs; clearing only the first one's left the rest flagged for good,
     and their node never went ready again."""
     calls = []
-    worker = Worker.__new__(Worker)
-    worker._graph_runtime = SimpleNamespace(
+    worker = make_worker(
+        graph_runtime=SimpleNamespace(
         set_in_flight=lambda node, rids, wg_ids, value: calls.append(
             (dict(zip(rids, wg_ids, strict=True)), value)),
+    ),
     )
     batch = ScheduledBatch(
         node_name="LLM", graph_walk="mixed",
@@ -27,7 +28,7 @@ def test_a_mixed_batch_flags_each_worker_graph():
         request_walks={0: "decode", 1: "prefill", 2: "decode"},
     )
 
-    worker._clear_in_flight_flag(batch)
+    worker.executor.clear_in_flight(batch)
 
     assert calls == [({0: 7, 1: 9, 2: 7}, False)]  # one call, each row its own graph
 
@@ -37,11 +38,12 @@ def test_a_mixed_speculative_batch_is_flagged_in_each_worker_graph():
     walk's node of the rest; the per-graph clear never reached it, so that
     node never went ready again."""
     flagged = []
-    worker = Worker.__new__(Worker)
-    worker._graph_runtime = SimpleNamespace(
+    worker = make_worker(
+        graph_runtime=SimpleNamespace(
         commit_speculation=lambda spec_id, success, dropped, node=None, wg_ids=None,
         scheduled_rids=(): flagged.append(dict(zip(scheduled_rids, wg_ids, strict=True)))
         if node else None,
+    ),
     )
     batch = ScheduledBatch(
         node_name="LLM", graph_walk="mixed",
@@ -52,7 +54,7 @@ def test_a_mixed_speculative_batch_is_flagged_in_each_worker_graph():
         scheduled_batch=batch, spec_id=1, consumed_streaming_edges={},
     )
 
-    worker._settle_speculation(speculation, success=True)
+    worker.speculator.settle(speculation, success=True)
 
     assert flagged == [{0: 5, 1: 0, 2: 5}]  # one call, each row its own graph
 
@@ -61,14 +63,15 @@ def test_a_batch_of_one_walk_names_its_worker_graph_once():
     """A node in one walk lives in one worker graph, so a step of one walk
     sends that id once rather than once per row."""
     calls = []
-    worker = Worker.__new__(Worker)
-    worker._graph_runtime = SimpleNamespace(
+    worker = make_worker(
+        graph_runtime=SimpleNamespace(
         set_in_flight=lambda node, rids, wg_ids, value: calls.append((list(rids), list(wg_ids))),
+    ),
     )
     batch = ScheduledBatch(
         node_name="LLM", graph_walk="decode", request_to_worker_graph={0: 7, 1: 7, 2: 7},
     )
 
-    worker._clear_in_flight_flag(batch)
+    worker.executor.clear_in_flight(batch)
 
     assert calls == [([0, 1, 2], [7])]

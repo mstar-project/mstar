@@ -295,6 +295,9 @@ async def _main_async(args: argparse.Namespace) -> None:
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(json.dumps(report, indent=2), encoding="utf-8")
+    if save_dir is not None:
+        # tts_speech_wer reads which sentences were sent from here
+        (save_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(report["markdown_row"])
 
 
@@ -319,7 +322,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--label", default=None, help="row label for the markdown table")
     parser.add_argument("--engine-version", default=None, help="recorded verbatim in the report")
     parser.add_argument("--out", default=None, help="JSON report path")
-    parser.add_argument("--save-audio-dir", default=None, help="write <id>.wav per request (last repeat)")
+    parser.add_argument("--save-audio-dir", default=None,
+                        help="write <id>.wav per request (last repeat) and report.json, which tts_speech_wer reads")
     args = parser.parse_args(argv)
     if args.concurrency < 1 or args.repeats < 1:
         parser.error("concurrency and repeats must be positive")

@@ -618,12 +618,9 @@ class ShmKVTransferEngine(KVTransferEngine):
                 weights_only=True,
             )
             for layer, packed_page, local_page, token_start, token_end in chunk_copies:
-                if self._kv_cache.layout == KVLayout.MLA:
-                    # one latent row per token: [layers, pages, page_size, latent]
-                    source = packed[layer, packed_page, token_start:token_end]
-                else:
-                    source = packed[layer, packed_page, :, token_start:token_end]
-                source = source.to(self._kv_cache.device)
+                source = self._kv_cache.chunk_view(
+                    layer, packed_page, token_start, token_end, tensor=packed,
+                ).to(self._kv_cache.device)
                 destination = self._kv_cache.chunk_view(
                     layer_idx=layer,
                     page_idx=local_page,
@@ -864,8 +861,8 @@ class KVTransferManager:
         # cache data is ready at the producer end before the consumer reads it. Pytorch
         # does not currently support transmitting Event objects over IPC, so we opt to
         # use the following contract: the producer always default-stream-syncs before
-        # publishing seq_info (this currently happens in worker.py, right before sending
-        # outputs). Once torch.Event supports the interprocess flag (it's present in the
+        # publishing seq_info (this currently happens in StepExecutor.postprocess, right
+        # before sending outputs). Once torch.Event supports the interprocess flag (it's present in the
         # function signature but currently a no-op), this path can be refatored to wait
         # on an event on the reader end instead.
         return self._kv_transfer_engine.read_batched_async(

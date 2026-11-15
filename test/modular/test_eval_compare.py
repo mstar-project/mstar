@@ -28,6 +28,8 @@ from benchmark.eval.e2e import manifest as mf  # noqa: E402
 from benchmark.eval.e2e.manifest import Case, Model  # noqa: E402
 from benchmark.eval.e2e.report import Perf, Stat  # noqa: E402
 
+pytestmark = pytest.mark.usefixtures("no_host_gpus", "fake_cargo")
+
 RUN = {"id": "r", "base": {"label": "main", "sha": "a" * 40}, "head": {"label": "PR #1", "sha": "b" * 40},
        "gpu": "h200", "perf_pct": 5, "noise_sigma": 2, "gpu_hours": 1.0}
 
@@ -101,7 +103,7 @@ def test_manifest_validation_errors(mutate, msg):
 def test_shipped_manifest():
     m = mf.load()
     regular = [x for x in m.models.values() if not x.optional]
-    assert len(regular) == 16
+    assert len(regular) == 15
     assert {c.kind for x in m.models.values() for c in x.cases} >= {"tts", "asr", "duplex", *mf.CLIENT_KINDS}
     assert {c.check["kind"] for x in m.models.values() for c in x.cases} == set(mf.CHECKS)
     mc = m.select("tag:mooncake")
@@ -520,9 +522,22 @@ ThreadingHTTPServer(("127.0.0.1", a.port), H).serve_forever()
 '''
 
 
+@pytest.fixture
+def fake_cargo(tmp_path_factory, monkeypatch):
+    """A ``cargo`` first on PATH whose ``build`` leaves a do-nothing ``mstar-server`` in ``CARGO_TARGET_DIR``:
+    every arm builds its tree's mstar-server, and a fake tree's server ignores ``--rust-frontend-bin``."""
+    bin_dir = tmp_path_factory.mktemp("fake-cargo")
+    fake_bin(bin_dir, "cargo", 'mkdir -p "$CARGO_TARGET_DIR/release"\n'
+                               'printf "#!/bin/sh\\n" > "$CARGO_TARGET_DIR/release/mstar-server"\n'
+                               'chmod +x "$CARGO_TARGET_DIR/release/mstar-server"\n')
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
 def fake_tree(d: Path, delay: float = 0.0, suffix: str = "", done: bool = True) -> Path:
-    """A checkout whose `python -m mstar.cli.main serve` is a stdlib chat server streaming the prompt back."""
+    """A checkout whose `python -m mstar.cli.main serve` is a stdlib chat server streaming the prompt back, with a
+    ``rust/server`` for ``fake_cargo`` to build."""
     (d / "mstar" / "cli").mkdir(parents=True)
+    (d / "rust" / "server").mkdir(parents=True)
     (d / "mstar" / "__init__.py").write_text("")
     (d / "mstar" / "cli" / "__init__.py").write_text("")
     (d / "mstar" / "cli" / "main.py").write_text(FAKE_SERVE.format(delay=delay, suffix=suffix, done=done))
@@ -905,13 +920,13 @@ def test_signals_wait_until_server_teardown_is_done():
     import os as _os
     import signal as _signal
 
-    from benchmark.eval.e2e import arm
+    from benchmark.eval.server import _exit_on_signal, signals_deferred
 
-    old = _signal.signal(_signal.SIGTERM, arm._on_term)
+    old = _signal.signal(_signal.SIGTERM, _exit_on_signal)
     try:
         finished = []
-        with pytest.raises(SystemExit) as e:
-            with arm.signals_deferred():
+        with pytest.raises(SystemExit) as e:           # delivered to its own handler once the block is done
+            with signals_deferred():
                 _os.kill(_os.getpid(), _signal.SIGTERM)
                 finished.append(True)                  # the teardown keeps going after the signal
         assert finished == [True] and e.value.code == 128 + _signal.SIGTERM
@@ -1025,7 +1040,7 @@ sys.path[:0] = [{root!r}, {tests!r}]
 from argparse import Namespace
 from pathlib import Path
 import test_eval_compare as T
-from benchmark.eval import cli
+from benchmark.eval import cli, server
 from benchmark.eval.e2e import compare, hosts, manifest as mf, trees
 
 compare.POLL_S = 0.2
@@ -1045,9 +1060,8 @@ slot = hosts.Slot(T.FakeRemote(tmp / "home"), None)
 runner = compare.Runner(args, man, man.select("all"), base, base, tmp / "run", [slot])
 runner.cache = tmp / "cache"
 T.fake_tree(runner.cache / "src" / base.sha, delay=0.05)
-for sig in (signal.SIGTERM, signal.SIGHUP):
-    signal.signal(sig, cli._exit_on_signal)
-hosts.run_slots([slot], hosts.WorkQueue(["fake"], {{}}), runner.run_one, stop=runner.stop)
+with server.exit_on_signals():
+    hosts.run_slots([slot], hosts.WorkQueue(["fake"], {{}}), runner.run_one, stop=runner.stop)
 """
 
 
@@ -1082,7 +1096,7 @@ def test_sigterm_to_compare_stops_the_remote_job_before_compare_exits(tmp_path):
     assert not procs_under(tmp_path / "home")
 
 
-CTRL_C_RUN = SIGTERM_RUN.split("for sig in", maxsplit=1)[0] + r"""
+CTRL_C_RUN = SIGTERM_RUN.split("with server.exit_on_signals", maxsplit=1)[0] + r"""
 def fake_compare(args):
     hosts.run_slots([slot], hosts.WorkQueue(["fake"], {{}}), runner.run_one, stop=runner.stop)
     return 0
@@ -1544,7 +1558,8 @@ def test_whichever_arm_starts_first_on_cold_caches_still_starts(tmp_path, monkey
             "python": sys.executable, "gpu": None, "host_dir": str(root / "host"),
             "model": {"name": "fake", "serve": "fake", "startup_timeout_s": 2.0, "cases": [], "serve_args": [],
                       "env": {"FAKE_COMPILE_CACHE": str(root / "compiled")}},
-            "arms": {a: {"src": str(s)} for a, s in srcs.items()}})
+            # run() builds each arm's mstar-server before its first start; a fake tree's server ignores it
+            "arms": {a: {"src": str(s), "rust_server": str(root / "host" / "mstar-server")} for a, s in srcs.items()}})
         infos = {a: arm.run_arm(a, 0) for a in order}
         assert all(i["healthy"] for i in infos.values()), (order, infos)
         assert infos[order[0]]["startup_s"] > 2.0 and infos[order[1]]["startup_s"] < 2.0

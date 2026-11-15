@@ -1,0 +1,25 @@
+# CosyVoice3 with the flow and vocoder on their own worker, sharing GPU 0. The LM's decode no
+# longer takes turns with them on one worker loop, so stream chunks arrive together and the flow
+# batches them; `mps: true` overlaps the two workers' kernels. A throughput-oriented alternative
+# to configs/cosyvoice3.yaml. About 67 GB of GPU memory, most of it resources.flow_kv.
+model: "cosyvoice3"
+max_seq_len: 3312
+max_concurrent_requests: 32
+resources:
+  lm_kv:
+    page_size: 64
+    max_num_pages: 1792
+node_groups:
+  - node_names: [speaker_encoder, llm]
+    ranks: [0]
+    graph_walks: [prefill, prefill_voice, decode]
+  - node_names: [flow, hift]
+    ranks: [1]
+    graph_walks: [token2wav]
+rank_devices: {1: 0}
+mps: true
+model_kwargs:
+  flow_max_batch_size: 16
+  hift_max_batch_size: 16
+  flow_new_batch_sizes: [1, 2, 4, 8, 16]
+  hift_capture_batch_sizes: [1, 2, 4, 8, 16]

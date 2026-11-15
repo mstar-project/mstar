@@ -403,10 +403,10 @@ class DepthKV:
 
     The cache, ``[layers, max_batch_size, 2, max_depth, kv_heads, head_dim]``,
     and ``cp_linear``'s row partials are small model-held scratch rather than
-    engine resources. They are made at the first step, the cache in the
-    activations' dtype, and sliced to each batch, so every captured step reads
-    the same buffers. Nothing clears them: every position a step reads was
-    written earlier in the same frame.
+    engine resources. They are made at load, the cache in the activations' dtype,
+    and sliced to each batch, so every captured step reads the same buffers.
+    Nothing clears them: every position a step reads was written earlier in the
+    same frame.
     """
 
     def __init__(self, shape: tuple[int, ...]) -> None:
@@ -415,13 +415,9 @@ class DepthKV:
         self.partials: torch.Tensor | None = None
         self._fresh = False
 
-    @torch.compiler.disable
-    def scratch(self, like: torch.Tensor) -> torch.Tensor:
-        """Make the buffers on ``like``'s device on first use; returns the partials."""
-        if self.kv_cache is None:
-            self.kv_cache = torch.zeros(self.shape, dtype=like.dtype, device=like.device)
-            self.partials = torch.zeros(_MAX_PARTIALS, _MAX_ROWS, dtype=torch.float32, device=like.device)
-        return self.partials
+    def make(self, dtype: torch.dtype, device: torch.device | str) -> None:
+        self.kv_cache = torch.zeros(self.shape, dtype=dtype, device=device)
+        self.partials = torch.zeros(_MAX_PARTIALS, _MAX_ROWS, dtype=torch.float32, device=device)
 
     @torch.compiler.disable
     def bind_step(self, cache_pos: int) -> None:
@@ -625,7 +621,7 @@ class ResidualCodePredictor(nn.Module):
         codes[:, 0] = layer0_codes
         # a copy even when the dtypes match: the sum is updated in place
         embed_sum = layer0_embed.to(self.embed_sum_dtype or layer0_embed.dtype, copy=True)
-        partials = self.depth.scratch(last_hidden)
+        partials = self.depth.partials
         tables = self.input_tables
         # position 0 only fills the cache: group 0's code is the Talker's
         self.depth.bind_step(0)

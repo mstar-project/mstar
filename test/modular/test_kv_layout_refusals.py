@@ -17,6 +17,7 @@ from mstar.conductor.conductor import Conductor
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig
 from mstar.graph.base import GraphNode, Loop
 from mstar.model.base import KVLabel, LabelLayout, Span
+from mstar.testing_utils.model import StubModel, make_model
 from mstar.validation.resources import _undeclared_pools, _unknown_prefix_walks
 
 
@@ -37,8 +38,7 @@ def _refuse_unknown_walks(model):
 LLM = GraphNode(name="llm", input_names=["text_inputs"], outputs=[])
 
 
-class _Declaring:
-
+class _Declaring(StubModel):
     def __init__(self, labels: dict, decode: Loop | None = None):
         self._labels = labels
         self._decode = decode or Loop(name="decode_loop", max_iters=8, outputs=[], section=LLM)
@@ -133,7 +133,7 @@ def test_each_worker_counts_only_the_labels_its_nodes_open():
     }, loop_caps={})
     pool = PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, max_num_pages=17, page_size=16)
     conductor = Conductor.__new__(Conductor)
-    conductor.model = SimpleNamespace(get_node_resources=lambda: [
+    conductor.model = make_model(get_node_resources=lambda: [
         KVSpec(resource_key="kv", nodes={"llm", "talker"}, config=pool),
     ])
     conductor.model_config = {}

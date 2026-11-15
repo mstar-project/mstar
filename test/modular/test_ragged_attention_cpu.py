@@ -8,9 +8,16 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from mstar.engine.resources import AttentionStep, RaggedAttentionConfig, Segment, StepContext
+from mstar.engine.resources import (
+    AttentionStep,
+    RaggedAttentionConfig,
+    RaggedCrossAttentionStep,
+    Segment,
+    StepContext,
+)
 from mstar.engine.resources.attn.ragged.dense import DenseRaggedManager
 from mstar.engine.resources.attn.ragged.dense_wrappers import DenseRaggedPrefillWrapper
+from mstar.engine.resources.attn.ragged.flashinfer import FlashInferRaggedCrossManager
 from mstar.engine.resources.attn.ragged.wrappers import (
     SUPPORTED_HEAD_DIMS,
     FlashInferRaggedPrefillWrapper,
@@ -127,6 +134,36 @@ def test_mixed_wrapper_builds_both_halves_in_graph_mode(monkeypatch, tensor_core
         assert prefill.call_args_list[0].kwargs["backend"] == "fa2"
 
 
+@pytest.mark.parametrize(("tp", "sp", "ulysses", "heads"), [
+    (1, 1, True, 8), (2, 1, True, 4), (1, 2, True, 4), (2, 2, True, 2), (2, 2, False, 4),
+])
+def test_cfg_ranks_keep_every_head(tp, sp, ulysses, heads):
+    """On a lockstep instance with a two-rank CFG axis, a Ulysses ragged attention's
+    heads split over the TP x SP ranks only (any other over TP only): each CFG rank
+    runs whole guidance branches, so the instance's world size over-counts the head
+    shards."""
+    from mstar.distributed.communication import CommGroup, JointGroups
+    from mstar.engine.resources import RaggedAttentionConfig, RaggedAttentionSpec
+    from mstar.engine.resources.base import EngineResourceInfo, build_resource
+    from mstar.engine.resources.sequence_shard import SeqShardSpec
+
+    def group(size):
+        return CommGroup(my_global_rank=0, my_group_rank=0, group_members=list(range(size)))
+
+    joint = JointGroups(tp_group=group(tp), sp_group=group(sp), cfg_group=group(2), instance=group(tp * sp * 2))
+    spec = RaggedAttentionSpec(
+        resource_key="by_hand", nodes={"dit"},
+        config=RaggedAttentionConfig(num_qo_heads=8, num_kv_heads=8, head_dim=64),
+    )
+    # what `RaggedAttentionSpec.derive` sets over a node whose sequence shard splits a label the spec lists
+    spec.shard_key, spec.sp_exchange = ("shard", "ulysses") if ulysses else (None, "none")
+    mgr = build_resource(spec, EngineResourceInfo(
+        device=torch.device("cpu"), kv_dtype=torch.bfloat16, joint_comm_group=joint,
+        dependencies={"shard": SeqShardSpec("shard", {"dit"}, ("main",), 0)} if ulysses else {},
+    ))
+    assert mgr._kwargs["num_qo_heads"] == heads
+
+
 def test_a_dropped_manager_leaves_the_op_registry():
     """The custom op finds a manager by key; the registry must not keep one
     alive past the engine that built it, nor hand one engine's key to
@@ -176,3 +213,17 @@ def test_a_ragged_wrapper_does_not_replan_an_unchanged_layout(monkeypatch):
     plan(64, 32, causal=True)
     plan(64, 33)
     assert len(planned) == 4
+
+
+def test_cross_pair_with_both_sides_split_is_refused_at_its_first_split_step():
+    # a hand-written spec: only the split step knows both labels split (load checks state-contract reads)
+    from mstar.engine.resources.sequence_shard import SeqRange, SeqShardPlan
+
+    manager = object.__new__(FlashInferRaggedCrossManager)
+    manager._kv_labels = {}
+    group = SimpleNamespace(rank=0)
+    plan = SeqShardPlan(True, {"video": SeqRange(group, (8, 8), 2), "text": SeqRange(group, (2, 2), 2)})
+    segments = (Segment("r0", "video", 16), Segment("r0", "text", 4))
+    step = RaggedCrossAttentionStep(segments=segments, pairs=(("video", "text"),))
+    with pytest.raises(ValueError, match="splits both sides"):
+        manager._plan_layouts(step, StepContext(request_ids=["r0"], graph_walk="w", slot=0, capture=False), {}, plan)

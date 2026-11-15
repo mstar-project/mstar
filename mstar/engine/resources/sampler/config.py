@@ -74,13 +74,13 @@ class LoopbackState:
 
 @dataclass
 class SamplerSpec(NodeResourceSpec):
-    vocab_size: int | None # must be set for enabled_repetion_penalty
+    vocab_size: int | None # must be set for enable_repetition_penalty
     # Capability, not intent: whether this node's sampling kernel is *able* to
     # apply a repetition penalty, which decides both the seen-token buffers and
     # the kernel variant baked into the captured graph. Whether the penalty
     # actually runs on a given step is settled per step from the resident
     # requests' `repetition_penalty` — see `SamplerResource.admit`.
-    enable_repetion_penalty: bool = True
+    enable_repetition_penalty: bool = True
     # Same kind of capability for min-p: whether the node's sampler (eager and
     # graph-captured) carries the filter. It costs two passes over ``[B, V]``
     # per step, so nodes that never ask for it pay nothing; a request that
@@ -104,10 +104,20 @@ class SamplerSpec(NodeResourceSpec):
     # Allows ``logprobs_mode: "processed"``; the captured sampler then also
     # renorms every step's distribution again (CUDA only).
     enable_processed_logprobs: bool = False
+    # Whether a step whose rows all sample greedily may take each row's argmax
+    # (`SamplerResource.lean_for`), in a twin of each batched capture: None
+    # decides by the vocabulary (past the one-kernel draw), False never, True
+    # always. The twins cost capture memory and time, so a deployment that never
+    # samples greedily turns them off in its ``resources:`` block.
+    greedy_capture: bool | None = None
 
     def apply_yaml_overrides(
         self, enable_logprobs: bool | None = None, enable_processed_logprobs: bool | None = None,
+        greedy_capture: bool | None = None,
     ) -> None:
+        if greedy_capture is not None:
+            check_bool_knob("greedy_capture", greedy_capture)
+            self.greedy_capture = greedy_capture
         if enable_logprobs is not None:
             check_bool_knob("enable_logprobs", enable_logprobs)
             self.enable_logprobs = enable_logprobs
@@ -194,7 +204,7 @@ class SamplingReqConfig(ResourceReqConfig):
             raise ValueError("this deployment does not report processed logprobs; use logprobs_mode 'raw'")
         # a windowed penalty counts the generation history, not the seen-token mask
         windowed = self.repetition_window > 0 and spec.max_repetition_window > 0
-        if self.repetition_penalty not in (None, 1) and not (spec.enable_repetion_penalty or windowed):
+        if self.repetition_penalty not in (None, 1) and not (spec.enable_repetition_penalty or windowed):
             raise ValueError(
                 "this model does not support repetition_penalty; send 1 or leave it unset"
             )

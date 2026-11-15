@@ -12,8 +12,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
-from mstar.api_server.openai.protocol import SpeechRequest, VideoGenerationRequest
+from mstar.api_server.openai.adapters import ADAPTER_REGISTRY, Qwen3_5Adapter
+from mstar.api_server.openai.protocol import ImageGenerationRequest, SpeechRequest, VideoGenerationRequest
 from mstar.integrations.dynamo.bridges import (
     TENSOR_SPECS,
     RealtimeBridge,
@@ -62,7 +62,9 @@ def test_image_body_flattens_nvext_and_rejects_url():
         "nvext": {"seed": 3, "guidance_scale": 5.0},
     })
     assert body["seed"] == 3 and body["guidance_scale"] == 5.0 and body["size"] == "512x512"
-    with pytest.raises(ValueError, match="media store"):
+    # a null response_format is the default, not a str the request model refuses
+    ImageGenerationRequest.model_validate(_image_body({"prompt": "x", "response_format": None}))
+    with pytest.raises(ValueError, match="b64_json"):
         _image_body({"prompt": "x", "response_format": "url"})
 
 
@@ -88,7 +90,7 @@ def test_video_body_reference_and_no_leakage():
     })
     assert body["image"] == PNG_1X1
     assert not {"input_reference", "stream", "output_format", "user"} & body.keys()
-    with pytest.raises(ValueError, match="media store"):
+    with pytest.raises(ValueError, match="b64_json"):
         _video_body({"prompt": "x", "response_format": "url"})
     with pytest.raises(ValueError, match="output_format"):
         _video_body({"prompt": "x", "output_format": "mjpeg"})
@@ -510,8 +512,8 @@ def test_chat_reaches_the_server_with_its_prompt_parts(tmp_path):
     ], "the bridge dropped the prompt parts, so the chat reaches the model as one user turn"
 
 
-def _chat_through_bridge(server, fields):
-    bridge = RequestBridge(server, ADAPTER_REGISTRY["qwen3_omni"], "q3o")
+def _chat_through_bridge(server, fields, adapter=ADAPTER_REGISTRY["qwen3_omni"]):
+    bridge = RequestBridge(server, adapter, "q3o")
 
     async def run():
         return [out async for out in bridge.generate({
@@ -521,29 +523,44 @@ def _chat_through_bridge(server, fields):
     return asyncio.run(run())
 
 
-@pytest.mark.parametrize("fields", [
-    {"tools": [{"type": "function", "function": {"name": "get_weather"}}]},
-    {"tool_choice": "required"},
-    {"tool_choice": {"type": "function", "function": {"name": "get_weather"}}},
-], ids=["tools", "required", "named"])
-def test_a_chat_that_asks_for_a_tool_call_is_a_400_with_the_adapters_message(tmp_path, fields):
-    """Stripped before the adapter, the fields left a chat that ran and answered in plain text.
+TOOLS_REFUSED = "tool calling is not supported for this model"
+
+
+@pytest.mark.parametrize(("fields", "message"), [
+    ({"tools": [{"type": "function", "function": {"name": "get_weather"}}]}, TOOLS_REFUSED),
+    ({"tool_choice": "required"}, TOOLS_REFUSED),
+    ({"tool_choice": {"type": "function", "function": {"name": "get_weather"}}}, TOOLS_REFUSED),
+    ({"presence_penalty": 0.5}, "presence_penalty is not supported"),
+    ({"response_format": {"type": "json_object"}},
+     "response_format needs constrained decoding; only {'type': 'text'} is served"),
+], ids=["tools", "required", "named", "penalty", "json"])
+def test_a_chat_that_asks_for_an_unserved_field_is_a_400_with_the_adapters_message(tmp_path, fields, message):
+    """Stripped before the adapter, the fields left a chat that ran and ignored them.
 
     Dynamo's worker sends the client the ``code`` and ``message`` it finds on the exception.
     """
     server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
     with pytest.raises(ValueError) as refused:
         _chat_through_bridge(server, fields)
-    assert (refused.value.code, refused.value.message) == (400, "tool calling is not supported for this model"), (
+    assert (refused.value.code, refused.value.message) == (400, message), (
         "the client gets a 400 without the adapter's own message"
     )
-    assert not server.submitted, "the chat reached the model, which answers in plain text"
+    assert not server.submitted, "the chat reached the model, which ignores the field"
 
 
-def test_the_tool_fields_clients_send_by_default_reach_the_model(tmp_path):
+def test_the_chat_fields_clients_send_by_default_reach_the_model(tmp_path):
     server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
-    _chat_through_bridge(server, {"tools": [], "tool_choice": "auto"})
-    assert server.submitted, "a client's default tool fields refused a plain chat"
+    _chat_through_bridge(server, {"tools": [], "tool_choice": "auto", "presence_penalty": 0, "logprobs": False,
+                                  "response_format": None})
+    assert server.submitted, "a client's default chat fields refused a plain chat"
+
+
+def test_a_chat_s_template_kwargs_reach_the_model(tmp_path):
+    """Dynamo forwards a client's chat_template_kwargs as chat_template_args (its serde
+    alias), which was stripped: Qwen3.5 and Cosmos3-Edge thought whatever the client asked."""
+    server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
+    _chat_through_bridge(server, {"chat_template_args": {"enable_thinking": False}}, adapter=Qwen3_5Adapter())
+    assert server.submitted[0]["model_kwargs"]["enable_thinking"] is False
 
 
 def test_images_cancel_before_first_chunk(tmp_path):
@@ -613,6 +630,53 @@ def test_images_edit_carries_declared_seed(tmp_path):
     assert submit["model_kwargs"].get("seed") == 5
     assert submit["file_paths"]["image"]
     assert len(result["data"]) == 1
+
+
+def test_images_edit_refuses_n_it_would_drop(tmp_path):
+    """An edit is one engine request, so n=2 came back as one image."""
+    server = _FakeRealtimeServer([_chunk("image", b"png-bytes")], tmp_path)
+    bridge = RequestBridge(server, ADAPTER_REGISTRY["bagel"], "bagel")
+    ref = "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\nfake").decode()
+    with pytest.raises(ValueError) as refused:
+        asyncio.run(bridge._images(
+            {"prompt": "make it night", "model": "bagel", "input_reference": ref, "n": 2}, _Ctx()))
+    assert (refused.value.code, refused.value.message) == (400, "n=2: this route returns one result per request")
+    assert not server.submitted
+    assert not list(tmp_path.iterdir())  # refused before the reference image is saved
+
+
+def test_videos_refuse_n_they_would_drop(tmp_path):
+    """A video request is one engine request, so n=2 came back as one video."""
+    server = _FakeRealtimeServer([_chunk("video", b"mp4")], tmp_path)
+    bridge = RequestBridge(server, ADAPTER_REGISTRY["ltx2_5"], "ltx2_5")
+    async def drain():
+        return [r async for r in bridge.videos({"prompt": "x", "model": "ltx2_5", "n": 2}, _Ctx())]
+
+    with pytest.raises(ValueError) as refused:
+        asyncio.run(drain())
+    assert (refused.value.code, refused.value.message) == (400, "n=2: this route returns one result per request")
+    assert not server.submitted
+
+
+def test_videos_mux_the_audio_off_the_event_loop(tmp_path, monkeypatch):
+    from mstar.api_server import media_io
+
+    server = _FakeRealtimeServer([_chunk("video", b"mp4"), _chunk("audio", b"\x01\x00")], tmp_path)
+    bridge = RequestBridge(server, ADAPTER_REGISTRY["ltx2_5"], "ltx2_5")
+
+    def fake_mux(video, audio, **kwargs):
+        # ffmpeg can run for minutes: off the worker's event loop, which serves every other request
+        with pytest.raises(RuntimeError):
+            asyncio.get_running_loop()
+        return b"muxed"
+
+    monkeypatch.setattr(media_io, "mux_mp4_with_pcm16", fake_mux)
+
+    async def run():
+        return [out async for out in bridge.videos({"prompt": "a dog barking", "model": "ltx2_5"}, _Ctx())]
+
+    (out,) = asyncio.run(run())
+    assert base64.b64decode(out["data"][0]["b64_json"]) == b"muxed"
 
 
 # ----------------------------------------------------------------------
@@ -708,6 +772,34 @@ def test_tensor_state_is_optional(tmp_path):
     out = _run_tensor(server, _pi05_request(_pi05_frames(cameras=1)))
     assert out[0]["tensors"][0]["metadata"]["shape"] == [1, 32]
     assert "robot_state" not in server.submitted[0]["model_kwargs"]
+
+
+@pytest.mark.parametrize("refused", [False, True])
+def test_a_submit_schedules_its_uploads_for_cleanup(tmp_path, monkeypatch, refused):
+    """The bridges save a request's media under upload_dir, and nothing past the
+    submit deletes it, so each submit hands it to the deferred cleanup the
+    native routes use, also when the server refuses it."""
+    from mstar.api_server import media_io
+    from mstar.api_server.openai.adapters import SubmitArgs
+    from mstar.integrations.dynamo.bridges import _submit
+
+    scheduled = []
+    monkeypatch.setattr(media_io, "schedule_upload_cleanup", lambda paths, root: scheduled.append((paths, root)))
+
+    class Server(_FakeRealtimeServer):
+        def submit_request(self, **kwargs):
+            super().submit_request(**kwargs)
+            if refused:
+                raise ValueError("refused")
+
+    server = Server([], tmp_path)
+    args = SubmitArgs(text="hi", file_paths={"image": [str(tmp_path / "a.png")]}, input_modalities=["image", "text"])
+    if refused:
+        with pytest.raises(ValueError, match="refused"):
+            _submit(server, args, "req")
+    else:
+        _submit(server, args, "req")
+    assert server.submitted and scheduled == [(args.file_paths, server.upload_dir)]
 
 
 def test_tensor_prompt_as_bytes(tmp_path):
@@ -1016,3 +1108,73 @@ def test_realtime_refused_format_is_not_applied(tmp_path, fmt):
     assert out[1]["session"]["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": 24000}
     with wave.open(server.submitted[0]["file_paths"]["audio"][0], "rb") as wf:
         assert wf.getframerate() == 24000 and wf.readframes(wf.getnframes()) == PCM
+
+
+def _build_server(monkeypatch, tmp_path, config, idle_hold="off"):
+    """Run the Dynamo worker's ``build_server`` on ``config`` with the model,
+    server, conductor and CPU setup stubbed; returns what it built and what it
+    held."""
+    import yaml
+
+    from mstar.api_server import entrypoint
+    from mstar.integrations.dynamo import worker
+
+    path = tmp_path / "c.yaml"
+    path.write_text(yaml.safe_dump(config))
+    seen = {"held": 0}
+
+    def hold_idle():
+        seen["held"] += 1
+        return "held"
+
+    monkeypatch.setattr("mstar.model.registry.get_model_class", lambda name: lambda **kw: SimpleNamespace())
+    monkeypatch.setattr(entrypoint, "deployment_cpu_plan", lambda c: None)
+    monkeypatch.setattr(entrypoint.cpus, "install", lambda plan: None)
+    monkeypatch.setattr(entrypoint.cpus, "hold_idle", hold_idle)
+    monkeypatch.setattr(entrypoint.knobs, "idle_hold", lambda: idle_hold)
+    monkeypatch.setattr(entrypoint, "APIServer", lambda **kw: seen.setdefault("server", SimpleNamespace(**kw)))
+    monkeypatch.setattr(worker.mp, "get_context", lambda method: SimpleNamespace(Process=lambda **kw: seen.setdefault(
+        "conductor", SimpleNamespace(start=lambda: None, pid=1, **kw))))
+    # build_server keeps the API key from the processes it starts by popping it
+    monkeypatch.delenv("MSTAR_API_KEY", raising=False)
+    worker.build_server(SimpleNamespace(
+        config=str(path), cache_dir=None, socket_path_prefix="p", upload_dir="u", timeout=1,
+        tensor_comm_protocol="TCP", log_level="INFO"))
+    return seen
+
+
+def test_the_worker_builds_its_server_on_the_deployment_config(monkeypatch, tmp_path):
+    """Without it a Dynamo worker had no prefix-cache keys, LoRA adapters or request limits."""
+    config = {"model": "whisper_large", "preprocess_torch_threads": None, "max_call_input_mb": 1}
+    seen = _build_server(monkeypatch, tmp_path, config)
+    assert seen["server"].model_config == config
+    # the conductor reads the same config, which the server resolved (``resolve_lora_spec``)
+    assert seen["conductor"].kwargs == {"model_config": config}
+
+
+@pytest.mark.parametrize("hold", ["qos", "off"])
+def test_the_worker_takes_the_idle_hold_the_config_asks_for(monkeypatch, tmp_path, hold):
+    """``knobs: idle_hold: qos`` holds the CPUs out of deep idle for the
+    worker's life, as it does for the native server."""
+    seen = _build_server(monkeypatch, tmp_path, {"model": "whisper_large", "preprocess_torch_threads": None}, hold)
+    assert seen["held"] == (1 if hold == "qos" else 0)
+
+
+def test_the_worker_runs_the_deployment_s_warmups_before_it_serves(monkeypatch):
+    """Without them the first Dynamo request of a shape paid its compile."""
+    from mstar.api_server import entrypoint
+    from mstar.integrations.dynamo import worker
+
+    events = []
+    server = SimpleNamespace(
+        model_config={"model": "whisper_large", "warmup_requests": [{"text": "hi"}]}, model=None,
+        fatal_error=None, cleanup=lambda: None, finalize_setup=lambda: events.append("setup"))
+    monkeypatch.setattr(worker, "build_server", lambda args: (server, None, "whisper_large"))
+    monkeypatch.setattr(entrypoint, "_data_parallel_replicas",
+                        lambda model, path: entrypoint.DataParallelReplicas(1, 1))
+    monkeypatch.setattr(entrypoint, "_run_warmup_requests",
+                        lambda server, specs, replicas, **kw: events.append(("warmup", specs, kw)))
+    monkeypatch.setattr(entrypoint, "_shutdown_conductor_process", lambda proc: None)
+    monkeypatch.setattr(worker, "serve", lambda server, name, args: events.append("serve"))
+    worker._serve_until_shutdown(SimpleNamespace(config="c.yaml", cache_dir="/models"))
+    assert events == ["setup", ("warmup", [{"text": "hi"}], {"cache_dir": "/models"}), "serve"]

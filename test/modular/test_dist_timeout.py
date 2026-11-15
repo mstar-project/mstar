@@ -60,22 +60,28 @@ def _two_tp_groups() -> WorkerParallelGroups:
         num_workers=4, global_rank=0, any_parallelism=True,
         world_parallel_groups=[(0, 1), (2, 3)],
     )
-    groups.add("llm", CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1]))
+    groups.add("llm", CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1]), "tp")
     return groups
 
 
 def test_init_dist_threads_timeout_into_world_and_every_subgroup(monkeypatch):
     calls = _capture_process_group_calls(monkeypatch)
     groups = _two_tp_groups()
+    # a lockstep instance no axis group spans gets a gloo group of its own,
+    # which every warmup capture barrier waits on
+    groups.node_to_instance_comm["llm"] = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1, 2, 3])
+    groups.node_to_instance_groups["llm"] = frozenset({(0, 1, 2, 3)})
     groups.dist_timeout_s = 3600
     groups.init_dist(device=torch.device("cpu"))
 
     expected = timedelta(seconds=3600)
     assert calls["store"] == [expected]
     assert [c["timeout"] for c in calls["init"]] == [expected]
-    # ``new_group`` runs once per rank tuple on every rank, members or not,
-    # for the device group and its gloo twin.
-    assert [c["timeout"] for c in calls["new_group"]] == [expected] * 4
+    # ``new_group`` runs once per gloo group (each axis tuple's twin, a
+    # non-member's stand-in included, and the instance's), then once per axis
+    # tuple for its device group.
+    assert [c["timeout"] for c in calls["new_group"]] == [expected] * 5
+    assert [0, 1, 2, 3] in [c["ranks"] for c in calls["new_group"]]
 
 
 def test_init_dist_without_timeout_leaves_torch_default(monkeypatch):
@@ -115,7 +121,7 @@ def test_serving_returns_every_group_to_torch_default(one_rank_gloo_world):
     sub = one_rank_gloo_world
     groups = _two_tp_groups()
     groups.dist_timeout_s = 3600
-    comm = groups.node_to_tp_group["llm"]
+    comm = groups.axis_groups["tp"]["llm"]
     comm.device_group = comm.cpu_group = sub
     assert _timeout(dist.group.WORLD) == _timeout(sub) == timedelta(seconds=3600)
 

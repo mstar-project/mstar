@@ -32,6 +32,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.model.components.snake import snake
 from mstar.model.voxcpm2.config import AudioVAEConfig
 
 
@@ -54,12 +55,16 @@ class CausalTransposeConv1d(nn.ConvTranspose1d):
 
 
 class Snake1d(nn.Module):
+    """``x + sin(alpha * x)^2 / alpha``, per channel: the shared Snake kernel
+    (``mstar.model.components.snake``), every intermediate in fp32."""
+
     def __init__(self, channels: int):
         super().__init__()
         self.alpha = nn.Parameter(torch.ones(1, channels, 1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + (self.alpha + 1e-9).reciprocal() * torch.sin(self.alpha * x).pow(2)
+        alpha = self.alpha.reshape(-1).float()
+        return snake(x, alpha, (alpha + 1e-9).reciprocal())
 
 
 class CausalResidualUnit(nn.Module):

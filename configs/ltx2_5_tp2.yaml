@@ -7,7 +7,6 @@ max_seq_len: 1024
 # upsampler on rank 0. The placement of the non-DiT nodes measured within noise of
 # the alternatives (integration notes in the PR).
 model_kwargs:
-  attention_backend: flashinfer
   max_batch_size: 4
   # the video VAE decode compiled for the capture shapes, ~55 dB from the eager decode;
   # false for bit-exact output

@@ -8,13 +8,13 @@ bias on the attention scores, so attention over a clip runs through SDPA rather
 than a paged kernel. Cache-aware streaming checkpoints differ only in causal
 convolutions, a LayerNorm in the conv module and chunked attention; with no
 right context they also run as a stream, attending in a bounded KV
-(``FastConformerEncoder.blocks``).
+(``FastConformerEncoder.blocks_stream``).
 """
 from __future__ import annotations
 
 import math
 import re
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -154,7 +154,7 @@ def _conv_out_len(lengths, kernel: int, stride: int, causal: bool):
     return (lengths + pad - kernel) // stride + 1
 
 
-class _Subsampling(nn.Module):
+class DwStridingSubsampling(nn.Module):
     """Depthwise-separable striding over (time, mel): a full conv into
     ``subsampling_channels``, then depthwise + pointwise pairs, then a linear
     from the flattened channels x remaining mel bins.
@@ -243,9 +243,9 @@ def rel_positional_encoding(seq_len: int, hidden_size: int, device, dtype: torch
 class RelPositionAttention(nn.Module):
     """``softmax(((q + u) k^T + skew((q + v) R^T)) / sqrt(d))`` with ``R``
     the projected position sinusoids; the second term enters SDPA as a bias.
-    A stream step attends its new frames in the bounded KV ``kv_key`` names
-    instead, which keeps each stream's window of keys and values, with the
-    distances it can see projected once, at bind (``band``)."""
+    A stream step adds its new frames to the unbounded array ``kv_key`` names
+    and reads them through its window instead, with the distances it can see
+    projected once, at bind (``band``)."""
 
     lora_unservable = {"relative_k_proj": "projects position encodings, not the step's tokens (a stream's at bind)"}
 
@@ -255,7 +255,7 @@ class RelPositionAttention(nn.Module):
         self.num_heads, self.head_dim = h, d
         self.layer_idx, self._kv_key = layer_idx, kv_key
         self.left_context = config.left_context
-        self.kv = None
+        self.state = None
         self.band = None
         self.qkv_proj = nn.Linear(config.hidden_size, 3 * h * d, bias=config.attention_bias)
         self.o_proj = nn.Linear(h * d, config.hidden_size, bias=config.attention_bias)
@@ -263,9 +263,9 @@ class RelPositionAttention(nn.Module):
         self.bias_u = nn.Parameter(torch.zeros(h, d))
         self.bias_v = nn.Parameter(torch.zeros(h, d))
 
-    def bind_resources(self, resources: dict) -> None:
-        if self._kv_key is not None:
-            self.kv = resources[self._kv_key]
+    def bind_state(self, handles: dict) -> None:
+        self.state = handles.get(self._kv_key)
+        if self.state is not None:
             # distances 0..left_context, all a stream's frame sees (row d is
             # distance d), projected in the weights' dtype, which is what autocast
             # computes it in: fixed weights, so once, here, before any capture
@@ -275,18 +275,17 @@ class RelPositionAttention(nn.Module):
                 band = rel_positional_encoding(n, w.shape[1], w.device, w.dtype)[:n].flip(0)
                 self.band = self.relative_k_proj(band).view(n, self.num_heads, self.head_dim).transpose(0, 1)
 
-    def forward(
-        self, x: torch.Tensor, pos_emb: torch.Tensor | None, mask: torch.Tensor | None, stream: bool = False,
-    ) -> torch.Tensor:
+    def _qkv(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        b, t, _ = x.shape
+        return self.qkv_proj(x).view(b, t, 3, self.num_heads, self.head_dim).unbind(2)  # (B, T, H, D) each
+
+    def forward(self, x: torch.Tensor, pos_emb: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
         """``x`` is ``(B, T, hidden)``, ``pos_emb`` ``(P, hidden)`` with
         ``P >= 2T-1`` (rows past ``2T-1`` are zero padding) and ``mask``
-        ``(B, 1, T, T)`` with True where a query may attend; or ``stream``, a
-        stream step, which takes neither."""
+        ``(B, 1, T, T)`` with True where a query may attend."""
         b, t, _ = x.shape
         h, d = self.num_heads, self.head_dim
-        q, k, v = self.qkv_proj(x).view(b, t, 3, h, d).unbind(2)  # (B, T, H, D) each
-        if stream:
-            return self._attend_stream(q, k, v)
+        q, k, v = self._qkv(x)
         r = self.relative_k_proj(pos_emb).view(-1, h, d).permute(1, 2, 0)  # (H, D, P)
         # one GEMM per head over all B*T queries: no copy of r per row
         bd = torch.bmm((q + self.bias_v).reshape(b * t, h, d).transpose(0, 1), r)  # (H, B*T, P)
@@ -302,18 +301,18 @@ class RelPositionAttention(nn.Module):
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
         return self.o_proj(out.transpose(1, 2).reshape(b, t, h * d))
 
-    def _attend_stream(self, q, k, v) -> torch.Tensor:
-        """Each new frame attends the ``left_context`` frames before it and
-        itself, the older ones from the KV, which then keeps this step's. The
-        position term depends on the distance alone, so it goes in as the band
-        of distances, unscaled: the kernel scales the sum."""
+    def forward_stream(self, x: torch.Tensor) -> torch.Tensor:
+        """A stream step: each new frame attends the ``left_context`` frames
+        before it and itself, the older ones kept by the array, which then
+        keeps this step's. The position term depends on the distance alone, so
+        it goes in as the band of distances projected at bind, unscaled: the
+        read scales the sum."""
+        q, k, v = self._qkv(x)
         b, t, h, d = q.shape
         r = self.band  # (H, left + 1, D)
-        # in k's dtype: under autocast the bias add promotes q, and the kernel takes one dtype
-        q_u = (q + self.bias_u).to(k.dtype).transpose(1, 2)
         bias = torch.matmul((q + self.bias_v).transpose(1, 2), r.transpose(-2, -1))  # (B, H, T, left + 1)
-        out = self.kv.attend(self.layer_idx, q_u, k.transpose(1, 2), v.transpose(1, 2), rel_bias=bias,
-                             ieee=k.dtype == torch.float32)
+        self.state.add(self.layer_idx, k=k, v=v)
+        out = self.state.read(self.layer_idx, q + self.bias_u, distance_bias=bias)
         return self.o_proj(out.reshape(b, t, h * d))
 
 
@@ -322,7 +321,7 @@ class ConvModule(nn.Module):
     pointwise. The offline checkpoints' BatchNorm is folded into the depthwise
     conv at load (it is a per-channel affine at inference); the streaming ones
     use a LayerNorm, which stays. A stream step's causal conv continues each
-    stream's last ``k - 1`` inputs, kept in the pool ``conv_key`` names."""
+    stream's last ``k - 1`` inputs, kept in the Value ``conv_key`` names."""
 
     def __init__(self, config: FastConformerConfig, layer_idx: int = 0, conv_key: str | None = None):
         super().__init__()
@@ -337,18 +336,11 @@ class ConvModule(nn.Module):
         self.norm = nn.LayerNorm(c) if self.causal else None
         self.pointwise_conv2 = nn.Linear(c, c, bias=config.convolution_bias)
 
-    def bind_resources(self, resources: dict) -> None:
-        if self._conv_key is not None:
-            self.state = resources[self._conv_key]
+    def bind_state(self, handles: dict) -> None:
+        self.state = handles.get(self._conv_key)
 
-    def forward(
-        self, x: torch.Tensor, valid: torch.Tensor | None, tails: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """``tails`` marks a stream step: per row, where its newest ``k - 1``
-        conv inputs sit in the cached ones followed by the step's (``blocks``)."""
+    def forward(self, x: torch.Tensor, valid: torch.Tensor | None) -> torch.Tensor:
         x = self.pointwise_conv1(x)
-        if tails is not None:
-            return self._stream(x, tails)
         if use_triton(x):
             conv = self.depthwise_conv
             left_pad = self.kernel_size - 1 if self.causal else conv.padding[0]
@@ -361,18 +353,27 @@ class ConvModule(nn.Module):
         x = x.transpose(1, 2)
         if self.causal:
             x = F.pad(x, (self.kernel_size - 1, 0))
+        return self._depthwise_pointwise(x)
+
+    def forward_stream(self, x: torch.Tensor, tails: torch.Tensor) -> torch.Tensor:
+        """A stream step. ``tails`` is, per row, where its newest ``k - 1`` conv
+        inputs sit in the cached ones followed by the step's
+        (``FastConformerEncoder.blocks_stream``)."""
+        # eager: the Triton kernel takes no cached inputs
+        x = F.glu(self.pointwise_conv1(x), dim=-1).transpose(1, 2)
+        cached = self.state.read(self.layer_idx).fields["conv"]  # (B, C, k - 1)
+        x = torch.cat([cached.to(x.dtype), x], dim=2)
+        self.state.write(self.layer_idx, conv=x.gather(2, tails).to(cached.dtype))
+        return self._depthwise_pointwise(x)
+
+    def _depthwise_pointwise(self, x: torch.Tensor) -> torch.Tensor:
+        """``(B, C, k - 1 + T)`` GLU outputs when causal (zeros before them
+        offline, the cached inputs in a stream), else ``(B, C, T)``, to
+        ``(B, T, C)``."""
         x = self.depthwise_conv(x).transpose(1, 2)
         if self.norm is not None:
             x = self.norm(x)
         return self.pointwise_conv2(F.silu(x))
-
-    def _stream(self, x: torch.Tensor, tails: torch.Tensor) -> torch.Tensor:
-        # eager: the Triton kernel takes no cached inputs
-        cached = self.state.gather("conv", self.layer_idx)  # (B, C, k - 1)
-        x = torch.cat([cached.to(x.dtype), F.glu(x, dim=-1).transpose(1, 2)], dim=2)
-        self.state.scatter_("conv", x.gather(2, tails).to(cached.dtype), self.layer_idx)
-        x = self.depthwise_conv(x).transpose(1, 2)
-        return self.pointwise_conv2(F.silu(self.norm(x)))
 
 
 class FeedForward(nn.Module):
@@ -402,22 +403,29 @@ class FastConformerBlock(nn.Module):
         self.norm_out = nn.LayerNorm(c)
 
     def forward(
-        self, x: torch.Tensor, pos_emb: torch.Tensor | None, mask: torch.Tensor | None, valid: torch.Tensor | None,
-        tails: torch.Tensor | None = None,
+        self, x: torch.Tensor, pos_emb: torch.Tensor, mask: torch.Tensor | None, valid: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Offline: ``pos_emb``, ``mask`` and ``valid``. A stream step: ``tails``
-        (see ``ConvModule.forward``), which streams the attention as well."""
-        stream = tails is not None
+        return self._macaron(x, lambda h: self.self_attn(h, pos_emb, mask), lambda h: self.conv(h, valid))
+
+    def forward_stream(self, x: torch.Tensor, tails: torch.Tensor) -> torch.Tensor:
+        """A stream step: ``tails`` for the conv (see ``ConvModule.forward_stream``)."""
+        return self._macaron(x, self.self_attn.forward_stream, lambda h: self.conv.forward_stream(h, tails))
+
+    def _macaron(
+        self, x: torch.Tensor,
+        attn: Callable[[torch.Tensor], torch.Tensor], conv: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """Half FFN, ``attn``, ``conv``, half FFN, each a pre-norm residual, then the output norm."""
         if use_triton(x):
             # each residual add runs in the kernel of the norm that reads it
             x, h = add_layer_norm(x, self.feed_forward1(self.norm_feed_forward1(x)), 0.5, self.norm_self_att)
-            x, h = add_layer_norm(x, self.self_attn(h, pos_emb, mask, stream), 1.0, self.norm_conv)
-            x, h = add_layer_norm(x, self.conv(h, valid, tails), 1.0, self.norm_feed_forward2)
+            x, h = add_layer_norm(x, attn(h), 1.0, self.norm_conv)
+            x, h = add_layer_norm(x, conv(h), 1.0, self.norm_feed_forward2)
             return add_layer_norm(x, self.feed_forward2(h), 0.5, self.norm_out, keep_sum=False)[1]
         # alpha folds the half step into the add (0.5 * y is exact either way)
         x = torch.add(x, self.feed_forward1(self.norm_feed_forward1(x)), alpha=0.5)
-        x = x + self.self_attn(self.norm_self_att(x), pos_emb, mask, stream)
-        x = x + self.conv(self.norm_conv(x), valid, tails)
+        x = x + attn(self.norm_self_att(x))
+        x = x + conv(self.norm_conv(x))
         x = torch.add(x, self.feed_forward2(self.norm_feed_forward2(x)), alpha=0.5)
         return self.norm_out(x)
 
@@ -459,16 +467,17 @@ class FastConformerEncoder(nn.Module):
     ``(B, T', hidden)`` and per-request encoder lengths out: ``subsample``
     then ``blocks``, the split NeMo's ``bypass_pre_encode`` makes.
 
-    A causal encoder also runs as a stream, a few frames at a time: ``blocks``
-    with ``new`` attends in the bounded KV ``kv_key`` names (each frame over the
-    ``left_context`` before it) and continues each conv from the recurrent-state
-    pool ``conv_key`` names, which hold a stream's state between steps."""
+    A causal encoder also runs as a stream, a few frames at a time:
+    ``blocks_stream`` attends through the unbounded array ``kv_key`` names
+    (each frame over the ``left_context`` before it) and continues each conv
+    from the Value ``conv_key`` names, which hold a stream's state between
+    steps."""
 
     def __init__(self, config: FastConformerConfig, kv_key: str | None = None, conv_key: str | None = None):
         super().__init__()
         self.config = config
         self.kv_key, self.conv_key = kv_key, conv_key
-        self.subsampling = _Subsampling(config)
+        self.subsampling = DwStridingSubsampling(config)
         self.layers = nn.ModuleList(
             FastConformerBlock(config, i, kv_key, conv_key) for i in range(config.num_layers)
         )
@@ -515,16 +524,9 @@ class FastConformerEncoder(nn.Module):
             x = x * math.sqrt(self.config.hidden_size)
         return x
 
-    def blocks(
-        self, x: torch.Tensor, lengths: torch.Tensor | None = None, new: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """The Conformer blocks over ``x (B, T', hidden)``: offline over the
-        clip, ``lengths`` (encoder frames per row) masking the padding; or, given
-        ``new`` (a device ``(B,)`` count of each stream's new frames, ``<= T'``),
-        one stream step under the plans its declaration made for the bound KV
-        and conv pool. A stream with no new frame keeps its conv state."""
-        if new is not None:
-            return self._stream_blocks(x, new)
+    def blocks(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
+        """The Conformer blocks over a clip's ``x (B, T', hidden)``, ``lengths``
+        (encoder frames per row) masking the padding."""
         t = x.shape[1]
         valid = None if lengths is None else length_mask(lengths, t)
         mask = None
@@ -541,14 +543,18 @@ class FastConformerEncoder(nn.Module):
             x = layer(x, pos_emb, mask, valid)
         return x
 
-    def _stream_blocks(self, x: torch.Tensor, new: torch.Tensor) -> torch.Tensor:
+    def blocks_stream(self, x: torch.Tensor, new: torch.Tensor) -> torch.Tensor:
+        """One stream step of the blocks over ``x (B, T', hidden)``, ``new`` a
+        device ``(B,)`` count of each stream's new frames (``<= T'``), under the
+        plans its declaration made for the bound arrays. A stream with no new
+        frame keeps its conv state."""
         b, c = x.shape[0], self.config
         keep = c.conv_kernel_size - 1
         # each stream keeps its newest k - 1 conv inputs: new .. new + k - 1 of cached ++ this step's
         tails = (new.view(b, 1, 1) + torch.arange(keep, device=x.device).view(1, 1, keep)).expand(
             b, c.hidden_size, keep)
         for layer in self.layers:
-            x = layer(x, None, None, None, tails=tails)
+            x = layer.forward_stream(x, tails)
         return x
 
     # ------------------------------------------------------------------

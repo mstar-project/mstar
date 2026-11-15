@@ -116,7 +116,7 @@ class PhaseLaps:
 
 
 def phase_buffer() -> dict[str, list[float]]:
-    """The shared sample buffer; ``Worker.run`` reads and clears it."""
+    """The shared sample buffer; ``PhaseTimer.flush`` reads and clears it."""
     return _PHASE_BUF
 
 
