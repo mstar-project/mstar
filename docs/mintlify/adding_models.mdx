@@ -1279,6 +1279,17 @@ A top-level `kv_cache:` block is no longer read. It raises an error at load time
 
 </Note>
 
+### Serving structured outputs {#serving-structured-outputs}
+
+A model serves `response_format` and `structured_outputs` (see **Structured output** in [models](/models)) once it does four things; Qwen3.5 is the reference:
+
+- sets `STRUCTURED_OUTPUTS = True` on its model class, or a deployment with `enable_grammar` is refused at startup;
+- attaches the request's grammar to its text sampler's settings: in `get_request_resource_configs`, `SampleSettings(..., grammar=request_grammar(model_kwargs))`, with `request_grammar` from `mstar.engine.state` (a bad grammar raises the client's 400);
+- lists its reply's stop ids in `text_output()`, the stops the grammar lets a reply end on (a loop that stops through a `TokenStop` on the grammar sampler without them is refused at startup);
+- if it reasons, declares the texts that open and end its reasoning, `TextOutput.reasoning_start` and `reasoning_end` (`REASONING_START` and `REASONING_END` on a `MultimodalDecoderModel`), so a turn whose prompt leaves a reasoning block open thinks freely and answers in its grammar.
+
+The deployment then sets `enable_grammar: true` on that sampler, and installs the `grammar` extra.
+
 ### Routing across data-parallel replicas {#routing-across-data-parallel-replicas}
 
 When a node group has several replicas, the conductor sends each new request to the replica where it is cheapest (see "Data-parallel routing" in [Serving](/serving)). A resource whose state makes a request cheaper on one replica than another takes part through its spec, so models declare nothing for it.

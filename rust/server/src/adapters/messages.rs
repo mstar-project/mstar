@@ -324,7 +324,7 @@ pub(super) fn refuse_unserved_chat(req: &ChatCompletionRequest, mk: &mut BTreeMa
 }
 
 /// OpenAI `response_format` as a `structured_outputs` value, None for text:
-/// `response_format_request` in `engine/resources/sampler/grammar.py`.
+/// `response_format_request` in `api_server/openai/adapters.py`.
 fn response_format_request(v: &Value) -> Result<Option<Value>, String> {
     let obj = match v {
         Value::Null => return Ok(None),

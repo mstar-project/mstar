@@ -31,11 +31,11 @@ import ssl
 import urllib.error
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from mstar.api_server import media_io
 from mstar.api_server.openai.speech_chunking import _cut_evenly, split_sentences
-from mstar.engine.resources.sampler.grammar import STRUCTURED_OUTPUTS_KWARG, response_format_request
+from mstar.engine.resources.sampler.grammar import STRUCTURED_OUTPUTS_KWARG
 from mstar.model.multimodal import PromptPart
 from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG
 from mstar.model.registry import qwen_3_5_dense_sizes as QWEN_3_5_DENSE_SIZES
@@ -176,6 +176,26 @@ def _passthrough(req) -> dict:
 # model_kwargs, so a client that sends it on every call (LiveKit's
 # ``stream_options``) is not logged as ignoring it. Dynamo's bridge strips the same.
 CHAT_ENVELOPE_KEYS = ("stream_options", "parallel_tool_calls", "user", "store", "metadata", "service_tier")
+
+
+def response_format_request(response_format: Any) -> dict | None:
+    """OpenAI ``response_format`` as a ``structured_outputs`` value; None for
+    text. ``ValueError`` for another type."""
+    if response_format is None:
+        return None
+    if not isinstance(response_format, dict):
+        raise ValueError(f"response_format must be an object; got {response_format!r}")
+    kind = response_format.get("type")
+    if kind == "text":
+        return None
+    if kind == "json_object":
+        return {"json_object": True}
+    if kind == "json_schema":
+        spec = response_format.get("json_schema")
+        if not isinstance(spec, dict) or spec.get("schema") is None:
+            raise ValueError("response_format json_schema needs json_schema.schema")
+        return {"json": spec["schema"]}
+    raise ValueError(f"response_format type must be text, json_object or json_schema; got {kind!r}")
 
 
 def _refuse_unserved_chat(req, mk: dict) -> None:

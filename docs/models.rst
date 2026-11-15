@@ -790,8 +790,11 @@ reply: chat ``response_format`` (``json_object``, or ``json_schema`` with its ``
 ``structured_outputs`` in ``model_kwargs`` / ``extra_body`` with exactly one of ``json`` (a
 JSON schema), ``json_object``, ``regex``, ``choice`` (a list of strings) or ``grammar`` (EBNF),
 as vLLM takes it. ``"after": "</think>"`` starts the constraint once the reply holds that text,
-so a reasoning model thinks freely first; Qwen3.5 declares the text that ends its reasoning
-(``</think>``), so it sets ``after`` itself on any turn whose prompt leaves the reasoning open. An
+so a reasoning model thinks freely first; Qwen3.5 declares the texts that open and end its
+reasoning (``<think>``, ``</think>``), so it sets ``after`` itself on any turn whose prompt opens a
+reasoning block it doesn't close. Until a reply parser serves ``reasoning_content``, such a reply's
+``content`` holds the reasoning, ``</think>`` and then the reply its grammar holds; send
+``chat_template_kwargs: {"enable_thinking": false}`` for a ``content`` that is the JSON alone. An
 unsupported schema is a 400, and so is a request on a deployment without ``enable_grammar`` or a
 grammar and ``after`` over 131072 characters, or one that also sends ``min_tokens`` or
 ``ignore_eos``.

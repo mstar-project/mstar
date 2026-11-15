@@ -38,10 +38,10 @@ STRUCTURED_OUTPUTS_KWARG = "structured_outputs"
 GRAMMAR_KINDS = ("json", "json_object", "regex", "choice", "grammar")
 # a grammar compiles while its request waits for admission, so its size is bounded
 MAX_GRAMMAR_CHARS = 1 << 17
-# xgrammar's batch fill starts every one of its threads on each call, however few the rows:
-# measured on the dev machine, about 25 us of the caller's time per thread, and a 6-row fill
-# took 0.29 ms serially against 0.23 ms with 2 threads. A fill takes a thread per this many
-# rows, up to 8 threads; the 16-row cut is provisional until the H200 profile sets it
+# xgrammar's batch fill starts every one of its threads on each call, however few the rows (about
+# 25 us of the caller's time per thread on the dev machine). A fill takes a thread per this many
+# rows, up to 8, and batches only from two threads (16 rows), filling row by row below that. The
+# cut isn't tuned: a 6-row fill measured 0.29 ms serially and 0.23 ms with 2 threads
 FILL_ROWS_PER_THREAD = 8
 
 
@@ -173,25 +173,6 @@ def after_reasoning(structured: Any, text_output: TextOutput | None, prompt_ids:
     text = tail.decode("utf-8", errors="replace")
     return {**structured, "after": end} if text.rfind(start) > text.rfind(end) else structured
 
-
-def response_format_request(response_format: Any) -> dict | None:
-    """OpenAI ``response_format`` as a ``structured_outputs`` value; None for
-    text. ``ValueError`` for another type."""
-    if response_format is None:
-        return None
-    if not isinstance(response_format, dict):
-        raise ValueError(f"response_format must be an object; got {response_format!r}")
-    kind = response_format.get("type")
-    if kind == "text":
-        return None
-    if kind == "json_object":
-        return {"json_object": True}
-    if kind == "json_schema":
-        spec = response_format.get("json_schema")
-        if not isinstance(spec, dict) or spec.get("schema") is None:
-            raise ValueError("response_format json_schema needs json_schema.schema")
-        return {"json": spec["schema"]}
-    raise ValueError(f"response_format type must be text, json_object or json_schema; got {kind!r}")
 
 
 class _Row:
