@@ -1,6 +1,6 @@
 """Everything inbound: the message dispatch, input reads, ready tensors and
-stream polls. Holds no state of its own beside ``LoraLoads``, the runtime LoRA
-loads in flight, which it builds and finishes after each message pass: lifecycle
+stream polls. Holds messages deferred during completion waits and ``LoraLoads``,
+the runtime LoRA loads in flight, which it builds and finishes after each message pass: lifecycle
 messages are recorded on ``RequestLifecycle`` for the worker to apply at its next
 teardown point, and TP-follow messages go to ``Lockstep``."""
 from __future__ import annotations
@@ -52,6 +52,9 @@ _NEEDS_ACTIVE_REQUEST = frozenset({
     WorkerMessageType.STOP_LOOPS,
 })
 
+_TEARDOWN_MESSAGES = frozenset({WorkerMessageType.DRAIN_REQUEST, WorkerMessageType.REMOVE_REQUEST})
+_TP_QUEUE_MESSAGES = frozenset({WorkerMessageType.SCHEDULE_TP, WorkerMessageType.TP_NO_SPEC})
+
 
 def _one_rids_edges(rid: int, edges: list[GraphEdge]) -> ColumnarEdgeSpecs:
     """Arriving edges as columns, for the runtime's ingest. Only uuids cross: the
@@ -83,6 +86,8 @@ class InputIngest:
         self._lockstep = lockstep
         self._wakeup_event = wakeup_event
         self._enable_nvtx = enable_nvtx
+        self._deferred_messages: list[WorkerMessage] = []
+        self._defer_teardown = False
         # marks each paged KV cache of a request's first NewRequest rebuildable or not, before the engine adds it,
         # and returns the nodes whose log of the request the rebuild pool couldn't hold
         self._set_rebuildable = set_rebuildable
@@ -114,9 +119,43 @@ class InputIngest:
     # -- messages -------------------------------------------------------------
 
     def process_messages(self) -> None:
-        self._dispatch(self._communicator.get_all_new_messages())
+        messages = self._communicator.get_all_new_messages()
+        if self._deferred_messages:
+            self._deferred_messages.extend(messages)
+            messages, self._deferred_messages = self._deferred_messages, []
+            self._defer_teardown = False
+        self._dispatch(messages)
         if self.lora_loads:
             self.lora_loads.finish()
+
+    def process_teardown_messages(self, in_flight: Collection[int]) -> None:
+        """During a completion wait, only record teardown and TP decisions.
+
+        INPUT_SIGNALS can replace the current forward info or end a duplex
+        stream; STOP_LOOPS changes the runtime's routing. Neither may land
+        halfway through postprocess. Defer them, new requests, tensor messages
+        and adapter changes to the next normal message pass, in arrival order.
+
+        TP messages only enqueue decisions: keeping their counts current stops
+        a drain from ACKing READS_DONE ahead of a queued step. A deferred NEW
+        also defers subsequent teardown messages, so REMOVE cannot overtake
+        admission. An in-flight row's teardown stays deferred too: even recording
+        it changes ``RequestLifecycle.publishable`` on the GPU thread. A deferred
+        REMOVE holds later teardowns to preserve TP removal order. The pipeline
+        still fences admission/pre-plan before applying recorded teardown.
+        """
+        ready = []
+        for message in self._communicator.get_all_new_messages():
+            kind = message.message_type
+            teardown = kind in _TEARDOWN_MESSAGES
+            held = teardown and self._runtime.get_rid_handle(message.body.request_id) in in_flight
+            if kind == WorkerMessageType.NEW_REQUEST or (held and kind == WorkerMessageType.REMOVE_REQUEST):
+                self._defer_teardown = True
+            if kind in _TP_QUEUE_MESSAGES or (teardown and not held and not self._defer_teardown):
+                ready.append(message)
+            else:
+                self._deferred_messages.append(message)
+        self._dispatch(ready)
 
     def _dispatch(self, messages: list[WorkerMessage]) -> None:
         handlers = self._handlers

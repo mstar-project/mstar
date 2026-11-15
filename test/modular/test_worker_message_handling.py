@@ -123,3 +123,16 @@ def test_signals_for_a_live_request_are_delivered_not_buffered():
     assert err is None and finished
     assert stub.delivered == [msg.body], "the signals never reached the worker"
     assert stub.lifecycle._parked == {}, "a live request must not buffer"
+
+
+def test_wait_replays_inputs_before_new_arrivals_in_order():
+    stub = _stub_worker(active_rids=["X"])
+    messages = [WorkerMessage(WorkerMessageType.INPUT_SIGNALS, InputSignals("X", [], None)) for _ in range(3)]
+    polls = iter([[message] for message in messages])
+    stub.ingest._communicator = types.SimpleNamespace(get_all_new_messages=lambda: next(polls))
+    stub.ingest.process_teardown_messages({0})
+    stub.ingest.process_teardown_messages({0})
+    assert stub.delivered == []
+    stub.ingest.process_messages()
+    assert all(got is sent.body for got, sent in zip(stub.delivered, messages, strict=True))
+    assert stub.ingest._deferred_messages == []

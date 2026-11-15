@@ -5,6 +5,8 @@ is in flight; no read may start after that. The hard cleanup
 (force_cleanup_request) waits for the conductor's REMOVE_REQUEST.
 """
 
+from concurrent.futures import Future
+from threading import Event, get_ident
 from types import SimpleNamespace
 
 import pytest
@@ -26,13 +28,16 @@ from mstar.utils.ipc_format import (
     DrainRequest,
     InputSignals,
     MessageSource,
+    NewRequest,
     RemoveRequest,
     ScheduleTPNode,
+    StopLoops,
     WorkerMessage,
     WorkerMessageType,
 )
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rid_table import RidTable
+from mstar.worker.step_executor import PendingBatch
 from mstar.worker.stream_buffers import StreamBufferManager
 
 # ── worker ──────────────────────────────────────────────────────────────────
@@ -114,6 +119,393 @@ def _reads_done(w):
     ]
 
 
+def test_long_forward_services_other_requests_teardown_before_it_finishes():
+    w = _worker(known_rids=("old", "busy"), in_flight=("busy",))
+    future = Future()
+    admitted = Event()
+    admitted.set()
+    pending = SimpleNamespace(future=future, node_batch=SimpleNamespace(launch_started_event=admitted))
+    polls = []
+
+    def messages():
+        assert not future.done()
+        polls.append(True)
+        if len(polls) == 1:
+            return [WorkerMessage(WorkerMessageType.DRAIN_REQUEST, DrainRequest(rid))
+                    for rid in ("old", "busy")]
+        assert [m.body.request_id for m in _reads_done(w)] == ["old"]
+        assert w.forced == [], "draining must retain tensors until REMOVE"
+        return [WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest(rid))
+                for rid in ("old", "busy")]
+
+    def release(rid):
+        assert rid == "old" and not future.done()
+        future.set_result(BatchedModelOutput())
+
+    w.communicator.get_all_new_messages = messages
+    w.engine_manager.remove_request = release
+    w.pipeline._wait_with_teardown(pending)
+
+    assert w.forced == ["old"]
+    assert "busy" not in w.lifecycle.pending_drains
+    assert "busy" not in w.lifecycle.pending_removes
+    assert w.pipeline._step_result(pending) == future.result()
+    w.communicator.get_all_new_messages = list
+    w.ingest.process_messages()
+    assert "busy" in w.lifecycle.pending_drains
+    assert "busy" in w.lifecycle.pending_removes
+
+
+@pytest.mark.parametrize("speculation,side_lane", [(object(), False), (None, True)])
+def test_forward_wait_keeps_existing_fences_for_speculation_and_side_steps(speculation, side_lane):
+    w = _worker()
+    w.pipeline._speculation = speculation
+    w.pipeline._has_side_lane = side_lane
+    # These paths must not touch even the future until their usual wait.
+    w.pipeline._wait_with_teardown(SimpleNamespace())
+
+
+@pytest.mark.parametrize("unsettled", ["current", "next", "side", "preplan"])
+def test_gpu_wait_defers_teardown_until_admission_and_preplan_settle(unsettled):
+    w = _worker()
+    polled = []
+    w.communicator.get_all_new_messages = lambda: polled.append(True) or []
+    admitted = Event()
+    step = SimpleNamespace(
+        node_batch=SimpleNamespace(launch_started_event=admitted),
+        batch=ScheduledBatch(node_name="n", graph_walk="w", request_to_worker_graph={}),
+    )
+    if unsettled == "preplan":
+        w.pipeline._speculation = SimpleNamespace(plan_future=Future())
+    else:
+        setattr(w.pipeline, {"current": "pending", "next": "_spec_pending", "side": "side_pending"}[unsettled], step)
+
+    w.pipeline._service_gpu_teardown()
+    assert polled == []
+    if unsettled == "preplan":
+        w.pipeline._speculation.plan_future.set_result(None)
+        w.pipeline._service_gpu_teardown()
+        assert polled == [], "a finished pre-plan still owns its reserved state"
+
+    admitted.set()
+    if unsettled == "preplan":
+        w.pipeline._speculation.plan_future = None
+    w.pipeline._service_gpu_teardown()
+    assert polled == [True]
+
+
+def test_gpu_wait_ready_event_does_not_start_a_waiter():
+    w = _worker(device=torch.device("cuda"))
+    step = SimpleNamespace(node_batch=SimpleNamespace(completion_event=SimpleNamespace(query=lambda: True)))
+    w.executor.wait_for_step(step, while_waiting=lambda: pytest.fail("already complete"))
+    assert w.executor._wait_pool is None
+
+
+@pytest.mark.parametrize("wait_kind", ["cpu", "gpu"])
+def test_wait_defers_duplex_stream_end_walk_and_loop_stop_until_postprocess(wait_kind):
+    """Late realtime inputs must not change what N's stop check and route see."""
+    w = _worker(known_rids=("busy", "old"), in_flight=("busy",))
+    sbuf = StreamBuffer("busy", "audio_frame", "Encoder", FixedChunkPolicy(chunk_size=1))
+    old_info = CurrentForwardPassInfo("busy", "decode", 0, 0, 10)
+    next_info = CurrentForwardPassInfo("busy", "prefill", 1, 0, 20)
+    state = w.request_state.per_request_info["busy"]
+    state.stream_buffers = {"audio_frame": sbuf}
+    state.current_fwd_info = old_info
+    walks, stops, seen = [], [], []
+    w._graph_runtime.set_walk = lambda *args: walks.append(args)
+    w._graph_runtime.apply_peer_loop_stops = lambda *args: stops.append(args)
+    w._graph_runtime.get_dynamic_loop_iters = lambda *args, **kwargs: []
+    w._graph_runtime.ingest_inputs_batch = lambda *args, **kwargs: None
+    w.request_state.update_request_info = lambda rid, current_fwd_info, **kwargs: setattr(
+        state, "current_fwd_info", current_fwd_info,
+    )
+    w.tensor_manager.start_read_tensors = lambda *args, **kwargs: []
+    messages = [
+        WorkerMessage(WorkerMessageType.INPUT_SIGNALS, InputSignals(
+            "busy", [], None, producer_done={"Encoder"}, producer_done_items={"audio_frame": 0},
+        )),
+        WorkerMessage(WorkerMessageType.INPUT_SIGNALS, InputSignals(
+            "busy", [GraphEdge(name="go", next_node="LLM")], next_info,
+        )),
+        WorkerMessage(WorkerMessageType.STOP_LOOPS, StopLoops(
+            "busy", {"decode"}, "default", loop_stop_times={"decode": (1,)},
+        )),
+        # Recording either active teardown would suppress publication by the
+        # unfinished step, even though _teardown cannot release its rows yet.
+        WorkerMessage(WorkerMessageType.DRAIN_REQUEST, DrainRequest("busy")),
+        WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("old")),
+        WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("busy")),
+    ]
+    w.communicator.get_all_new_messages = lambda: messages
+    future = Future()
+    admitted = Event()
+    admitted.set()
+    w.engine_manager.remove_request = lambda rid: future.set_result(BatchedModelOutput())
+    if wait_kind == "cpu":
+        w.pipeline._wait_with_teardown(SimpleNamespace(
+            future=future, node_batch=SimpleNamespace(launch_started_event=admitted),
+        ))
+    else:
+        w.pipeline._service_gpu_teardown()
+    assert w.forced == ["old"]
+
+    # Exercise the stop-check entry point after the completion wait. The
+    # model reads its step's info; routing reads the worker's current info.
+    node_batch = ExecutingBatch(
+        node_name="LLM", per_request_info={"busy": old_info},
+        step_context=StepContext(request_ids=("busy",), graph_walk="decode", slot=0, capture=False),
+    )
+    node_batch.request_ids = ["busy"]
+    batch = ScheduledBatch(node_name="LLM", graph_walk="decode", request_to_worker_graph={"busy": 0})
+    pending = SimpleNamespace(batch=batch, node_batch=node_batch, node_name="LLM", partition="default")
+
+    def check_stop(batch, outputs, **kwargs):
+        seen.append("check_stop")
+        assert not sbuf.producer_done
+        assert batch.per_request_info["busy"] is state.current_fwd_info is old_info
+        assert w.lifecycle.publishable(batch) == ["busy"]
+        return {}
+
+    checked = w.executor._check_stops(
+        pending, BatchedModelOutput(), {}, None, SimpleNamespace(check_stop_for_batch=check_stop),
+    )
+    assert checked.stops == {} and seen == ["check_stop"]
+    assert walks == stops == []  # no runtime routing change during the wait
+    assert state.current_fwd_info.graph_walk == batch.graph_walk == "decode"
+
+    w.communicator.get_all_new_messages = list
+    w.ingest.process_messages()
+    assert sbuf.producer_done and state.current_fwd_info is next_info
+    assert walks == [("busy", "default", "prefill")]
+    assert stops == [("busy", "default", {"decode": (1,)})]
+    assert "busy" in w.lifecycle.pending_drains and "busy" in w.lifecycle.pending_removes
+
+
+def test_wait_keeps_new_request_and_removals_in_order_across_polls():
+    w = _worker(known_rids=("old",))
+    new = WorkerMessage(WorkerMessageType.NEW_REQUEST, NewRequest(
+        "new", [], {}, [], CurrentForwardPassInfo("new", "decode", 0, 0, 10), {},
+    ))
+    first = [new, WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("new"))]
+    second = [WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("old"))]
+    polls = iter([first, second, []])
+    w.communicator.get_all_new_messages = lambda: next(polls)
+    w.pipeline._service_gpu_teardown()
+    w.pipeline._service_gpu_teardown()
+    assert w.forced == []
+    assert not w.lifecycle.pending_removes
+    assert w.lifecycle.park(WorkerMessage(WorkerMessageType.INPUT_SIGNALS, InputSignals("new", [], None)))
+    delivered = []
+    w.ingest._handlers[WorkerMessageType.NEW_REQUEST] = lambda body: delivered.append(("new", body.request_id))
+    w.ingest._handlers[WorkerMessageType.REMOVE_REQUEST] = lambda body: delivered.append(("remove", body.request_id))
+    w.ingest.process_messages()
+    assert delivered == [("new", "new"), ("remove", "new"), ("remove", "old")]
+
+
+def test_wait_queues_tp_heads_before_acking_drains():
+    w = _worker(known_rids=("old",), is_follower=True)
+    head = ScheduleTPNode(node_name="LLM", graph_walk="decode", request_ids=["old"])
+    messages = [
+        WorkerMessage(WorkerMessageType.DRAIN_REQUEST, DrainRequest("old", source=MessageSource.TP_RANK_0)),
+        WorkerMessage(WorkerMessageType.SCHEDULE_TP, head),
+    ]
+    w.communicator.get_all_new_messages = lambda: messages
+    w.pipeline._service_gpu_teardown()
+    assert w.lockstep.follow_head() is head
+    assert not _reads_done(w), "READS_DONE must wait for the queued TP step"
+
+
+@pytest.mark.parametrize("previous_wait", [None, 0.001, 0.01, 0.02], ids=["unknown", "short", "threshold", "long"])
+def test_serial_gpu_wait_stays_on_main_thread(previous_wait):
+    w = _worker(device=torch.device("cuda"))
+    w.executor._serial_steps = True
+    if previous_wait is not None:
+        w.executor._gpu_wait_s[("Encoder", "encode")] = previous_wait
+    threads = []
+    step = SimpleNamespace(
+        node_name="Encoder", graph_walk="encode",
+        node_batch=SimpleNamespace(completion_event=SimpleNamespace(
+            query=lambda: False, synchronize=lambda: threads.append(get_ident()),
+        )),
+    )
+    try:
+        w.executor.wait_for_step(step, while_waiting=lambda: pytest.fail("serial wait serviced teardown"))
+        assert threads == [get_ident()]
+        assert w.executor._wait_pool is None
+    finally:
+        if w.executor._wait_pool is not None:
+            w.executor._wait_pool.shutdown()
+
+
+def test_short_gpu_waits_stay_on_main_thread_and_relearn_long_waits(monkeypatch):
+    """Each walk learns independently, and a slower step restores callbacks."""
+    w = _worker(device=torch.device("cuda"))
+    clock = iter([0.0, 0.001, 1.0, 1.001, 2.0, 2.02, 3.0, 3.02, 4.0, 4.001])
+    monkeypatch.setattr("mstar.worker.step_executor._time.perf_counter", lambda: next(clock))
+    threads = []
+    step = SimpleNamespace(
+        node_name="LLM", graph_walk="decode",
+        node_batch=SimpleNamespace(completion_event=SimpleNamespace(
+            query=lambda: False, synchronize=lambda: threads.append(get_ident()),
+        )),
+    )
+    main = get_ident()
+    try:
+        for _ in range(4):
+            w.executor.wait_for_step(step, while_waiting=lambda: None)
+        step.graph_walk = "prefill"
+        w.executor.wait_for_step(step, while_waiting=lambda: None)
+    finally:
+        w.executor._wait_pool.shutdown()
+    assert threads[0] != main  # unknown: cooperative
+    assert threads[1:3] == [main, main]  # short, then the first newly long wait
+    assert threads[3] != main  # long: cooperative again
+    assert threads[4] != main  # a different walk has no short-wait history
+
+
+@pytest.mark.parametrize("callback_raises", [False, True])
+def test_long_gpu_wait_services_cleanup_and_keeps_completion_fence(callback_raises):
+    w = _worker(device=torch.device("cuda"))
+    release, finished = Event(), Event()
+    callbacks = []
+
+    def synchronize():
+        assert release.wait(5), "cleanup was not serviced during the GPU wait"
+        finished.set()
+
+    def service():
+        callbacks.append(True)
+        release.set()
+        if callback_raises:
+            raise ValueError("cleanup failed")
+
+    step = SimpleNamespace(
+        node_name="Encoder", graph_walk="encode",
+        node_batch=SimpleNamespace(completion_event=SimpleNamespace(query=lambda: False, synchronize=synchronize)),
+    )
+    try:
+        if callback_raises:
+            with pytest.raises(ValueError, match="cleanup failed"):
+                w.executor.wait_for_step(step, while_waiting=service)
+        else:
+            w.executor.wait_for_step(step, while_waiting=service)
+        assert callbacks and finished.is_set()
+    finally:
+        release.set()
+        w.executor._wait_pool.shutdown()
+
+
+@pytest.mark.parametrize("failure_site,error,isolated", [
+    ("request_state", ValueError("bad request bookkeeping"), True),
+    ("profile_info", KeyError("missing request bookkeeping"), True),
+    ("engine_manager", ValueError("bad shared resource state"), False),
+    ("tensor_manager", ValueError("bad tensor store state"), False),
+    ("_rebuilds", ValueError("bad shared host pool state"), False),
+    ("scheduler", ValueError("bad shared batch state"), False),
+    ("_graph_runtime", ValueError("bad runtime state"), False),
+    ("request_state", RuntimeError("device failure"), False),
+    ("request_state", MemoryError("host allocation failure"), False),
+])
+def test_gpu_wait_cleanup_failure_isolation_through_postprocess(failure_site, error, isolated, caplog):
+    w = _worker(known_rids=("old", "busy", "next"), device=torch.device("cuda"))
+    release, finished = Event(), Event()
+    cleaned, stored, routed, sent, completed = [], [], [], [], []
+    runtime, tensors = w._graph_runtime, w.tensor_manager
+    runtime.remove_request = cleaned.append
+    runtime.cleanup_consumed_inputs = lambda *args: FreedTensors.none()
+    runtime.clear_pending_loop_stops = lambda: None
+    runtime.get_dynamic_loop_iters = lambda *args: []
+    runtime.update_dynamic_loop_iters = lambda *args: None
+    runtime.complete_and_route_batch = lambda request: routed.append(request) or RouteOutput(
+        completion_id=42, register_uuids=[], register_rids=[], new_token_output_idxs=[],
+        local_streaming_by_signal={},
+    )
+    runtime.send_outputs = lambda request: sent.append(request) or ["busy"]
+    tensors.cleanup_collectable = lambda *args: None
+    tensors.increment_ref_batch_uniform = lambda *args: None
+    tensors.drop_host_copies = lambda: None
+    token = torch.tensor([17])
+
+    def store(rids, outputs, signals, **kwargs):
+        assert finished.is_set(), "outputs must wait for GPU completion"
+        assert rids == ["busy"] and signals == ["new_token"]
+        stored.append(outputs.get("busy")["new_token"][0])
+        return StoredOutputs([123], ["busy"], [0], [1])
+
+    tensors.store_and_return_tensor_info_batch = store
+    w.engine_manager.get_engine = lambda node: SimpleNamespace(
+        check_stop_for_batch=lambda *args, **kwargs: {},
+        step_finished=lambda *args, **kwargs: None,
+        after_output_copy=lambda batch: None,
+        materialize_publish=lambda batch, rids: None,
+    )
+    w.request_state.get_fwd_info = lambda rid, partition: None
+    w.request_state.get_pending_publish_info = lambda rid, partition: {}
+    w.request_state.flush_publish_info = lambda rid, partition: completed.append(rid)
+    messages = [WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("old"))]
+    w.communicator.get_all_new_messages = lambda: [messages.pop()] if messages else []
+
+    def cleanup(rid):
+        assert rid == "old" and not finished.is_set()
+        release.set()
+        raise error
+
+    method = {
+        "profile_info": "pop_request", "tensor_manager": "force_cleanup_request", "scheduler": "clear_rid",
+    }.get(
+        failure_site, "remove_request",
+    )
+    setattr(getattr(w, failure_site), method, cleanup)
+
+    def synchronize():
+        assert release.wait(5), "teardown was not serviced during the GPU wait"
+        finished.set()
+
+    node_batch = ExecutingBatch(
+        node_name="LLM", per_request_info={},
+        step_context=StepContext(request_ids=("busy",), graph_walk="decode", slot=0, capture=False),
+    )
+    node_batch.request_ids = ["busy"]
+    node_batch.completion_event = SimpleNamespace(query=lambda: False, synchronize=synchronize)
+    pending = PendingBatch(
+        batch=ScheduledBatch(
+            node_name="LLM", graph_walk="decode", request_to_worker_graph={"busy": 0},
+            output_signals=["new_token"],
+        ),
+        node_batch=node_batch, node_name="LLM", partition="default", graph_walk="decode", future=Future(),
+    )
+    w.pipeline._set_pending(pending)
+    w.pipeline._spec_pending = SimpleNamespace(
+        batch=ScheduledBatch(node_name="LLM", graph_walk="decode", request_to_worker_graph={"next": 0}),
+        node_batch=SimpleNamespace(launch_started_event=None),
+    )
+    outputs = BatchedModelOutput(per_rid_outputs={"busy": {"new_token": [token]}})
+    try:
+        if isolated:
+            w.pipeline._finish_step(pending, outputs)
+        else:
+            with pytest.raises(type(error)) as caught:
+                w.pipeline._finish_step(pending, outputs)
+            assert caught.value is error
+        assert finished.is_set(), "even a fatal callback error must fence the GPU work"
+    finally:
+        release.set()
+        if w.executor._wait_pool is not None:
+            w.executor._wait_pool.shutdown()
+
+    assert w.lifecycle.failed_rids == {"old"}
+    assert not w.lifecycle.pending_removes, "a partial teardown must not be retried"
+    assert cleaned == [], "a partial teardown must not recycle its handle"
+    assert not [m for _, m in w.sent if m.message_type == ConductorMessageType.FAIL_REQUESTS]
+    if isolated:
+        assert stored == [token] and completed == ["busy"]
+        assert list(routed[0].wg_ids.keys) == ["busy"] and routed[0].tensors == [123]
+        assert sent[0].completion_id == 42
+        assert "old" in caplog.text and str(error) in caplog.text
+    else:
+        assert stored == routed == sent == completed == []
+
+
 @pytest.mark.parametrize("enable_nvtx", [False, True])
 def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
     monkeypatch, enable_nvtx,
@@ -134,7 +526,7 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
             node_name="LLM", request_ids=[7], per_request_info={7: object()}, no_forward_rids=set(),
             final_stream_rids={7}, partition_done_rids={7},
         ),
-        speculative_new_iter=True, graph_walk="decode", loop_name="decode",
+        speculative_new_iter=True, node_name="LLM", graph_walk="decode", loop_name="decode",
     )
     outputs = BatchedModelOutput(per_rid_outputs={7: {}})
     ranges, markers = [], []
@@ -166,7 +558,8 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
 
 
 @pytest.mark.parametrize("has_event", [True, False])
-def test_stopped_speculative_batch_still_waits_for_its_gpu_work(monkeypatch, has_event):
+@pytest.mark.parametrize("cooperative", [False, True])
+def test_stopped_speculative_batch_still_waits_for_its_gpu_work(monkeypatch, has_event, cooperative):
     """No output of the step leaves, but a later step reuses its slot while
     its kernels may still run, so postprocess waits for them anyway."""
     w = _worker(device=torch.device("cuda"))
@@ -174,7 +567,7 @@ def test_stopped_speculative_batch_still_waits_for_its_gpu_work(monkeypatch, has
     w.tensor_manager.cleanup_collectable = lambda *args: None
     w._graph_runtime.pending_loop_stop_rids = lambda *args: {7}
     waits = []
-    event = SimpleNamespace(synchronize=lambda: waits.append("event")) if has_event else None
+    event = SimpleNamespace(synchronize=lambda: waits.append("event"), query=lambda: False) if has_event else None
     pending = SimpleNamespace(
         batch=ScheduledBatch(
             node_name="LLM", graph_walk="decode", request_to_worker_graph={7: 0},
@@ -184,11 +577,18 @@ def test_stopped_speculative_batch_still_waits_for_its_gpu_work(monkeypatch, has
             final_stream_rids=set(), partition_done_rids=set(),
             completion_event=event,
         ),
-        speculative_new_iter=True, graph_walk="decode", loop_name="decode",
+        speculative_new_iter=True, node_name="LLM", graph_walk="decode", loop_name="decode",
     )
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda device=None: waits.append("device"))
 
-    w.executor.postprocess(pending, BatchedModelOutput(per_rid_outputs={7: {}}))
+    try:
+        w.executor.postprocess(
+            pending, BatchedModelOutput(per_rid_outputs={7: {}}),
+            while_waiting=(lambda: None) if cooperative else None,
+        )
+    finally:
+        if w.executor._wait_pool is not None:
+            w.executor._wait_pool.shutdown()
 
     assert waits == ["event" if has_event else "device"]
     assert pending.batch.request_to_worker_graph == {}

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import time as _time
 from collections.abc import Collection, Iterable, Mapping
+from concurrent.futures import wait
 from functools import partial
 from types import MappingProxyType
 
@@ -366,6 +367,7 @@ class StepPipeline:
             if enable_nvtx:
                 range_push("worker.await_gpu", synchronize=False)
             t0 = _time.perf_counter() if phase_period else 0.0
+            self._wait_with_teardown(pending)
             outputs = self._step_result(pending)
             if phase_period:
                 timer.record("await_gpu", _time.perf_counter() - t0)
@@ -669,7 +671,12 @@ class StepPipeline:
             set_step_key(step_key(step.node_name, step.graph_walk))
         try:
             with self.timer.span(span, cpu=f"{span}.cpu"):
-                self.executor.postprocess(step, outputs, clear_loop_stops=chain)
+                if self.executor.device.type == "cpu":
+                    self.executor.postprocess(step, outputs, clear_loop_stops=chain)
+                else:
+                    self.executor.postprocess(
+                        step, outputs, clear_loop_stops=chain, while_waiting=self._service_gpu_teardown,
+                    )
         finally:
             if keyed:
                 set_step_key(None)
@@ -677,6 +684,25 @@ class StepPipeline:
         self._report_failures()
         if self._metrics is not None:
             self._metrics.step_done(step.node_name, step.graph_walk, step.node_batch.inputs, step.submitted_at)
+
+    def _service_gpu_teardown(self) -> None:
+        """Release unrelated rows after every launched step has admitted."""
+        if self._speculation is not None and self._speculation.plan_future is not None:
+            return
+        steps = (self.pending, self._spec_pending, self.side_pending)
+        for step in steps:
+            if step is not None:
+                admitted = step.node_batch.launch_started_event
+                if admitted is not None and not admitted.is_set():
+                    return
+        # N+1 is submitted before N's postprocess, but does not replace the
+        # chain's held rows until afterwards. Its fresh rows need protection too.
+        held = set(self.in_flight_rids)
+        for step in steps:
+            if step is not None:
+                held.update(step.batch.request_to_worker_graph)
+        self.ingest.process_teardown_messages(held)
+        self._teardown(held)
 
     def _count_turn(self, pending: "PendingBatch | None") -> None:
         """Once ``pending``'s admit has settled (``_await_admit_settled``): if
@@ -728,6 +754,20 @@ class StepPipeline:
             last_in_line=partial(self.scheduler.last_in_line, node, walk),
             could_refill=partial(self.scheduler.could_refill, node, walk, batch_ids),
         )
+
+    def _wait_with_teardown(self, pending: PendingBatch) -> None:
+        """Service teardown during a CPU forward, after admission settles.
+        Speculation and side lanes retain their usual waits to protect
+        pre-plans and admissions; in-flight rows stay protected.
+        """
+        if self._speculation is not None or self._has_side_lane:
+            return
+        while not pending.future.done():
+            if wait((pending.future,), timeout=0.01).done:
+                break
+            self._await_admit_settled(pending)
+            self.ingest.process_teardown_messages(self.in_flight_rids)
+            self._teardown(self.in_flight_rids)
 
     def _step_result(self, pending: PendingBatch) -> BatchedModelOutput:
         """N's outputs. A forward that raised becomes N's verdict instead: no
@@ -968,16 +1008,30 @@ class StepPipeline:
         if freed:
             self.admission.lift_caps(freed)
         laps.lap("engine")
-        self.streams.remove_request(rid)
-        self.request_state.remove_request(rid)
         self.tensor_manager.force_cleanup_request(rid)
         laps.lap("worker_state_tensors")
-        self.profile_info.pop_request(rid)
-        self.scheduler.clear_rid(rid)
-        self.admission.clear(rid)
-        self.lockstep.clear(rid, wire_rid)
         self._rebuilds.remove_request(rid)
-        self.preemption.remove_request(rid)
+        self.scheduler.clear_rid(rid)
+        # Only missing or malformed per-request host bookkeeping is local.
+        # Resource, transport, shared-batch and runtime cleanup stay outside
+        # this boundary because other rows depend on their state.
+        try:
+            self.streams.remove_request(rid)
+            self.request_state.remove_request(rid)
+            self.profile_info.pop_request(rid)
+            self.admission.clear(rid)
+            self.lockstep.clear(rid, wire_rid)
+            self.preemption.remove_request(rid)
+        except (LookupError, TypeError, ValueError):
+            self.lifecycle.teardown_failed(rid)
+            # REMOVE already ended the conductor's request. Keep its handle
+            # quarantined and name it in the log, rather than failing the batch
+            # whose GPU wait happened to service this teardown.
+            logger.exception(
+                "Worker %s failed to clean up request %s; retaining its handle",
+                self.worker_id, wire_rid,
+            )
+            return
         laps.lap("misc")
         # DEBUG: once per request on the main thread, it cost as much as the
         # engine's own removal (test/waypoint/serve_rollout.py, which waits on
