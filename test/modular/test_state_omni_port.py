@@ -22,7 +22,6 @@ from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
-from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.sequence_shard import SeqShardSpec
@@ -149,8 +148,8 @@ def test_specs_equal_the_hand_written_ones_after_yaml_overrides():
     _assert_specs_equal(specs, reference)
 
 
-def test_the_port_writes_only_lora_by_hand():
-    assert {spec.resource_key for spec in _model().get_node_resources()} == {LORA_RESOURCE_KEY}
+def test_the_port_writes_no_spec_by_hand():
+    assert _model().get_node_resources() == []
 
 
 def test_the_value_of_host_fields_is_on_a_node_with_no_prefix_keys():
