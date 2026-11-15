@@ -159,8 +159,8 @@ should only compare runs scored by the same judge and normalizer.
   ``utmos22_strong_step7459_v1.pt`` checkpoint with ``--mos-repo`` and
   ``--mos-checkpoint`` alongside ``--mos``. Both paths are required; the
   results record fingerprints of the local Python code and checkpoint. A run
-  rejects changes to either file set between repeats; restart the judge process
-  after changing the local code.
+  rejects changes to either file set before MOS scoring. Restart the judge process
+  after changing the local code or switching to a different local checkout.
 
 Judges run between repeats, after the load has finished, so they never compete with
 measured requests; ``--judge-device`` moves them to another GPU or the CPU.

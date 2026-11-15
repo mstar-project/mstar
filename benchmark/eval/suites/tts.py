@@ -261,6 +261,8 @@ class TTSSuite(Suite):
             m["sim_mean"] = stats.mean(r["sim"] for r in clone)
         if ok and a.mos:
             judge = judges.mos_judge(a.judge_device, a.mos_repo, a.mos_checkpoint)
+            if self._mos_local_id is not None and judge.id != self._mos_local_id:
+                raise RuntimeError("local UTMOS files changed during this run")
             for r in ok:
                 r["utmos"] = judge.score((r["_audio"], r["sample_rate"]))
             m["utmos_mean"] = stats.mean(r["utmos"] for r in ok)

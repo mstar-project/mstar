@@ -134,6 +134,8 @@ class MosJudge:
                 raise FileNotFoundError(f"offline UTMOS checkpoint not found: {checkpoint}")
             code_id = _mos_code_id(repo)
             with _MOS_REPO_CODE_LOCK:
+                if _MOS_REPO_CODE and repo not in _MOS_REPO_CODE:
+                    raise RuntimeError("different local UTMOS repo path; restart the judge process")
                 loaded = _MOS_REPO_CODE.get(repo)
                 if loaded is not None and loaded != code_id:
                     raise RuntimeError("local UTMOS code changed at this repo path; restart the judge process")
