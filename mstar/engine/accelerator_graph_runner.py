@@ -1272,7 +1272,7 @@ class AcceleratorGraphRunner:
     def _splittable(self) -> bool:
         """Whether this node's captures may split: only with a resource that splits them (the grammar
         sampler). Every capture of the node, the sizing ones included, records the same way."""
-        return any(getattr(r, "splits_capture", False) for r in self._resources.values())
+        return any(r.splits_capture for r in self._resources.values())
 
     def _capture_one(self, spec: CGSlotSpec, forwards: int) -> AcceleratorGraphSlot:
         # no forward after sizing, which already ran this spec's

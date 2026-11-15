@@ -234,6 +234,12 @@ class Resource(ResidentHooks, ABC):
     # plain kernels must issue the same collectives.
     lean_capture: bool = False
 
+    # Whether this resource's step splits its node's captures: it calls `split_capture` once per
+    # capture, from inside its call (the grammar sampler, from its draw), and the runner records
+    # every capture of the node with the backend's ``capture_split``; any other node's capture
+    # is the runtime's own.
+    splits_capture: bool = False
+
     def lean_for(self, request_ids) -> bool:
         """Whether every one of ``request_ids`` lets this ``lean_capture`` resource
         run lean. Read from state every rank of a lockstep instance sets alike (its

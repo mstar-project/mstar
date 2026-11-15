@@ -842,7 +842,10 @@ class Conductor:
         if (model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None or with_grammar) and not (
             with_grammar and with_grammar <= serving
         ):
-            raise ValueError("this deployment does not serve structured_outputs")
+            raise ValueError(
+                "this deployment does not serve a JSON response_format or structured_outputs: they need a model "
+                "that serves them, with enable_grammar on its sampler"
+            )
         lora_ops = getattr(self, "_lora_ops_cache", None)
         if lora_ops is not None:
             lora_ops.refuse_request(configs.values())

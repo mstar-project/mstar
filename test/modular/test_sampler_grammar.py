@@ -518,9 +518,9 @@ def _conductor(enable_grammar: bool, attaches: bool = True):
 
 def test_the_conductor_serves_structured_outputs_only_where_a_sampler_enables_it():
     kwargs = {"structured_outputs": {"regex": "a+"}}
-    with pytest.raises(ValueError, match="does not serve structured_outputs"):
+    with pytest.raises(ValueError, match="does not serve a JSON response_format or structured_outputs"):
         _conductor(False)._get_resource_configs(["text"], ["text"], kwargs)
-    with pytest.raises(ValueError, match="does not serve structured_outputs"):
+    with pytest.raises(ValueError, match="does not serve a JSON response_format or structured_outputs"):
         _conductor(True, attaches=False)._get_resource_configs(["text"], ["text"], kwargs)
     config = _conductor(True)._get_resource_configs(["text"], ["text"], kwargs)["sampler"]
     assert config.temperature == 0.3 and config.grammar.kind == "regex", "the model's own settings were dropped"
