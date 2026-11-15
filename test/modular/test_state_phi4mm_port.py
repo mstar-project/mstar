@@ -30,7 +30,7 @@ from mstar.engine.resources.position.config import MAX_POSITION_KWARG, PositionC
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.engine.resources.step import Segment, SubmoduleStep
-from mstar.engine.state import Span
+from mstar.engine.state import SampleSettings, Span
 from mstar.engine.state.adapters import StateSetup, kv_layouts
 from mstar.engine.state.analysis import state_declaration_problems
 from mstar.model.base import LabelLayout, ProcessPromptOutput, enabled_resources, serving_resources
@@ -112,6 +112,14 @@ def test_phi4mm_specs_equal_the_hand_written_ones_on_its_published_config():
     lora = {spec.resource_key for spec in specs if spec.resource_key.startswith(LORA_RESOURCE_KEY)}
     assert len(lora) == 1, "the published config serves both adapters from one LoRA pool"
     _assert_equal_per_key([spec for spec in specs if spec.resource_key not in lora], _reference(model))
+
+
+def test_phi4mm_samples_through_the_contracts_settings():
+    """`sampling_configs` checks a `SampleSettings` against the declared samplers, and passes a `SamplingReqConfig`
+    through unchecked."""
+    configs = _phi4mm().get_request_resource_configs(["text"], ["text"], {"temperature": 0.5})
+    assert isinstance(configs["sampler"], SampleSettings), "the request would skip the sampler's name and draws checks"
+    assert configs["sampler"].temperature == 0.5
 
 
 def test_phi4mm_llm_layers_each_carry_their_own_kv_layer():
