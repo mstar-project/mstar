@@ -1038,7 +1038,7 @@ class AcceleratorGraphRunner:
                             partial(
                                 capture_into_graph, warmed.run, device=self._device,
                                 autocast_dtype=self._autocast_dtype, node_name=self._submodule_name,
-                                stream=self._capture_stream,
+                                stream=self._capture_stream, splittable=self._splittable,
                             ),
                             f"{self._submodule_name} {spec}", self._executables.setdefault(walk, ExecutableMemory()),
                         )
@@ -1075,7 +1075,7 @@ class AcceleratorGraphRunner:
                         partial(
                             capture_into_graph, warmed.run, device=self._device,
                             autocast_dtype=self._autocast_dtype, node_name=self._submodule_name,
-                            stream=self._capture_stream,
+                            stream=self._capture_stream, splittable=self._splittable,
                         ),
                         f"{self._submodule_name} {spec}",
                         self._executables[(spec.bucket.graph_walk, spec.bucket.cg_key_info, spec.bucket.lean)],
@@ -1268,6 +1268,12 @@ class AcceleratorGraphRunner:
             (mem_after - mem_before) / (1024 ** 2),
         )
 
+    @property
+    def _splittable(self) -> bool:
+        """Whether this node's captures may split: only with a resource that splits them (the grammar
+        sampler). Every capture of the node, the sizing ones included, records the same way."""
+        return any(getattr(r, "splits_capture", False) for r in self._resources.values())
+
     def _capture_one(self, spec: CGSlotSpec, forwards: int) -> AcceleratorGraphSlot:
         # no forward after sizing, which already ran this spec's
         with self._warmed(spec, forwards) as warmed:
@@ -1276,9 +1282,7 @@ class AcceleratorGraphRunner:
             torch.accelerator.empty_cache()
             graph, output = capture_into_graph(
                 warmed.run, self._memory_pool, self._device, self._autocast_dtype,
-                node_name=self._submodule_name, stream=self._capture_stream,
-                # only a node with a resource that splits its capture (the grammar sampler)
-                splittable=any(getattr(r, "splits_capture", False) for r in self._resources.values()),
+                node_name=self._submodule_name, stream=self._capture_stream, splittable=self._splittable,
             )
             return self._build_slot_from_capture(
                 output=BatchedModelOutput.coerce(output),
