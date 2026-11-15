@@ -21,7 +21,15 @@ from mstar.engine.accelerator_graph_runner import capture_into_graph  # noqa: E4
 from mstar.engine.resources import StepRunner  # noqa: E402
 from mstar.engine.resources.sampler import grammar, utils  # noqa: E402
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig  # noqa: E402
-from mstar.engine.resources.sampler.grammar import MAX_GRAMMAR_CHARS, GrammarRequest, grammar_request  # noqa: E402
+from mstar.engine.resources.sampler.grammar import (  # noqa: E402
+    GRAMMAR_TOOLS_KWARG,
+    MAX_GRAMMAR_CHARS,
+    TOOL_CALLS,
+    GrammarRequest,
+    grammar_request,
+    request_grammar,
+    tool_call_grammar,
+)
 from mstar.engine.resources.sampler.resource import GrammarSamplerResource  # noqa: E402
 from mstar.engine.resources.step import ASKS, SlotLease, StepContext  # noqa: E402
 from mstar.engine.state.contract import Sampler, SampleSettings  # noqa: E402
@@ -541,7 +549,7 @@ def _conductor(enable_grammar: bool, attaches: bool = True):
     spec = SamplerSpec(resource_key="sampler", nodes={"LLM"}, vocab_size=V, enable_grammar=enable_grammar)
 
     def configs(i, o, kw):
-        grammar = grammar_request(kw.get("structured_outputs")) if attaches else None
+        grammar = request_grammar(kw) if attaches else None
         return {"sampler": SampleSettings(temperature=0.3, grammar=grammar)}
 
     conductor = Conductor.__new__(Conductor)
@@ -562,6 +570,12 @@ def test_the_conductor_serves_structured_outputs_only_where_a_sampler_enables_it
     assert config.temperature == 0.3 and config.grammar.kind == "regex", "the model's own settings were dropped"
     plain = _conductor(False)._get_resource_configs(["text"], ["text"], {})["sampler"]
     assert plain.grammar is None and plain.temperature == 0.3
+    # a forced tool call's grammar, which the data worker built: refused by name without enable_grammar
+    tag = tool_call_grammar("qwen_3_5", {"tools": _tools(), "tool_choice": "required"}, True)
+    with pytest.raises(ValueError, match="does not serve forced tool calls"):
+        _conductor(False)._get_resource_configs(["text"], ["text"], {GRAMMAR_TOOLS_KWARG: tag})
+    assert _conductor(True)._get_resource_configs(
+        ["text"], ["text"], {GRAMMAR_TOOLS_KWARG: tag})["sampler"].grammar.kind == TOOL_CALLS
 
 
 @pytest.mark.parametrize("knob", [{"min_tokens": 4}, {"ignore_eos": True}], ids=str)
@@ -609,3 +623,67 @@ def test_a_loop_stop_the_model_does_not_declare_is_refused_for_a_grammar_deploym
     _refuse_unlisted_grammar_stops(submodules, specs, model)
     model.text_output = lambda: None
     _refuse_unlisted_grammar_stops(submodules, specs, model)
+
+
+_WEATHER = {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
+            "required": ["city"]}
+
+
+def _tools(strict=None):
+    fn = {"name": "get_weather", "parameters": _WEATHER, **({} if strict is None else {"strict": strict})}
+    return [{"type": "function", "function": fn}]
+
+
+def _call(days="3"):
+    return ("<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n"
+            f"<parameter=days>\n{days}\n</parameter>\n</function>\n</tool_call>")
+
+
+def _accepts(kwargs, reply, reasoning=True):
+    from xgrammar.testing import _is_grammar_accept_string
+
+    tag = tool_call_grammar("qwen_3_5", kwargs, reasoning)
+    return _is_grammar_accept_string(request_grammar({GRAMMAR_TOOLS_KWARG: tag}).grammar(), reply)
+
+
+@pytest.mark.parametrize(("kwargs", "forced"), [
+    ({"tools": _tools()}, False),
+    ({"tools": _tools(), "tool_choice": "auto"}, False),
+    ({"tools": _tools(), "tool_choice": "none"}, False),
+    ({"tools": _tools(), "tool_choice": "required"}, True),
+    ({"tools": _tools(), "tool_choice": {"type": "function", "function": {"name": "get_weather"}}}, True),
+    ({"tools": _tools(strict=True)}, True),
+    ({"tool_choice": "required"}, False),
+], ids=["default", "auto", "none", "required", "named", "strict-auto", "no-tools"])
+def test_a_forced_tool_call_gets_a_grammar_and_a_free_one_none(kwargs, forced):
+    """``auto`` only parses, as vLLM: the sampler holds a reply only when a call is forced, or a
+    strict tool's arguments must follow its schema."""
+    assert (tool_call_grammar("qwen_3_5", kwargs, True) is not None) == forced
+    assert tool_call_grammar(None, kwargs, True) is None, "a model with no tool format gets no grammar"
+
+
+def test_a_forced_call_holds_the_reply_to_qwen3_5s_call_format():
+    """``required``: after the reasoning the reply is a call, typed by its schema only for a strict
+    tool (vLLM's rule; xgrammar would type every tool's); one call when parallel_tool_calls is false;
+    with the reasoning closed, the call comes first."""
+    required = {"tools": _tools(), "tool_choice": "required"}
+    assert _accepts(required, "Let me check.</think>\n\n" + _call())
+    assert not _accepts(required, "Let me check.</think>\n\nIt is sunny."), "text where a call is required"
+    assert not _accepts(required, "Let me check.</think>\n\nSure: " + _call()), "text before a required call"
+    assert _accepts(required, "x</think>\n\n" + _call(days="three")), "a tool that isn't strict has free arguments"
+    strict = {"tools": _tools(strict=True), "tool_choice": "required"}
+    assert not _accepts(strict, "x</think>\n\n" + _call(days="three")), "a strict tool's arguments follow its schema"
+    single = {**required, "parallel_tool_calls": False}
+    assert _accepts(required, "x</think>\n\n" + _call() + "\n" + _call())
+    assert not _accepts(single, "x</think>\n\n" + _call() + "\n" + _call())
+    assert _accepts(required, _call(), reasoning=False)
+
+
+def test_a_tool_grammar_is_the_requests_own_kind_and_a_bad_one_is_a_400():
+    tag = tool_call_grammar("qwen_3_5", {"tools": _tools(), "tool_choice": "required"}, True)
+    request = request_grammar({GRAMMAR_TOOLS_KWARG: tag, "structured_outputs": {"regex": "a"}})
+    assert (request.kind, request.after) == (TOOL_CALLS, None), "the tools' grammar wins, with no `after` of its own"
+    with pytest.raises(ValueError, match="^tools: "):
+        request_grammar({GRAMMAR_TOOLS_KWARG: '{"type": "structural_tag", "format": {"type": "nope"}}'})
+    with pytest.raises(ValueError, match="at most"):
+        request_grammar({GRAMMAR_TOOLS_KWARG: "x" * (MAX_GRAMMAR_CHARS + 1)})

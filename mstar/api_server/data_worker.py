@@ -52,7 +52,13 @@ from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items, variant_root
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG
 from mstar.engine.resources.position.config import MAX_POSITION_KWARG
-from mstar.engine.resources.sampler.grammar import GRAMMAR_AFTER_KWARG, STRUCTURED_OUTPUTS_KWARG, after_reasoning
+from mstar.engine.resources.sampler.grammar import (
+    GRAMMAR_AFTER_KWARG,
+    GRAMMAR_TOOLS_KWARG,
+    STRUCTURED_OUTPUTS_KWARG,
+    after_reasoning,
+    tool_call_grammar,
+)
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.state.adapters import kv_layouts
 from mstar.engine.state.contract import Array
@@ -1006,11 +1012,12 @@ class PreprocessWorkerThread:
         # Likewise only process_prompt sets the model's INTERNAL_KWARGS and the
         # LongRoPE ceiling (which picks the request's table and prefix variant),
         # and only this worker knows which client streams the opening leaves open,
-        # and where a reply's grammar starts (`after_reasoning`).
+        # and where a reply's grammar starts (`after_reasoning`), and a forced tool call's grammar.
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
         for name in (
             "prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "state_layout", "keyed_spans", "prefix_root",
-            "stream_lead_items", "open_streams", MAX_POSITION_KWARG, GRAMMAR_AFTER_KWARG, *internal,
+            "stream_lead_items", "open_streams", MAX_POSITION_KWARG, GRAMMAR_AFTER_KWARG, GRAMMAR_TOOLS_KWARG,
+            *internal,
         ):
             model_kwargs.pop(name, None)
         open_streams = self._client_edges - input.ends
@@ -1038,14 +1045,19 @@ class PreprocessWorkerThread:
                 prompt_tensors = prompt_tensors.new_input_tensors
             if prompt_tensors:
                 tensors.update(prompt_tensors)
-            if (input.parse_reply or model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None) \
+            tools = model_kwargs.get("tools")
+            if (input.parse_reply or tools or model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None) \
                     and tensors.get("text_inputs"):
-                # one answer for the grammar and the reply's parser
+                # one answer for the grammars and the reply's parser
                 after = after_reasoning(self.model.text_output(), tensors["text_inputs"][0])
                 if input.parse_reply:
                     reply_in_reasoning = after is not None
                 if after is not None and model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None:
                     model_kwargs[GRAMMAR_AFTER_KWARG] = after
+                if tools:
+                    tag = tool_call_grammar(getattr(self.model, "TOOL_FORMAT", None), model_kwargs, after is not None)
+                    if tag is not None:
+                        model_kwargs[GRAMMAR_TOOLS_KWARG] = tag
             state_layout = model_kwargs.pop("state_layout", None)
             keyed_spans = model_kwargs.pop("keyed_spans", {})
             layouts = (

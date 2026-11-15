@@ -113,3 +113,19 @@ def test_qwen3_5_attaches_the_requests_grammar_to_its_sampler_settings(tmp_path)
     assert model.get_request_resource_configs(["text"], ["text"], {})["sampler"].grammar is None
     with pytest.raises(ValueError, match="structured_outputs"):
         model.get_request_resource_configs(["text"], ["text"], {"structured_outputs": {"regex": "a", "json": {}}})
+
+
+def test_a_forced_tool_call_gets_its_grammar_from_the_data_worker(tmp_path):
+    """``tool_choice`` required: the data worker builds Qwen3.5's call format for the sampler, past
+    the reasoning a thinking prompt left open; ``auto`` gets none, and a client's own is dropped."""
+    from mstar.engine.resources.sampler.grammar import GRAMMAR_TOOLS_KWARG
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    repo = _repo(tmp_path / "repo", None)
+    (repo / "chat_template.jinja").write_text(CHAT_TEMPLATE)
+    model = Qwen3_5DenseModel(str(repo))
+    tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}]
+    forced = _prepared_kwargs(model, None, tools=tools, tool_choice="required")
+    assert "</think>" in forced[GRAMMAR_TOOLS_KWARG], "the call format lets the reasoning finish first"
+    free = _prepared_kwargs(model, None, tools=tools, tool_choice="auto", **{GRAMMAR_TOOLS_KWARG: "x"})
+    assert GRAMMAR_TOOLS_KWARG not in free

@@ -38,6 +38,11 @@ STRUCTURED_OUTPUTS_KWARG = "structured_outputs"
 # the text after which the request's grammar starts (`GrammarRequest.after`): only the data worker
 # sets it (`after_reasoning`), dropping a client's value, and ``structured_outputs`` takes no `after`
 GRAMMAR_AFTER_KWARG = "structured_outputs_after"
+# a forced tool call's grammar, the model's tool-call format as a structural tag: only the data worker
+# builds it (`tool_call_grammar`), dropping a client's value
+GRAMMAR_TOOLS_KWARG = "structured_outputs_tools"
+# the `GrammarRequest.kind` of a forced tool call; no client sends it
+TOOL_CALLS = "tool_calls"
 GRAMMAR_KINDS = ("json", "json_object", "regex", "choice", "grammar")
 # a grammar compiles while its request waits for admission, so its size is bounded
 MAX_GRAMMAR_CHARS = 1 << 17
@@ -86,6 +91,10 @@ class GrammarRequest:
         """The xgrammar ``Grammar``; tokenizer-free, so it checks the request
         anywhere. ``ValueError`` names what is unsupported."""
         try:
+            if self.kind == TOOL_CALLS:
+                import xgrammar as xgr
+
+                return xgr.Grammar.from_structural_tag(self.value)
             content = self._content()
             if self.after is None:
                 return content
@@ -93,10 +102,12 @@ class GrammarRequest:
 
             return xgr.Grammar.from_structural_tag(self._structural_tag(content))
         except (RuntimeError, ValueError) as e:
-            raise ValueError(f"structured_outputs {self.kind}: {e}") from e
+            raise ValueError(f"{'tools' if self.kind == TOOL_CALLS else f'structured_outputs {self.kind}'}: {e}") from e
 
     def compile(self, compiler):
         """Compiled against ``compiler``'s vocabulary, through the calls its cache keys by text."""
+        if self.kind == TOOL_CALLS:
+            return compiler.compile_structural_tag(self.value)
         if self.after is not None:
             return compiler.compile_structural_tag(self._structural_tag(self._content()))
         if self.kind == "json":
@@ -157,11 +168,46 @@ def grammar_request(value: Any, after: str | None = None) -> GrammarRequest | No
     return request
 
 
+def tool_call_grammar(tool_format: str | None, model_kwargs: dict, reasoning: bool) -> str | None:
+    """A chat's forced tool calls as ``tool_format``'s structural tag (xgrammar's), for the sampler to
+    hold the reply to: with ``tool_choice`` required or a named function, or a strict tool under auto;
+    None for a reply that may call freely (auto with no strict tool) or not at all (none).
+    ``reasoning``: the reply starts inside a reasoning block, which the tag lets it finish first.
+    A call's arguments are held to its tool's schema only when the tool is strict, as vLLM holds them
+    (xgrammar holds every tool's unless told otherwise)."""
+    tools = model_kwargs.get("tools") or []
+    choice = model_kwargs.get("tool_choice") or "auto"
+    strict = [bool(tool["function"].get("strict")) for tool in tools]
+    if tool_format is None or not tools or choice == "none" or (choice == "auto" and not any(strict)):
+        return None
+    shaped = [{"type": "function", "function": {**tool["function"], "strict": s}}
+              for tool, s in zip(tools, strict, strict=True)]
+    try:
+        import xgrammar as xgr
+    except ImportError as e:
+        raise ValueError(f"tool_choice {choice!r} needs xgrammar on the server ({XGRAMMAR_INSTALL})") from e
+    tag = xgr.get_model_structural_tag(
+        tool_format, tools=shaped, tool_choice=choice, reasoning=reasoning,
+        parallel_tool_calls=model_kwargs.get("parallel_tool_calls") is not False,
+    )
+    return tag.model_dump_json()
+
+
 def request_grammar(model_kwargs: dict | None) -> GrammarRequest | None:
-    """The grammar a request's kwargs ask for (``structured_outputs``, starting where the data
-    worker set), checked, for a model to attach to its `SampleSettings`; None when unset.
-    ``ValueError`` (the client's 400) for a bad one."""
+    """The grammar a request's kwargs ask for, checked, for a model to attach to its `SampleSettings`:
+    a forced tool call's (the data worker's `tool_call_grammar`), else ``structured_outputs``, starting
+    where the data worker set; None when neither. ``ValueError`` (the client's 400) for a bad one."""
     kwargs = model_kwargs or {}
+    tools = kwargs.get(GRAMMAR_TOOLS_KWARG)
+    if tools is not None:
+        if len(tools) > MAX_GRAMMAR_CHARS:
+            raise ValueError(f"the tools' grammar is {len(tools)} characters; at most {MAX_GRAMMAR_CHARS} are served")
+        request = GrammarRequest(TOOL_CALLS, tools)
+        try:
+            request.grammar()
+        except ImportError as e:
+            raise ValueError(f"a forced tool call needs xgrammar on the server ({XGRAMMAR_INSTALL})") from e
+        return request
     return grammar_request(kwargs.get(STRUCTURED_OUTPUTS_KWARG), after=kwargs.get(GRAMMAR_AFTER_KWARG))
 
 

@@ -47,7 +47,7 @@ from mstar.engine.resources.kv.config import (
 )
 from mstar.engine.resources.lora.config import LoraSpec
 from mstar.engine.resources.sampler.config import SamplerSpec
-from mstar.engine.resources.sampler.grammar import STRUCTURED_OUTPUTS_KWARG
+from mstar.engine.resources.sampler.grammar import GRAMMAR_TOOLS_KWARG, STRUCTURED_OUTPUTS_KWARG
 from mstar.engine.state import SampleSettings
 from mstar.engine.state.adapters import sampling_configs
 from mstar.engine.state.analysis import declaration_digests
@@ -842,6 +842,11 @@ class Conductor:
         if (model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None or with_grammar) and not (
             with_grammar and with_grammar <= serving
         ):
+            if model_kwargs.get(GRAMMAR_TOOLS_KWARG) is not None:
+                raise ValueError(
+                    "this deployment does not serve forced tool calls (tool_choice required or a named function, "
+                    "or a strict tool): they need enable_grammar on the model's sampler"
+                )
             raise ValueError(
                 "this deployment does not serve a JSON response_format or structured_outputs: they need a model "
                 "that serves them, with enable_grammar on its sampler"
