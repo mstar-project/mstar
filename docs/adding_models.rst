@@ -816,7 +816,10 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
 - ``Positions(rope=)``: a position counter per request and label, on an append-only array
   that keeps entries. ``rope=None`` is a counter only. ``Rope`` carries ``theta``,
   ``rotary_dim``, ``interleave``, ``scale``, the Llama 3.1 factors (all three or none), the
-  rotation's ``dtype`` and a ``table_dtype`` for a cos/sin table built once. On the contract
+  rotation's ``dtype`` and a ``table_dtype`` for a cos/sin table built once. ``longrope`` takes
+  a ``LongRoPE``'s short and long factor sets, and a request rotates with the long set when the
+  prompt length ``process_prompt`` sets under ``MAX_POSITION_KWARG`` passes the original context
+  (Phi-4-multimodal). On the contract
   this picks the kernel, and a shared layer's ``rope_*`` arguments have no effect, so a port
   declares what its layer passed before. The counter is
   separate from log positions: a kept step advances it by each row's advance, a fork copies
@@ -934,7 +937,7 @@ a refused admit draws the same noise.
 ``kernel_settings(self)`` is a temporary hook for what the engine doesn't pick itself yet:
 ``splits``, ``decode_fmha`` and ``decode_tensor_cores`` on a read of a paged array,
 ``splits`` on a ``GatedDeltaNet``, and ``max_segments_per_request``, ``max_segments_per_step``,
-``compile_op`` and ``workspace_mb`` on a ``Block`` read. Under an array's name it sets the default size of the array's pool, ``max_num_pages``
+``compile_op``, ``workspace_mb`` and ``backend`` on a ``Block`` read. Under an array's name it sets the default size of the array's pool, ``max_num_pages``
 on a paged array and ``max_slots`` on a ``Value`` with tensor fields or an unbounded array, which a deployment's
 ``resources:`` block overrides. ``max_slots_of`` names the pool a ``Value``'s pool takes its size from, for state
 every request holds beside its state there: a paged array, whose pages give it a slot per label for each request
@@ -2639,8 +2642,9 @@ row whose last step did not keep its value on the device (its first decode step,
 the prefill) still brings it routed, and that read puts it over the slot's.
 ``SampledTokenDecoder`` declares it for Qwen3.5, Muse Glimmer, Higgs Audio, Qwen3-ASR and the Cosmos3 reasoner,
 and a node on it that reads the routed token sets ``device_loopback = None``; Whisper and
-Qwen3-Omni's Thinker declare their own. Qwen3.5, Qwen3-ASR and Whisper read the tokens with
-``last_sampled``, and put a row's routed token over its slot's with ``splice_loopback_ids``.
+Qwen3-Omni's Thinker declare their own. A node on ``DeclaredTokenDecoder`` and Whisper's decoder
+read the tokens with ``last_sampled``, and put a row's routed token over its slot's with
+``splice_loopback_ids``.
 Its ``walk`` may be a ``frozenset`` of walks when several decode walks read the token back; a
 combined step's rows each follow their own walk, and naming a combined walk is refused at
 startup.
@@ -3936,8 +3940,8 @@ There are three graph walks: ``prefill`` and a ``decode`` ``Loop`` on the LLM, p
 ``process_prompt`` formats the string ``"{voice}: {text}"``, tokenizes it, wraps the ids in
 the model's start and end tokens, and returns ``{"text_inputs": [ids]}``, with its layout under
 ``state_layout``.
-``get_submodule`` builds either the Llama LLM submodule, a ``SampledTokenDecoder`` that
-declares little beyond its walk names, the state its steps list and capture buckets, or the SNAC
+``get_submodule`` builds either the Llama LLM submodule, a ``DeclaredTokenDecoder`` that
+declares little beyond its walk names and capture buckets, or the SNAC
 decoder submodule, and caches the result. The SNAC submodule emits int16
 PCM, which the default ``postprocess`` passes through as raw bytes.
 
@@ -4343,7 +4347,9 @@ submodule cache and where the files come from. A model sets ``NAME`` and
 ``METADATA_FILES`` and writes ``__init__`` (setting
 ``config``, ``tokenizer`` and ``media``), its resources (the sampler from
 ``_sampler_spec``; ``MIXED_SPLIT`` is the attention resources' split of a mixed step),
-``_prompt_ids`` and ``_create_submodule``. The scaffold's
+``_prompt_ids`` and ``_create_submodule``. A model on the state contract subclasses
+``DeclaredDecoderModel``, which returns the layout as ``state_layout`` and the request's
+settings as ``SampleSettings``. The scaffold's
 ``rebuild_policies`` lets the KV cache drop a request and reprefill its ids on its prefill
 walk, a media prompt's with host copies of its encoders' outputs. A model whose LLM node
 holds a resource that can't drop returns ``{}``, or the engine refuses to start; Muse
@@ -4408,8 +4414,10 @@ Its decoder module provides ``embed(ids)``, ``forward(input_embeds, *, label, **
 ``Qwen3_5ForCausalLM`` and ``Qwen3DenseLM`` do. The sampler is declared under
 ``mstar.model.keys``' ``SAMPLER``, and the positions under the node's ``POS_KEY``
 (``ROPE`` unless the model's layers name another ``pos_key``). A model on the state contract
-overrides ``node_step``, ``next_position``, ``loopback_tokens``, ``last_token_hidden`` and
-``sample_tokens`` with its handle calls, as Qwen3.5 does. ``MSTAR_DECODE_BUCKETS`` sets the
+subclasses ``DeclaredTokenDecoder`` instead and sets none of ``ATTN_KEY``, ``POS_KEY`` or
+``layer_steps``, since its positions are the array's: its ``node_step``, ``next_position``,
+``loopback_tokens``, ``last_token_hidden`` and ``sample_tokens`` make the handle calls, and a model
+overrides ``node_step`` only when it steps a second array, as Qwen3.5 does. ``MSTAR_DECODE_BUCKETS`` sets the
 default decode ladder, ``MIXED_MAX_PREFILL_ROWS`` caps a mixed step's prompt rows, ``capture_compile_mode(walk)`` names a capture's ``compile_mode`` (``None``, the default,
 takes the deployment's compile level), and ``CAPTURE_PREFILL = False`` captures decode
 only. A lone encoder's ``MediaEncoder.walk`` names its media walk when the model's graph

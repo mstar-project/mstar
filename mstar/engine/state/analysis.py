@@ -147,6 +147,12 @@ def _array_problems(array: Array) -> list[str]:
         if None in llama31 and any(factor is not None for factor in llama31):
             problems.append(f"{where}.positions.rope: low_freq_factor, high_freq_factor and old_context_len are "
                             f"all set or all None, and they are {llama31}")
+        # `Rope` checks the factor count only against a rotary_dim it is given, and None rotates the whole head
+        if rope is not None and rope.longrope is not None and rope.rotary_dim is None and "k" in array.entry.tensors:
+            head_dim, factors = array.entry.tensors["k"].shape[-1], len(rope.longrope.short_factor)
+            if factors != head_dim // 2:
+                problems.append(f"{where}.positions.rope.longrope: it needs {head_dim // 2} factors per set for the "
+                                f"head dim {head_dim}, which a rotary_dim of None rotates, and got {factors}")
     return problems
 
 
