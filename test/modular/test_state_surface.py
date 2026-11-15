@@ -28,7 +28,7 @@ from mstar.engine.state.adapters import (
 from mstar.engine.state.calls import ArrayHandle
 
 # Today's types the surface re-exports, and a NamedTuple, whose fields stay positional.
-_POSITIONAL = {"PagedLatentTarget", "PagedNHDTarget", "Segment", "SlotLease", "Span"}
+_POSITIONAL = {"LongRoPE", "PagedLatentTarget", "PagedNHDTarget", "Segment", "SlotLease", "Span"}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
     "add_read", "at_last_token", "causal_conv", "gated_delta_net", "gather", "host", "last_sampled", "mamba2",
@@ -119,6 +119,12 @@ SNAPSHOT = {
     "Mamba2": [
         ["time_step_limit", "KEYWORD_ONLY", '(0.0, inf)'],
     ],
+    "LongRoPE": [
+        ["short_factor", "POSITIONAL_OR_KEYWORD", None],
+        ["long_factor", "POSITIONAL_OR_KEYWORD", None],
+        ["original_max_position_embeddings", "POSITIONAL_OR_KEYWORD", None],
+        ["max_position_embeddings", "POSITIONAL_OR_KEYWORD", None],
+    ],
     "PagedFormat": [
         ["dtypes", "KEYWORD_ONLY", 'None'],
         ["devices", "KEYWORD_ONLY", 'None'],
@@ -171,6 +177,7 @@ SNAPSHOT = {
         ["old_context_len", "KEYWORD_ONLY", 'None'],
         ["dtype", "KEYWORD_ONLY", 'None'],
         ["table_dtype", "KEYWORD_ONLY", 'None'],
+        ["longrope", "KEYWORD_ONLY", 'None'],
     ],
     "RowTensors": [
         ["fields", "POSITIONAL_OR_KEYWORD", None],
