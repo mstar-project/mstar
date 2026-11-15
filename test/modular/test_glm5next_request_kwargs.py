@@ -7,6 +7,8 @@ import pytest
 
 from mstar.engine.resources import SamplerSpec, SamplingReqConfig
 from mstar.engine.resources.sampler.config import BOOL_KNOBS, INT_KNOB_RULES, REAL_KNOB_RULES
+from mstar.engine.state.adapters import sampling_configs
+from mstar.model.base import serving_resources
 from mstar.model.glm5_next.config import SAMPLER
 from mstar.model.glm5_next.glm5_next_model import SAMPLING_KEYS, Glm5NextModel, generation_config_dir
 
@@ -64,8 +66,13 @@ def test_a_kwarg_it_cannot_read_is_refused_in_process_prompt(kwargs):
 
 
 def _spec(m: Glm5NextModel) -> SamplerSpec:
-    [spec] = [s for s in m.get_node_resources() if isinstance(s, SamplerSpec)]
+    [spec] = [s for s in serving_resources(m, {}) if isinstance(s, SamplerSpec)]
     return spec
+
+
+def _config(m: Glm5NextModel, model_kwargs: dict) -> SamplingReqConfig:
+    """The sampler config a request with ``model_kwargs`` is admitted with."""
+    return sampling_configs(m.get_request_resource_configs([], [], model_kwargs), m.declare_state())[SAMPLER]
 
 
 @pytest.mark.parametrize("k", [0, 3])
@@ -73,11 +80,11 @@ def test_min_p_is_forwarded_and_refused_at_admission(k):
     m = _model(mtp_num_draft_tokens=k)
     # the checkpoint defaults no min_p, so the sampler is built without the filter
     assert not _spec(m).enable_min_p
-    cfg = m.get_request_resource_configs([], [], {"min_p": 0.2})[SAMPLER]
+    cfg = _config(m, {"min_p": 0.2})
     assert cfg.min_p == 0.2
     with pytest.raises(ValueError, match="min_p"):
         cfg.validate(_spec(m))
-    m.get_request_resource_configs([], [], {"min_p": 0})[SAMPLER].validate(_spec(m))
+    _config(m, {"min_p": 0}).validate(_spec(m))
 
 
 def test_request_kwargs_are_the_keys_it_reads():
@@ -103,7 +110,7 @@ def test_the_checkpoint_generation_config_sets_the_defaults(tmp_path):
     (tmp_path / "generation_config.json").write_text(json.dumps(
         {**PUBLISHED, "top_k": 40, "min_p": 0.05, "repetition_penalty": 1.1}))
     m = _model(checkpoint_path=str(tmp_path))
-    cfg = m.get_request_resource_configs([], [], {})[SAMPLER]
+    cfg = _config(m, {})
     assert (cfg.temperature, cfg.top_p, cfg.top_k, cfg.min_p, cfg.repetition_penalty) == (1.0, 0.95, 40, 0.05, 1.1)
     # a checkpoint min_p turns the filter on, so its own default is not refused
     assert _spec(m).enable_min_p

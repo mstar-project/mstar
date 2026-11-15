@@ -740,6 +740,10 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   ``LatentEntry(rank=, rope_dim=)`` builds an MLA latent: ``ckv`` of ``rank`` and, with
   ``rope_dim`` above 0, the decoupled RoPE key ``kpe``, neither sharded, since every query head
   reads both.
+  A ``LatentEntry`` with ``rope_dim=0`` on an array whose ``verify_span`` is above 1, as GLM-5.3's
+  with MTP, keeps each verify block whole, so the next step's plan doesn't wait on this step's
+  counts: ``settle`` marks a row's rejected entries, which every later read skips. Its pool holds
+  ``max_len * verify_span`` entries a request, and it keeps no positions.
   A paged array's pool is held in the model's ``get_autocast_dtype``. A model that runs
   without the engine's autocast returns its K/V dtype there and sets ``disable_autocast`` on
   each node, as Waypoint and LingBot-World do.
@@ -789,11 +793,17 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   ``selected``, which the ``TopK`` read of array ``of`` picked, and with ``selected=None`` what
   ``Causal()`` sees. The two arrays hold an entry at the same positions, so analysis refuses
   them with different ``verify_span``.
-- ``Value(name, nodes=, layers=, entry=, updates=)``: a rewritable array of one entry, such
-  as a recurrent state. ``updates`` names the kernels that read and write one of its fields
-  in place: ``CausalConv()`` needs a field ``conv`` of shape ``(channels, kernel - 1)``,
-  ``GatedDeltaNet()`` a field ``state`` of shape ``(h_v, d_k, d_v)``, and ``Mamba2()`` a field
-  ``ssm`` of shape ``(heads, head_dim, state_size)``.
+- ``Value(name, nodes=, layers=, entry=, updates=, verify_span=1)``: a rewritable array of one
+  entry, such as a recurrent state. ``updates`` names the kernels that read and write one of its
+  fields in place: ``CausalConv()`` needs a field ``conv`` of shape ``(channels, kernel - 1)``,
+  ``GatedDeltaNet()`` a field ``state`` of shape ``(h_v, d_k, d_v)``, ``Mamba2()`` a field
+  ``ssm`` of shape ``(heads, head_dim, state_size)``, and ``KimiDelta(lower_bound=)`` both, ``conv`` of shape ``(3 * h * d, kernel - 1)`` and a float32
+  ``state`` of shape ``(h, d, d)``, as one update a layer runs through ``kimi_delta``. A
+  ``verify_span`` above 1 lets the ``Value`` take verify steps through the one update that keeps
+  verify blocks, ``KimiDelta``. The step's ``settle`` comes after that update, and the
+  ``Value`` can't be read whole, since part of its entry lives in those blocks between steps.
+  ``openable`` gives how many more requests can open a label on the ``Value``, which at bind is
+  its capacity.
 - ``max_len=0``: the array keeps nothing between steps, for attention within this step only.
   Its one read uses ``Block()``, which sees only the entries of the token's own segment. See
   `Cacheless attention (encoder towers)`_.
@@ -929,9 +939,10 @@ a refused admit draws the same noise.
 ``splits`` on a ``GatedDeltaNet``, and ``max_segments_per_request``, ``max_segments_per_step``,
 ``compile_op``, ``workspace_mb`` and ``backend`` on a ``Block`` read. Under an array's name it sets the default size of the array's pool, ``max_num_pages``
 on a paged array and ``max_slots`` on a ``Value`` with tensor fields or an unbounded array, which a deployment's
-``resources:`` block overrides. ``max_slots_of`` names a paged array whose pages size the
-``Value``'s pool, a slot per label for each request those pages could hold, for state every
-request holds beside its KV. A cross read on an array that keeps entries takes
+``resources:`` block overrides. ``max_slots_of`` names the pool a ``Value``'s pool takes its size from, for state
+every request holds beside its state there: a paged array, whose pages give it a slot per label for each request
+they could hold, or another ``Value``, whose pool size it takes, so a deployment that sizes that pool sizes both.
+A cross read on an array that keeps entries takes
 ``decode_tensor_cores`` alone, and two reads that share a resource can't set one field to two
 values. It refuses anything else.
 
@@ -1224,21 +1235,20 @@ The spec types are:
      - Linear attention planned against a ``RecurrentStateSpec`` pool that holds its
        state: gated DeltaNet (``LinearAttnVariant.GDN``), Kimi delta attention (``KDA``:
        fused Triton kernels on CUDA, a torch reference elsewhere) or Mamba-2. A layer
-       calls gated DeltaNet through ``causal_conv`` and ``gated_delta_net``, Mamba-2
-       through ``causal_conv`` and ``mamba2``, and KDA through ``KDACallable``
-       (``mstar/engine/resources/convenience.py``), which hands the kernels the layer's
-       blocks of the pool, so the layer never names one. A KDA pool built with
+       calls gated DeltaNet through ``causal_conv`` and ``gated_delta_net``, Kimi delta
+       attention through ``kimi_delta`` on a ``Value`` with a ``KimiDelta``, and Mamba-2
+       through ``causal_conv`` and ``mamba2``. A KDA pool built with
        ``DeltaNetGeometry.to_blocks(speculative_tokens=k)`` also runs verify steps
-       (``LinearAttnStep(speculative=True)``), and ``KDACallable.set_prefix_len``
-       settles each one's accepted drafts. The layers are shared:
-       ``ParallelGatedDeltaNet`` and ``ParallelKimiDeltaAttention``
-       (``mstar/model/components/distributed/``, over ``KDAConfig``). A KDA layer tells
-       the resource its gates as it binds: with Kimi K3's full-rank output gate
-       (``full_rank_output_gate``) the resource runs the torch reference. Where the fused
+       (``LinearAttnStep(speculative=True)``), which a ``Value`` declares with
+       ``verify_span=k + 1``, and ``settle`` keeps each one's accepted drafts. The layers are
+       shared: ``ParallelGatedDeltaNet`` and ``ParallelKimiDeltaAttention``
+       (``mstar/model/components/distributed/``, over ``KDAConfig``). A ``KimiDelta``
+       declares its gates: with Kimi K3's full-rank output gate (``full_rank_gate``) the
+       resource runs the torch reference. Where the fused
        kernels run, activations other than bf16 or a forget-gate bound below -5 are a
        ValueError at load. The torch reference's prefill can't be captured
-       (``KDAManager.prefill_capturable`` is False), so the resource refuses a prefill
-       bucket on it and the model leaves those buckets out.
+       (``KDAManager.prefill_capturable`` is False), so ``KDAManager.can_capture``
+       refuses a prefill step on it and the runner drops that capture config, logging it.
    * - ``LoraSpec`` (built from ``lora_roots``)
      - Per-request LoRA adapters on the node's LoRA-capable linears: a pool of device
        slots, a pinned host tier, and the per-step addressing a LoRA kernel reads.
@@ -2585,9 +2595,10 @@ Value (issue #1447).
 - ``per_request_states`` is a ``Mapping`` that is resolved on first read.
 - ``piecewise_runners`` holds the piecewise CUDA-graph runners, keyed by region name.
 
-The shared layers take their layer id in the constructor. ``ParallelGatedDeltaNet`` takes a
-handle, and ``Attention``, ``ParallelAttention`` and ``VisionAttention`` pick their path at
-bind from what they receive: a handle under their key, or the resources.
+The shared layers take their layer id in the constructor. ``ParallelGatedDeltaNet`` and
+``ParallelKimiDeltaAttention`` take a handle, and ``Attention``, ``ParallelAttention`` and
+``VisionAttention`` pick their path at bind from what they receive: a handle under their key,
+or the resources.
 
 A model that hasn't moved reads ``engine_inputs.resources`` in the forward, keyed by
 ``resource_key``. In a layer, resources are resolved once at load time. The engine calls
@@ -3247,8 +3258,9 @@ that a misspelled setting is never silently ignored:
        each batched capture)
    * - ``RecurrentStateSpec``
      - ``max_slots``, ``max_slots_of`` (a paged KV pool, whose ``max_num_pages`` size this
-       one unless its block sets ``max_slots``), ``state_dtype`` (on a ``Value``, only with a
-       ``GatedDeltaNet``), ``prefix_slots`` (see **Cross-request prefix reuse**).
+       one, or another recurrent pool, whose ``max_slots`` it takes, unless its block sets
+       ``max_slots``), ``state_dtype`` (on a ``Value``, only with a ``GatedDeltaNet``),
+       ``prefix_slots`` (see **Cross-request prefix reuse**).
        ``max_slots`` counts the sink unless ``disable_sink_slot``; a value that leaves no
        slot for a request is refused at startup.
    * - ``AttentionSpec``
@@ -3591,8 +3603,8 @@ refused at load: a replay's padding rows would sit between its real ones.
 A step of one token a row attends the pages after its KV write (in TP mode on tensor cores
 whatever ``decode_tensor_cores`` says). Any other step attends its stored context on the pages
 and its own tokens from the ``k`` and ``v`` the layer passes ``run``, so a layer that calls
-``attn.run`` itself passes them (``AttentionCallable`` and ``MLAAttention`` without
-``mla_absorb`` do). A fused K/V write that leaves ``k`` unrotated asks ``reads_step_kv()`` first
+``attn.run`` itself passes them (``AttentionCallable`` does).
+A fused K/V write that leaves ``k`` unrotated asks ``reads_step_kv()`` first
 and rotates it when the step attends it (``AttentionCallable.norm_rope_attend``); a state op's fused
 kernel doesn't run on such a step, so its reference's ``add`` hands the handle ``k`` and ``v``.
 In SP mode, rank ``r`` attends only the step's

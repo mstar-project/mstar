@@ -305,8 +305,9 @@ class RecurrentStateConfig:
     prefix_slots: int = 0
     kv_cache: str | None = None
 
-    # A paged KV pool whose requests each hold a slot here per label, unless the deployment sizes this pool: for
-    # state every request holds beside its KV, so this pool never admits fewer requests than that one.
+    # The pool this one takes its size from, unless the deployment sizes this one, for state every request holds
+    # beside its state there: a paged KV pool, whose pages give this pool a slot per label for each request they could
+    # hold, or another recurrent pool, whose max_slots this one takes.
     max_slots_of: str | None = None
 
     def __post_init__(self):
@@ -370,11 +371,16 @@ class RecurrentStateSpec(NodeResourceSpec):
         state, key = self.config, self.config.max_slots_of
         if key is None:
             return []
-        kv = specs.get(key)
-        if not isinstance(kv, KVSpec) or not isinstance(kv.config, PagedKVConfig):
-            return [f"max_slots_of names {key!r}, which is no paged KV pool"]
-        # a request holds at least one of its pages
-        state.max_slots = kv.config.max_num_pages * len(state.labels) + (0 if state.disable_sink_slot else 1)
+        other = specs.get(key)
+        if isinstance(other, KVSpec) and isinstance(other.config, PagedKVConfig):
+            # a request holds at least one of its pages
+            state.max_slots = other.config.max_num_pages * len(state.labels) + (0 if state.disable_sink_slot else 1)
+        elif isinstance(other, RecurrentStateSpec):
+            if other.config.max_slots_of is not None:
+                return [f"max_slots_of names {key!r}, which takes its own size from {other.config.max_slots_of!r}"]
+            state.max_slots = other.config.max_slots
+        else:
+            return [f"max_slots_of names {key!r}, which is neither a paged KV pool nor a recurrent state pool"]
         return []
 
     def keeps_prefix_cache(self, world_size: int, checkpoint_named: bool) -> bool:
@@ -403,9 +409,9 @@ class RecurrentStateSpec(NodeResourceSpec):
         self, max_slots: int | None = None, state_dtype: str | None = None,
         prefix_slots: int | None = None, max_slots_of: str | None = None,
     ):
-        """How many slots this deployment gets, or the paged KV pool it
-        takes them from, the state's dtype, and how many snapshots it keeps
-        for prefix reuse. A ``max_slots`` here wins over ``max_slots_of``.
+        """How many slots this deployment gets, or the pool it takes them
+        from, the state's dtype, and how many snapshots it keeps for prefix
+        reuse. A ``max_slots`` here wins over ``max_slots_of``.
 
         Block shapes are the model's and not tunable. The dtype trades
         accumulated precision against bandwidth and decides which kernels the

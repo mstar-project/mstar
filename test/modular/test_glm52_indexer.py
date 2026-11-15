@@ -189,6 +189,10 @@ class _StubDenseHandle(_StubLatentHandle):
         mask = torch.triu(q.new_full((t, t), float("-inf")), diagonal=1)
         return masked_reference_attention(q, self.k, self.v, mask)
 
+    def _add_read(self, layer, q, *, keep=None, k=None, v=None):
+        self.add(layer, keep=keep, k=k, v=v)
+        return self.read(layer, q)
+
 
 def _build_attention(seed):
     torch.manual_seed(seed)

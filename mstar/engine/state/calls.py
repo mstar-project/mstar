@@ -20,6 +20,8 @@ from mstar.engine.state.contract import (
     ArrayStep,
     CausalConv,
     GatedDeltaNet,
+    KimiDelta,
+    KimiDeltaWeights,
     Mamba2,
     Op,
     Reached,
@@ -55,6 +57,12 @@ class VerifyRun:
 
     def settle(self, kept: torch.Tensor) -> None:
         raise self.handle._refusal("settle, and the array declares no verify span")
+
+    def check_read(self) -> None:
+        """Refuse a read of the whole entry, where part of it lives elsewhere between verify steps."""
+
+    def check_update(self) -> None:
+        """Refuse an update after this step's settle."""
 
     def end(self, ctx) -> None:
         """Refuse a verify step whose calls didn't settle it, in an eager step or at capture."""
@@ -380,10 +388,13 @@ class ArrayHandle(StepHandle):
                                 f"{sorted(binding.read_back) or 'none'}")
         return getattr(self.reads[read], field)
 
-    def _update(self, kind: type[Op], layer: int) -> tuple[Any, torch.Tensor]:
-        """Record the update of type ``kind`` on ``layer``'s field that ``kind`` writes, and return the resource that
-        runs it and the field's view."""
+    def _update(self, kind: type[Op], layer: int) -> tuple[Any, tuple[torch.Tensor, ...]]:
+        """Record the update of type ``kind`` on each of ``layer``'s fields that ``kind`` writes, and return the
+        resource that runs it and the fields' views, in the order of ``kind.writes``."""
         raise self._unsupported(f"an update of type {kind.__name__}")
+
+    def _openable(self) -> int:
+        raise self._unsupported("openable")
 
     def _host(self, request: int, label: str, layer: int) -> Mapping[str, object]:
         raise self._unsupported("host")
@@ -501,7 +512,7 @@ def causal_conv(
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """The declared `CausalConv` over ``x``, which reads and writes ``layer``'s ``conv`` field in place."""
-    run, conv = h._update(CausalConv, h._layer_id(layer))
+    run, (conv,) = h._update(CausalConv, h._layer_id(layer))
     return run.run_conv(x, conv_layer=conv, weight=weight, bias=bias, label=h.label)
 
 
@@ -511,8 +522,22 @@ def gated_delta_net(
     b: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
 ) -> torch.Tensor:
     """The declared `GatedDeltaNet`, which reads and writes ``layer``'s ``state`` field in place."""
-    run, state = h._update(GatedDeltaNet, h._layer_id(layer))
+    run, (state,) = h._update(GatedDeltaNet, h._layer_id(layer))
     return run.run(q, k, v, a, b, state_layer=state, a_log=a_log, dt_bias=dt_bias, label=h.label)
+
+
+@torch.compiler.disable
+def kimi_delta(
+    h: ArrayHandle, layer: int | torch.Tensor, qkv: torch.Tensor, g: torch.Tensor, beta: torch.Tensor,
+    weights: KimiDeltaWeights, *, gate: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """The declared `KimiDelta`, which reads and writes ``layer``'s ``conv`` and ``state`` in place. ``qkv`` is (tokens,
+    3 * heads * head_dim) before the conv, ``g`` (tokens, head_dim) the forget gate's low-rank factor, ``beta`` (tokens,
+    heads) before its sigmoid, and ``gate`` (tokens, head_dim) the output gate's low-rank factor. Returns (tokens,
+    heads * head_dim) gated and normed, or (tokens, heads, head_dim) under ``full_rank_gate``."""
+    layer = h._layer_id(layer)
+    run, (conv, state) = h._update(KimiDelta, layer)
+    return run.run(h._pool_layer[layer], qkv, g, beta, conv, state, weights, gate=gate, label=h.label)
 
 
 @torch.compiler.disable
@@ -522,7 +547,7 @@ def mamba2(
 ) -> torch.Tensor:
     """The declared `Mamba2`, which reads and writes ``layer``'s ``ssm`` field in place. ``x`` is (tokens, heads,
     head_dim), ``dt`` (tokens, heads) before its bias and softplus, and ``b`` and ``c`` (tokens, groups, state_size)."""
-    run, ssm = h._update(Mamba2, h._layer_id(layer))
+    run, (ssm,) = h._update(Mamba2, h._layer_id(layer))
     return run.run(x, dt, b, c, ssm_layer=ssm, a_log=a_log, d=d, dt_bias=dt_bias, label=h.label)
 
 
@@ -547,6 +572,12 @@ def split_range(h: ShardHandle):
 def host(h: ArrayHandle, request: int, label: str, layer: int | torch.Tensor) -> Mapping[str, object]:
     """One entry's host fields on the host, as the last committed step left them."""
     return h._host(request, label, h._layer_id(layer))
+
+
+def openable(h: ArrayHandle) -> int:
+    """How many more requests ``h``'s array can open a label for now, on the host. A Value holds one entry per request
+    and label. At bind, before any request holds a slot, it is the Value's capacity."""
+    return h._openable()
 
 
 def _positions(h: ArrayHandle, cause: str = "the array declares no positions") -> Any:
@@ -589,7 +620,10 @@ def selects(h: ArrayHandle) -> bool:
 @torch.compiler.disable
 def settle(h: ArrayHandle, kept: torch.Tensor) -> None:
     """End this verify step's block on ``h``'s array: row r keeps the first ``kept[r]`` entries its adds wrote this
-    step, and the rest are as if never added. ``kept`` is (rows,) int on the device, padding rows included."""
+    step, and the rest are as if never added. ``kept`` is (rows,) int on the device, padding rows included.
+
+    On a Value, the entry is as if the step's updates had run over each row's first ``kept[r]`` tokens. It comes after
+    the step's last update, and no read follows it."""
     h._check_open("settle")
     h.verify.settle(kept)
 

@@ -799,7 +799,7 @@ def test_absorbed_mla_refuses_the_projections_it_folds_at_load(absorb):
 
     def build(_):
         root = nn.Module()
-        root.layers = nn.ModuleList([MLAAttention(cfg, kv_key="kv", attn_key="attn", pos_key="pos")])
+        root.layers = nn.ModuleList([MLAAttention(cfg, kv_key="kv")])
         return root
 
     spec = module_lora_spec(build, nodes={"N"}, root_path="")

@@ -39,11 +39,13 @@ PORTED = (
     "mstar/model/components/fastconformer_stream.py",
     "mstar/model/waypoint", "mstar/model/lingbot_world",
     "mstar/model/glm52",
+    "mstar/model/glm5_next", "mstar/model/components/kda.py", "mstar/model/components/distributed/kda.py",
+    "mstar/model/components/mla.py",
 )
 # The list only shrinks: a package leaves it when its port lands, and nothing is added to it.
 UNPORTED = (
-    "mstar/model/cosmos3", "mstar/model/cosyvoice3", "mstar/model/glm5_next", "mstar/model/minicpm_o",
-    "mstar/model/muse", "mstar/model/ripple",
+    "mstar/model/cosmos3", "mstar/model/cosyvoice3", "mstar/model/minicpm_o", "mstar/model/muse",
+    "mstar/model/ripple",
 )
 # shared code under mstar/model/ that holds no model
 SHARED = ("mstar/model/components", "mstar/model/loader")
@@ -60,10 +62,10 @@ _CAPTURE = "a capture's buckets and compile mode, which the engine doesn't pick 
 ALLOWED = {
     ("mstar.engine.accelerator_graph_config", name): _CAPTURE
     for name in (
-        "AcceleratorGraphConfig", "BatchedAcceleratorGraphConfig", "DETERMINISTIC_COMPILE_MODE",
-        "PackedAcceleratorGraphConfig", "PiecewiseAcceleratorGraphConfig", "PiecewiseBatchedConfig",
-        "PiecewiseCallInputs", "PiecewiseCaptureShape", "PiecewisePackedConfig", "decode_rows_then_prompt",
-        "check_inductor_options", "distribute_tokens", "geometric_batch_sizes",
+        "AcceleratorGraphConfig", "BatchedAcceleratorGraphConfig", "DEFAULT_CAPTURE_BATCH_SIZES",
+        "DETERMINISTIC_COMPILE_MODE", "PackedAcceleratorGraphConfig", "PiecewiseAcceleratorGraphConfig",
+        "PiecewiseBatchedConfig", "PiecewiseCallInputs", "PiecewiseCaptureShape", "PiecewisePackedConfig",
+        "decode_rows_then_prompt", "check_inductor_options", "distribute_tokens", "geometric_batch_sizes",
     )
 } | {
     ("mstar.engine.accelerator_graph_runner", "compile_kwargs"): _CAPTURE,
@@ -96,6 +98,13 @@ ALLOWED_IN: dict[tuple[str, str, str], str] = {
     for module, name in (
         ("mstar.engine.accelerator_graph_backend", "CapturedGraph"),
         ("mstar.engine.accelerator_graph_runner", "capture_into_graph"),
+    )
+} | {
+    ("mstar/model/components/kda.py", "mstar.engine.resources.linear_attn.kda_torch", name):
+        "the layer's torch oracle (`prefill`, `decode_step`), which the KDA tests compare `kimi_delta` against"
+    for name in (
+        "causal_conv1d_prefill", "causal_conv1d_update", "chunk_kda", "forget_gate", "gated_rms_norm",
+        "recurrent_kda_step",
     )
 }
 # Exceptions each scoped to one function and one attribute, by file, the function's qualified name in that file, and

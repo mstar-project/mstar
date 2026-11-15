@@ -109,7 +109,7 @@ def test_the_seed_pool_admits_every_request_the_kv_pool_can():
     with pytest.raises(ValueError, match="300 slots of resources.mtp_seed"):
         check_kv_pools_fit(model, config, "glm52.yaml", log)
     config["resources"][MTP_SEED] = {"max_slots_of": SAMPLER}
-    with pytest.raises(ValueError, match="max_slots_of names 'sampler', which is no paged KV pool"):
+    with pytest.raises(ValueError, match="max_slots_of names 'sampler', which is neither a paged KV pool"):
         serving_resources(model, config)
 
 

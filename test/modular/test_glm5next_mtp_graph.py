@@ -1,6 +1,5 @@
 """glm5_next MTP on CUDA (sm90, FlashInfer MLA, fused KDA): the captured verify step emits what
-the eager one does, and both emit what greedy decode without MTP does; the rejected rows' mask
-moves FlashInfer's MLA output by at most one bf16 ulp."""
+the eager one does, and both emit what greedy decode without MTP does."""
 import pytest
 import torch
 
@@ -8,15 +7,20 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.engine.resources import SamplingReqConfig, StepRunner
-from mstar.engine.resources.attn.workspace import WorkspacePool
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import StepContext
+from mstar.engine.state.adapters import node_handles
+from mstar.engine.state.state_op import bind_state_ops
+from mstar.model.base import serving_resources
 from mstar.model.glm5_next import fused_decode
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
 from mstar.model.glm5_next.config import (
+    COUNT,
     KDA_STATE,
     KV_CACHE,
+    MTP_SEED,
+    PROMPT_LEN,
     SAMPLER,
     Glm5NextModelConfig,
     build_indexer_types,
@@ -24,9 +28,9 @@ from mstar.model.glm5_next.config import (
     build_mlp_layer_types,
 )
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
-from mstar.model.glm5_next.submodules import HOLE_KPE, Glm5NextLLMSubmodule
+from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.glm5_next.weight_loader import restore_fp32_params
-from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine
+from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, engine_step
 from mstar.utils.fp8_block import Fp8BlockQuantConfig
 
 pytestmark = pytest.mark.skipif(
@@ -111,7 +115,7 @@ class _Engine:
         self.lm = lm.eval().requires_grad_(False)
         model = Glm5NextModel("x", config_variant="reduced", kda_max_requests=8)
         model.config = cfg
-        specs = model.get_node_resources()
+        specs = serving_resources(model, {})
         by_key = resolve_spec_dependencies(specs)
         self.resources = {}
         for spec in specs:
@@ -123,6 +127,10 @@ class _Engine:
         self.runner = StepRunner(self.resources, node_resources={"LLM": list(self.resources)})
         self.sub = Glm5NextLLMSubmodule(self.lm, cfg)
         self.sub.bind_node_resources(self.resources)
+        handles = node_handles(model, "LLM", self.resources)
+        bind_state_ops(handles)
+        self.sub.bind_node_state(handles)
+        self.prompt_lens: dict[str, int] = {}
         trivial = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
         self.cg = AcceleratorGraphRunner(
             submodule_name="LLM", submodule=self.sub, resources=self.resources,
@@ -139,6 +147,8 @@ class _Engine:
             max_tokens=MAX_TOKENS,
             resource_configs={SAMPLER: SamplingReqConfig(temperature=0.0)},
             dynamic_loop_iter_counts={"decode_loop": 0},
+            # the walk plan puts the prompt's length in the decode step's metadata alone
+            step_metadata={PROMPT_LEN: self.prompt_lens[rid]} if walk == "decode" else {},
         )
 
     def preplan(self, walk, rids, slot):
@@ -149,8 +159,8 @@ class _Engine:
         ctx = StepContext(request_ids=tuple(rids), graph_walk=walk, slot=slot, capture=False,
                           slot_lease=lease)
         ctx.set_padded_rids(self.cg.step_ids(lease, rids))
-        step = self.sub.declare_step(walk, list(ctx.padded_request_ids),
-                                     self.cg.declare_inputs_for(lease), slot_lease=lease)
+        step = engine_step(self.sub, graph_walk=walk, request_ids=list(ctx.padded_request_ids),
+                           inputs=self.cg.declare_inputs_for(lease), slot_lease=lease)
         ctx.is_preplan = True
         step.set_ctx(ctx)
         assert self.runner.pre_admit(step).ok
@@ -159,15 +169,16 @@ class _Engine:
         return lease
 
     def step(self, walk, prompts, captured, slot=0, preplan=False):
-        """One step; returns ({rid: emitted tokens}, {rid: next input}, lease)."""
+        """One step over each request's input tensors; returns ({rid: emitted tokens},
+        {rid: next inputs}, lease)."""
         rids = list(prompts)
         if walk == "prefill":
             for rid in rids:
                 self.runner.ingest_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0)})
+                self.prompt_lens[rid] = prompts[rid]["text_inputs"][0].numel()
         lease = self.preplan(walk, rids, slot) if preplan else None
         infos = {rid: self.info(rid, walk) for rid in rids}
-        inputs = [self.sub.prepare_inputs(walk, infos[rid], {"text_inputs": [ids]})
-                  for rid, ids in prompts.items()]
+        inputs = [self.sub.prepare_inputs(walk, infos[rid], feed) for rid, feed in prompts.items()]
         if captured and lease is None:
             lease = self.cg.lease_slot(walk, bs=len(rids), slot=slot,
                                        num_tokens=sum(i.input_seq_len for i in inputs))
@@ -180,10 +191,11 @@ class _Engine:
             infos = self.cg.step_metadata(lease, rids, infos)
             ctx.set_padded_rids(self.cg.step_ids(lease, rids))
         padded = list(ctx.padded_request_ids)
-        step = self.sub.declare_step(walk, padded, inputs, slot_lease=lease)
+        step = engine_step(self.sub, graph_walk=walk, request_ids=padded, inputs=inputs, slot_lease=lease)
         step.set_ctx(ctx)
         assert self.runner.admit(step).ok
         self.runner.plan(step)
+        step.begin_calls()
         ei = ModelInputsFromEngine(request_ids=padded, per_request_info=infos,
                                    resources=self.resources, captured=lease is not None,
                                    step=step)
@@ -191,7 +203,10 @@ class _Engine:
         with torch.no_grad():
             raw = (self.cg.run_forward(lease, pre) if lease is not None
                    else self.sub.forward_batched(walk, ei, **pre))
+        step.check_calls()
         self.runner.commit(step)
+        step.commit_calls()
+        step.end_calls()
         raw = BatchedModelOutput.coerce(raw)
         out_ids = self.cg.slot_for(lease).dummy_rids if lease is not None else padded
         unpacked = self.sub.unpack_packed_outputs(
@@ -204,13 +219,16 @@ class _Engine:
                 name: [t[i : i + 1]] for name, t in (raw.row_outputs or {}).items()}
             out = {**per_rid, **unpacked.get(rid, {})}
             emitted[rid] = out["new_token"][0].tolist()
-            nxt[rid] = out.get("text_inputs", out["new_token"])[0].clone().to(DEV)
+            nxt[rid] = {"text_inputs": [out.get("text_inputs", out["new_token"])[0].clone().to(DEV)]}
+            if COUNT in out:
+                nxt[rid][COUNT] = out[COUNT]
         if lease is not None:
             self.cg.release(lease, len(rids))
         return emitted, nxt, lease
 
     def generate(self, prompts, captured_decode, captured_prefill=False, preplan=False):
-        emitted, nxt, _ = self.step("prefill", prompts, captured=captured_prefill)
+        emitted, nxt, _ = self.step("prefill", {rid: {"text_inputs": [ids]} for rid, ids in prompts.items()},
+                                    captured=captured_prefill)
         seqs = dict(emitted)
         step = 0
         while min(len(s) for s in seqs.values()) < MAX_TOKENS:
@@ -286,60 +304,10 @@ def test_captured_verify_matches_eager_and_greedy(greedy, k, batch):
     # step allows because nothing it plans waits on the last verdict.
     ahead, _ = eng.generate(_prompts(lengths), captured_decode=True, preplan=True)
     assert ahead == graph, ("preplanned", ahead, "graph", graph)
-    kv, pool = eng.resources[KV_CACHE], eng.resources[KDA_STATE]
+    kv = eng.resources[KV_CACHE]
     # the graph runner's padding streams stay resident; the requests' are gone
     assert not any(rid in kv._streams for rid in _prompts(lengths))
-    assert pool.num_free_slots == pool.config.usable_slots
+    for key in (KDA_STATE, MTP_SEED):
+        pool = eng.resources[key]
+        assert pool.num_free_slots == pool.config.usable_slots, f"{key} kept a slot of a removed request"
 
-
-@torch.no_grad()
-def test_holes_move_flashinfer_mla_by_at_most_one_bf16_ulp():
-    """A verify block's queries over a cache whose rejected rows carry HOLE_KPE in the rope
-    slot, against the same cache without those rows: the query rope part of ones scores a
-    real key +0 and a hole about -6.4e5, so only the kernel's split of the keys moves. That
-    moves about half the outputs by one bf16 ulp of their row's largest value, as a second
-    request in the batch (another split) does too."""
-    from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAWrapper
-
-    torch.manual_seed(0)
-    heads, latent, rope, page, block = 8, 512, 64, 128, 4
-    real = 700
-    keep = torch.rand(real + 400) < real / (real + 400)  # holes spread through the context
-    keep[-block:] = True  # the query block's own rows are real
-    n_all = int(keep.numel())
-    ckv = torch.randn(n_all, latent, device=DEV, dtype=torch.bfloat16)
-    kpe = torch.zeros(n_all, rope, device=DEV, dtype=torch.bfloat16)
-    kpe[~keep.to(DEV)] = HOLE_KPE
-    q_nope = torch.randn(block, heads, latent, device=DEV, dtype=torch.bfloat16)
-    ones = torch.ones(block, heads, rope, device=DEV, dtype=torch.bfloat16)
-
-    def attend(rows, q_pe):
-        n = rows.shape[0]
-        pages = -(-n // page)
-        cache = torch.zeros(pages, page, latent + rope, device=DEV, dtype=torch.bfloat16)
-        cache.view(-1, latent + rope)[:n] = torch.cat([ckv, kpe], -1)[rows]
-        # main's wrappers take a pool's Workspace (#1142), not a raw buffer
-        workspace = WorkspacePool(torch.device(DEV), size_mb=128).get("main")
-        wrapper = FlashInferMLAWrapper(
-            workspace, num_qo_heads=heads, kv_lora_rank=latent, qk_rope_head_dim=rope,
-            page_size=page, sm_scale=192 ** -0.5, device=DEV)
-        assert not wrapper.fallback
-        wrapper.plan(
-            qo_indptr=torch.tensor([0, block], dtype=torch.int32),
-            paged_kv_indptr=torch.tensor([0, pages], dtype=torch.int32),
-            paged_kv_indices=torch.arange(pages, dtype=torch.int32),
-            paged_kv_last_page_len=torch.tensor([n - (pages - 1) * page], dtype=torch.int32),
-            causal=True, dtype=torch.bfloat16,
-        )
-        return wrapper.run(q_nope, q_pe, cache).float()
-
-    everything = torch.arange(n_all, device=DEV)
-    only_real = everything[keep.to(DEV)]
-    base = attend(only_real, ones)
-    # a real key's rope slot is 0, so the rope part of the query is exact
-    assert torch.equal(attend(only_real, torch.zeros_like(ones)), base)
-    holes = attend(everything, ones)
-    # one bf16 ulp of each (query, head) row's largest output
-    ulp = torch.exp2(torch.floor(torch.log2(base.abs().amax(-1, keepdim=True))) - 7)
-    diff = (holes - base).abs()
-    assert (diff <= ulp).all(), (diff / ulp).max()

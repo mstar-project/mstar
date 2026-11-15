@@ -71,7 +71,7 @@ def test_module_fused_path_matches_torch_path(monkeypatch, reduced, T):
     """``_latent_rows`` through the kernel vs through FlashInfer rmsnorm + split/clone/cat."""
     cfg = Glm5NextModelConfig.reduced() if reduced else Glm5NextModelConfig()
     with torch.device("cuda"):
-        attn = Glm5NextMLAAttention(cfg, layer_idx=3, kv_plane=0).to(torch.bfloat16)
+        attn = Glm5NextMLAAttention(cfg, layer_idx=3).to(torch.bfloat16)
     with torch.no_grad():
         attn.q_a_layernorm.weight.normal_(1.0, 0.1)
         attn.kv_a_layernorm.weight.normal_(1.0, 0.1)
@@ -87,15 +87,14 @@ def test_module_fused_path_matches_torch_path(monkeypatch, reduced, T):
 
 
 def test_torch_path_on_cpu():
-    """No CUDA -> the torch path: q_c normed, cache row = normed kv || zero kpe."""
+    """No CUDA -> the torch path: q_c normed, cache row = normed kv."""
     cfg = Glm5NextModelConfig.reduced()
-    attn = Glm5NextMLAAttention(cfg, layer_idx=3, kv_plane=0)
+    attn = Glm5NextMLAAttention(cfg, layer_idx=3)
     fused = torch.randn(4, cfg.q_lora_rank + cfg.kv_lora_rank)
     assert not mla_latent_norm_available(
         fused, attn.q_a_layernorm.weight, attn.kv_a_layernorm.weight)
     q_c, latent = attn._latent_rows(fused)
     L = cfg.kv_lora_rank
-    assert q_c.shape == (4, cfg.q_lora_rank) and latent.shape == (4, L + cfg.mla_cache_kpe)
+    assert q_c.shape == (4, cfg.q_lora_rank) and latent.shape == (4, L)
     torch.testing.assert_close(q_c, attn.q_a_layernorm(fused[:, : cfg.q_lora_rank]))
-    torch.testing.assert_close(latent[:, :L], attn.kv_a_layernorm(fused[:, cfg.q_lora_rank:]))
-    assert torch.equal(latent[:, L:], torch.zeros_like(latent[:, L:]))
+    torch.testing.assert_close(latent, attn.kv_a_layernorm(fused[:, cfg.q_lora_rank:]))

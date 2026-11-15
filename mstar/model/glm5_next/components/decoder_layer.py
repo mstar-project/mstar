@@ -12,7 +12,7 @@ from mstar.model.glm5_next.components.language_model import (
     build_mlp_for_layer,
     build_rmsnorm,
 )
-from mstar.model.glm5_next.config import LINEAR_ATTENTION, Glm5NextModelConfig
+from mstar.model.glm5_next.config import KDA_STATE, LINEAR_ATTENTION, Glm5NextModelConfig
 from mstar.model.glm5_next.mhc import Glm5NextHyperConnection, update_streams
 
 
@@ -39,35 +39,26 @@ class Glm5NextDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.is_linear_attention = config.layer_types[layer_idx] == LINEAR_ATTENTION
         if self.is_linear_attention:
-            self.self_attn = ParallelKimiDeltaAttention(config.kda_config(), comm_group=comm_group)
-            # This layer's index among the KDA layers: its blocks in the pool.
-            self.kda_pos = config.kda_layer_indices.index(layer_idx)
-            self.kv_plane = None
+            self.self_attn = ParallelKimiDeltaAttention(
+                config.kda_config(), comm_group=comm_group, state_key=KDA_STATE, layer=layer_idx)
         else:
-            # this layer's plane of the MLA cache: 3 -> 0, 7 -> 1, ..., 43 -> 10
-            self.kv_plane = config.full_attn_layer_indices.index(layer_idx)
-            self.self_attn = Glm5NextMLAAttention(
-                config, comm_group=comm_group, layer_idx=layer_idx,
-                kv_plane=self.kv_plane,
-            )
-            self.kda_pos = None
+            self.self_attn = Glm5NextMLAAttention(config, comm_group=comm_group, layer_idx=layer_idx)
         self.mlp = build_mlp_for_layer(config, layer_idx, comm_group=comm_group)
         self.input_layernorm = build_rmsnorm(config)
         self.post_attention_layernorm = build_rmsnorm(config)
         self.attn_hc = build_hyper_connection(config)
         self.ffn_hc = build_hyper_connection(config)
 
-    def forward(self, hidden_streams: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_streams: torch.Tensor, decode: bool = False) -> torch.Tensor:
+        """``decode``: the step decodes or verifies, which the KDA layer's output all-reduce
+        follows."""
         if fused_decode.fused_available(hidden_streams):
-            hidden_streams, pending = self._forward_fused(hidden_streams)
+            hidden_streams, pending = self._forward_fused(hidden_streams, decode=decode)
             return fused_decode.update_streams(hidden_streams, *pending)
         residual = hidden_streams
         post, comb, hidden = self.attn_hc(hidden_streams)
         hidden = self.input_layernorm(hidden.squeeze(0))
-        if self.is_linear_attention:
-            hidden = self.self_attn(hidden, self.kda_pos)
-        else:
-            hidden = self.self_attn(hidden)
+        hidden = self._attend(hidden, decode)
         hidden_streams = update_streams(residual, hidden.unsqueeze(0), post, comb)
 
         residual = hidden_streams
@@ -76,7 +67,12 @@ class Glm5NextDecoderLayer(nn.Module):
         hidden = self.mlp(hidden)
         return update_streams(residual, hidden.unsqueeze(0), post, comb)
 
-    def forward_carry(self, hidden_streams, pending=None, rows=None):
+    def _attend(self, hidden: torch.Tensor, decode: bool) -> torch.Tensor:
+        if self.is_linear_attention:
+            return self.self_attn(hidden, decode=decode)
+        return self.self_attn(hidden)
+
+    def forward_carry(self, hidden_streams, pending=None, rows=None, decode=False):
         """``forward`` that, at prefill sizes, returns its closing ``update_streams`` as
         ``pending`` for the next layer's first mHC site to apply. ``(streams, pending)``.
         With ``rows``, only those tokens go on past the attention: the last layer's FFN
@@ -84,19 +80,16 @@ class Glm5NextDecoderLayer(nn.Module):
         fused = fused_decode.fused_available(hidden_streams)
         if pending is None and not (fused and (rows is not None
                                                or fused_decode.prefill_sized(hidden_streams))):
-            out = self(hidden_streams)
+            out = self(hidden_streams, decode)
             return (out if rows is None else out.index_select(1, rows)), None
-        return self._forward_fused(hidden_streams, pending, rows)
+        return self._forward_fused(hidden_streams, pending, rows, decode)
 
-    def _forward_fused(self, hidden_streams, pending=None, rows=None):
+    def _forward_fused(self, hidden_streams, pending=None, rows=None, decode=False):
         """``forward`` with each mHC site fused with its norm and with the update before it
         (``pending``, then the attention's). Returns the streams and the MLP's update."""
         post, comb, hidden, hidden_streams = self.attn_hc.forward_fused(
             hidden_streams, self.input_layernorm, update=pending)
-        if self.is_linear_attention:
-            hidden = self.self_attn(hidden, self.kda_pos)
-        else:
-            hidden = self.self_attn(hidden)
+        hidden = self._attend(hidden, decode)
         if rows is not None:
             hidden_streams, post, comb = (t.index_select(1, rows)
                                           for t in (hidden_streams, post, comb))
@@ -112,14 +105,11 @@ class Glm5NextPlainDecoderLayer(nn.Module):
         self,
         config: Glm5NextModelConfig,
         layer_idx: int,
-        kv_plane: int,
         comm_group: CommGroup | None = None,
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
-        self.kv_plane = kv_plane
-        self.self_attn = Glm5NextMLAAttention(
-            config, comm_group=comm_group, layer_idx=layer_idx, kv_plane=kv_plane)
+        self.self_attn = Glm5NextMLAAttention(config, comm_group=comm_group, layer_idx=layer_idx)
         self.mlp = build_mlp_for_layer(config, layer_idx, comm_group=comm_group)
         self.input_layernorm = build_rmsnorm(config)
         self.post_attention_layernorm = build_rmsnorm(config)

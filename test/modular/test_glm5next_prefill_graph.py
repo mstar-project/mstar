@@ -14,11 +14,15 @@ from mstar.engine.resources.linear_attn import kda_triton
 from mstar.engine.resources.recurrent.pool import SINK_SLOT
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import StepContext
+from mstar.engine.state.adapters import node_handles
+from mstar.engine.state.state_op import bind_state_ops
+from mstar.model.base import serving_resources
 from mstar.model.components.kda import KDAConfig, KimiDeltaAttention
 from mstar.model.glm5_next import fused_decode
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
 from mstar.model.glm5_next.config import (
     KDA_STATE,
+    PROMPT_LEN,
     SAMPLER,
     Glm5NextModelConfig,
     build_indexer_types,
@@ -28,7 +32,7 @@ from mstar.model.glm5_next.config import (
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.glm5_next.weight_loader import restore_fp32_params
-from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine
+from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, engine_step
 from mstar.utils.fp8_block import Fp8BlockQuantConfig
 
 pytestmark = pytest.mark.skipif(
@@ -164,7 +168,7 @@ class _Engine:
         self.lm = lm.eval().requires_grad_(False)
         model = Glm5NextModel("x", config_variant="reduced", kda_max_requests=8)
         model.config = cfg
-        specs = model.get_node_resources()
+        specs = serving_resources(model, {})
         by_key = resolve_spec_dependencies(specs)
         self.resources = {}
         for spec in specs:
@@ -176,6 +180,10 @@ class _Engine:
         self.runner = StepRunner(self.resources, node_resources={"LLM": list(self.resources)})
         self.sub = Glm5NextLLMSubmodule(self.lm, cfg)
         self.sub.bind_node_resources(self.resources)
+        handles = node_handles(model, "LLM", self.resources)
+        bind_state_ops(handles)
+        self.sub.bind_node_state(handles)
+        self.prompt_lens: dict[str, int] = {}
         trivial = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
         self.cg = AcceleratorGraphRunner(
             submodule_name="LLM", submodule=self.sub, resources=self.resources,
@@ -191,6 +199,8 @@ class _Engine:
             request_id=f"wire-{rid}", rid_handle=rid, graph_walk=walk, fwd_index=0, random_seed=0, max_tokens=8,
             resource_configs={SAMPLER: SamplingReqConfig(temperature=0.0)},
             dynamic_loop_iter_counts={"decode_loop": 0},
+            # the walk plan puts the prompt's length in the decode step's metadata alone
+            step_metadata={PROMPT_LEN: self.prompt_lens[rid]} if walk == "decode" else {},
         )
 
     def step(self, walk, prompts, captured):
@@ -199,6 +209,7 @@ class _Engine:
         for rid in rids:
             if walk == "prefill" and rid not in self.resources[KDA_STATE]._slots:
                 self.runner.ingest_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0)})
+                self.prompt_lens[rid] = prompts[rid].numel()
         infos = {rid: self.info(rid, walk) for rid in rids}
         inputs = [self.sub.prepare_inputs(walk, infos[rid], {"text_inputs": [ids]})
                   for rid, ids in prompts.items()]
@@ -214,10 +225,11 @@ class _Engine:
             infos = self.cg.step_metadata(lease, rids, infos)
             ctx.set_padded_rids(self.cg.step_ids(lease, rids))
         padded = list(ctx.padded_request_ids)
-        step = self.sub.declare_step(walk, padded, inputs, slot_lease=lease)
+        step = engine_step(self.sub, graph_walk=walk, request_ids=padded, inputs=inputs, slot_lease=lease)
         step.set_ctx(ctx)
         assert self.runner.admit(step).ok
         self.runner.plan(step)
+        step.begin_calls()
         ei = ModelInputsFromEngine(request_ids=padded, per_request_info=infos,
                                    resources=self.resources, captured=lease is not None,
                                    step=step)
@@ -225,7 +237,10 @@ class _Engine:
         with torch.no_grad():
             raw = (self.cg.run_forward(lease, pre) if lease is not None
                    else self.sub.forward_batched(walk, ei, **pre))
+        step.check_calls()
         self.runner.commit(step)
+        step.commit_calls()
+        step.end_calls()
         raw = BatchedModelOutput.coerce(raw)
         rows = raw.row_outputs["new_token"]
         tokens = {rid: rows[i : i + 1].clone() for i, rid in enumerate(rids)}

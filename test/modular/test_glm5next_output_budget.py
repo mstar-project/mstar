@@ -39,11 +39,11 @@ def test_a_budget_past_the_window_is_refused_not_clamped(k):
             conductor._loop_caps({"max_output_tokens": over})
 
 
-def test_mtp_loop_cap_is_held_to_the_cache_rows():
+def test_mtp_loop_cap_is_held_to_the_context():
     m = _model(mtp_num_draft_tokens=3)
-    cfg = m.config
-    # every verify step stores k + 1 cache rows, accepted or not
-    assert _decode(m).max_iters == min(cfg.index_topk - 1, (cfg.kv_rows - 1) // 4)
+    # every verify step emits a token at least and stores k + 1 cache rows, which the holed pool
+    # keeps for each token of the context
+    assert _decode(m).max_iters == m.config.context_limit - 1
 
 
 def test_chat_template_returns_the_bare_ids():

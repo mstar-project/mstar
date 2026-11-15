@@ -69,8 +69,8 @@ class ParallelKimiDeltaAttention(KimiDeltaAttention):
         comm_group: CommGroup | None = None,
         dtype: torch.dtype | None = None,
         *,
-        kda_key: str = "kda",
         state_key: str = "kda_state",
+        layer: int | None = None,
     ) -> None:
         if dtype is None:
             dtype = torch.get_default_dtype()
@@ -82,7 +82,7 @@ class ParallelKimiDeltaAttention(KimiDeltaAttention):
         self.total_num_heads = config.num_heads
         # the base sees this rank's heads only, and its widths follow
         local = replace(config, num_heads=divide(config.num_heads, self.tp_size))
-        super().__init__(local, dtype=dtype, kda_key=kda_key, state_key=state_key)
+        super().__init__(local, dtype=dtype, state_key=state_key, layer=layer)
         self.total_qkv_dim = self.total_num_heads * self.head_dim
         self._attach_weight_loaders()
 
@@ -139,11 +139,10 @@ class ParallelKimiDeltaAttention(KimiDeltaAttention):
 
     # -- TP: sum the o_proj partials once per layer -----------------------
 
-    def _project_out(self, out: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _project_out(self, out: torch.Tensor, hidden_states: torch.Tensor, decode: bool) -> torch.Tensor:
         if self.tp_size == 1:
             return self.o_proj(out)
-        plan = self.mix.current_plan()
-        if plan.is_decode or plan.is_verify:
+        if decode:
             # o_proj writes its partial straight into the all-reduce buffer
             buf = self.comm_group.all_reduce_buffer(
                 hidden_states.shape, self.o_proj.weight.dtype, hidden_states.device)
