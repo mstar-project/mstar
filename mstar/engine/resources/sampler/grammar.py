@@ -359,10 +359,12 @@ class GrammarRows:
         """The host bitmask for a step's rows: all ones for a free row. A row whose grammar
         failed (in this step's accepts, alike on every rank) draws anything but a stop, so its
         request reaches the next admit and fails there with the error instead of ending as a
-        200. A row whose own fill raises does the same when this rank serves alone; under
-        several ranks it may only stop, since only rank 0 fills and an error set there would
-        split the admits. A model that resolves no stop gets all ones. If the batched call
-        raises, its rows fill one by one, so only the bad row fails."""
+        200. A row whose own fill raises draws anything but a stop too. Alone, this rank fails
+        its request at the next admit; under several ranks, where only rank 0 fills (an error
+        set there would split the admits), every rank feeds the draw to its grammar, which fails
+        the request alike on each if it refuses the draw and holds the reply if it accepts it.
+        A model that resolves no stop gets all ones. If the batched call raises, its rows fill
+        one by one, so only the bad row fails."""
         mask = torch.full((len(rids), self.words), -1, dtype=torch.int32)
         matchers, index = [], []
         for i, rid in enumerate(rids):
@@ -405,10 +407,7 @@ class GrammarRows:
     def _failed(self, row: _Row, mask: torch.Tensor, i: int, exc: Exception) -> None:
         if self._decides and row.error is None:
             row.error = f"structured_outputs grammar failed to fill its mask: {exc}"
-        if self._stops is None:
-            mask[i] = -1
-        else:
-            mask[i] = ~self._stops if self._decides else self._stops
+        mask[i] = -1 if self._stops is None else ~self._stops
 
     def apply(self, logits: torch.Tensor, mask: torch.Tensor) -> None:
         """Set every disallowed logit to -inf, in place; capturable (no host

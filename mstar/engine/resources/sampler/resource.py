@@ -966,7 +966,7 @@ class GrammarSamplerResource(SamplerResource):
 
     def admit(self, step: SamplerStep, ctx: StepContext) -> AdmitOutcome:
         """Fail the rows whose grammar can no longer be served (it failed to
-        compile, start or accept, or refused a drawn token; or, on one rank, failed
+        compile, start or accept, or refused a drawn token; or, on a lone rank, failed
         to fill), and a constrained request with two
         rows in the step: an error to the client rather than a reply its
         constraint stopped holding. The same on every rank, which compile and

@@ -805,8 +805,9 @@ a draw, with a 500. A
 failed mask fill fails its request with an error on a single-GPU deployment: its row draws
 anything but a stop that once, and the next step's
 admit reports the error (unless the reply reaches its length limit at that draw; one row's own
-fill failing fails only that row). Under tensor parallelism only the first rank fills, so the
-row may only stop there, and the reply ends at that stop. A drawn token the grammar refuses
+fill failing fails only that row). Under tensor parallelism only the first rank fills, so its
+failed fill sets no error: the row still draws anything but a stop, every rank feeds that draw to
+its grammar, and a draw the grammar refuses fails the request alike on every rank. A drawn token the grammar refuses
 (only a mask that failed to cover the draw lets one through) fails its request with an error at
 the step after the next; the draw between may be anything but a stop, so the reply can't end
 first (unless it reaches its length limit at the refused draw or the one after). The stops here

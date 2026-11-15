@@ -309,12 +309,12 @@ def test_a_grammar_that_does_not_compile_fails_first_as_the_client_s_400():
 @pytest.mark.parametrize("ranks", [1, 2])
 def test_a_fill_or_accept_that_raises_fails_what_every_rank_agrees_on(monkeypatch, ranks, tokenizer_eos):
     """A replay fills the masks between its forward and its draw: a fill that raises
-    still draws. On a lone rank the row may draw anything but a stop for that draw, so its request
-    reaches the next admit and fails there with the error (a stop would end the reply
-    first, as a 200); under several ranks the row may only stop, since a fill runs on
-    rank 0 alone and an error set there would split the admits. One row's own fill
-    raising fails only that row. An accept runs on every rank, so one that raises
-    fails its row's request on each, and the other rows' draws are still accepted. The
+    still draws, anything but a stop (a stop would end the reply first, as a 200). On a lone
+    rank its request then fails at the next admit; under several ranks a fill runs on rank 0
+    alone and an error set there would split the admits, so the row fails only if its grammar
+    refuses the draw (the next test). One row's own fill raising fails only that row. An accept
+    runs on every rank, so one that raises fails its row's request on each, and the other rows'
+    draws are still accepted. The
     stops are the ones xgrammar resolves, so a model that declares none but whose tokenizer
     has an EOS is masked alike."""
     res = _resource(graph=True, comm_group=SimpleNamespace(world_size=ranks, rank=0), tokenizer_eos=tokenizer_eos)
@@ -333,8 +333,7 @@ def test_a_fill_or_accept_that_raises_fails_what_every_rank_agrees_on(monkeypatc
     logits = torch.zeros(4, V)
     logits[:, EOS] = 1.0  # the model's own pick is its stop
     res._grammar.apply(logits, res._grammar_mask)
-    forced_stop = logits[0].argmax().item() == EOS
-    assert forced_stop == (ranks > 1), "a lone rank's failed fill must not end the reply before its error"
+    assert logits[0].argmax().item() != EOS, "a failed fill must not end the reply before its grammar sees the draw"
     assert res.admit(step, ctx).ok == (ranks > 1)
 
     res = _resource(graph=True, comm_group=SimpleNamespace(world_size=ranks, rank=0), tokenizer_eos=tokenizer_eos)
@@ -347,7 +346,7 @@ def test_a_fill_or_accept_that_raises_fails_what_every_rank_agrees_on(monkeypatc
         is_terminated=real.is_terminated, fill_next_token_bitmask=lambda mask, i: 1 / 0)
     res._fill_grammar()
     res._grammar.apply(logits := torch.zeros(4, V), res._grammar_mask)
-    assert (logits[0].argmax().item() == EOS) == (ranks > 1), "the failed row's mask"
+    assert logits[0].argmax().item() != EOS, "the failed row's mask"
     assert logits[1, VOCAB.index(b"a")] == 0 and logits[1, VOCAB.index(b"b")] == float("-inf"), \
         "the healthy row lost its mask"
     assert [r for r in (1, 2) if res._grammar.failures([r])] == ([] if ranks > 1 else [1])
@@ -377,6 +376,42 @@ def test_a_fill_or_accept_that_raises_fails_what_every_rank_agrees_on(monkeypatc
         outcome = res.admit(step, ctx)
         outcomes.append((outcome.ok, outcome.reason and outcome.reason.request_ids))
     assert outcomes == [(False, {1})] * ranks
+
+
+@pytest.mark.parametrize("draw, fails", [("a", False), ("x", True)], ids=["legal draw", "illegal draw"])
+def test_under_tp_a_failed_fill_fails_on_every_rank_only_if_its_draw_breaks_the_grammar(monkeypatch, draw, fails):
+    """Under several ranks only rank 0 fills, so its failed fill sets no error of its own: the row
+    draws anything but a stop, rank 0's draw is every rank's, and each rank feeds it to its
+    grammar. A draw the grammar refuses fails the request at the same admit on every rank; one it
+    accepts keeps the reply in its grammar, and the next fill masks the row again."""
+    lease = SlotLease(slot=0, bucket=SimpleNamespace(bs=4))
+    step = SamplerStep(apply_penalty=False)
+    ctx = StepContext(request_ids=(0,), graph_walk="w", slot=0, capture=False, slot_lease=lease)
+    outcomes = []
+    for rank in (0, 1):
+        res = _resource(graph=True, comm_group=SimpleNamespace(world_size=2, rank=rank))
+        res.ingest_request(0, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"]})))
+        res.plan(step, ctx)
+        with monkeypatch.context() as patch:
+            patch.setattr(grammar._Row, "matcher", property(lambda row: 1 / 0))
+            res._fill_grammar()
+        if rank == 0:
+            res._grammar.apply(logits := torch.zeros(4, V), res._grammar_mask)
+            logits[0, EOS] = 1.0
+            res._grammar.apply(logits, res._grammar_mask)
+            assert logits[0].argmax().item() != EOS, "the failed row may not stop"
+        assert res.admit(step, ctx).ok, "no rank fails the row on its own"
+        res._cg_sampler.last_token_buf.fill_(VOCAB.index(draw.encode()))
+        res.commit(step, ctx)
+        res.plan(step, ctx)
+        res._fill_grammar()
+        outcome = res.admit(step, ctx)
+        outcomes.append((outcome.ok, outcome.reason and outcome.reason.request_ids))
+        if rank == 0 and not fails:
+            res._grammar.apply(logits := torch.zeros(4, V), res._grammar_mask)
+            assert logits[0, VOCAB.index(b"b")] == 0 and logits[0, VOCAB.index(b"a")] == float("-inf"), \
+                "the next fill masks the row again"
+    assert outcomes == [(not fails, None if not fails else {0})] * 2
 
 
 @pytest.mark.parametrize("batched", [False, True])
