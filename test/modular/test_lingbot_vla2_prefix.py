@@ -9,9 +9,9 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from mstar.model.components.lingbot_vla2_prefix import LingBotVLAPrefixConfig, load_prefix_weights
 from mstar.model.components.qwen3_lm import Qwen3DenseLM, Qwen3LMConfig
 from mstar.model.components.qwen_vision import QwenVisionConfig, QwenVisionModel
-from mstar.model.lingbot_vla2.prefix import LingBotVLAPrefixConfig, load_prefix_weights
 
 VLM = "model.qwenvl_with_expert.qwenvl.model."
 
