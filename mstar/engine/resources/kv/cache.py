@@ -326,6 +326,22 @@ class KVCache:
             )
         return self.tensor[layer_idx]
 
+    def read_tokens(
+        self, layer_idx: int,
+        page_idx: torch.Tensor, cache_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gather the (page, offset-in-page) slots written by ``write_tokens``.
+        Returns [num_tokens, 2, num_kv_heads, head_dim] (K at index 0, V at 1)
+        under NHD and [num_tokens, latent_dim] under MLA; it is a gather, so a
+        copy rather than a view."""
+        if self.layout == KVLayout.MLA:
+            return self.tensor[layer_idx][page_idx, cache_idx]
+        if self.layout != KVLayout.NHD:
+            raise NotImplementedError(
+                f"read_tokens is not implemented for layout {self.layout}."
+            )
+        return self.layer_view(layer_idx)[page_idx, :, cache_idx]
+
     def write_tokens(
         self, layer_idx: int,
         k: torch.Tensor, v: torch.Tensor | None,

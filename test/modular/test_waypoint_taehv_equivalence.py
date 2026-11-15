@@ -10,8 +10,8 @@ import torch
 
 from mstar.model.waypoint.components.taehv import (
     decode_latent,
+    decoder_history_shapes,
     encode_seed_clip,
-    initial_decoder_histories,
     load_taehv,
     validate_taehv_architecture,
 )
@@ -68,7 +68,7 @@ def test_functional_taehv_matches_upstream_init_and_steady_state():
     assert expected_encoded is not None
     assert torch.equal(encoded, expected_encoded.squeeze(1))
 
-    histories = initial_decoder_histories(ae, encoded)
+    histories = tuple(encoded.new_zeros(1, *shape) for shape in decoder_history_shapes(*encoded.shape[-2:]))
     initialized_frames, initialized_histories = decode_latent(
         ae, encoded, histories, output_size=(32, 32), initialize=True
     )

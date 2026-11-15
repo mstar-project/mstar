@@ -8,7 +8,7 @@ the graph: a compiled frame of a walk the shard never splits traces them straigh
 
 from abc import abstractmethod
 from collections.abc import Collection, Iterable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, overload
 
 import torch
 
@@ -22,6 +22,7 @@ from mstar.engine.state.contract import (
     GatedDeltaNet,
     Mamba2,
     Op,
+    Reached,
     Sampler,
     SeqShard,
 )
@@ -213,8 +214,6 @@ class ArrayHandle(StepHandle):
         if layer not in self.array.layers:
             raise self._refusal(f"add on layer {layer}, which the array doesn't declare")
         kept = self._keep and keep is not False
-        if kept and layer in self._read:
-            raise self._refusal(f"a kept add on layer {layer} after a read in the same layer")
         if layer in self._kept:
             raise self._refusal(f"an add on layer {layer} after its kept add")
         if keep and not self._keep:
@@ -255,21 +254,30 @@ class ArrayHandle(StepHandle):
         return held
 
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
-        """Append each row's span at its next log positions. A kept add happens once per layer per step, as the
-        layer's last add. ``keep`` False is scratch: it can repeat, after a read too, and lasts until the next add or
-        the end of the step. None takes the step's ``keep``. The resources keep or drop a step's adds as a whole, so a
-        step that keeps needs each layer to end on a kept add, or each row it lists at span 1 or more to get its adds
-        from a region whose own step lists it, and a step with ``keep`` False refuses ``keep=True``."""
+        """Append each row's span at its next log positions, before or after a read of the layer. A kept add happens
+        once per layer per step, as the layer's last add. ``keep`` False is scratch: it can repeat, and lasts until the
+        next add or the end of the step. None takes the step's ``keep``. The resources keep or drop a step's adds as a
+        whole, so a step that keeps needs each layer to end on a kept add, or each row it lists at span 1 or more to get
+        its adds from a region whose own step lists it, and a step with ``keep`` False refuses ``keep=True``."""
         raise self._unsupported("add")
 
-    def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
+    @overload
+    def read(self, layer: int | torch.Tensor, q: torch.Tensor, **mask_args: Any) -> torch.Tensor: ...
+
+    @overload
+    def read(self, layer: int | torch.Tensor, q: None = None, **mask_args: Any) -> Reached: ...
+
+    def read(
+        self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any,
+    ) -> torch.Tensor | Reached:
         """Attend ``q`` through the read declared for ``layer``: kept entries from earlier steps, plus this layer's
-        latest add, at the positions its mask reaches."""
+        latest add, at the positions its mask reaches. A read that declares no op takes no ``q`` and returns the
+        entries it reaches."""
         raise self._unsupported("read")
 
     def _add_read(
         self, layer: int | torch.Tensor, q: torch.Tensor | None, *, keep: bool | None, **keywords: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | Reached:
         self._check_add_read("add_read")
         fields = self.array.entry.tensors
         self.add(layer, keep=keep, **{name: keywords.pop(name) for name in fields if name in keywords})
@@ -287,6 +295,11 @@ class ArrayHandle(StepHandle):
         if self._write_refused is not None:
             raise self._refusal(self._write_refused)
         raise self._unsupported("write")
+
+    def clear(self, layer: int | torch.Tensor, *fields: str) -> None:
+        """Drop ``fields`` for the step's row and give their bytes back, on a sized Value. A cleared field stays unset
+        for the rest of the request."""
+        raise self._unsupported("clear")
 
     def set_start(self, start: Mapping[str, torch.Tensor]) -> None:
         """What a row of this Value reads while it has nothing written, has span 0 or pads a step: ``start``'s tensor
@@ -415,13 +428,26 @@ class ShardHandle(StepHandle):
         self.label = self.walk = None
 
 
+@overload
+def add_read(
+    h: ArrayHandle, layer: int | torch.Tensor, q: torch.Tensor, *, keep: bool | None = None, **keywords: Any,
+) -> torch.Tensor: ...
+
+
+@overload
+def add_read(
+    h: ArrayHandle, layer: int | torch.Tensor, q: None = None, *, keep: bool | None = None, **keywords: Any,
+) -> Reached: ...
+
+
 @torch.compiler.disable
 def add_read(
     h: ArrayHandle, layer: int | torch.Tensor, q: torch.Tensor | None = None, *, keep: bool | None = None,
     **keywords: Any,
-) -> torch.Tensor:
+) -> torch.Tensor | Reached:
     """`add` then `read` on ``layer`` behind one graph break, for a layer with nothing traced between them, so it
-    compiles no frame for the gap. A keyword that names an entry field goes to `add`, and any other to `read`."""
+    compiles no frame for the gap. A keyword that names an entry field goes to `add`, and any other to `read`. As
+    `read`, a read with no op takes no ``q`` and returns the entries it reaches."""
     return h._add_read(layer, q, keep=keep, **keywords)
 
 

@@ -33,15 +33,16 @@ PORTED = (
     "mstar/model/canary_qwen", "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
     "mstar/model/qwen3_tts",
     "mstar/model/pi05", "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
+    "mstar/model/components/wan_vae.py",
     "mstar/model/bagel", "mstar/model/chatterbox", "mstar/model/whisper", "mstar/model/phi4mm",
     "mstar/model/nemotron_duplex", "mstar/model/components/fastconformer.py",
     "mstar/model/components/fastconformer_stream.py",
+    "mstar/model/waypoint", "mstar/model/lingbot_world",
 )
 # The list only shrinks: a package leaves it when its port lands, and nothing is added to it.
 UNPORTED = (
     "mstar/model/cosmos3", "mstar/model/cosyvoice3", "mstar/model/glm52", "mstar/model/glm5_next",
-    "mstar/model/lingbot_world", "mstar/model/minicpm_o", "mstar/model/muse", "mstar/model/ripple",
-    "mstar/model/waypoint",
+    "mstar/model/minicpm_o", "mstar/model/muse", "mstar/model/ripple",
 )
 # shared code under mstar/model/ that holds no model
 SHARED = ("mstar/model/components", "mstar/model/loader")
@@ -64,6 +65,7 @@ ALLOWED = {
         "check_inductor_options", "geometric_batch_sizes",
     )
 } | {
+    ("mstar.engine.accelerator_graph_runner", "compile_kwargs"): _CAPTURE,
     ("mstar.engine.engine", "ExecutingBatch"): "the annotation of `NodeSubmodule.can_batch`, a base class's hook",
     ("mstar.engine.resources.lora.checkpoint", "LoraFile"): "a model's static LoRA merge at load, which holds no state",
     ("mstar.engine.resources.kv.config", "DEFAULT_PAGE_SIZE"):

@@ -6,10 +6,11 @@ residual threaded the wrong way round, a missing ``.clone()`` between the two
 passes of a frame, an fp32 island that came back bf16, or a derived RoPE table
 left as whatever ``to_empty`` happened to allocate.
 
-The model owns no cache: tests drive the DiT against the two engine resources
-it is bound to -- ``RingKVManager`` and ``FlexAttentionManager``, built here
-directly rather than through an engine -- so the ring geometry, the visibility
-rows and the attention numerics are the served ones and a test can assert on
+The model owns no cache: its layers call the ring through a state handle, built
+here as the engine builds it, from the model's own declaration over a real
+``RingKVManager`` and ``FlexAttentionManager`` rather than through an engine.
+Each frame runs in a step the ring admits and plans, so the ring geometry, the
+masks and the attention numerics are the served ones and a test can assert on
 what the model *did* without changing what it computed.
 
 CPU-only and checkpoint-free. The real 720P config is used only for structural
@@ -20,25 +21,31 @@ controller fusion on ``i % 3 == 0``, GQA live).
 """
 
 import sys
+from contextlib import contextmanager
+from dataclasses import replace
+from typing import Any
 
 import pytest
 import torch
 
 sys.path.insert(0, ".")
 
-from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttnBackend
 from mstar.engine.resources.base import EngineResourceInfo
-from mstar.engine.resources.kv.config import KVSpec, RingKVConfig, RingKVLayerConfig
+from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.kv.ring import RingKVManager
+from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
+from mstar.engine.state import ArrayStep, position
+from mstar.engine.state.adapters import node_handles, node_resources, state_steps
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.waypoint.components.attention import WaypointAttention
 from mstar.model.waypoint.components.dit import WaypointDiT
 from mstar.model.waypoint.components.layers import FP32_MODULE_PATHS, rms_norm
 from mstar.model.waypoint.components.rope import OrthoRoPEAngles, apply_ortho_rope
 from mstar.model.waypoint.config import WaypointConfig, waypoint_1_5_1b_720p
+from mstar.model.waypoint.waypoint_model import WaypointModel
 
 TPF = 128  # tokens per frame in the reduced config
+RID = "r"
 
 
 def reduced_config(**overrides) -> WaypointConfig:
@@ -66,62 +73,39 @@ def reduced_config(**overrides) -> WaypointConfig:
     return WaypointConfig(**{**base, **overrides})
 
 
-def ring_kv_spec(config: WaypointConfig, *, num_sessions: int = 1) -> KVSpec:
-    """The ``RingKVConfig`` a ``WaypointConfig``'s geometry implies.
+def waypoint_model(config: WaypointConfig) -> WaypointModel:
+    """The model over ``config``, for its declaration; nothing loads."""
+    model = WaypointModel(skip_weight_loading=True)
+    model.config = config
+    return model
 
-    Hand-rolled because the model does not declare its specs yet. Every field
-    is read off the config rather than restated, so a geometry change cannot
-    leave the tests measuring a ring the model no longer asks for.
+
+def build_resources(config: WaypointConfig, dtype: torch.dtype = torch.float32) -> dict[str, Any]:
+    """The dit node's resources, built the way the engine builds them: from the
+    specs the model's own declaration gives, through each spec's ``build``
+    rather than the constructors, so the declaration picks the ring and the
+    flex backend over it. The ring is a ``RecordingRingKV``.
     """
-    return KVSpec(
-        resource_key="kv",
-        nodes={"dit"},
-        config=RingKVConfig(
-            num_layers=config.n_layers,
-            num_kv_heads=config.n_kv_heads,
-            head_dim=config.d_head,
-            num_qo_heads=config.n_heads,
-            tokens_per_frame=config.tokens_per_frame,
-            num_sessions=num_sessions,
-            layers=tuple(
-                RingKVLayerConfig(
-                    ring_frames=config.ring_frames(i),
-                    ring_buckets=config.ring_buckets(i),
-                    pinned_dilation=config.pinned_dilation(i),
-                )
-                for i in range(config.n_layers)
-            ),
-        ),
-    )
-
-
-def build_resources(config: WaypointConfig, dtype: torch.dtype = torch.float32):
-    """The two resources the DiT calls, built the way the engine builds them:
-    through ``Resource.build(spec, info)``/``AttentionManager.build``, not the
-    constructors, so the spec picks ``RingKVManager`` over the paged one and
-    cross-checks the flex backend against the ring config.
-    """
-    kv_spec = ring_kv_spec(config)
-    cpu = torch.device("cpu")
-    kv = RingKVManager.build(kv_spec, EngineResourceInfo(device=cpu, kv_dtype=dtype))
-    attn = AttentionManager.build(
-        AttentionSpec(
-            resource_key="attn",
-            nodes={"dit"},
-            config=AttentionConfig(kv_cache="kv", backend=AttnBackend.FLEX),
-        ),
-        EngineResourceInfo(device=cpu, kv_dtype=dtype, dependencies={"kv": kv_spec}),
-    )
-    return kv, attn
+    specs = node_resources(waypoint_model(config))
+    by_key = {spec.resource_key: spec for spec in specs}
+    resources = {}
+    for spec in specs:
+        info = EngineResourceInfo(
+            device=torch.device("cpu"), kv_dtype=dtype,
+            dependencies={key: by_key[key] for key in spec.depends_on()},
+        )
+        builder = RecordingRingKV if isinstance(spec, KVSpec) else spec.resource_class
+        resources[spec.resource_key] = builder.build(spec, info)
+    return resources
 
 
 class DitNode(NodeSubmodule):
     """Stands in for the node submodule that will own the DiT (structural
     parity with phase 6: the DiT is a child of the node, not the node itself).
 
-    ``bind_node_resources`` walks ``self.modules()`` and skips ``self``, so
-    binding through the node is what the real submodule does; the 24 attention
-    layers are the only consumers either way.
+    ``bind_node_state`` walks ``self.modules()``, so binding through the node
+    is what the real submodule does; the 24 attention layers are the only
+    holders of the ring's handle.
     """
 
     def __init__(self, dit: WaypointDiT):
@@ -135,93 +119,87 @@ class DitNode(NodeSubmodule):
         raise NotImplementedError("structural stand-in; nothing here runs a step")
 
 
-def bind_resources_on(dit: WaypointDiT, kv, attn) -> DitNode:
+def bind_state_on(dit: WaypointDiT, handles) -> DitNode:
     """Bind through the engine's own walk rather than a copy of it: one call on
     the node is what has to reach the driver *and* every layer."""
     node = DitNode(dit)
-    node.bind_node_resources({"kv": kv, "attn": attn})
+    node.bind_node_state(handles)
     return node
 
 
-class RecordingRingKV:
-    """A real ``RingKVManager`` with every model-facing call logged.
+class RecordingRingKV(RingKVManager):
+    """A real ``RingKVManager`` with every write the model's adds reach logged.
 
-    Delegation, not a stub: ring geometry, visibility rows and (via the paired
-    attention resource) the numerics stay real. Only the KV side is spied on;
-    attention passes through untouched.
+    Delegation, not a stub: ring geometry, the planned masks and (via the flex
+    attention over it) the numerics stay real.
     """
 
-    def __init__(self, config: WaypointConfig, dtype: torch.dtype = torch.float32):
-        self.config = config
-        self.inner, self.attn = build_resources(config, dtype=dtype)
-        self.upserts: list[dict] = []
-        self.resets = 0
-        self.states: list[str] = []
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.writes: list[dict] = []
 
-    # -- the model-facing surface, delegated ---------------------------------
-
-    def upsert(
-        self, k, v, layer_idx, frame_pos, *, commit, build_visibility=True,
-    ):
-        del build_visibility
-        self.upserts.append(
+    def write(self, k, v, layer_idx, *, keep):
+        self.writes.append(
             {
-                "commit": commit,
+                "keep": keep,
                 "layer": layer_idx,
-                "frame_pos": int(frame_pos),
+                "frame": int(self._static_frame_pos[0]),
                 "k": k.detach().clone(),
                 "v": v.detach().clone(),
             }
         )
-        return self.inner.upsert(k, v, layer_idx, frame_pos, commit=commit)
-
-    def reset(self):
-        self.resets += 1
-        self.inner.reset()
-        self.upserts.clear()
-
-    def get_state(self, rid):
-        self.states.append("get")
-        return self.inner.get_state(rid)
-
-    def load_state(self, rid, state):
-        self.states.append("load")
-        self.inner.load_state(rid, state)
-
-    # -- introspection the tests read ----------------------------------------
-
-    @property
-    def layers(self):
-        return self.inner.layers
-
-    def capacity(self, layer_idx: int) -> int:
-        return self.inner.capacity(layer_idx)
-
-    def total_slots(self, layer_idx: int) -> int:
-        return self.inner.total_slots(layer_idx)
-
-    @property
-    def tokens_per_frame(self) -> int:
-        return self.inner.tokens_per_frame
+        super().write(k, v, layer_idx, keep=keep)
 
     def passes(self) -> list[list[dict]]:
-        """The upsert log regrouped into forwards: one entry per layer, in
+        """The write log regrouped into forwards: one entry per layer, in
         layer order, per pass. A misgrouping means the model skipped or
         repeated a layer."""
-        n = self.config.n_layers
-        assert len(self.upserts) % n == 0, f"{len(self.upserts)} upserts is not a whole number of passes"
-        grouped = [self.upserts[i : i + n] for i in range(0, len(self.upserts), n)]
+        n = len(self.layers)
+        assert len(self.writes) % n == 0, f"{len(self.writes)} writes is not a whole number of passes"
+        grouped = [self.writes[i : i + n] for i in range(0, len(self.writes), n)]
         for group in grouped:
-            assert [u["layer"] for u in group] == list(range(n))
+            assert [w["layer"] for w in group] == list(range(n))
         return grouped
 
 
+class DitState:
+    """The dit node's resources and its handles over them, with ``kv`` the
+    ring, which holds a session for the one request ``RID``."""
+
+    def __init__(self, config: WaypointConfig, dtype: torch.dtype = torch.float32):
+        self.resources = build_resources(config, dtype=dtype)
+        self.handles = node_handles(waypoint_model(config), "dit", self.resources)
+        self.kv: RecordingRingKV = self.resources["kv"]
+        self.kv.ingest_request(RID)
+
+    @contextmanager
+    def frame(self, walk: str = "rollout"):
+        """One frame's step, driven as the engine's resource runner drives it:
+        the ring admits and plans it, the flex attention stages each layer's
+        mask from that plan, and the commit counts the frame."""
+        flex_key = self.handles["kv"].flex_key
+        step = state_steps(
+            SubmoduleStep(segments=[Segment(RID, "main", self.kv.tokens_per_frame)], state={"kv": ArrayStep()}),
+            self.handles, graph_walk=walk,
+        )
+        step.set_ctx(StepContext(request_ids=[RID], graph_walk=walk, slot=0, capture=False))
+        assert self.kv.admit(step.steps["kv"], step.ctx).ok
+        step.ctx.plan_results["kv"] = self.kv.plan(step.steps["kv"], step.ctx)
+        self.resources[flex_key].plan(step.steps[flex_key], step.ctx)
+        step.begin_calls()
+        yield
+        step.check_calls()
+        self.kv.commit(step.steps["kv"], step.ctx)
+        step.end_calls()
+
+
 def bound_dit(config: WaypointConfig, seed: int = 0, dtype: torch.dtype = torch.float32):
-    """A reduced DiT wired to a recording ring and a real flex attention."""
+    """A reduced DiT bound to the dit node's state: a recording ring and a real
+    flex attention."""
     dit = build_reduced_dit(config, seed=seed)
-    kv = RecordingRingKV(config, dtype=dtype)
-    bind_resources_on(dit, kv, kv.attn)
-    return dit, kv
+    state = DitState(config, dtype=dtype)
+    bind_state_on(dit, state.handles)
+    return dit, state
 
 
 def build_reduced_dit(config: WaypointConfig, seed: int = 0) -> WaypointDiT:
@@ -292,7 +270,6 @@ def test_720p_gqa_is_live_and_the_fused_qkv_slabs_are_unequal(meta_720p):
     assert (attn.q_out, attn.kv_out) == (2048, 1024)
     assert attn.qkv_proj.weight.shape == (2048 + 2 * 1024, 2048)
     assert attn.qkv_proj.bias is None and attn.out_proj.bias is None
-    assert attn.enable_gqa is True
 
 
 def test_720p_head_and_patchify_shapes(meta_720p):
@@ -347,50 +324,42 @@ def test_config_rejects_unsupported_checkpoint_variants():
 
 
 # ---------------------------------------------------------------------------
-# 6b. The resource binding
+# 6b. The state binding
 # ---------------------------------------------------------------------------
 
 
 def test_binding_the_node_reaches_every_layer_and_the_driver_holds_nothing():
-    """The attention layers are the *only* consumers of either resource; the
-    driver holds neither (``commit`` arrives as an argument).
-
-    Binding on the DiT itself would silently fail: ``bind_node_resources``
-    walks ``self.modules()`` and skips ``self``, so ``dit.kv`` would stay None
-    and raise nothing until four Euler steps into a frame. Asserted rather than
-    assumed, since a future handle on the driver would bring the trap back.
-    """
+    """The attention layers are the *only* holders of the ring's handle; the
+    driver holds none (``commit`` arrives as an argument)."""
     config = reduced_config()
     with torch.device("meta"):
         dit = WaypointDiT(config)
-    kv, attn = build_resources(config)
+    handles = DitState(config).handles
     layers = [block.attn for block in dit.blocks]
-    assert all(la.kv is None and la.attn is None for la in layers)
+    assert all(la.state is None for la in layers)
 
     # The way phase 6's submodule does it: the DiT as a child.
-    bind_resources_on(dit, kv, attn)
+    bind_state_on(dit, handles)
 
-    assert all(la.kv is kv and la.attn is attn for la in layers)
+    assert all(la.state is handles["kv"] for la in layers)
     assert len(layers) == config.n_layers
-    assert not hasattr(dit, "kv") and not hasattr(dit, "attn"), (
-        "the driver took a resource handle back; `commit` is an argument and "
+    assert not hasattr(dit, "state"), (
+        "the driver took a state handle back; `commit` is an argument and "
         "nothing else on the DiT root talks to the ring"
     )
 
 
-def test_a_layer_binds_only_what_the_node_owns():
-    """``.get``, not ``[]``: a layer may sit on a node that owns some of its
-    resources and not others, and the missing one has to read as absent rather
-    than raise at load."""
+def test_a_layer_on_a_node_without_the_ring_fails_at_bind():
+    """``[]``, not ``.get``: every pass of a layer calls the ring, so a node
+    that holds the decoder's histories and not the ring has to raise at load
+    rather than at the first forward."""
     config = reduced_config()
     with torch.device("meta"):
         dit = WaypointDiT(config)
-    kv, _attn = build_resources(config)
+    handles = DitState(config).handles
 
-    DitNode(dit).bind_node_resources({"kv": kv})
-
-    assert dit.blocks[0].attn.kv is kv
-    assert dit.blocks[0].attn.attn is None
+    with pytest.raises(KeyError, match="'kv'"):
+        DitNode(dit).bind_node_state({"decoder": handles["decoder"]})
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +372,7 @@ def test_generate_frame_is_four_frozen_denoise_passes_then_one_commit():
     Euler steps at sigma = 1.0, 0.9, 0.75, 0.3 that must not touch the ring,
     then one committing pass at sigma = 0 on the settled latent."""
     config = reduced_config()
-    dit, kv = bound_dit(config)
+    dit, state = bound_dit(config)
     noise, mouse, button, scroll = frame_inputs(config)
 
     sigmas: list[torch.Tensor] = []
@@ -411,7 +380,7 @@ def test_generate_frame_is_four_frozen_denoise_passes_then_one_commit():
         lambda _m, args: sigmas.append(args[0].detach().clone())
     )
     try:
-        with torch.no_grad():
+        with torch.no_grad(), state.frame():
             dit.generate_frame(
                 noise, torch.tensor([0], dtype=torch.int64),
                 mouse=mouse, button=button, scroll=scroll,
@@ -425,17 +394,14 @@ def test_generate_frame_is_four_frozen_denoise_passes_then_one_commit():
     assert list(config.scheduler_sigmas) == [1.0, 0.9, 0.75, 0.3, 0.0]
     assert config.num_denoise_steps == 4
 
-    passes = kv.passes()
+    passes = state.kv.passes()
     assert len(passes) == 5, "a generated frame costs exactly five forwards"
     # Per pass, not per resource: a single-element set per pass also asserts no
     # layer disagreed with the driver about which pass it was.
-    commit_per_pass = [{u["commit"] for u in group} for group in passes]
-    assert commit_per_pass == [{False}, {False}, {False}, {False}, {True}]
-    # All five passes of a frame share one ring clock.
-    assert {u["frame_pos"] for u in kv.upserts} == {0}
-    # ...and nothing else on the resource: dropping/snapshotting the world is a
-    # level up; resetting between frames would silently start a new rollout.
-    assert (kv.resets, kv.states) == (0, [])
+    keep_per_pass = [{w["keep"] for w in group} for group in passes]
+    assert keep_per_pass == [{False}, {False}, {False}, {False}, {True}]
+    # All five passes of a frame write the one frame the ring planned.
+    assert {w["frame"] for w in state.kv.writes} == {0}
 
 
 def test_cond_head_cache_is_bit_exact_and_replaces_the_live_projection():
@@ -446,8 +412,8 @@ def test_cond_head_cache_is_bit_exact_and_replaces_the_live_projection():
     noise, mouse, button, scroll = frame_inputs(config)
     fp = torch.tensor([0], dtype=torch.int64)
 
-    live, _ = bound_dit(config, seed=0)
-    cached, _ = bound_dit(config, seed=0)
+    live, live_state = bound_dit(config, seed=0)
+    cached, cached_state = bound_dit(config, seed=0)
     cached.materialize_runtime_tables("cpu")
 
     assert all(b.cond_head._cache is None for b in live.blocks), "live path must not cache"
@@ -459,8 +425,10 @@ def test_cond_head_cache_is_bit_exact_and_replaces_the_live_projection():
         )
 
     with torch.no_grad():
-        x_live = live.generate_frame(noise, fp, mouse=mouse, button=button, scroll=scroll)
-        x_cached = cached.generate_frame(noise, fp, mouse=mouse, button=button, scroll=scroll)
+        with live_state.frame():
+            x_live = live.generate_frame(noise, fp, mouse=mouse, button=button, scroll=scroll)
+        with cached_state.frame():
+            x_cached = cached.generate_frame(noise, fp, mouse=mouse, button=button, scroll=scroll)
 
     assert torch.equal(x_live, x_cached), "cond_head cache changed the frame; it must be bit-exact"
 
@@ -468,21 +436,21 @@ def test_cond_head_cache_is_bit_exact_and_replaces_the_live_projection():
 def test_the_ring_only_moves_on_the_committing_pass():
     """The behavioural half of the same invariant, measured on the ring itself."""
     config = reduced_config()
-    dit, kv = bound_dit(config)
+    dit, state = bound_dit(config)
+    kv = state.kv
     noise, mouse, button, scroll = frame_inputs(config)
     fp = torch.tensor([0], dtype=torch.int64)
 
     ring_lens = [layer.ring_len for layer in kv.layers]
     before = [layer.kv[:, :, :, :n].clone() for layer, n in zip(kv.layers, ring_lens, strict=True)]
 
-    with torch.no_grad():
+    with torch.no_grad(), state.frame():
         sigma_table = dit._sigma_schedule(noise.device, noise.dtype)
         dit._denoise_pass(noise, fp, sigma_table, mouse=mouse, button=button, scroll=scroll)
-    after_denoise = [layer.kv[:, :, :, :n] for layer, n in zip(kv.layers, ring_lens, strict=True)]
-    assert all(torch.equal(a, b) for a, b in zip(before, after_denoise, strict=True))
-    assert not any(layer.written[: layer.ring_len].any() for layer in kv.layers)
+        after_denoise = [layer.kv[:, :, :, :n] for layer, n in zip(kv.layers, ring_lens, strict=True)]
+        assert all(torch.equal(a, b) for a, b in zip(before, after_denoise, strict=True))
+        assert not any(layer.written[: layer.ring_len].any() for layer in kv.layers)
 
-    with torch.no_grad():
         dit._cache_pass(noise, fp, mouse=mouse, button=button, scroll=scroll)
     assert all(layer.written[: layer.tokens_per_frame].all() for layer in kv.layers)
 
@@ -496,7 +464,7 @@ def test_generate_frame_clones_the_denoised_latent():
     in caller-owned memory, outside the compiled region.
     """
     config = reduced_config()
-    dit, _kv = bound_dit(config)
+    dit, state = bound_dit(config)
     noise, mouse, button, scroll = frame_inputs(config)
 
     produced: list[torch.Tensor] = []
@@ -508,7 +476,7 @@ def test_generate_frame_clones_the_denoised_latent():
         return out
 
     dit._denoise_pass = spy
-    with torch.no_grad():
+    with torch.no_grad(), state.frame():
         x0 = dit.generate_frame(
             noise, torch.tensor([0], dtype=torch.int64),
             mouse=mouse, button=button, scroll=scroll,
@@ -525,7 +493,7 @@ def test_append_frame_is_the_committing_pass_alone():
     """Priming from a VAE-encoded real frame: no denoising, one forward, and the
     latent is already the settled x0 so there is nothing to clone."""
     config = reduced_config()
-    dit, kv = bound_dit(config)
+    dit, state = bound_dit(config)
     latent, mouse, button, scroll = frame_inputs(config)
 
     sigmas: list[torch.Tensor] = []
@@ -533,7 +501,7 @@ def test_append_frame_is_the_committing_pass_alone():
         lambda _m, args: sigmas.append(args[0].detach().clone())
     )
     try:
-        with torch.no_grad():
+        with torch.no_grad(), state.frame(walk="prime"):
             out = dit.append_frame(
                 latent, torch.tensor([0], dtype=torch.int64),
                 mouse=mouse, button=button, scroll=scroll,
@@ -542,8 +510,8 @@ def test_append_frame_is_the_committing_pass_alone():
         handle.remove()
 
     assert [s.flatten().tolist() for s in sigmas] == [[0.0]]
-    assert len(kv.passes()) == 1
-    assert all(u["commit"] is True for u in kv.upserts), "priming must commit"
+    assert len(state.kv.passes()) == 1
+    assert all(w["keep"] is True for w in state.kv.writes), "priming must commit"
     assert out is latent
 
 
@@ -572,52 +540,20 @@ def test_sigma_schedule_is_built_in_the_latent_dtype():
 # ---------------------------------------------------------------------------
 
 
-class CaptureKV:
-    """Records the exact ``(k, v)`` handed to the ring and returns them
-    unchanged, so a test can inspect what would have been stored.
-
-    Not a ``RingKVManager``: a real ring returns the whole capacity with the
-    frame scattered into a slot the test would have to find. Returning
-    ``(k, v, None)`` keeps the submitted tensor and the tensor the kernel sees
-    identical.
-    """
-
-    def __init__(self):
-        self.calls: list[tuple[torch.Tensor, torch.Tensor]] = []
-
-    def upsert(
-        self, k, v, layer_idx, frame_pos, *, commit, build_visibility=True,
-    ):
-        del build_visibility
-        self.calls.append((k.detach().clone(), v.detach().clone()))
-        return k, v, None
-
-
-class DenseAttn:
-    """Plain SDPA over whatever ``CaptureKV`` returned. ``visible`` is ``None``
-    and ignored: these tests are about what enters the cache, not the mask."""
-
-    requires_kv_write = False
-
-    def attend(self, q, k, v, visible, *, enable_gqa, layer_idx=None):
-        del layer_idx
-        assert visible is None, "CaptureKV returns no visibility row"
-        return torch.nn.functional.scaled_dot_product_attention(q, k, v, enable_gqa=enable_gqa)
-
-
 def run_two_attention_layers(config: WaypointConfig, lamb0: float, lamb1: float):
+    # a ring of these two layers alone, so the frame's step closes on their kept adds
+    state = DitState(replace(config, n_layers=2))
     torch.manual_seed(21)
     layer0 = WaypointAttention(config, 0).eval()
     layer1 = WaypointAttention(config, 1).eval()
-    capture, dense = CaptureKV(), DenseAttn()
     for layer, lamb in ((layer0, lamb0), (layer1, lamb1)):
         for p in layer.parameters():
             torch.nn.init.normal_(p, std=0.05)
         with torch.no_grad():
             layer.v_lamb.fill_(lamb)
         # Per-layer bind, directly: these two are loose layers, not a node's
-        # module tree, and `bind_resources` is the seam a layer actually has.
-        layer.bind_resources({"kv": capture, "attn": dense})
+        # module tree, and `bind_state` is the seam a layer actually has.
+        layer.bind_state(state.handles)
 
     idx = torch.arange(config.tokens_per_frame)
     angles = OrthoRoPEAngles(config)(
@@ -627,11 +563,10 @@ def run_two_attention_layers(config: WaypointConfig, lamb0: float, lamb1: float)
     )
     gen = torch.Generator().manual_seed(22)
     x = torch.randn(1, config.tokens_per_frame, config.d_model, generator=gen)
-    fp = torch.tensor(0, dtype=torch.int64)
-    with torch.no_grad():
-        _, v1 = layer0(x, fp, angles, None, commit=True)
-        _, v1_out = layer1(x, fp, angles, v1, commit=True)
-    return layer0, layer1, x, angles, capture, v1, v1_out
+    with torch.no_grad(), state.frame():
+        _, v1 = layer0(x, angles, None, commit=True)
+        _, v1_out = layer1(x, angles, v1, commit=True)
+    return layer0, layer1, x, angles, state.kv, v1, v1_out
 
 
 def raw_qkv(layer: WaypointAttention, x: torch.Tensor):
@@ -651,7 +586,7 @@ def test_v1_is_captured_pre_lerp_and_threads_through_unchanged():
     Getting this backwards still produces plausible output, so the ordering is
     asserted directly rather than through the activations."""
     config = reduced_config()
-    layer0, layer1, x, _angles, capture, v1, v1_out = run_two_attention_layers(config, 0.25, 0.5)
+    layer0, layer1, x, _angles, kv, v1, v1_out = run_two_attention_layers(config, 0.25, 0.5)
 
     _, _, v_raw0 = raw_qkv(layer0, x)
     _, _, v_raw1 = raw_qkv(layer1, x)
@@ -661,7 +596,7 @@ def test_v1_is_captured_pre_lerp_and_threads_through_unchanged():
     assert not torch.equal(v_raw1, v1), "precondition: the two layers' raw V differ"
 
     # ...and the LERPED V is what enters the cache, at layer 1.
-    cached_v1 = capture.calls[1][1]
+    cached_v1 = kv.writes[1]["v"]
     want = torch.lerp(v_raw1, v1, layer1.v_lamb)
     assert torch.equal(cached_v1, want)
     assert not torch.equal(cached_v1, v_raw1), "the cache stored the pre-lerp V"
@@ -673,22 +608,22 @@ def test_value_residual_lerp_direction():
     cached V *is* layer 0's V, at 0 it is the layer's own. Swapping the lerp
     operands is a silent sign flip on the residual."""
     config = reduced_config()
-    _, layer1, x, _, capture_one, v1, _ = run_two_attention_layers(config, 0.25, 1.0)
-    assert torch.equal(capture_one.calls[1][1], v1)
+    _, layer1, x, _, kv_one, v1, _ = run_two_attention_layers(config, 0.25, 1.0)
+    assert torch.equal(kv_one.writes[1]["v"], v1)
 
-    _, layer1_zero, x0, _, capture_zero, v1_zero, _ = run_two_attention_layers(config, 0.25, 0.0)
+    _, layer1_zero, x0, _, kv_zero, v1_zero, _ = run_two_attention_layers(config, 0.25, 0.0)
     _, _, v_raw1 = raw_qkv(layer1_zero, x0)
-    assert torch.equal(capture_zero.calls[1][1], v_raw1)
+    assert torch.equal(kv_zero.writes[1]["v"], v_raw1)
 
 
 def test_q_and_k_are_normed_and_rotated_but_v_is_neither():
     """Q/K are RMS-normed then RoPE'd; V is neither. K enters the
     ring already rotated, so replayed history is never re-rotated."""
     config = reduced_config()
-    layer0, _layer1, x, angles, capture, v1, _ = run_two_attention_layers(config, 0.25, 0.5)
+    layer0, _layer1, x, angles, kv, v1, _ = run_two_attention_layers(config, 0.25, 0.5)
     _, k_raw0, v_raw0 = raw_qkv(layer0, x)
 
-    cached_k, cached_v = capture.calls[0]
+    cached_k, cached_v = kv.writes[0]["k"], kv.writes[0]["v"]
     assert torch.equal(cached_k, apply_ortho_rope(rms_norm(k_raw0), angles))
     assert not torch.equal(cached_k, rms_norm(k_raw0)), "K reached the cache un-rotated"
     assert not torch.equal(cached_k, apply_ortho_rope(k_raw0, angles)), "K reached the cache un-normed"
@@ -702,19 +637,19 @@ def test_layer_zero_v_reaches_every_block_in_the_dit():
     stored by all 4 blocks must be byte-identical to layer 0's. A block that
     re-captured ``v1`` from its own projection would drift here."""
     config = reduced_config()
-    dit, kv = bound_dit(config)
+    dit, state = bound_dit(config)
     with torch.no_grad():
         for block in dit.blocks:
             block.attn.v_lamb.fill_(1.0)
 
     latent, mouse, button, scroll = frame_inputs(config)
-    with torch.no_grad():
+    with torch.no_grad(), state.frame(walk="prime"):
         dit.append_frame(
             latent, torch.tensor([0], dtype=torch.int64),
             mouse=mouse, button=button, scroll=scroll,
         )
 
-    (single_pass,) = kv.passes()
+    (single_pass,) = state.kv.passes()
     reference_v = single_pass[0]["v"]
     for record in single_pass[1:]:
         assert torch.equal(record["v"], reference_v), (
@@ -840,10 +775,10 @@ def test_meta_built_model_generates_a_frame_in_the_serving_dtypes():
         torch.nn.init.normal_(p, std=0.02)
     dit.eval()
 
-    kv = RecordingRingKV(config, dtype=torch.bfloat16)
-    bind_resources_on(dit, kv, kv.attn)
+    state = DitState(config, dtype=torch.bfloat16)
+    bind_state_on(dit, state.handles)
     noise, mouse, button, scroll = frame_inputs(config, dtype=torch.bfloat16)
-    with torch.no_grad():
+    with torch.no_grad(), state.frame():
         x0 = dit.generate_frame(
             noise, torch.tensor([0], dtype=torch.int64),
             mouse=mouse, button=button, scroll=scroll,
@@ -851,30 +786,32 @@ def test_meta_built_model_generates_a_frame_in_the_serving_dtypes():
 
     assert x0.dtype == torch.bfloat16 and x0.shape == noise.shape
     assert bool(torch.isfinite(x0.float()).all())
-    assert len(kv.passes()) == 5
+    assert len(state.kv.passes()) == 5
     assert dit.denoise_step_emb.mlp.fc1.weight.dtype == torch.float32
     assert dit.patchify.weight.dtype == torch.bfloat16
 
 
 def test_two_frames_advance_the_ring_clock_together():
-    """The caller owns ``frame_pos`` and advances it by exactly one per
-    committed frame; ``t_pos = f_pos * ts_mult`` is the RoPE clock and
-    is threaded separately even though ``ts_mult == 1`` here."""
+    """The ring counts each committed frame and writes the next one at that
+    count, which is also the frame index the caller reads back for RoPE;
+    ``t_pos = f_pos * ts_mult`` is the RoPE clock and is threaded separately
+    even though ``ts_mult == 1`` here."""
     config = reduced_config()
     assert config.ts_mult == 1 == waypoint_1_5_1b_720p().ts_mult
 
-    dit, kv = bound_dit(config)
+    dit, state = bound_dit(config)
+    handle = state.handles["kv"]
     noise, mouse, button, scroll = frame_inputs(config)
     with torch.no_grad():
-        for f in range(2):
-            dit.generate_frame(
-                noise, torch.tensor([f], dtype=torch.int64),
-                mouse=mouse, button=button, scroll=scroll,
-            )
+        for _ in range(2):
+            frame_pos = torch.tensor([position(handle, RID, "main") // TPF], dtype=torch.int64)
+            with state.frame():
+                dit.generate_frame(noise, frame_pos, mouse=mouse, button=button, scroll=scroll)
 
-    passes = kv.passes()
+    passes = state.kv.passes()
     assert len(passes) == 10
-    assert [next(iter({u["frame_pos"] for u in group})) for group in passes] == [0] * 5 + [1] * 5
+    assert [next(iter({w["frame"] for w in group})) for group in passes] == [0] * 5 + [1] * 5
+    assert position(handle, RID, "main") == 2 * TPF, "the ring should count each committed frame"
 
     pos = dit._pos_ids(torch.tensor([3], dtype=torch.int64))
     assert pos.f_pos.item() == 3 and pos.f_pos.ndim == 1
@@ -912,8 +849,8 @@ def test_a_materialized_dit_reads_the_noise_island_rows_instead_of_running_it():
     noise, mouse, button, scroll = frame_inputs(config)
     fp = torch.tensor([0], dtype=torch.int64)
 
-    live, _ = bound_dit(config, seed=0)
-    cached, _ = bound_dit(config, seed=0)
+    live, live_state = bound_dit(config, seed=0)
+    cached, cached_state = bound_dit(config, seed=0)
     cached.materialize_runtime_tables("cpu")
     assert tuple(cached._cond_rows.shape) == (len(config.scheduler_sigmas), 1, config.d_model)
 
@@ -922,6 +859,8 @@ def test_a_materialized_dit_reads_the_noise_island_rows_instead_of_running_it():
 
     cached.denoise_step_emb.forward = no_island
     with torch.no_grad():
-        x_live = live.generate_frame(noise, fp, mouse=mouse, button=button, scroll=scroll)
-        x_cached = cached.generate_frame(noise, fp, mouse=mouse, button=button, scroll=scroll)
+        with live_state.frame():
+            x_live = live.generate_frame(noise, fp, mouse=mouse, button=button, scroll=scroll)
+        with cached_state.frame():
+            x_cached = cached.generate_frame(noise, fp, mouse=mouse, button=button, scroll=scroll)
     assert torch.equal(x_live, x_cached)

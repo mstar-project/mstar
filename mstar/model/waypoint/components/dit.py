@@ -1,10 +1,10 @@
-"""The Waypoint-1.5 DiT: 24 blocks, the 4+1 pass driver, and the world clock.
+"""The Waypoint-1.5 DiT: 24 blocks, and the 4+1 pass driver.
 
 Five forwards per generated frame: four frozen Euler denoise passes over
 ``config.scheduler_sigmas``, then one committing pass at sigma=0 that writes
-the ring. Two clocks are threaded separately: ``f_pos`` (buckets, slots,
-visibility) and ``t_pos = f_pos * config.ts_mult`` (RoPE time); conflating
-them is silent drift at any fps where ``ts_mult != 1``.
+the ring. The frame's index ``f_pos`` and its RoPE time
+``t_pos = f_pos * config.ts_mult`` are two clocks; conflating them is silent
+drift at any fps where ``ts_mult != 1``.
 """
 
 from typing import NamedTuple
@@ -36,8 +36,7 @@ __all__ = ["WaypointDiT", "WaypointDiTBlock", "WaypointPosIds"]
 class WaypointPosIds(NamedTuple):
     """The four position streams for one frame, per row of the step batch.
 
-    ``f_pos`` is the ``[B]`` int64 ring clock (the KV resource's ``upsert``
-    takes it); ``t_pos`` is the ``[B, T]`` RoPE time coordinate
+    ``f_pos`` is each row's ``[B]`` int64 frame index; ``t_pos`` is the ``[B, T]`` RoPE time coordinate
     ``f_pos * ts_mult``; ``y_pos``/``x_pos`` are ``[B, T]`` token-grid
     coordinates, ``row = i // width`` and ``col = i % width``.
     """
@@ -72,7 +71,6 @@ class WaypointDiTBlock(nn.Module):
     def forward(
         self,
         x: Tensor,
-        frame_pos: Tensor,
         rope_angles: tuple[Tensor, Tensor],
         cond: Tensor,
         ctrl_emb: Tensor,
@@ -84,13 +82,13 @@ class WaypointDiTBlock(nn.Module):
         """``x`` ``[B, N*T, D]``, ``cond``/``ctrl_emb`` ``[B, N, D]`` (per frame) ->
         ``(x, v1)``. ``v1`` is layer 0's pre-lerp V, threaded down the stack;
         ``cond_idx`` is the ``scheduler_sigmas`` slot for the cond_head cache.
-        Only ``f_pos`` reaches this far -- RoPE angles are built once at the root.
+        RoPE angles are built once at the root.
         """
         s0, b0, g0, s1, b1, g1 = self.cond_head(cond, cond_idx)
 
         residual = x
         x = ada_rmsnorm(x, s0, b0)
-        x, v1 = self.attn(x, frame_pos, rope_angles, v1, commit=commit)
+        x, v1 = self.attn(x, rope_angles, v1, commit=commit)
         x = ada_gate(x, g0) + residual
 
         # Both operands are bare-RMS-normed (no adaLN scale here) and the fusion
@@ -163,8 +161,8 @@ class WaypointDiT(nn.Module):
         # to_empty for the meta build path.
         self.retie_cond_proj()
 
-    # No `bind_resources` here: the driver holds no resource handle, it passes
-    # `commit` down to the layers, which own the only calls into the ring.
+    # No `bind_state` here: the driver holds no handle, it passes `commit`
+    # down to the layers, which own the only calls into the ring.
 
     # Build-time surface
 
@@ -247,7 +245,7 @@ class WaypointDiT(nn.Module):
     # Positions
 
     def _pos_ids(self, frame_pos: Tensor) -> WaypointPosIds:
-        """Build one frame's position streams from the ring clock."""
+        """Build one frame's position streams from its index."""
         if not torch.compiler.is_compiling():
             torch._check(
                 frame_pos.ndim == 1 and frame_pos.dtype == torch.int64,
@@ -280,7 +278,7 @@ class WaypointDiT(nn.Module):
         """One pass over one latent frame; returns the rectified-flow velocity.
 
         ``x`` ``[B, N, C, H, W]`` (N == 1), ``sigma`` ``[B, N]``, ``frame_pos``
-        ``[B]`` int64 ring clock. Returns ``[B, N, C, H, W]``. ``commit`` says
+        ``[B]`` int64 frame index. Returns ``[B, N, C, H, W]``. ``commit`` says
         whether this pass keeps its K/V (False for the four denoise passes,
         True for the fifth); ``cond_idx`` selects the cached modulation row
         and must match ``sigma``.
@@ -294,8 +292,8 @@ class WaypointDiT(nn.Module):
             Hp * Wp == self.config.tokens_per_frame,
             f"{Hp} * {Wp} != {self.config.tokens_per_frame}",
         )
-        # One frame per call per row: the ring cache indexes a single frame per
-        # upsert and the whole driver is built on that.
+        # One frame per call per row: the ring takes a single frame per row and
+        # step, and the whole driver is built on that.
         torch._assert(N == 1, "WaypointDiT.forward supports N == 1")
 
         pos_ids = self._pos_ids(frame_pos)
@@ -318,10 +316,7 @@ class WaypointDiT(nn.Module):
 
         v1 = None  # layer 0's pre-lerp V, threaded through all 24 blocks
         for block in self.blocks:
-            h, v1 = block(
-                h, pos_ids.f_pos, rope_angles, cond, ctrl_emb, v1,
-                commit=commit, cond_idx=cond_idx,
-            )
+            h, v1 = block(h, rope_angles, cond, ctrl_emb, v1, commit=commit, cond_idx=cond_idx)
 
         # silu sits BETWEEN the adaLN norm and the unpatchify projection,
         # not after it (matches the reference).
@@ -425,7 +420,7 @@ class WaypointDiT(nn.Module):
         """Denoise one frame from ``noise`` ``[B, N, C, H, W]`` and commit it.
 
         Five forwards: 4 frozen + 1 committing, all sharing one ``frame_pos``.
-        The caller owns the ring clock and advances it once per committed frame.
+        The ring counts the committed frame.
         """
         # The .clone() is load-bearing and must stay OUTSIDE the compiled
         # region: both passes share one CUDA-graph capture, so without it the

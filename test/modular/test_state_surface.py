@@ -17,7 +17,7 @@ sys.path.insert(0, ".")
 import pytest
 
 from mstar.engine import state
-from mstar.engine.state.adapters import BoundedHandle, PagedArrayHandle, ValueHandle, WithinStepHandle
+from mstar.engine.state.adapters import BoundedHandle, PagedArrayHandle, RingHandle, ValueHandle, WithinStepHandle
 from mstar.engine.state.calls import ArrayHandle
 
 # Today's types the surface re-exports, and a NamedTuple, whose fields stay positional.
@@ -40,6 +40,7 @@ SNAPSHOT = {
         ["rewritable", "KEYWORD_ONLY", 'False'],
         ["labels", "KEYWORD_ONLY", "frozenset({'main'})"],
         ["positions", "KEYWORD_ONLY", 'None'],
+        ["largest", "KEYWORD_ONLY", '{}'],
     ],
     "ArrayStep": [
         ["segments", "KEYWORD_ONLY", 'None'],
@@ -55,7 +56,9 @@ SNAPSHOT = {
     "Attend": [
         ["q_heads", "POSITIONAL_OR_KEYWORD", None],
     ],
-    "Bidirectional": [],
+    "Bidirectional": [
+        ["kept_window", "KEYWORD_ONLY", 'False'],
+    ],
     "Block": [],
     "Causal": [],
     "CausalConv": [
@@ -71,6 +74,11 @@ SNAPSHOT = {
         ["at", "KEYWORD_ONLY", None],
         ["rows", "KEYWORD_ONLY", 'None'],
     ],
+    "FrameWindow": [
+        ["tokens", "POSITIONAL_OR_KEYWORD", None],
+        ["frames", "KEYWORD_ONLY", None],
+        ["stride", "KEYWORD_ONLY", '1'],
+    ],
     "GatedDeltaNet": [
         ["qk_l2norm", "KEYWORD_ONLY", 'True'],
         ["scale", "KEYWORD_ONLY", 'None'],
@@ -79,11 +87,17 @@ SNAPSHOT = {
         ["heads", "KEYWORD_ONLY", None],
         ["head_dim", "KEYWORD_ONLY", None],
     ],
+    "KeptWindow": [
+        ["sink", "POSITIONAL_OR_KEYWORD", None],
+        ["window", "KEYWORD_ONLY", None],
+    ],
     "Layout": [
         ["spans", "KEYWORD_ONLY", '()'],
         ["growth", "KEYWORD_ONLY", '()'],
         ["scratch", "KEYWORD_ONLY", '0'],
         ["max_growth", "KEYWORD_ONLY", 'None'],
+        ["kept_windows", "KEYWORD_ONLY", '{}'],
+        ["sizes", "KEYWORD_ONLY", '{}'],
     ],
     "Mamba2": [
         ["time_step_limit", "KEYWORD_ONLY", '(0.0, inf)'],
@@ -132,6 +146,9 @@ SNAPSHOT = {
         ["table_dtype", "KEYWORD_ONLY", 'None'],
         ["longrope", "KEYWORD_ONLY", 'None'],
     ],
+    "RowTensors": [
+        ["fields", "POSITIONAL_OR_KEYWORD", None],
+    ],
     "SampleSettings": [
         ["temperature", "KEYWORD_ONLY", '0.6'],
         ["top_k", "KEYWORD_ONLY", '0'],
@@ -174,6 +191,10 @@ SNAPSHOT = {
         ["walks", "KEYWORD_ONLY", 'None'],
         ["exchange", "KEYWORD_ONLY", "'auto'"],
     ],
+    "Size": [
+        ["name", "POSITIONAL_OR_KEYWORD", None],
+        ["scale", "KEYWORD_ONLY", '1'],
+    ],
     "SlotLease": [
         ["slot", "POSITIONAL_OR_KEYWORD", None],
         ["bucket", "POSITIONAL_OR_KEYWORD", None],
@@ -199,6 +220,7 @@ SNAPSHOT = {
         ["layers", "KEYWORD_ONLY", None],
         ["entry", "KEYWORD_ONLY", None],
         ["updates", "KEYWORD_ONLY", '{}'],
+        ["largest", "KEYWORD_ONLY", '{}'],
     ],
     "Window": [
         ["size", "POSITIONAL_OR_KEYWORD", None],
@@ -341,7 +363,9 @@ def test_the_surface_equals_the_snapshot():
     assert _surface() == SNAPSHOT, "an addition updates SNAPSHOT, and a change in meaning comes as a new name"
 
 
-@pytest.mark.parametrize("handle", [ArrayHandle, PagedArrayHandle, ValueHandle, WithinStepHandle, BoundedHandle])
+@pytest.mark.parametrize(
+    "handle", [ArrayHandle, PagedArrayHandle, ValueHandle, WithinStepHandle, BoundedHandle, RingHandle],
+)
 def test_a_handles_calls_equal_the_snapshot(handle):
     surface = {
         name: [[p.name, p.kind.name, _default(p)] for p in inspect.signature(getattr(handle, name)).parameters.values()]
