@@ -2701,19 +2701,6 @@ class KVManager(AttentionResource):
         return KVPlanOutput(
             cpu_indptrs=build_paged_indptrs(views, page_size, ring=ring),
             views=views,
-            beyond_reach=bool(self._retentions) and any(
-                view.retention is not None and view.retention.can_release(view.length - view.to_compute)
-                for view in views
-            ),
-        )
-
-    def _beyond_reach(self, segments: list[Segment], group: int) -> bool:
-        """`KVPlanOutput.beyond_reach` of ``segments`` in group ``group``, False at once while no request holds a
-        retention."""
-        return bool(self._retentions) and any(
-            (policy := self._exact(s.request_id, s.label)) is not None
-            and policy.can_release(self._streams[s.request_id][s.label].group(group).stored_len)
-            for s in segments
         )
 
     def _exact(self, rid: str, label: str) -> RetentionPolicy | None:
@@ -2800,7 +2787,6 @@ class KVManager(AttentionResource):
             rows=segments,
             view_builder=build_views,
             columns=cols,
-            beyond_reach=self._beyond_reach(segments, group),
         )
 
     def _plan_label_rows(
@@ -2846,7 +2832,6 @@ class KVManager(AttentionResource):
             rows=segments,
             view_builder=build_views,
             columns=cols,
-            beyond_reach=self._beyond_reach(segments, 0),
         )
 
     @staticmethod

@@ -33,10 +33,8 @@ from test_state_calls import (
 from test_state_kept_reads import _CpuVarlenSdpa
 
 from mstar.communication.tensors import LocalTransferEngine
-from mstar.engine.resources import BucketKey, SlotLease
-from mstar.engine.resources.attn import flashinfer
 from mstar.engine.resources.attn.base import EagerSlotKey
-from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep, AttnBackend
+from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttnBackend
 from mstar.engine.resources.attn.dense import DenseAttentionManager
 from mstar.engine.resources.kv.config import (
     KVReqConfig,
@@ -53,7 +51,6 @@ from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Attend, Bidirectional, Block, Causal, KeptWindow, Layout, Read
 from mstar.engine.state.adapters import (
-    KeptWindowEagerDense,
     PageWindowEagerDense,
     build_specs,
     kv_layouts,
@@ -225,38 +222,6 @@ def _commit(pool: KVManager, ctx: StepContext, start: int, span: int) -> None:
     pool.commit(step, ctx)
 
 
-@pytest.mark.parametrize("page_size", [16, 128])
-def test_the_dense_prefix_is_the_kept_reach(page_size):
-    """Against the dense reference: after each of 30 commits of uneven spans, a denoise step on the dense kernel
-    attends the first ``sink`` log positions and the last ``window`` the stream kept, while the pool releases pages
-    behind the sink. Gathering whole pages from the first would attend the released ones' successors in their place."""
-    sink, window = 2 * page_size + 5, 3 * page_size + 7
-    pool = _windowed_pool(page_size, sink, window)
-    dense = DenseAttentionManager(
-        kv_cache="kv", device=torch.device("cpu"), dtype=torch.float32, kv_config=pool.config,
-        wrapper_class=_CpuVarlenSdpa,
-    )
-    ctx = StepContext(request_ids=("a",), graph_walk="rollout", slot=0, capture=False)
-    start = 0
-    for commit in range(30):
-        span = 1 + (7 * commit) % (page_size // 2)
-        step = KVStep(segments=(Segment("a", "main", span),))
-        assert pool.admit(step, ctx).ok
-        pool.plan(step, ctx)
-        pool.write_kv(*([torch.arange(start, start + span, dtype=torch.float32)[:, None, None]] * 2), layer_idx=0,
-                      label="main")
-        pool.commit(step, ctx)
-        start += span
-        denoise = KVStep(segments=(Segment("a", "main", 4),), commit=False)
-        assert pool.admit(denoise, ctx).ok
-        plan = dense._build_plan(pool.plan(denoise, ctx)["main"], False, EagerSlotKey(label="main", slot=0))
-        k, _ = dense._prefix_kv(plan.segments[0], 0, pool.layer_view(0))
-        pool.commit(denoise, ctx)
-        expected = sorted({*range(min(sink, start)), *range(max(sink, start - window), start)})
-        assert plan.cu_k == (0, len(expected) + 4), f"the denoise after commit {commit} plans another key length"
-        assert k.flatten().long().tolist() == expected, f"the denoise after commit {commit} attends other entries"
-
-
 def _reference_context(sink: int, window: int, page_size: int, committed: int, released: int) -> tuple[list[int], int]:
     """What Cosmos3's block-causal reference attends after a commit, and what it has released by then: the ``sink``
     prompt entries, the frames that share the prompt's last page, and the frames past those it released
@@ -273,8 +238,7 @@ def _reference_context(sink: int, window: int, page_size: int, committed: int, r
 @pytest.mark.parametrize("page_size", [16, 128])
 def test_a_window_of_whole_pages_attends_what_the_reference_keeps(page_size):
     """After a prompt that ends inside a page and each of 30 window commits, a denoise step on the dense kernel and a
-    commit on the paged one both attend every entry the stream holds, which is the reference's context. The exact
-    window drops the frames beside the prompt and up to a page of the oldest window, on the dense kernel alone."""
+    commit on the paged one both attend every entry the stream holds, which is the reference's context."""
     sink, window, frame = 2 * page_size + 5, 3 * page_size + 7, page_size // 2 + 3
     pool = _windowed_pool(page_size, sink, window, exact=False)
     dense = DenseAttentionManager(
@@ -298,7 +262,6 @@ def test_a_window_of_whole_pages_attends_what_the_reference_keeps(page_size):
         held = pool.layer_view(0)[view.page_idxs, 0].flatten()[:view.length - view.to_compute]
         assert k.flatten().long().tolist() == expected, f"the denoise after commit {commit} left the reference"
         assert held.long().tolist() == expected, f"the pages after commit {commit} hold other entries than it attends"
-        assert not planned.beyond_reach, "a captured denoise step would be refused the paged kernel"
     assert released > 2 * window, "the stream never released, so the window was never cut"
 
 
@@ -324,17 +287,12 @@ def _laid_out(layout: Layout):
     return kv_layouts([_windowed()], {"kv": {"main": layout}}, {})["kv"]["main"]
 
 
-def test_a_windowed_read_on_its_own_walk_takes_its_eager_pair():
-    setup, problems = state_setup({}, [_windowed()], EAGER)
-    assert not problems and type(setup.by_read["attn_gen"]) is KeptWindowEagerDense, (
-        "the windowed generation read would have no kernel beside the prefill read"
-    )
-
-
-def test_a_windowed_deployment_without_its_eager_kernel_has_no_layout():
-    """The gathered kept-window kernel is a spec of its own, over the layers the prefill read's paged spec covers."""
+@pytest.mark.parametrize("settings", [{}, EAGER])
+def test_a_window_cut_by_entry_beside_a_prefill_read_has_no_layout(settings):
+    """The gathered kept-window kernel is a spec of its own, over the layers the prefill read's paged spec covers, and
+    the dense kernel has no pair for it."""
     _refused(r"Array 'kv': no layout yet: reads\['attn'\] and reads\['attn_gen'\] build different specs and both "
-             "cover layer 0", lambda: build_specs([_windowed()]))
+             "cover layer 0", lambda: state_setup({}, [_windowed()], settings))
 
 
 def test_a_window_of_whole_pages_runs_the_kernels_of_a_read_with_no_window():
@@ -408,42 +366,6 @@ def test_a_max_seq_len_is_held_to_max_len_only_under_a_kept_window(kept):
     assert deployment_problems(model, {"kv": {"max_seq_len": 2 * SLOTS}}) == [], "validation raised before reporting"
 
 
-# The paged leg of a kept window
-
-
-def _committed(entries: int):
-    """A pool of pages of 16 whose request ``a`` keeps a sink of 8 and a window of 16, after ``entries`` kept entries:
-    its config, and the plan of a step of 4 after them."""
-    pool = _windowed_pool(16, sink=8, window=16)
-    ctx = StepContext(request_ids=("a",), graph_walk="rollout", slot=0, capture=False)
-    for _ in range(0, entries, 8):
-        step = KVStep(segments=(Segment("a", "main", 8),))
-        assert pool.admit(step, ctx).ok
-        pool.plan(step, ctx)
-        pool.write_kv(*([torch.zeros(8, 1, 1)] * 2), layer_idx=0, label="main")
-        pool.commit(step, ctx)
-    denoise = KVStep(segments=(Segment("a", "main", 4),), commit=False)
-    assert pool.admit(denoise, ctx).ok
-    return pool.config, pool.plan(denoise, ctx)
-
-
-def test_a_released_stream_never_plans_under_a_lease():
-    """The paged kernel attends every page a row holds, which is the window's reach only while the stream keeps no
-    entry past it. A captured step replays the paged kernel, so it refuses such a row."""
-    config, planned = _committed(48)
-    paged = flashinfer.FlashInferManager("kv", torch.device("cpu"), torch.float32, config)
-    lease = SlotLease(slot=0, bucket=BucketKey(graph_walk="rollout", cg_key_info=None, bs=1, num_tokens=4))
-    ctx = SimpleNamespace(resident=None, slot_lease=lease, is_preplan=False, force_prefill=False, slot=0,
-                          plan_phase="res.plan", plan_results={"kv": planned})
-    with pytest.raises(RuntimeError, match="holds entries its kept window no longer reaches"):
-        paged.plan(AttentionStep(causal=False), ctx)
-
-
-def test_a_stream_its_window_reaches_whole_is_not_marked():
-    _, planned = _committed(16)
-    assert not planned["main"].beyond_reach, "a captured step would refuse a stream that released nothing"
-
-
 # A capture of the paged leg
 
 
@@ -468,7 +390,7 @@ def test_a_capture_warms_a_kept_window_read_up_on_its_padding_row():
     pool.build_accelerator_graph_buffers([], 1, TOKENS)
     pool.ingest_capture_row(-2)
     paged = _StubPaged()
-    h = _handle(kv=pool, paged=paged, array=_windowed())
+    h = _handle(kv=pool, paged=paged, array=_windowed(whole_pages=True))
     step = SubmoduleStep(segments=[Segment(-2, "main", TOKENS)], state={"kv": ArrayStep(keep=False)})
     step = state_steps(step, {"kv": h}, graph_walk="gen", leased=True)
     lease = _ctx(leased=True).slot_lease
