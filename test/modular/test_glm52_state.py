@@ -190,14 +190,12 @@ def test_a_speculated_step_takes_the_count_its_verify_step_unpacked():
     sub = _submodule(k)
     sub._mailboxes = {None: (torch.tensor([[11, 12, 13, 14, 2]]), torch.ones(1, dtype=torch.long))}
     sub._verdicts = None, {"r": 0}
-    inp = ARNodeInputs(input_ids=torch.tensor([11]), input_seq_len=k + 1,
-                       kwargs={"emitted": 5, "budget": 64, "ignore_eos": True})
-    # the forward's next input, then what the engine's unpack adds
-    outputs = {"r": {"text_inputs": [torch.tensor([13])]}}
-    outputs["r"].update(sub.unpack_packed_outputs(
+    inp = ARNodeInputs(input_seq_len=k + 1, kwargs={"emitted": 5, "budget": 64, "ignore_eos": True})
+    # the forward outputs nothing per row, so the row's outputs are what the engine's unpack gives it
+    outputs = sub.unpack_packed_outputs(
         static_output={}, request_ids=["r"], real_seq_lens=[k + 1], inputs=[inp],
         per_request_info={"r": _info("decode", 64, 5)},
-    )["r"])
+    )
     spec = Speculation(
         scheduled_batch=ScheduledBatch(node_name="LLM", graph_walk="decode", request_to_worker_graph={"r": "wg"}),
         node_batch=ExecutingBatch(
@@ -263,8 +261,7 @@ def test_a_verify_step_cuts_by_the_budget_its_count_edge_carries():
     sub = _submodule(3)
     sampling = SimpleNamespace(temperature=0, repetition_penalty=1)
     info = SimpleNamespace(request_id="r", resource_configs={SAMPLER: sampling})
-    signals = {"text_inputs": [torch.tensor([7])], "count": [torch.tensor([5, 7, 6, 1])]}
-    row = sub.prepare_inputs("decode", info, signals)
+    row = sub.prepare_inputs("decode", info, {"count": [torch.tensor([5, 7, 6, 1])]})
     assert row.kwargs == {"emitted": 5, "budget": 6, "ignore_eos": 1}
     sub._mailboxes = {None: (torch.tensor([[11, 12, 13, 14, 3]]), torch.ones(1, dtype=torch.long))}
     sub._verdicts = None, {"r": 0}
@@ -334,14 +331,16 @@ def test_a_decode_row_from_prepare_inputs_has_the_template_row_s_span(k):
     template = sub.get_accelerator_graph_configs(torch.device("cpu"))[0].single_request_inputs
     info = _info("decode", 16, 5)
     info.resource_configs[SAMPLER].temperature, info.resource_configs[SAMPLER].repetition_penalty = 0, 1
-    signals = {"text_inputs": [torch.tensor([7])], "count": [torch.tensor([5, 7, 16, 1])]}
+    # under MTP the row's input token is in the seed, and the loop carries the count alone
+    signals = {"count": [torch.tensor([5, 7, 16, 1])]} if k else {"text_inputs": [torch.tensor([7])]}
     row = sub.prepare_inputs("decode", info, signals)
     declared, real = (sub.declare_step("decode", ["a"], [one]) for one in (template, row))
     assert (declared.segments, declared.state) == (real.segments, real.state), (
         "the pre-plan's step is not the one the forward would declare for this row"
     )
-    with pytest.raises(RuntimeError, match="a decode row of 2 ids"):
-        sub.prepare_inputs("decode", info, {**signals, "text_inputs": [torch.tensor([7, 8])]})
+    if not k:
+        with pytest.raises(RuntimeError, match="a decode row of 2 ids"):
+            sub.prepare_inputs("decode", info, {"text_inputs": [torch.tensor([7, 8])]})
 
 
 def _reduced(monkeypatch, **fields) -> None:

@@ -53,7 +53,8 @@ class _MtpNode(_Node):
             out = self.step("prefill", {rid: (infos[rid], {"text_inputs": [ids]})})[rid]
             self.sub.postprocess(rid, infos[rid], out)
             streams[rid] += out["new_token"][0].tolist()
-            texts[rid] = {"text_inputs": [out["text_inputs"][0].clone()], "count": out["count"]}
+            # the decode loop's one loop-back: the step's input token is in the seed
+            texts[rid] = {"count": out["count"]}
             assert not self.sub.check_stop(rid, infos[rid], out)
         live = list(self.prompts)
         for _ in range(MAX_TOKENS + 2):
@@ -70,7 +71,7 @@ class _MtpNode(_Node):
                 out = outs[rid]
                 self.sub.postprocess(rid, infos[rid], out)
                 streams[rid] += out["new_token"][0].tolist()
-                texts[rid] = {"text_inputs": [out["text_inputs"][0].clone()], "count": out["count"]}
+                texts[rid] = {"count": out["count"]}
                 if self.sub.check_stop(rid, infos[rid], out):
                     live.remove(rid)
         return streams
