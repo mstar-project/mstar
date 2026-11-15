@@ -398,9 +398,11 @@ def test_a_windowed_array_takes_no_max_seq_len_past_its_max_len():
     ], "a request past max_len would release entries under a window the guard let through"
 
 
-def test_a_max_seq_len_is_held_to_max_len_only_under_a_kept_window():
-    """An array with no bound has no ``max_len`` to compare, and one with no kept window has no sink guard."""
-    unbounded = _eager()
+@pytest.mark.parametrize("kept", [False, True])
+def test_a_max_seq_len_is_held_to_max_len_only_under_a_kept_window(kept):
+    """An array with no bound has no ``max_len`` to compare, with a kept window (token2wav's) or without, and one with
+    no kept window has no sink guard."""
+    unbounded = _windowed() if kept else _eager()
     object.__setattr__(unbounded, "max_len", None)
     model = SimpleNamespace(declare_state=lambda: [unbounded])
     assert deployment_problems(model, {"kv": {"max_seq_len": 2 * SLOTS}}) == [], "validation raised before reporting"
