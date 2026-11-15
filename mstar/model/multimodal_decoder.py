@@ -329,6 +329,7 @@ class MultimodalDecoderModel(Model):
             [p.text or "" for p in prompt_parts if p.modality == TEXT]
             if prompt_parts is not None else prompt,
             [p.role for p in prompt_parts or ()],
+            [p.extras for p in prompt_parts or ()],
         )
         unsupported = {p.modality for p in parts} - {TEXT, *media}
         if unsupported:

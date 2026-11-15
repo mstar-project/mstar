@@ -75,6 +75,10 @@ class Qwen3_5DenseModel(DeclaredDecoderModel):
     REASONING_START = "<think>"
     REASONING_END = "</think>"
     STRUCTURED_OUTPUTS = True
+    TOOL_FORMAT = "qwen_3_5"
+    # the tool fields reach the prompt (and a forced call's grammar) in the data worker, and stay
+    # there: a tool's schema can hold numbers the conductor's wire doesn't carry
+    PREPROCESS_ONLY_KWARGS = ("tools", "tool_choice", "parallel_tool_calls")
     METADATA_FILES = (
         "config.json",
         "preprocessor_config.json",
@@ -358,6 +362,8 @@ class Qwen3_5DenseModel(DeclaredDecoderModel):
         try:
             text = self.tokenizer.apply_chat_template(
                 messages_from_parts(parts),
+                # with tool_choice none too, as vLLM renders them by default
+                tools=kwargs.get("tools") or None,
                 tokenize=False,
                 add_generation_prompt=True,
                 enable_thinking=enable_thinking,
@@ -408,7 +414,7 @@ class Qwen3_5DenseModel(DeclaredDecoderModel):
         return image_position_advance(torch.tensor(grid), self._merge())
 
     def request_kwargs(self) -> frozenset[str]:
-        return super().request_kwargs() | {"enable_thinking"}
+        return super().request_kwargs() | {"enable_thinking", *self.PREPROCESS_ONLY_KWARGS}
 
     def process_prompt(self, *args: Any, **kwargs: Any) -> ProcessPromptOutput:
         out = super().process_prompt(*args, **kwargs)

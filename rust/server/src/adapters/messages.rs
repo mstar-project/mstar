@@ -10,12 +10,15 @@ use super::*;
 /// it: text newline-joined, attachments persisted under `upload_dir` and
 /// grouped by modality, `input_modalities` the per-part modality sequence.
 /// So an attachment's position and a repeated modality both survive. Each
-/// text part carries its message's role, so a reply stays its own turn. The rules
-/// are `flatten_messages` in `api_server/openai/adapters.py`, line for line.
+/// text part carries its message's role, so a reply stays its own turn. With `tool_turns`
+/// (an adapter whose models may call tools), a `tool` message and an assistant message's
+/// `tool_calls` and reasoning stay their own turns. The rules are `flatten_messages` in
+/// `api_server/openai/adapters.py`, line for line.
 pub fn flatten_messages(
     messages: &[crate::protocol::ChatMessage],
     upload_dir: &Path,
     allow_remote: bool,
+    tool_turns: bool,
 ) -> Result<(Option<String>, BTreeMap<String, Vec<String>>, Vec<String>, Vec<Part>), String> {
     let mut parts: Vec<Part> = Vec::new();
     // A refused chat is never submitted, so a refusal below drops `saved`
@@ -25,13 +28,43 @@ pub fn flatten_messages(
     for msg in messages {
         let role = match msg.role.as_str() {
             "developer" => "system", // OpenAI's newer name for system
+            "tool" if tool_turns => {
+                parts.push(Part {
+                    modality: "text".to_string(),
+                    text: Some(message_text(&msg.content)),
+                    index: 0,
+                    role: Some("tool".to_string()),
+                    extras: None,
+                });
+                continue;
+            }
             role @ ("system" | "user" | "assistant") => role,
             other => {
-                return Err(format!(
-                    "a message's role must be system, developer, user or assistant, not '{other}'"
-                ))
+                let roles = if tool_turns {
+                    "system, developer, user, assistant or tool"
+                } else {
+                    "system, developer, user or assistant"
+                };
+                return Err(format!("a message's role must be {roles}, not '{other}'"));
             }
         };
+        if tool_turns && role == "assistant" {
+            // Python's `reasoning or reasoning_content`
+            let reasoning = [&msg.reasoning, &msg.reasoning_content]
+                .into_iter()
+                .flatten()
+                .find(|v| truthy(v));
+            if let Some(extras) = turn_extras(msg.tool_calls.as_ref(), reasoning)? {
+                parts.push(Part {
+                    modality: "text".to_string(),
+                    text: Some(message_text(&msg.content)),
+                    index: 0,
+                    role: Some(role.to_string()),
+                    extras: Some(extras),
+                });
+                continue;
+            }
+        }
         let content = match &msg.content {
             None => continue,
             Some(Content::Text(s)) => {
@@ -103,6 +136,7 @@ pub(super) fn add_file(
         text: None,
         index: paths.len(),
         role: Some("user".to_string()),
+        extras: None,
     });
     paths.push(path);
 }
@@ -113,7 +147,7 @@ pub(super) fn add_text(parts: &mut Vec<Part>, text: &str, role: &str) {
     // the boundary between them), so only text an attachment or a role change
     // separates gets its own part.
     if let Some(last) = parts.last_mut() {
-        if last.modality == "text" && last.role.as_deref() == Some(role) {
+        if last.modality == "text" && last.role.as_deref() == Some(role) && role != "tool" && last.extras.is_none() {
             let merged = last.text.get_or_insert_with(String::new);
             merged.push('\n');
             merged.push_str(text);
@@ -125,7 +159,64 @@ pub(super) fn add_text(parts: &mut Vec<Part>, text: &str, role: &str) {
         text: Some(text.to_string()),
         index: 0,
         role: Some(role.to_string()),
+        extras: None,
     });
+}
+
+/// A tool or tool-call message's text: its string, or its text parts joined.
+fn message_text(content: &Option<Content>) -> String {
+    match content {
+        None => String::new(),
+        Some(Content::Text(s)) => s.clone(),
+        Some(Content::Parts(parts)) => parts
+            .iter()
+            .filter_map(Value::as_object)
+            .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+/// `turn_extras` in `api_server/openai/adapters.py`: an assistant message's `tool_calls` and
+/// reasoning as the chat template reads them, canonical JSON (keys sorted, no spaces).
+fn turn_extras(tool_calls: Option<&Value>, reasoning: Option<&Value>) -> Result<Option<String>, String> {
+    let mut extras = Map::new();
+    match tool_calls {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(calls)) if calls.is_empty() => {}
+        Some(Value::Array(calls)) => {
+            let mut out = Vec::new();
+            for call in calls {
+                let f = call.as_object().and_then(|c| c.get("function")).and_then(Value::as_object);
+                let name = f.and_then(|f| f.get("name")).and_then(Value::as_str).filter(|n| !n.is_empty());
+                let (f, name) = match (f, name) {
+                    (Some(f), Some(n)) => (f, n),
+                    _ => return Err("each of an assistant message's tool_calls needs a function name".to_string()),
+                };
+                let args = match f.get("arguments") {
+                    None | Some(Value::Null) => Some(Value::Object(Map::new())),
+                    Some(Value::String(s)) if s.trim().is_empty() => Some(Value::Object(Map::new())),
+                    Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok(),
+                    Some(other) => Some(other.clone()),
+                };
+                let args = match args {
+                    Some(Value::Object(o)) => Value::Object(o),
+                    _ => return Err(format!("tool call {}'s arguments must be a JSON object", crate::media::py_repr(name))),
+                };
+                out.push(serde_json::json!({"function": {"arguments": args, "name": name}, "type": "function"}));
+            }
+            extras.insert("tool_calls".to_string(), Value::Array(out));
+        }
+        Some(_) => return Err("an assistant message's tool_calls must be a list".to_string()),
+    }
+    if let Some(Value::String(r)) = reasoning {
+        if !r.is_empty() {
+            extras.insert("reasoning_content".to_string(), serde_json::json!(r));
+        }
+    }
+    Ok((!extras.is_empty()).then(|| Value::Object(extras).to_string()))
 }
 
 /// `{ "<key>": { "url": "..." } }` -> the url string (or "").
@@ -150,8 +241,9 @@ pub(super) fn text_chat(
     req: &ChatCompletionRequest,
     upload_dir: &Path,
     allow_remote: bool,
+    tool_turns: bool,
 ) -> Result<SubmitArgs, String> {
-    let (text, file_paths, in_mods, parts) = flatten_messages(&req.messages, upload_dir, allow_remote)?;
+    let (text, file_paths, in_mods, parts) = flatten_messages(&req.messages, upload_dir, allow_remote, tool_turns)?;
     let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
     apply_sampling(
         &mut mk,
@@ -183,14 +275,19 @@ pub(super) fn text_chat(
 /// clients send template variables. A flat key wins, except one the refusal
 /// dropped as off. Read before the attachments are saved, since a malformed
 /// value refuses the request.
-pub(super) fn template_kwargs_chat(req: &ChatCompletionRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
+pub(super) fn template_kwargs_chat(
+    req: &ChatCompletionRequest,
+    upload_dir: &Path,
+    allow_remote: bool,
+    tool_turns: bool,
+) -> Result<SubmitArgs, String> {
     let mut req = req.clone();
     let template_kwargs = match req.extra.remove("chat_template_kwargs") {
         Some(Value::Object(m)) => m,
         Some(v) if truthy(&v) => return Err("chat_template_kwargs must be an object".to_string()),
         _ => Map::new(),
     };
-    let mut args = text_chat(&req, upload_dir, allow_remote)?;
+    let mut args = text_chat(&req, upload_dir, allow_remote, tool_turns)?;
     for (key, value) in template_kwargs {
         set_default(&mut args.model_kwargs, &key, value);
     }
@@ -200,7 +297,7 @@ pub(super) fn template_kwargs_chat(req: &ChatCompletionRequest, upload_dir: &Pat
 /// `TextChatAdapter.chat_to_request`: text-only LLMs, which refuse what they
 /// cannot serve rather than dropping it. Remote media is never fetched.
 pub(super) fn text_only_chat(req: &ChatCompletionRequest, upload_dir: &Path) -> Result<SubmitArgs, String> {
-    let (text, file_paths, in_mods, parts) = flatten_messages(&req.messages, upload_dir, false)?;
+    let (text, file_paths, in_mods, parts) = flatten_messages(&req.messages, upload_dir, false, false)?;
     let refuse = |message: String| {
         // a refused chat is never submitted, so nothing else removes its attachments
         for path in file_paths.values().flatten() {
@@ -266,7 +363,11 @@ const CHAT_ENVELOPE_FIELDS: [&str; 6] =
 /// `api_server/openai/adapters.py`. `mk` is the request's passthrough; an off
 /// value of one of these fields (`logprobs: false`, `tools: []`) is dropped
 /// from it, before any `chat_template_kwargs` key is merged in.
-pub(super) fn refuse_unserved_chat(req: &ChatCompletionRequest, mk: &mut BTreeMap<String, Value>) -> Result<(), String> {
+pub(super) fn refuse_unserved_chat(
+    req: &ChatCompletionRequest,
+    mk: &mut BTreeMap<String, Value>,
+    tools: bool,
+) -> Result<(), String> {
     if let Some(n) = req.n.filter(|&n| n != 1) {
         return Err(format!("n={n}: this model returns one choice"));
     }
@@ -292,6 +393,15 @@ pub(super) fn refuse_unserved_chat(req: &ChatCompletionRequest, mk: &mut BTreeMa
             }
             mk.insert("structured_outputs".to_string(), structured);
         }
+    }
+    if tools {
+        check_tools(mk)?;
+        let off = ["best_of", "functions", "function_call"];
+        let envelope = CHAT_ENVELOPE_FIELDS.iter().filter(|f| **f != "parallel_tool_calls");
+        for name in UNSERVED_CHAT_FIELDS.iter().chain(&off).chain(envelope) {
+            mk.remove(*name);
+        }
+        return Ok(());
     }
     let listed = |field: &str| match mk.get(field) {
         None | Some(Value::Null) => false,
@@ -319,6 +429,92 @@ pub(super) fn refuse_unserved_chat(req: &ChatCompletionRequest, mk: &mut BTreeMa
     let off = ["best_of", "tools", "tool_choice", "functions", "function_call"];
     for name in UNSERVED_CHAT_FIELDS.iter().chain(&off).chain(&CHAT_ENVELOPE_FIELDS) {
         mk.remove(*name);
+    }
+    Ok(())
+}
+
+const TOOL_CHOICE_SHAPE: &str =
+    r#"tool_choice must be none, auto, required or {"type": "function", "function": {"name": ...}}"#;
+
+/// `_check_tools` in `api_server/openai/adapters.py`, word for word: a chat's tool fields,
+/// checked and kept, for an adapter whose models may call tools.
+fn check_tools(mk: &mut BTreeMap<String, Value>) -> Result<(), String> {
+    let function_call = mk.get("function_call");
+    let call_off = match function_call {
+        None | Some(Value::Null) => true,
+        Some(Value::String(c)) => c == "none" || c == "auto",
+        Some(_) => false,
+    };
+    let call_says_none = function_call.and_then(Value::as_str) == Some("none");
+    let functions_listed = match mk.get("functions") {
+        None | Some(Value::Null) => false,
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(_) => true,
+    };
+    if (functions_listed && !call_says_none) || !call_off {
+        return Err("functions and function_call are not supported; send tools and tool_choice".to_string());
+    }
+    let choice = mk.get("tool_choice").cloned();
+    let tools_empty = match mk.get("tools") {
+        None | Some(Value::Null) => true,
+        Some(Value::Array(a)) => a.is_empty(),
+        Some(_) => false,
+    };
+    if tools_empty {
+        if matches!(&choice, Some(Value::String(c)) if c == "required") || matches!(&choice, Some(Value::Object(_))) {
+            return Err("tool_choice asks for a call, but tools lists none".to_string());
+        }
+        for name in ["tools", "tool_choice", "parallel_tool_calls"] {
+            mk.remove(name);
+        }
+        return Ok(());
+    }
+    let shape = r#"each of tools must be {"type": "function", "function": {"name": ...}}"#;
+    let tools = mk.get("tools").and_then(Value::as_array).ok_or_else(|| shape.to_string())?;
+    let mut names: Vec<String> = Vec::new();
+    for tool in tools {
+        let f = tool
+            .as_object()
+            .filter(|t| t.get("type").and_then(Value::as_str) == Some("function"))
+            .and_then(|t| t.get("function"))
+            .and_then(Value::as_object);
+        let name = f.and_then(|f| f.get("name")).and_then(Value::as_str).filter(|n| !n.is_empty());
+        let (f, name) = match (f, name) {
+            (Some(f), Some(n)) => (f, n),
+            _ => return Err(shape.to_string()),
+        };
+        let repr = crate::media::py_repr(name);
+        if f.get("parameters").is_some_and(|p| !p.is_null() && !p.is_object()) {
+            return Err(format!("tool {repr}'s parameters must be a JSON schema object"));
+        }
+        if f.get("strict").is_some_and(|s| !s.is_null() && !s.is_boolean()) {
+            return Err(format!("tool {repr}'s strict must be true or false"));
+        }
+        names.push(name.to_string());
+    }
+    match &choice {
+        None | Some(Value::Null) => {}
+        Some(Value::String(c)) if matches!(c.as_str(), "none" | "auto" | "required") => {}
+        Some(Value::Object(o)) => {
+            let name = o
+                .get("function")
+                .filter(|_| o.get("type").and_then(Value::as_str) == Some("function"))
+                .and_then(Value::as_object)
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .filter(|n| !n.is_empty())
+                .ok_or_else(|| TOOL_CHOICE_SHAPE.to_string())?;
+            if !names.iter().any(|n| n == name) {
+                return Err(format!("tool_choice names {}, which tools doesn't list", crate::media::py_repr(name)));
+            }
+        }
+        _ => return Err(TOOL_CHOICE_SHAPE.to_string()),
+    }
+    if mk.get("parallel_tool_calls").is_some_and(|p| !p.is_null() && !p.is_boolean()) {
+        return Err("parallel_tool_calls must be true or false".to_string());
+    }
+    if mk.get("structured_outputs").is_some_and(|x| !x.is_null()) {
+        return Err("send tools or a JSON response_format (structured_outputs), not both".to_string());
     }
     Ok(())
 }

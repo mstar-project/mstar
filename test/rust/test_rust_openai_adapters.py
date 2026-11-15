@@ -515,6 +515,60 @@ def test_both_frontends_turn_a_response_format_into_the_same_structured_outputs(
     assert "response_format" not in sub["mk"] and "response_format" not in want.model_kwargs
 
 
+# ── tools and tool turns (Qwen3.5) ──────────────────────────────────────────
+
+_TOOL = {"type": "function", "function": {"name": "get_weather", "parameters": {
+    "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}
+_LOOP = [
+    {"role": "user", "content": "Weather in Paris and Rome?"},
+    {"role": "assistant", "content": None, "reasoning": "Check both.", "tool_calls": [
+        {"id": "c0", "type": "function", "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'}},
+        {"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": {"city": "Rome"}}}]},
+    {"role": "tool", "tool_call_id": "c0", "content": "sunny"},
+    {"role": "tool", "tool_call_id": "c1", "content": [{"type": "text", "text": "rainy"}]},
+]
+TOOL_CASES = {
+    "auto": {"tools": [_TOOL], "tool_choice": "auto"},
+    "required": {"tools": [_TOOL], "tool_choice": "required", "parallel_tool_calls": False},
+    "named": {"tools": [_TOOL], "tool_choice": {"type": "function", "function": {"name": "get_weather"}}},
+    "none": {"tools": [_TOOL], "tool_choice": "none"},
+    "loop": {"tools": [_TOOL], "messages": _LOOP},
+    "required-without-tools": {"tool_choice": "required"},
+    "named-not-listed": {"tools": [_TOOL], "tool_choice": {"type": "function", "function": {"name": "other"}}},
+    "bad-tool": {"tools": [{"name": "get_weather"}]},
+    "bad-parallel": {"tools": [_TOOL], "parallel_tool_calls": 1},
+    "tools-and-json": {"tools": [_TOOL], "response_format": {"type": "json_object"}},
+    "functions": {"functions": [{"name": "get_weather"}]},
+    "bad-arguments": {"tools": [_TOOL], "messages": [_LOOP[0], {"role": "assistant", "tool_calls": [
+        {"type": "function", "function": {"name": "get_weather", "arguments": "[1]"}}]}]},
+}
+
+
+@pytest.mark.parametrize("case", sorted(TOOL_CASES))
+def test_both_frontends_take_a_chats_tools_and_tool_turns_alike(case, tmp_path):
+    """Qwen3.5's adapter keeps a chat's tools and its tool turns, from either frontend alike: the
+    same tool fields and parts (the turn extras' JSON byte for byte) reach the backend, and a bad
+    shape is the same 400, word for word."""
+    body = {"model": "qwen3_5_0.8b", "messages": [{"role": "user", "content": "Weather in Paris?"}],
+            **TOOL_CASES[case]}
+    try:
+        want, refusal = ADAPTER_REGISTRY["qwen3_5_0.8b"].chat_to_request(_python_request(body), tmp_path), None
+    except ValueError as e:
+        want, refusal = None, str(e)
+    stub = _StubAPIServer()
+    with _model_stack("qwen3_5_0.8b", stub) as (port, _upload):
+        status, data = _post(port, ROUTES["chat"][0], body, timeout=30)
+    if refusal is not None:
+        assert (status, json.loads(data)["error"]["message"]) == (400, refusal)
+        assert not stub.submitted
+        return
+    assert status == 200, data
+    (sub,) = stub.submitted
+    for key in ("tools", "tool_choice", "parallel_tool_calls"):
+        assert sub["mk"].get(key) == want.model_kwargs.get(key), key
+    assert [asdict(p) for p in sub["parts"]] == [asdict(p) for p in want.prompt_parts]
+
+
 # ── an image request reaches the backend as the Python adapter builds it ────
 
 IMAGE_CASES = {

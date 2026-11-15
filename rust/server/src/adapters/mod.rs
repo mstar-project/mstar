@@ -58,6 +58,10 @@ pub struct Part {
     pub index: usize,
     /// The chat role of the message it came from; `None` from `/generate`.
     pub role: Option<String>,
+    /// `PromptPart.extras`: a tool-call message's fields the chat template reads, as canonical
+    /// JSON; left out when `None`, so every other part's map is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extras: Option<String>,
 }
 
 /// The arguments the bridge submits to the conductor (mirrors mstar's
@@ -198,6 +202,11 @@ pub trait OpenAIAdapter: Send + Sync {
     fn supports_chat(&self) -> bool {
         false
     }
+    /// Whether this adapter's models may call tools (`_refuse_unserved_chat`'s `tools`): its chat
+    /// keeps `tools` and tool turns, and the backend refuses them for a model with no tool format.
+    fn serves_tools(&self) -> bool {
+        false
+    }
 
     fn supports_speech(&self) -> bool {
         false
@@ -311,7 +320,7 @@ pub trait OpenAIAdapter: Send + Sync {
     fn chat_to_request(&self, req: &ChatCompletionRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
         let mut req = req.clone();
         let mut extra = std::mem::take(&mut req.extra);
-        refuse_unserved_chat(&req, &mut extra)?;
+        refuse_unserved_chat(&req, &mut extra, self.serves_tools())?;
         req.extra = extra;
         self.chat_args(&req, upload_dir, allow_remote)
     }

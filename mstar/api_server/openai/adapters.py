@@ -25,6 +25,7 @@ OpenAI-capable models opt in by adding an adapter and registering it in
 from __future__ import annotations
 
 import http.client
+import json
 import logging
 import re
 import ssl
@@ -86,7 +87,7 @@ class Transcript:
 
 
 def flatten_messages(
-    messages: list, upload_dir: Path, allow_remote: bool = False
+    messages: list, upload_dir: Path, allow_remote: bool = False, tool_turns: bool = False,
 ) -> tuple[str | None, dict[str, list[str]], list[str], list[PromptPart]]:
     """Flatten OpenAI chat ``messages`` into (text, file_paths, input_modalities, parts).
 
@@ -95,6 +96,8 @@ def flatten_messages(
     grouped by modality, ``input_modalities`` the per-part modality sequence.
     So an attachment's position and a repeated modality both survive. Each
     text part carries its message's role, so a reply stays its own turn.
+    With ``tool_turns`` (an adapter whose models may call tools), a ``tool`` message and an
+    assistant message's ``tool_calls`` and ``reasoning`` stay their own turns (`turn_extras`).
     """
     parts: list[PromptPart] = []
     file_paths: dict[str, list[str]] = {}
@@ -113,8 +116,10 @@ def flatten_messages(
         # slot for the boundary between them), so only text an attachment or a
         # role change separates gets its own part, and the rendered prompt
         # keeps the separator it used to have.
-        if parts and parts[-1].modality == "text" and parts[-1].role == role:
-            parts[-1] = replace(parts[-1], text=f"{parts[-1].text}\n{text}")
+        last = parts[-1] if parts else None
+        if last is not None and last.modality == "text" and last.role == role and role != "tool" \
+                and last.extras is None:
+            parts[-1] = replace(last, text=f"{last.text}\n{text}")
             return
         parts.append(PromptPart(modality="text", text=text, role=role))
 
@@ -127,8 +132,18 @@ def flatten_messages(
                 role, content = getattr(msg, "role", None), getattr(msg, "content", None)
             if role == "developer":  # OpenAI's newer name for system
                 role = "system"
+            elif tool_turns and role == "tool":
+                parts.append(PromptPart(modality="text", text=_message_text(content), role="tool"))
+                continue
             elif role not in ("system", "user", "assistant"):
-                raise ValueError(f"a message's role must be system, developer, user or assistant, not {role!r}")
+                roles = "system, developer, user, assistant or tool" if tool_turns else \
+                    "system, developer, user or assistant"
+                raise ValueError(f"a message's role must be {roles}, not {role!r}")
+            extras = turn_extras(_field(msg, "tool_calls"), _field(msg, "reasoning")
+                                 or _field(msg, "reasoning_content")) if tool_turns and role == "assistant" else None
+            if extras is not None:
+                parts.append(PromptPart(modality="text", text=_message_text(content), role=role, extras=extras))
+                continue
             if content is None:
                 continue
             if isinstance(content, str):
@@ -178,6 +193,48 @@ def _passthrough(req) -> dict:
 CHAT_ENVELOPE_KEYS = ("stream_options", "parallel_tool_calls", "user", "store", "metadata", "service_tier")
 
 
+def _field(msg, name: str):
+    """A message's field, from a dict or a pydantic message's extras."""
+    return msg.get(name) if isinstance(msg, dict) else getattr(msg, name, None)
+
+
+def _message_text(content) -> str:
+    """A tool or tool-call message's text: its string, or its text parts joined."""
+    if content is None or isinstance(content, str):
+        return content or ""
+    return "\n".join(p["text"] for p in content if isinstance(p, dict) and p.get("type") == "text" and p.get("text"))
+
+
+def turn_extras(tool_calls, reasoning) -> str | None:
+    """An assistant message's ``tool_calls`` and reasoning, as the chat template reads them
+    (``PromptPart.extras``): each call's ``arguments`` an object (sent as its JSON text), and
+    ``reasoning_content``. Canonical JSON, as the Rust frontend writes it. None when it has neither."""
+    extras: dict = {}
+    if tool_calls not in (None, []):
+        if not isinstance(tool_calls, list):
+            raise ValueError("an assistant message's tool_calls must be a list")
+        calls = []
+        for call in tool_calls:
+            fn = call.get("function") if isinstance(call, dict) else None
+            if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
+                raise ValueError("each of an assistant message's tool_calls needs a function name")
+            args = fn.get("arguments")
+            if args is None or (isinstance(args, str) and not args.strip()):
+                args = {}
+            elif isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = None
+            if not isinstance(args, dict):
+                raise ValueError(f"tool call {fn['name']!r}'s arguments must be a JSON object")
+            calls.append({"function": {"arguments": args, "name": fn["name"]}, "type": "function"})
+        extras["tool_calls"] = calls
+    if isinstance(reasoning, str) and reasoning:
+        extras["reasoning_content"] = reasoning
+    return json.dumps(extras, sort_keys=True, separators=(",", ":"), ensure_ascii=False) if extras else None
+
+
 def response_format_request(response_format: Any) -> dict | None:
     """OpenAI ``response_format`` as a ``structured_outputs`` value; None for
     text. ``ValueError`` for another type."""
@@ -198,7 +255,55 @@ def response_format_request(response_format: Any) -> dict | None:
     raise ValueError(f"response_format type must be text, json_object or json_schema; got {kind!r}")
 
 
-def _refuse_unserved_chat(req, mk: dict) -> None:
+_TOOL_CHOICE_SHAPE = 'tool_choice must be none, auto, required or {"type": "function", "function": {"name": ...}}'
+
+
+def _check_tools(mk: dict) -> None:
+    """A chat's tool fields, checked and kept, for an adapter whose models may call tools
+    (`submit_request` refuses a call for a model with no ``Model.TOOL_FORMAT``). ``tools`` empty
+    drops them all; ``tool_choice`` ``none`` keeps ``tools`` in the prompt and asks for no call.
+    The older ``functions`` / ``function_call`` aren't served. The Rust frontend's
+    ``check_tools`` is the same, word for word."""
+    function_call = mk.get("function_call")
+    if (mk.get("functions") not in (None, []) and function_call != "none") \
+            or function_call not in (None, "none", "auto"):
+        raise ValueError("functions and function_call are not supported; send tools and tool_choice")
+    tools, choice, parallel = mk.get("tools"), mk.get("tool_choice"), mk.get("parallel_tool_calls")
+    if tools in (None, []):
+        if choice == "required" or isinstance(choice, dict):
+            raise ValueError("tool_choice asks for a call, but tools lists none")
+        for name in ("tools", "tool_choice", "parallel_tool_calls"):
+            mk.pop(name, None)
+        return
+    shape = 'each of tools must be {"type": "function", "function": {"name": ...}}'
+    if not isinstance(tools, list):
+        raise ValueError(shape)
+    names = []
+    for tool in tools:
+        fn = tool.get("function") if isinstance(tool, dict) and tool.get("type") == "function" else None
+        if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
+            raise ValueError(shape)
+        if fn.get("parameters") is not None and not isinstance(fn["parameters"], dict):
+            raise ValueError(f"tool {fn['name']!r}'s parameters must be a JSON schema object")
+        if fn.get("strict") is not None and not isinstance(fn["strict"], bool):
+            raise ValueError(f"tool {fn['name']!r}'s strict must be true or false")
+        names.append(fn["name"])
+    if isinstance(choice, dict):
+        fn = choice.get("function") if choice.get("type") == "function" else None
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if not isinstance(name, str) or not name:
+            raise ValueError(_TOOL_CHOICE_SHAPE)
+        if name not in names:
+            raise ValueError(f"tool_choice names {name!r}, which tools doesn't list")
+    elif choice not in (None, "none", "auto", "required"):
+        raise ValueError(_TOOL_CHOICE_SHAPE)
+    if parallel is not None and not isinstance(parallel, bool):
+        raise ValueError("parallel_tool_calls must be true or false")
+    if mk.get(STRUCTURED_OUTPUTS_KWARG) is not None:
+        raise ValueError("send tools or a JSON response_format (structured_outputs), not both")
+
+
+def _refuse_unserved_chat(req, mk: dict, tools: bool = False) -> None:
     """Refuse a chat that asks for more than one plain reply: more choices, stop
     sequences, log probs, sampling penalties, or a tool call. A JSON
     ``response_format`` becomes ``structured_outputs``, which the deployment's
@@ -215,7 +320,8 @@ def _refuse_unserved_chat(req, mk: dict) -> None:
     ``tool_choice`` of ``none`` or ``auto`` ask for no call; clients send them
     by default. A ``tool_choice`` of ``none`` asks for no call even when
     ``tools`` lists some. Their older names, ``functions`` and
-    ``function_call``, follow the same rules.
+    ``function_call``, follow the same rules. With ``tools`` (an adapter whose models
+    may call tools), the tool fields are checked and kept instead (`_check_tools`).
     """
     if req.n not in (None, 1):
         raise ValueError(f"n={req.n}: this model returns one choice")
@@ -233,6 +339,12 @@ def _refuse_unserved_chat(req, mk: dict) -> None:
         if mk.get(STRUCTURED_OUTPUTS_KWARG) is not None:
             raise ValueError("send response_format or structured_outputs, not both")
         mk[STRUCTURED_OUTPUTS_KWARG] = structured
+    if tools:
+        _check_tools(mk)
+        for name in ("functions", "function_call", *CHAT_ENVELOPE_KEYS):
+            if name != "parallel_tool_calls":
+                mk.pop(name, None)
+        return
     choice = mk.get("tool_choice")
     function_call = mk.get("function_call")
     if (
@@ -311,6 +423,9 @@ class OpenAIAdapter:
 
     # Each flag gates exactly one OpenAI surface:
     supports_chat: bool = False     # POST /v1/chat/completions
+    # whether its models may call tools: its chat keeps ``tools`` and tool turns (`_check_tools`),
+    # and `submit_request` refuses them for a model with no ``Model.TOOL_FORMAT``
+    serves_tools: bool = False
     supports_speech: bool = False   # POST /v1/audio/speech
     supports_images: bool = False   # POST /v1/images/generations and /v1/images/edits
     supports_videos: bool = False   # POST /v1/videos/generations
@@ -569,13 +684,15 @@ class Qwen3_5Adapter(OpenAIAdapter):
 
     supports_chat = True
 
+    serves_tools = True
+
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
         mk = _passthrough(req)
-        _refuse_unserved_chat(req, mk)
+        _refuse_unserved_chat(req, mk, tools=self.serves_tools)
         _apply_sampling(req, mk)
         # before the attachments are saved, since a malformed value refuses the request
         _flatten_template_kwargs(mk)
-        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
+        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir, tool_turns=self.serves_tools)
         return SubmitArgs(
             text=text,
             file_paths=file_paths or None,

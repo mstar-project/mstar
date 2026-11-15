@@ -115,6 +115,14 @@ pub struct ChatMessage {
     pub role: String,
     #[serde(default)]
     pub content: Option<Content>,
+    /// An assistant message's calls, and its reasoning under either name, read only by an
+    /// adapter whose models call tools (`flatten_messages`' `tool_turns`).
+    #[serde(default)]
+    pub tool_calls: Option<Value>,
+    #[serde(default)]
+    pub reasoning: Option<Value>,
+    #[serde(default)]
+    pub reasoning_content: Option<Value>,
 }
 
 /// `content` may be a bare string or a list of content-part objects.

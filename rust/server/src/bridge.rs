@@ -735,8 +735,8 @@ mod tests {
     #[test]
     fn a_chat_submit_carries_each_part_by_name() {
         let parts = [
-            Part { modality: "image".into(), text: None, index: 0, role: Some("user".into()) },
-            Part { modality: "text".into(), text: Some("what is it".into()), index: 0, role: Some("user".into()) },
+            Part { modality: "image".into(), text: None, index: 0, role: Some("user".into()), extras: None },
+            Part { modality: "text".into(), text: Some("what is it".into()), index: 0, role: Some("user".into()), extras: None },
         ];
         assert_eq!(
             encoded(&parts)["prompt_parts"],

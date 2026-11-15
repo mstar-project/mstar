@@ -347,7 +347,7 @@ fn decode_files(files: Option<&Val>, upload_dir: &Path) -> Result<(PathsByModali
             })?;
             saved.push(path.clone());
             let list = paths.entry(modality.to_string()).or_default();
-            parts.push(Part { modality: modality.to_string(), text: None, index: list.len(), role: None });
+            parts.push(Part { modality: modality.to_string(), text: None, index: list.len(), role: None, extras: None });
             list.push(path.to_string_lossy().into_owned());
         }
         Ok(())
@@ -392,7 +392,7 @@ fn file_streams(files: Option<&Val>, parts: &[Part]) -> Result<Option<Value>, St
 fn input_layout(text: Option<&str>, input_modalities: Option<Vec<String>>, mut parts: Vec<Part>) -> (Vec<String>, Vec<Part>) {
     let text = text.filter(|t| !t.is_empty());
     if let Some(t) = text {
-        parts.push(Part { modality: "text".into(), text: Some(t.to_string()), index: 0, role: None });
+        parts.push(Part { modality: "text".into(), text: Some(t.to_string()), index: 0, role: None, extras: None });
     }
     if let Some(mut mods) = input_modalities {
         if text.is_some() && !mods.iter().any(|m| m == "text") {
@@ -933,7 +933,7 @@ mod tests {
 
     #[test]
     fn the_layout_keeps_a_text_slot_as_generate_does() {
-        let parts = vec![Part { modality: "image".into(), text: None, index: 0, role: None }];
+        let parts = vec![Part { modality: "image".into(), text: None, index: 0, role: None, extras: None }];
         assert_eq!(input_layout(Some("hi"), None, parts.clone()).0, vec!["image", "text"]);
         assert_eq!(input_layout(Some("hi"), Some(vec!["image".into()]), parts.clone()).0, vec!["image", "text"]);
         assert_eq!(input_layout(None, Some(vec!["image".into(), "text".into()]), parts).0, vec!["image"]);

@@ -84,3 +84,56 @@ def test_a_two_turn_chat_renders_as_its_template_renders_its_messages(env, rende
     text, _, in_mods, parts = flatten_messages(CHAT, tmp_path)
     ours, template = render(os.environ[env], text, in_mods, parts)
     assert ours == template, "the chat reached the template as one user message, its turns glued together"
+
+
+TOOLS = [{"type": "function", "function": {
+    "name": "get_weather", "description": "The weather in a city.",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
+                   "required": ["city"]},
+}}]
+# a tool loop as a client sends it back: the reply's reasoning and calls (arguments as JSON text),
+# then each result, then a question about them
+TOOL_LOOP = [
+    {"role": "system", "content": "Use tools when they help."},
+    {"role": "user", "content": "Weather in Paris and Rome?"},
+    {"role": "assistant", "content": None, "reasoning": "I should check both cities.", "tool_calls": [
+        {"id": "c0", "type": "function", "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'}},
+        {"id": "c1", "type": "function",
+         "function": {"name": "get_weather", "arguments": '{"city": "Rome", "days": 2}'}},
+    ]},
+    {"role": "tool", "tool_call_id": "c0", "content": "sunny, 24C"},
+    {"role": "tool", "tool_call_id": "c1", "content": "rainy, 15C"},
+]
+# the same, as the template reads it: each call's arguments an object, the reasoning as reasoning_content
+TOOL_LOOP_TEMPLATE = [
+    TOOL_LOOP[0], TOOL_LOOP[1],
+    {"role": "assistant", "content": "", "reasoning_content": "I should check both cities.", "tool_calls": [
+        {"type": "function", "function": {"name": "get_weather", "arguments": {"city": "Paris"}}},
+        {"type": "function", "function": {"name": "get_weather", "arguments": {"city": "Rome", "days": 2}}},
+    ]},
+    {"role": "tool", "content": "sunny, 24C"},
+    {"role": "tool", "content": "rainy, 15C"},
+]
+
+
+@pytest.mark.parametrize("thinking", [True, False])
+def test_a_tool_loop_renders_as_qwen3_5s_template_renders_its_messages(tmp_path, thinking):
+    """Tools in the prompt, the assistant's calls and reasoning on its turn, and each tool result its
+    own block: token for token the ids Qwen3.5's template gives the client's messages."""
+    path = os.environ.get("QWEN3_5_CKPT")
+    if not path:
+        pytest.skip("set QWEN3_5_CKPT to the checkpoint's directory")
+    from mstar.api_server.openai.adapters import Qwen3_5Adapter
+    from mstar.api_server.openai.protocol import ChatCompletionRequest
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    args = Qwen3_5Adapter().chat_to_request(ChatCompletionRequest(messages=TOOL_LOOP, tools=TOOLS), tmp_path)
+    model = Qwen3_5DenseModel(path)
+    [ids] = model.process_prompt(
+        args.text, args.input_modalities, ["text"], prompt_parts=args.prompt_parts,
+        tools=args.model_kwargs["tools"], enable_thinking=thinking,
+    ).new_input_tensors["text_inputs"]
+    rendered = model.tokenizer.apply_chat_template(
+        TOOL_LOOP_TEMPLATE, tools=TOOLS, tokenize=False, add_generation_prompt=True, enable_thinking=thinking,
+    )
+    assert ids.tolist() == model.tokenizer(rendered)["input_ids"]

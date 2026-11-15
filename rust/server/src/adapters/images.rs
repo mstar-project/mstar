@@ -77,7 +77,7 @@ impl OpenAIAdapter for Bagel {
         true
     }
     fn chat_args(&self, req: &ChatCompletionRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
-        text_chat(req, upload_dir, allow_remote)
+        text_chat(req, upload_dir, allow_remote, false)
     }
     fn image_to_request(&self, req: &ImageGenerationRequest) -> Result<SubmitArgs, String> {
         sized_image(req)

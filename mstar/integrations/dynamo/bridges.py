@@ -90,6 +90,18 @@ _STRIP_KEYS = {
     "min_tokens", "eos_token_ids", *CHAT_ENVELOPE_KEYS,
 }
 
+def _refuse_tools(args) -> None:
+    """Tool calls aren't served through Dynamo yet: this bridge returns the raw reply, with no
+    ``tool_calls``. A chat asking for one, or carrying a tool turn, is refused; tools with
+    ``tool_choice`` none are dropped, as the chat adapters dropped them before they served tools."""
+    mk = args.model_kwargs or {}
+    turns = any(p.role == "tool" or p.extras is not None for p in args.prompt_parts or ())
+    if mk.get("tools") not in (None, []) and mk.get("tool_choice") != "none" or turns:
+        raise _BadRequestError("tool calling is not served through Dynamo")
+    for name in ("tools", "tool_choice", "parallel_tool_calls"):
+        mk.pop(name, None)
+
+
 # Image-request fields that ride nvext (mirrors Dynamo's NvCreateImageRequest);
 # flattened onto the adapter request so they pass through as model_kwargs.
 _IMAGE_NVEXT_KEYS = ("negative_prompt", "num_inference_steps", "guidance_scale", "seed")
@@ -228,6 +240,7 @@ class RequestBridge:
             args = self.adapter.chat_to_request(req, self.server.upload_dir)
         except ValueError as exc:
             raise _BadRequestError(str(exc)) from exc
+        _refuse_tools(args)
         rid = self._submit(args, prefix="chatcmpl")
         created = int(time.time())
 

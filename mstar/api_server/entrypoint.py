@@ -822,6 +822,18 @@ class APIServer:
     # Submitting a request
     # ----------------------------------------------------------
 
+    def _refuse_unserved_tools(self, model_kwargs: dict, prompt_parts: list[PromptPart] | None) -> None:
+        """A chat's tools on a model with no ``Model.TOOL_FORMAT``: an adapter serves several
+        models, and a frontend can't tell them apart, so the call it asks for, or a tool turn, is
+        refused here, as the adapter refused it before; with ``tool_choice`` none the tools are dropped."""
+        if getattr(getattr(self, "model", None), "TOOL_FORMAT", None) is not None:
+            return
+        turns = any(p.role == "tool" or p.extras is not None for p in prompt_parts or ())
+        if model_kwargs.get("tools") not in (None, []) and model_kwargs.get("tool_choice") != "none" or turns:
+            raise ValueError("tool calling is not supported for this model")
+        for name in ("tools", "tool_choice", "parallel_tool_calls"):
+            model_kwargs.pop(name, None)
+
     def _reply_reasoning_end(self) -> str | None:
         """The text that ends the model's reasoning (`TextOutput.reasoning_end`), read once; None
         for a model that doesn't reason, whose replies aren't parsed."""
@@ -945,6 +957,7 @@ class APIServer:
         # here, before anything is queued: null is unset, types and ranges are
         # checked once for every endpoint, and an over-wide seed cannot be packed
         model_kwargs = normalize_generation_kwargs(model_kwargs)
+        self._refuse_unserved_tools(model_kwargs, prompt_parts)
         model_kwargs, prefix_root = self.lora_kwargs(model, model_kwargs)
         self._report_ignored_params(model_kwargs)
 

@@ -5,7 +5,7 @@ type Flattened = (Option<String>, BTreeMap<String, Vec<String>>, Vec<String>, Ve
 
 fn flatten(messages: &str, upload_dir: &Path) -> Result<Flattened, String> {
     let messages: Vec<ChatMessage> = serde_json::from_str(messages).unwrap();
-    flatten_messages(&messages, upload_dir, false)
+    flatten_messages(&messages, upload_dir, false, false)
 }
 
 fn described(parts: &[Part]) -> Vec<(&str, &str, Option<&str>, usize)> {
@@ -266,9 +266,35 @@ fn a_chat_that_asks_for_a_tool_call_is_refused() {
         r#""functions":[{"name":"get_weather"}]"#,
         r#""function_call":{"name":"get_weather"}"#,
     ] {
-        for (name, adapter) in ADAPTERS.iter().filter(|(_, a)| a.supports_chat()) {
+        for (name, adapter) in ADAPTERS.iter().filter(|(_, a)| a.supports_chat() && !a.serves_tools()) {
             let err = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false).unwrap_err();
             assert_eq!(err, "tool calling is not supported for this model", "{fields} reached {name}");
+        }
+    }
+}
+
+#[test]
+fn an_adapter_that_serves_tools_checks_and_keeps_them() {
+    let tool = r#"{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}"#;
+    for (name, adapter) in ADAPTERS.iter().filter(|(_, a)| a.serves_tools()) {
+        let mk = adapter
+            .chat_to_request(&chat_with(&format!(r#""tools":[{tool}],"tool_choice":"required","parallel_tool_calls":false"#)), Path::new("/unused"), false)
+            .unwrap()
+            .model_kwargs;
+        assert_eq!(mk["tool_choice"], serde_json::json!("required"), "{name}");
+        assert_eq!(mk["parallel_tool_calls"], serde_json::json!(false), "{name}");
+        assert_eq!(mk["tools"][0]["function"]["name"], serde_json::json!("get_weather"), "{name}");
+        for (fields, err) in [
+            (r#""tool_choice":"required""#.to_string(), "tool_choice asks for a call, but tools lists none"),
+            (r#""functions":[{"name":"f"}]"#.to_string(), "functions and function_call are not supported; send tools and tool_choice"),
+            (r#""tools":[{"name":"f"}]"#.to_string(), r#"each of tools must be {"type": "function", "function": {"name": ...}}"#),
+            (format!(r#""tools":[{tool}],"tool_choice":"some""#), r#"tool_choice must be none, auto, required or {"type": "function", "function": {"name": ...}}"#),
+            (format!(r#""tools":[{tool}],"tool_choice":{{"type":"function","function":{{"name":"other"}}}}"#), "tool_choice names 'other', which tools doesn't list"),
+            (format!(r#""tools":[{tool}],"parallel_tool_calls":"yes""#), "parallel_tool_calls must be true or false"),
+            (format!(r#""tools":[{tool}],"response_format":{{"type":"json_object"}}"#), "send tools or a JSON response_format (structured_outputs), not both"),
+        ] {
+            let got = adapter.chat_to_request(&chat_with(&fields), Path::new("/unused"), false).unwrap_err();
+            assert_eq!(got, err, "{fields} on {name}");
         }
     }
 }
@@ -339,7 +365,9 @@ fn the_tool_fields_clients_send_by_default_pass() {
             let mk = args.unwrap().model_kwargs;
             let sent: serde_json::Value = serde_json::from_str(&format!("{{{fields}}}")).unwrap();
             for key in sent.as_object().unwrap().keys() {
-                assert!(!mk.contains_key(key), "{key} reached the backend from {fields} on {name}");
+                // an adapter that serves tools keeps listed ones (tool_choice none renders them)
+                let kept = adapter.serves_tools() && fields.contains("get_weather") && key.starts_with("tool");
+                assert!(kept || !mk.contains_key(key), "{key} reached the backend from {fields} on {name}");
             }
         }
     }

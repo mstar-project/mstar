@@ -1825,7 +1825,7 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
                 return detail_error(500, &e.to_string());
             }
             let paths = uploads.paths.entry(modality.to_string()).or_default();
-            parts.push(Part { modality: modality.to_string(), text: None, index: paths.len(), role: None });
+            parts.push(Part { modality: modality.to_string(), text: None, index: paths.len(), role: None, extras: None });
             paths.push(save_path.to_string_lossy().into_owned());
         } else {
             // Propagate a field read failure (body-limit overrun, mid-upload
@@ -1924,7 +1924,7 @@ async fn generate_finish(
     // /generate lays it out.
     let has_text = text.is_some();
     if has_text {
-        parts.push(Part { modality: "text".to_string(), text: text.clone(), index: 0, role: None });
+        parts.push(Part { modality: "text".to_string(), text: text.clone(), index: 0, role: None, extras: None });
     }
     let input_modalities: Vec<String> = match in_mods_raw {
         // An explicit list is then the layout on its own, so the derived

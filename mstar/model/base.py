@@ -695,6 +695,10 @@ class Model(ABC):
     # declares it once its reasoning end, stop tokens and tests are in place; on any other, the switch is
     # refused at startup rather than served half right.
     STRUCTURED_OUTPUTS: bool = False
+    # The model's tool-call format, as xgrammar names it (``get_model_structural_tag``), for a model
+    # that serves OpenAI ``tools``: its chat template renders them, the reply parser finds its calls,
+    # and a forced call's grammar holds to it. None: a chat with tools is refused (`submit_request`).
+    TOOL_FORMAT: str | None = None
     # Output modalities a client plays as they stream, where a pause is a gap. A streamed request with one of
     # them reserves its whole KV footprint and is never preempted. ``unpausable_outputs`` in the serving config
     # overrides it.

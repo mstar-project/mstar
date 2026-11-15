@@ -1,6 +1,7 @@
 """Unit tests for the OpenAI request adapters (pydantic + numpy; no fastapi)."""
 
 import base64
+import json
 from pathlib import Path
 
 import pytest
@@ -231,7 +232,7 @@ _FUNCTION = {"name": "get_weather"}
 _NAMED = {"type": "function", "function": _FUNCTION}
 
 
-@pytest.mark.parametrize("adapter", _CHAT_ADAPTERS, ids=lambda a: a.__name__)
+@pytest.mark.parametrize("adapter", [a for a in _CHAT_ADAPTERS if not a.serves_tools], ids=lambda a: a.__name__)
 @pytest.mark.parametrize("fields", [
     {"tools": [_NAMED]}, {"tool_choice": "required"}, {"tool_choice": _NAMED},
     {"functions": [_FUNCTION]}, {"function_call": _FUNCTION},
@@ -274,7 +275,67 @@ def test_the_tool_fields_clients_send_by_default_pass(tmp_path, adapter, fields)
     req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
     sa = adapter().chat_to_request(req, tmp_path)
     assert sa.text == "hi", "a client's default tool fields refused a plain chat"
-    assert set(fields).isdisjoint(sa.model_kwargs)
+    # an adapter that serves tools keeps listed ones (tool_choice none renders them)
+    kept = {"tools", "tool_choice"} if adapter.serves_tools and fields.get("tools") else set()
+    assert set(fields).intersection(sa.model_kwargs) == kept
+
+
+_TOOL = {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}
+
+
+@pytest.mark.parametrize("adapter", [a for a in _CHAT_ADAPTERS if a.serves_tools], ids=lambda a: a.__name__)
+def test_an_adapter_that_serves_tools_checks_and_keeps_them(tmp_path, adapter):
+    """Kept for the backend, which refuses a call for a model with no tool format; each bad
+    shape is a 400 naming it, the Rust frontend's text word for word."""
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], tools=[_TOOL],
+                                tool_choice="required", parallel_tool_calls=False)
+    mk = adapter().chat_to_request(req, tmp_path).model_kwargs
+    assert (mk["tools"], mk["tool_choice"], mk["parallel_tool_calls"]) == ([_TOOL], "required", False)
+    for fields, error in [
+        ({"tool_choice": "required"}, "tool_choice asks for a call, but tools lists none"),
+        ({"functions": [_FUNCTION]}, "functions and function_call are not supported; send tools and tool_choice"),
+        ({"tools": [_FUNCTION]}, 'each of tools must be {"type": "function", "function": {"name": ...}}'),
+        ({"tools": [_TOOL], "tool_choice": "some"},
+         'tool_choice must be none, auto, required or {"type": "function", "function": {"name": ...}}'),
+        ({"tools": [_TOOL], "tool_choice": {"type": "function", "function": {"name": "other"}}},
+         "tool_choice names 'other', which tools doesn't list"),
+        ({"tools": [_TOOL], "parallel_tool_calls": "yes"}, "parallel_tool_calls must be true or false"),
+        ({"tools": [_TOOL], "response_format": {"type": "json_object"}},
+         "send tools or a JSON response_format (structured_outputs), not both"),
+    ]:
+        req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
+        with pytest.raises(ValueError) as refused:
+            adapter().chat_to_request(req, tmp_path)
+        assert str(refused.value) == error, fields
+
+
+_TOOL_LOOP = [
+    {"role": "user", "content": "Weather in Paris and Rome?"},
+    {"role": "assistant", "content": None, "reasoning": "I should check both.", "tool_calls": [
+        {"id": "c0", "type": "function", "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'}},
+        {"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": {"city": "Rome"}}},
+    ]},
+    {"role": "tool", "tool_call_id": "c0", "content": "sunny"},
+    {"role": "tool", "tool_call_id": "c1", "content": [{"type": "text", "text": "rainy"}]},
+]
+
+
+def test_a_tool_loop_keeps_each_turn_for_an_adapter_that_serves_tools(tmp_path):
+    """The calls ride on their assistant turn as the template reads them (arguments an object,
+    the reasoning as ``reasoning_content``), and two tool results stay two turns."""
+    req = ChatCompletionRequest(messages=_TOOL_LOOP, tools=[_TOOL])
+    parts = adapters.Qwen3_5Adapter().chat_to_request(req, tmp_path).prompt_parts
+    assert [(p.role, p.text) for p in parts] == [
+        ("user", "Weather in Paris and Rome?"), ("assistant", ""), ("tool", "sunny"), ("tool", "rainy"),
+    ]
+    assert json.loads(parts[1].extras) == {"reasoning_content": "I should check both.", "tool_calls": [
+        {"function": {"arguments": {"city": "Paris"}, "name": "get_weather"}, "type": "function"},
+        {"function": {"arguments": {"city": "Rome"}, "name": "get_weather"}, "type": "function"},
+    ]}
+    assert parts[1].extras == json.dumps(json.loads(parts[1].extras), sort_keys=True, separators=(",", ":"))
+    for adapter in (a for a in _CHAT_ADAPTERS if not a.serves_tools):
+        with pytest.raises(ValueError, match="not 'tool'"):
+            adapter().chat_to_request(ChatCompletionRequest(messages=_TOOL_LOOP), tmp_path)
 
 
 def test_qwen3_chat_audio_url_input(tmp_path):
