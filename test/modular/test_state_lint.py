@@ -33,15 +33,15 @@ PORTED = (
     "mstar/model/canary_qwen", "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
     "mstar/model/qwen3_tts",
     "mstar/model/pi05", "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
-    "mstar/model/bagel", "mstar/model/chatterbox", "mstar/model/whisper",
+    "mstar/model/bagel", "mstar/model/chatterbox", "mstar/model/whisper", "mstar/model/phi4mm",
     "mstar/model/nemotron_duplex", "mstar/model/components/fastconformer.py",
     "mstar/model/components/fastconformer_stream.py",
 )
 # The list only shrinks: a package leaves it when its port lands, and nothing is added to it.
 UNPORTED = (
     "mstar/model/cosmos3", "mstar/model/cosyvoice3", "mstar/model/glm52", "mstar/model/glm5_next",
-    "mstar/model/lingbot_world", "mstar/model/minicpm_o", "mstar/model/muse",
-    "mstar/model/phi4mm", "mstar/model/ripple", "mstar/model/waypoint",
+    "mstar/model/lingbot_world", "mstar/model/minicpm_o", "mstar/model/muse", "mstar/model/ripple",
+    "mstar/model/waypoint",
 )
 # shared code under mstar/model/ that holds no model
 SHARED = ("mstar/model/components", "mstar/model/loader")
@@ -61,7 +61,7 @@ ALLOWED = {
         "AcceleratorGraphConfig", "BatchedAcceleratorGraphConfig", "DETERMINISTIC_COMPILE_MODE",
         "PackedAcceleratorGraphConfig", "PiecewiseAcceleratorGraphConfig", "PiecewiseBatchedConfig",
         "PiecewiseCallInputs", "PiecewiseCaptureShape", "PiecewisePackedConfig", "decode_rows_then_prompt",
-        "geometric_batch_sizes",
+        "check_inductor_options", "geometric_batch_sizes",
     )
 } | {
     ("mstar.engine.engine", "ExecutingBatch"): "the annotation of `NodeSubmodule.can_batch`, a base class's hook",
@@ -145,6 +145,7 @@ CONTRACT = "mstar/engine/state/contract.py"
 CONTRACT_RESOURCE_IMPORTS = {
     ("mstar.engine.resources.attn.config", "SP_EXCHANGES"),
     ("mstar.engine.resources.kv.config", "Span"),
+    ("mstar.engine.resources.position.config", "LongRoPE"),
     ("mstar.engine.resources.step", "Segment"),
 }
 
