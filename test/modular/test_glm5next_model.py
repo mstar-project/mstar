@@ -422,7 +422,7 @@ def test_glm5next_refuses_a_seed_pool_short_of_the_cap():
     serve = yaml.safe_load((Path(__file__).parents[2] / "configs" / "glm5_next_tp8_mtp.yaml").read_text())
     model = Glm5NextModel("x", **serve["model_kwargs"])
     model.validate_config_yaml(serve, "glm5_next_tp8_mtp.yaml")
-    serve["resources"][MTP_SEED]["max_slots"] = serve["max_concurrent_requests"]
+    serve["resources"][MTP_SEED] = {"max_slots": serve["max_concurrent_requests"]}
     with pytest.raises(ValueError, match=MTP_SEED):
         model.validate_config_yaml(serve, "glm5_next_tp8_mtp.yaml")
 
