@@ -443,6 +443,10 @@ and its bridge (see :doc:`installation`).
        against the system trust store on the Python frontend and against
        the bundled Mozilla roots (``webpki-roots``) on the Rust frontend,
        so a private CA added to the system store is trusted by Python only.
+       At most 8 remote fetches run at once per frontend process (fewer on a
+       small Python host, leaving two default executor threads free). A
+       request above that limit is refused immediately; local media requests
+       are not counted.
    * - ``MSTAR_REMOTE_ALLOWED_HOSTS``
      - unset
      - Comma-separated hosts and ``*.suffix`` patterns (``*.example.com``

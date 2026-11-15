@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 
 use base64::Engine as _;
 use serde_json::Value;
@@ -487,6 +488,19 @@ fn save_remote_url(
     upload_dir: &Path,
     policy: &RemotePolicy,
 ) -> Result<(String, String), String> {
+    // Match Python's eight-slot upper bound. The blocking task holds its slot if cancelled.
+    static FETCH_SLOTS: OnceLock<Semaphore> = OnceLock::new();
+    let slots = FETCH_SLOTS.get_or_init(|| Semaphore::new(8));
+    save_remote_url_bounded(url, upload_dir, policy, slots)
+}
+
+fn save_remote_url_bounded(
+    url: &str,
+    upload_dir: &Path,
+    policy: &RemotePolicy,
+    slots: &Semaphore,
+) -> Result<(String, String), String> {
+    let _permit = slots.try_acquire().map_err(|_| fetch_error("", "too many concurrent fetches", ""))?;
     let deadline = Instant::now() + policy.timeout;
     if url.contains(URL_DROPPED) {
         return Err(fetch_error("", "invalid URL", format!("{url:?}")));
@@ -1276,6 +1290,23 @@ mod tests {
 
     fn refused(url: &str, policy: &RemotePolicy, reason: &str) {
         assert_eq!(fetch(url, policy).unwrap_err(), format!("remote media fetch failed: {reason}"));
+    }
+
+    #[test]
+    fn remote_fetch_cap_refuses_without_queueing() {
+        let (port, _) = serve();
+        let slots = Semaphore::new(1);
+        let permit = slots.try_acquire().unwrap();
+        let dir = std::env::temp_dir().join(format!("mstar-remote-{}", Uuid::new_v4()));
+        let url = format!("http://127.0.0.1:{port}/a.png");
+        let start = Instant::now();
+        let err = save_remote_url_bounded(&url, &dir, &local(), &slots).unwrap_err();
+        assert_eq!(err, "remote media fetch failed: too many concurrent fetches");
+        assert!(start.elapsed() < Duration::from_millis(500));
+        drop(permit);
+        let (_, path) = save_remote_url_bounded(&url, &dir, &local(), &slots).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), PNG);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
