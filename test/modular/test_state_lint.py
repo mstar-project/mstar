@@ -32,13 +32,15 @@ PORTED = (
     "mstar/model/canary_qwen", "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
     "mstar/model/qwen3_tts",
     "mstar/model/pi05", "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
+    "mstar/model/bagel", "mstar/model/chatterbox", "mstar/model/whisper",
+    "mstar/model/nemotron_duplex", "mstar/model/components/fastconformer.py",
+    "mstar/model/components/fastconformer_stream.py",
 )
 # The list only shrinks: a package leaves it when its port lands, and nothing is added to it.
 UNPORTED = (
-    "mstar/model/bagel", "mstar/model/chatterbox", "mstar/model/cosmos3", "mstar/model/cosyvoice3",
-    "mstar/model/glm52", "mstar/model/glm5_next", "mstar/model/higgs_audio", "mstar/model/lingbot_world",
-    "mstar/model/minicpm_o", "mstar/model/muse", "mstar/model/nemotron_duplex", "mstar/model/phi4mm",
-    "mstar/model/ripple", "mstar/model/waypoint", "mstar/model/whisper",
+    "mstar/model/cosmos3", "mstar/model/cosyvoice3", "mstar/model/glm52", "mstar/model/glm5_next",
+    "mstar/model/higgs_audio", "mstar/model/lingbot_world", "mstar/model/minicpm_o", "mstar/model/muse",
+    "mstar/model/phi4mm", "mstar/model/ripple", "mstar/model/waypoint",
 )
 # shared code under mstar/model/ that holds no model
 SHARED = ("mstar/model/components", "mstar/model/loader")
@@ -47,6 +49,8 @@ FORBIDDEN_ATTRIBUTES = {
     # what a handle holds
     "resource", "positions", "reads", "first_read", "_kv", "_attn", "_cross", "_pool", "_runners", "_views", "_blocks",
     "_bindings", "_layouts", "_update",
+    # what LoRA's binding sets on a module, and the pool call behind it
+    "lora_delta", "lora_params", "layer_delta",
 }
 
 _CAPTURE = "a capture's buckets and compile mode, which the engine doesn't pick yet"
@@ -61,17 +65,40 @@ ALLOWED = {
 } | {
     ("mstar.engine.engine", "ExecutingBatch"): "the annotation of `NodeSubmodule.can_batch`, a base class's hook",
     ("mstar.engine.resources.lora.checkpoint", "LoraFile"): "a model's static LoRA merge at load, which holds no state",
-    ("mstar.engine.resources.lora", "LoraSpec"): "the opt-in LoRA spec, written by hand: the contract declares no LoRA",
+    ("mstar.engine.resources.kv.config", "DEFAULT_PAGE_SIZE"):
+        "the page size a model's default pool sizes count in, until the pool sizes itself",
     ("mstar.engine.resources", "SeqShardSpec"): (
         "MiniMax-H3's video decoder's sequence shard, written by hand: a contract SeqShard brackets a label an array "
         "opens, and the decoder has no arrays"
     ),
 }
+_LORA = (
+    "per-request LoRA, outside the contract for good: adapters are weights the bridge builds from `lora_roots` and "
+    "binds, which no request writes, and a request picks one by its kwargs"
+)
+# Model-layer declarations of what stands outside the contract. A ported file may import these names from the LoRA
+# package and nothing else from it, by any form of import: the rest of the package is the bridge's.
+LORA_PACKAGE = "mstar.model.components.lora"
+OUTSIDE = {("mstar.model.components.lora.modules", name): _LORA for name in ("AdapterRoot", "LoraRoot", "PER_SEGMENT")}
 # Where an allowed import may stand: the one file whose text says why. Any other ported file importing it fails.
 ALLOWED_ONLY_IN = {("mstar.engine.resources", "SeqShardSpec"): "mstar/model/minimax_h3/minimax_h3_model.py"}
+# Exceptions for one file, by file, module and name, which a later port of the same kind mustn't inherit.
+ALLOWED_IN: dict[tuple[str, str, str], str] = {
+    ("mstar/model/bagel/bagel_model.py", "mstar.engine.resources", "KVReqConfig"):
+        "per-node and publish labels under CFG parallel and P/D, until P/D labels",
+} | {
+    ("mstar/model/chatterbox/components/s3gen_graphs.py", module, name):
+        "S3Gen's own captures per shape, which hold no state"
+    for module, name in (
+        ("mstar.engine.accelerator_graph_backend", "CapturedGraph"),
+        ("mstar.engine.accelerator_graph_runner", "capture_into_graph"),
+    )
+}
 # Exceptions each scoped to one function and one attribute, by file, the function's qualified name in that file, and
-# the attribute: a graph break (`disable`) or a forbidden read the function may keep.
+# the attribute: a graph break (`disable`), a forbidden read the function may keep, or `def` for a hook it may define.
 ALLOWED_IN_FUNCTION = {
+    ("mstar/model/minimax_h3/minimax_h3_model.py", "H3Model.get_node_resources", "def"):
+        "the video decoder's hand-written sequence shard, as its SeqShardSpec import says",
     ("mstar/model/minimax_h3/submodules.py", "H3VideoDecoderSubmodule.declare_step", "sequence_shard"):
         "the video decoder's hand-written sequence shard, which a contract SeqShard can't declare (no arrays)",
     ("mstar/model/minimax_h3/submodules.py", "H3VideoDecoderSubmodule.run_batch", "sequence_shard"):
@@ -84,22 +111,18 @@ ALLOWED_IN_FUNCTION = {
         "the opt-in watermark's per-stream state, until it moves to a watermark node's plain Value (issue #1447)",
     ("mstar/model/wan22/components/dit.py", "_token_runs", "disable"):
         "the timestep runs of a rank's share of the tokens, read off the shard's range outside the DiT's guards",
+    ("mstar/model/bagel/components/vit_encoder.py", "BagelViTAttention.attend", "disable"):
+        "the ViT's eager varlen attention, flash-attn or a masked SDPA, which keeps no state",
+    ("mstar/model/bagel/submodules.py", "ViTEncoderSubmodule._replay_block_loop", "disable"):
+        "the ViT region's replay, which runs its captured graph; no state call sits behind it",
 }
 # what a module defines to be handed the node's built resources, rather than its handles (`bind_state`)
 RESOURCE_BINDS = {"bind_resources", "bind_node_resources"}
-_LORA = "the opt-in LoRA spec, which the contract doesn't declare"
-# The ported files that still write a spec by hand in `get_node_resources`, each with the one call its override
-# returns: a listed file can't return a second spec, which a shared module the lint doesn't read could build.
-ALLOWED_NODE_RESOURCES = {
-    "mstar/model/qwen3_5/qwen3_5_model.py": ("qwen3_5_lora_spec", _LORA),
-    "mstar/model/qwen3_omni/qwen3_omni_model.py": ("self._lora_spec", _LORA),
-    "mstar/model/orpheus/orpheus_model.py": ("self._lora_spec", _LORA),
-    "mstar/model/qwen3_tts/qwen3_tts_model.py": ("self._lora_spec", _LORA),
-    "mstar/model/minimax_h3/minimax_h3_model.py": (
-        "SeqShardSpec",
-        "the video decoder's sequence shard, which a contract SeqShard can't declare since the decoder has no arrays",
-    ),
-}
+# what a model defines to write resource specs by hand, rather than declare them (`declare_state`, `lora_roots`)
+HAND_WRITTEN_SPECS = {"get_node_resources"}
+# what builds a LoRA spec, which only the bridge's own files do
+LORA_SPEC_BUILDERS = {"declared_lora_spec", "module_lora_spec", "join_lora_specs", "LoraSpec"}
+LORA_BRIDGE = {Path("mstar/model/base.py"), Path("mstar/model/components/lora/modules.py")}
 ADAPTERS = "mstar.engine.state.adapters"
 _BY_HAND = "the script builds a node's resources and handles by hand, as a test does"
 # the files that import the adapters from outside mstar/engine/ and the tests, each with its reason
@@ -109,6 +132,7 @@ ADAPTER_IMPORTERS = {
     "mstar/api_server/data_worker.py": "the data worker converts a prompt's state layout into today's KV layouts",
     "mstar/conductor/conductor.py": "the conductor converts a request's `SampleSettings` into sampler configs",
     "mstar/validation/__init__.py": "`validate_deployment` checks a deployment's state setup before a worker spawns",
+    "mstar/model/utils.py": "`check_kv_pools_fit` sizes each KV pool from a request's declared layouts at load",
     "benchmark/command_a_plus/validate_checkpoint.py": _BY_HAND,
     "benchmark/lora/module_parity.py": _BY_HAND,
     "benchmark/ltx2_5/profile_step.py": _BY_HAND,
@@ -139,14 +163,8 @@ def _in_functions(node: ast.AST, prefix: str = "", function: str | None = None):
             yield from _in_functions(child, prefix, function)
 
 
-def _returns_one(function: ast.FunctionDef, call: str) -> bool:
-    """Whether every return of ``function`` is a list of one call to ``call``."""
-    returns = [node.value for node in ast.walk(function) if isinstance(node, ast.Return)]
-    return bool(returns) and all(
-        isinstance(value, ast.List) and len(value.elts) == 1 and isinstance(value.elts[0], ast.Call)
-        and ast.unparse(value.elts[0].func) == call
-        for value in returns
-    )
+def _in_lora_package(name: str) -> bool:
+    return name == LORA_PACKAGE or name.startswith(f"{LORA_PACKAGE}.")
 
 
 def _violations(source: str, path: str = "") -> tuple[list[str], set[tuple[str, ...]]]:
@@ -165,20 +183,27 @@ def _violations(source: str, path: str = "") -> tuple[list[str], set[tuple[str, 
                 key = (node.module, alias.name)
                 if key in ALLOWED and ALLOWED_ONLY_IN.get(key, path) == path:
                     used.add(key)
+                elif (path, *key) in ALLOWED_IN:
+                    used.add((path, *key))
                 else:
                     found.append(f"from {node.module} import {alias.name}")
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                if (node.module, alias.name) in OUTSIDE:
+                    used.add((node.module, alias.name))
+                elif _in_lora_package(f"{node.module}.{alias.name}"):
+                    found.append(f"from {node.module} import {alias.name}, which is the bridge's")
         elif isinstance(node, ast.Import):
-            found += [f"import {a.name}" for a in node.names if a.name.startswith("mstar.engine")]
+            found += [
+                f"import {a.name}" for a in node.names if a.name.startswith("mstar.engine") or _in_lora_package(a.name)
+            ]
         elif isinstance(node, ast.FunctionDef) and node.name in RESOURCE_BINDS:
             found.append(f"def {node.name} at line {node.lineno}, which takes the built resources")
-        elif isinstance(node, ast.FunctionDef) and node.name == "get_node_resources":
-            call = ALLOWED_NODE_RESOURCES.get(path, ("",))[0]
-            if call and _returns_one(node, call):
-                used.add(path)
-            elif call:
-                found.append(f"def get_node_resources at line {node.lineno}, which returns more than its one `{call}`")
+        elif isinstance(node, ast.FunctionDef) and node.name in HAND_WRITTEN_SPECS:
+            if (path, function, "def") in ALLOWED_IN_FUNCTION:
+                used.add((path, function, "def"))
             else:
-                found.append(f"def get_node_resources at line {node.lineno}, where `declare_state` declares the state")
+                found.append(f"def {node.name} at line {node.lineno}, which writes resource specs by hand")
         elif isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_ATTRIBUTES:
             found.append(f".{node.attr} at line {node.lineno}")
         elif breaks:
@@ -277,10 +302,18 @@ def test_every_exception_is_still_used():
     for path in _sources():
         used |= _violations(path.read_text(), str(path))[1]
     excepted = (
-        ALLOWED.keys() | ALLOWED_IN_FUNCTION.keys() | ADAPTER_IMPORTERS.keys() | CONTRACT_RESOURCE_IMPORTS
-        | ALLOWED_NODE_RESOURCES.keys()
+        ALLOWED.keys() | ALLOWED_IN.keys() | ALLOWED_IN_FUNCTION.keys() | OUTSIDE.keys() | ADAPTER_IMPORTERS.keys()
+        | CONTRACT_RESOURCE_IMPORTS
     )
     assert excepted <= used, f"delete these exceptions: {sorted(excepted - used, key=str)}"
+
+
+def test_an_exception_for_one_file_refuses_the_import_in_another(monkeypatch):
+    source = "from mstar.engine.resources import KVReqConfig"
+    entry = ("mstar/model/a/a.py", "mstar.engine.resources", "KVReqConfig")
+    monkeypatch.setitem(ALLOWED_IN, entry, "a's own")
+    assert _violations(source, "mstar/model/a/a.py") == ([], {entry})
+    assert _violations(source, "mstar/model/b/b.py")[0] == [source], "the exception would reach every ported package"
 
 
 @pytest.mark.parametrize("source, expected", [
@@ -301,6 +334,12 @@ def test_every_exception_is_still_used():
     ("@torch.compiler.disable\ndef f(): pass", "torch.compiler.disable"),
     ("class M:\n    def bind_resources(self, resources): pass", "def bind_resources"),
     ("class M:\n    def get_node_resources(self): return []", "def get_node_resources"),
+    ("from mstar.model.components.lora.modules import module_lora_spec", "module_lora_spec, which is the bridge's"),
+    ("from mstar.model.components.lora import modules", "import modules, which is the bridge's"),
+    ("from mstar.model.components import lora", "import lora, which is the bridge's"),
+    ("import mstar.model.components.lora.modules as m", "import mstar.model.components.lora.modules"),
+    ("from mstar.model.components.lora.capable import make_lora_capable", "make_lora_capable, which is the bridge's"),
+    ("def f(self): return self.qkv_proj.lora_delta", ".lora_delta"),
 ])
 def test_the_lint_catches_each_way_past_the_contract(source, expected):
     found, _ = _violations(source)
@@ -315,6 +354,36 @@ def test_an_allowed_import_stands_only_in_the_file_that_needs_it():
 
 def test_the_lint_passes_the_contract_itself():
     assert _violations("from mstar.engine.state import Array, sample") == ([], set())
+
+
+def test_the_lint_lets_a_ported_file_declare_lora_roots():
+    source = "from mstar.model.components.lora.modules import PER_SEGMENT, LoraRoot"
+    modules = "mstar.model.components.lora.modules"
+    assert _violations(source) == ([], {(modules, "PER_SEGMENT"), (modules, "LoraRoot")})
+
+
+def test_minimax_h3s_entry_covers_only_its_own_get_node_resources():
+    path = "mstar/model/minimax_h3/minimax_h3_model.py"
+    source = (
+        "class H3Model:\n    def get_node_resources(self): return []\n"
+        "class H3Other:\n    def get_node_resources(self): return []\n"
+    )
+    found, used = _violations(source, path)
+    assert used == {(path, "H3Model.get_node_resources", "def")}
+    expected = ["def get_node_resources at line 4, which writes resource specs by hand"]
+    assert found == expected, "the entry covers another class's get_node_resources"
+
+
+def test_no_model_builds_a_lora_spec_by_hand():
+    """Every model file outside the bridge, ported or not. ``tests`` folders are skipped."""
+    found = []
+    for path in sorted(Path("mstar/model").rglob("*.py")):
+        if "tests" in path.parts or path in LORA_BRIDGE:
+            continue
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Call) and ast.unparse(node.func).split(".")[-1] in LORA_SPEC_BUILDERS:
+                found.append(f"{path}:{node.lineno}")
+    assert not found, f"these build a LoRA spec by hand, where a model declares `lora_roots`: {found}"
 
 
 def test_the_lint_lets_a_named_function_keep_its_break_and_no_other():
@@ -350,30 +419,6 @@ _WATERMARK = (_TTS, "CodecSubmodule.batch_postprocess", "request_state")
 def test_an_exception_covers_only_its_own_functions_attribute(path, source, found, used):
     """A key skips only its attribute, anywhere in its function, and is used only when it skips one."""
     assert _violations(source, path) == (found, used)
-
-
-_OMNI = "mstar/model/qwen3_omni/qwen3_omni_model.py"
-
-
-@pytest.mark.parametrize("path, body, refused", [
-    (_OMNI, "return [self._lora_spec()]", False),
-    (_OMNI, "return [self._lora_spec(), *token2wav_resources()]", True),
-    (_OMNI, "return [self._lora_spec()] + token2wav_resources()", True),
-    (_OMNI, "return token2wav_resources()", True),
-    (_OMNI, "if self.speaks:\n            return token2wav_resources()\n        return [self._lora_spec()]", True),
-    ("mstar/model/minicpm_o/minicpm_o_model.py", "return token2wav_resources()", True),
-], ids=["the listed spec", "a second spec", "a second list", "another spec", "another spec on one path",
-        "an unlisted file"])
-def test_an_override_returns_only_the_spec_its_file_is_listed_for(path, body, refused):
-    """Token2Wav's hand-written specs reached the engine from a ported model this way: a shared module the lint
-    doesn't read built them, and the model's ``get_node_resources`` returned them."""
-    source = (
-        "from mstar.model.components.token2wav.resources import token2wav_resources\n"
-        f"class Model:\n    def get_node_resources(self):\n        {body}\n"
-    )
-    found, used = _violations(source, path)
-    assert bool(found) == refused, f"`{body}` in {path} gave {found}"
-    assert used == (set() if refused else {path}), "an exception is used only by the override it allows"
 
 
 def test_the_lint_reads_the_five_speech_packages():

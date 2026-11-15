@@ -70,6 +70,7 @@ from mstar.engine.resources.step import (
     FULL_ADMIT_REBUILD,
     AdmitOutcome,
     PerReqSetting,
+    StepHandle,
     lean_subsets,
 )
 from mstar.engine.state.adapters import StateSetup, node_handles
@@ -888,6 +889,7 @@ class Engine:
 
         self._open_prefix_caches(specs_by_key, model, instance, prefix_caches, checkpoint)
 
+        shared: dict[str, StepHandle] = {}
         for node_name, submodule in submodules.items():
             # Inference only. `exec` is under no_grad, but `prepare_inputs` and
             # `postprocess_batch` are not, so anything they derive from a
@@ -912,7 +914,9 @@ class Engine:
                 region_ladders=(region_ladders or {}).get(node_name) or {},
             )
             submodule.bind_node_resources(resources)
-            handles = {} if model is None else node_handles(model, node_name, resources, setup=self._state_setup)
+            handles = {} if model is None else node_handles(
+                model, node_name, resources, setup=self._state_setup, built=shared,
+            )
             if handles:
                 bind_state_ops(handles)
                 submodule.bind_node_state(handles)

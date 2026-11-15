@@ -131,9 +131,7 @@ def test_bagel_process_prompt_rejects_before_tokenizing():
 
 
 def test_bagel_sampling_forwards_min_p_and_penalize_prompt():
-    sampling = _bagel_model().get_sampling_config(
-        "LLM", {"min_p": 0.1, "penalize_prompt": False, "temperature": 0.0},
-    )
+    sampling = _bagel_model()._sample_settings({"min_p": 0.1, "penalize_prompt": False, "temperature": 0.0})
     assert sampling.min_p == 0.1
     assert sampling.penalize_prompt is False
     assert sampling.temperature == 0.0
@@ -151,7 +149,7 @@ def test_bagel_checkpoint_knob_values_are_ignored_but_do_sample_false_is_greedy(
     (tmp_path / "generation_config.json").write_text(json.dumps(qwen2_5))
     model.sampling_defaults = model._load_sampling_defaults("repo", None)
     assert model.sampling_defaults == BAGEL_CONFIG_DEFAULTS
-    sampling = model.get_sampling_config("LLM", {"top_k": 5})
+    sampling = model._sample_settings({"top_k": 5})
     assert (sampling.temperature, sampling.top_p, sampling.top_k) == (0.6, 1.0, 5)
     assert sampling.min_p == 0.0
 
@@ -725,11 +723,11 @@ def _whisper_model(defaults=None) -> WhisperModel:
 
 
 def _whisper_sampler(model, **kw) -> SamplingReqConfig:
-    return model.get_request_resource_configs([], [], kw)[WHISPER_SAMPLER]
+    return sampling_configs(model.get_request_resource_configs([], [], kw), model.declare_state())[WHISPER_SAMPLER]
 
 
 def _whisper_spec(model):
-    return next(s for s in model.get_node_resources() if s.resource_key == WHISPER_SAMPLER)
+    return next(s for s in node_resources(model) if s.resource_key == WHISPER_SAMPLER)
 
 
 def test_whisper_request_kwargs_are_the_keys_it_reads():

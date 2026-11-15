@@ -52,6 +52,7 @@ from mstar.api_server.request_types import (
     ClientAppend,
     PreprocessInput,
     ResultChunk,
+    WorkersReady,
 )
 from mstar.api_server.served_models import Selected, ServedModels
 from mstar.api_server.streaming_response import ReleasingStreamingResponse, errors_in_band
@@ -60,6 +61,7 @@ from mstar.communication.tensors import ensure_deployment_token
 from mstar.conductor.workers import accelerator_type, deployment_workers
 from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY, LoraSpec, lora_enabled
 from mstar.engine.resources.lora.serving import lora_spec, resolve_lora_adapters
+from mstar.engine.state.analysis import declaration_digests, digest_mismatch
 from mstar.model.base import declared_resources
 from mstar.model.media_limits import RAW_INPUT_CHARGES
 from mstar.model.multimodal import SUPPORTED_MODALITIES, PromptPart
@@ -714,13 +716,14 @@ class APIServer:
         if self._result_cpu is not None:
             pin_thread({self._result_cpu}, self._process_cpus)
 
-    def finalize_setup(self) -> None:
+    def finalize_setup(self) -> WorkersReady:
         """Block until the conductor signals that every worker has finished
         setup (weight load + warmup + CUDA-graph capture), then start draining
-        results. Called before the HTTP server binds, so ``mstar`` only begins
-        serving once it can actually handle requests. Raises
-        ``DeadConductorError`` if the conductor exits first (it does when a
-        worker fails to initialize), so the server never binds.
+        results, and return what the conductor sent. Called before the HTTP
+        server binds, so ``mstar`` only begins serving once it can actually
+        handle requests. Raises ``DeadConductorError`` if the conductor exits
+        first (it does when a worker fails to initialize), so the server never
+        binds.
         """
         logger.info(
             "Waiting for workers to finish setup "
@@ -737,7 +740,7 @@ class APIServer:
                     # it (measured 200 ms per pass on this process under load)
                     freeze_after_setup("API server")
                     self._msg_thread.start()
-                    return
+                    return message.body
                 logger.warning(
                     "Unexpected message before setup_done: %s", type(message)
                 )
@@ -3302,7 +3305,16 @@ def main(argv: list[str] | None = None):
     try:
         # Block until all workers have finished setup, so the server only binds
         # (and logs "Starting…") once it can actually serve requests.
-        api_server.finalize_setup()
+        ready = api_server.finalize_setup()
+        # A declaration may follow the placement, which only get_worker_graphs reads. The data worker declares at its
+        # first prompt, after this.
+        model.get_worker_graphs(args.config)
+        mismatch = digest_mismatch(
+            declaration_digests(model.declare_state(), model.kernel_settings()), ready.declaration_digests,
+            here="API server", there="conductor",
+        )
+        if mismatch is not None:
+            raise RuntimeError(mismatch)
         # The deployment's warmup requests run here, before the bind: a
         # client never sees the first request of a shape.
         warmups = config.get("warmup_requests") or []

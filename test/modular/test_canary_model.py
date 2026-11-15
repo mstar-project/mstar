@@ -204,7 +204,7 @@ class _FakeSelfAttention:
     def _check_open(self, call):
         pass
 
-    def at_last_token(self, hidden):
+    def at_last_token(self, hidden, *, label=None):
         self.seen = hidden
         return hidden[-1:]
 

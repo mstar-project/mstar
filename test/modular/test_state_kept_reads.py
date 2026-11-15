@@ -223,12 +223,20 @@ def test_a_kept_cross_read_with_no_layout_yet_is_refused_by_name(arrays, cause):
         build_specs(arrays)
 
 
-def test_a_kept_cross_read_takes_no_kernel_setting_yet():
+def test_a_kept_cross_read_takes_only_decode_tensor_cores():
     arrays = [_self_array(), _context_array()]
-    with pytest.raises(ValueError, match=r"kernel_settings\['cross'\] names no read .* of \['attn', 'context', 'kv'\]"):
+    with pytest.raises(ValueError, match=r"kernel_settings\['cross'\] sets \['decode_fmha'\]; it may set only "
+                                         r"\['decode_tensor_cores'\]"):
         build_specs(arrays, kernel_settings={"cross": {"decode_fmha": True}})
+    built = build_specs(arrays, kernel_settings={"cross": {"decode_tensor_cores": False}})
+    assert next(spec for spec in built if spec.resource_key == "cross").config.decode_tensor_cores is False
     built = build_specs(arrays, kernel_settings={"context": {"max_num_pages": 9}})
     assert next(spec for spec in built if spec.resource_key == "context").config.max_num_pages == 9
+
+
+def test_a_kept_cross_reads_setting_takes_the_same_checks_as_under_resources():
+    with pytest.raises(ValueError, match=r"kernel_settings\['cross'\]: decode_tensor_cores must be true or false"):
+        build_specs([_self_array(), _context_array()], kernel_settings={"cross": {"decode_tensor_cores": "false"}})
 
 
 def test_a_max_len_0_read_over_a_kept_array_plans_todays_cross_step():
@@ -481,28 +489,9 @@ def test_the_handle_path_adds_the_projected_context_and_reads_through_the_handle
     assert handle.read_at == [3], "the layer id reaches the handle"
 
 
-def test_the_handle_path_needs_nothing_from_the_resources():
-    """A model on the contract names no resource of its own, and the engine binds resources on every node at load."""
-    layer = _cross_attention(context_kv_key="context", layer=0)
-    layer.bind_resources({})
-    assert layer.cross is None and layer.context_kv is None, "layer id 0 still selects the handle path"
-
-
-def test_a_layer_with_no_handle_key_is_refused_when_built():
-    with pytest.raises(ValueError, match="a layer id picks the handle path.*context_kv_key is None"):
-        _cross_attention(layer=0)
-
-
 def test_a_layer_on_a_node_without_its_context_array_is_refused_at_bind():
     with pytest.raises(ValueError, match="layer 0 reads the array 'context', which this node doesn't declare"):
         _cross_attention(context_kv_key="context", layer=0).bind_state({"kv": _StubContext()})
-
-
-def test_add_context_on_a_layer_with_no_layer_id_is_refused():
-    layer = _cross_attention(cross_key="cross", context_kv_key="context")
-    with pytest.raises(ValueError, match="a layer id picks the handle path, which add_context runs on, and this layer "
-                                         "has none"):
-        layer.add_context(torch.randn(5, 8))
 
 
 @torch.no_grad()
@@ -513,39 +502,6 @@ def test_a_layer_on_a_node_with_no_handles_is_refused_at_its_first_call():
         layer.add_context(torch.randn(5, 8))
     with pytest.raises(ValueError, match="layer 0 reads the array 'context'"):
         layer(torch.randn(2, 8))
-
-
-@torch.no_grad()
-def test_the_resource_path_is_unchanged_with_nothing_bound():
-    class _Cross:
-        context_cache_key = "cache"
-
-        def run(self, q, kv_cache_layer=None):
-            self.view = kv_cache_layer
-            return q
-
-    cross = _Cross()
-    layer = _cross_attention(cross_key="cross", source="default")
-    layer.bind_resources({"cross": cross, "cache": SimpleNamespace(layer_view=lambda: "cursor")})
-    assert layer.context is None and layer.layer is None
-    assert layer(torch.randn(2, 8)).shape == (2, 8)
-    assert cross.view == "cursor"
-
-
-def test_a_layer_with_no_layer_id_stays_on_the_resource_path_beside_a_handle():
-    """Whisper names its context's resource key, and a node may also declare an array under that name."""
-    class _Cross:
-        context_cache_key = "cache"
-
-        def run(self, q, kv_cache_layer=None):
-            return q
-
-    handle = _StubContext()
-    layer = _cross_attention(cross_key="cross", context_kv_key="context")
-    layer.bind_resources({"cross": _Cross(), "context": SimpleNamespace(layer_view=lambda: "cursor")})
-    layer.bind_state({"context": handle})
-    assert layer(torch.randn(2, 8)).shape == (2, 8)
-    assert handle.read_at == [], "a layer with no id read through the handle with layer None"
 
 
 # Through real resources

@@ -185,7 +185,8 @@ bagel_xpu = [
 ]
 
 cosmos3 = [
-    # PyAV encodes the mp4 when torchcodec can't load (video_encode.encode_mp4,
+    # PyAV muxes torchcodec's chunked encode (video_encode.encode_mp4_chunked)
+    # and encodes the mp4 when torchcodec can't load (video_encode.encode_mp4,
     # whose frame conversion threads need 19).
     "av>=19",
     # The Cosmos3 reference pipeline (used by the parity tests) landed in

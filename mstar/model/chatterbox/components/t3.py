@@ -33,7 +33,6 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.chatterbox.config import (
-    T3_ATTN,
     T3_KV,
     T3_POS,
     T3BackboneConfig,
@@ -71,7 +70,7 @@ class GPT2MLP(nn.Module):
         return self.fc2(F.gelu(self.fc1(x), approximate="tanh"))
 
 
-def _build_layer(config: T3BackboneConfig, comm_group: CommGroup) -> DecoderLayer:
+def _build_layer(config: T3BackboneConfig, comm_group: CommGroup, layer: int) -> DecoderLayer:
     if config.is_gpt2:
         return DecoderLayer(
             self_attn=ParallelAttention(
@@ -82,10 +81,10 @@ def _build_layer(config: T3BackboneConfig, comm_group: CommGroup) -> DecoderLaye
                 head_dim=config.head_dim,
                 qkv_bias=True,
                 o_bias=True,
-                attn_key=T3_ATTN,
                 kv_key=T3_KV,
                 # absolute positions are added at the input; no rotation
                 pos_key=None,
+                layer=layer,
             ),
             mlp=GPT2MLP(config.hidden_size, config.intermediate_size, comm_group),
             input_layernorm=nn.LayerNorm(config.hidden_size, eps=config.norm_eps),
@@ -104,9 +103,9 @@ def _build_layer(config: T3BackboneConfig, comm_group: CommGroup) -> DecoderLaye
             rope_low_freq_factor=scaling["low_freq_factor"],
             rope_high_freq_factor=scaling["high_freq_factor"],
             rope_old_context_len=scaling["original_max_position_embeddings"],
-            attn_key=T3_ATTN,
             kv_key=T3_KV,
             pos_key=T3_POS,
+            layer=layer,
         ),
         mlp=ParallelGatedMLP(
             comm_group=comm_group,
@@ -129,7 +128,7 @@ class T3Backbone(nn.Module):
             comm_group = CommGroup.trivial()
         self.config = config
         self.layers = nn.ModuleList(
-            [_build_layer(config, comm_group) for _ in range(config.num_hidden_layers)]
+            [_build_layer(config, comm_group, layer) for layer in range(config.num_hidden_layers)]
         )
         if config.is_gpt2:
             self.wpe = nn.Embedding(config.max_position_embeddings, config.hidden_size)
@@ -138,13 +137,7 @@ class T3Backbone(nn.Module):
             self.wpe = None
             self.norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
 
-    def forward(
-        self,
-        input_embeds: torch.Tensor,
-        *,
-        label: str,
-        position_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    def forward(self, input_embeds: torch.Tensor, *, position_ids: torch.Tensor | None = None) -> torch.Tensor:
         """``[N, D] -> [N, D]`` over the packed step.
 
         ``position_ids`` are the absolute positions the position resource
@@ -156,12 +149,7 @@ class T3Backbone(nn.Module):
             if position_ids is None:
                 raise ValueError("the GPT-2 backbone needs position_ids")
             hidden = hidden + self.wpe(position_ids[: hidden.shape[0]])
-        # The label and layer index are cursors on the shared resources: bind
-        # once, advance per layer (an int argument would make inductor
-        # specialize the layer body per layer).
-        self.layers[0].self_attn.attend.bind_step(label)
-        for layer_idx, layer in enumerate(self.layers):
-            layer.self_attn.attend.set_layer_idx(layer_idx)
+        for layer in self.layers:
             hidden = layer(hidden)
         return self.norm(hidden)
 
@@ -341,14 +329,8 @@ class T3Model(nn.Module):
 
     # -- transformer --------------------------------------------------------
 
-    def hidden(
-        self,
-        input_embeds: torch.Tensor,
-        *,
-        label: str,
-        position_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return self.backbone(input_embeds, label=label, position_ids=position_ids)
+    def hidden(self, input_embeds: torch.Tensor, *, position_ids: torch.Tensor | None = None) -> torch.Tensor:
+        return self.backbone(input_embeds, position_ids=position_ids)
 
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.speech_head(hidden)

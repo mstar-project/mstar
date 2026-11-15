@@ -186,6 +186,8 @@ class RecurrentStatePool(Resource):
         self._comm_group = comm_group
         # the resource key, for errors
         self._name = name
+        # the start `set_start` gave, by block and layer, or None before it is called
+        self._start: dict[tuple[str, int | None], torch.Tensor] | None = None
 
         # One [num_layers, max_slots + prefix_slots, *shape] tensor per block. Layer-major so
         # `blocks[name][layer]` is contiguous: FlashInfer's pool paths assert
@@ -229,7 +231,8 @@ class RecurrentStatePool(Resource):
         # Bumped by every change to which slot a (rid, label) holds or to its
         # `has_state`: a step's addressing depends on nothing else, so the
         # last one built is reused while this and the step's rows are unchanged
-        # (a steady decode batch). See `_build_addressing`.
+        # (a steady decode batch), and an eager step then stages nothing. See
+        # `_build_addressing`.
         self._version = 0
         self._addressing_memo: dict[str, tuple] = {}
 
@@ -315,20 +318,29 @@ class RecurrentStatePool(Resource):
         for name, tensor in self._blocks.items():
             yield tensor[:, index] if self.config.blocks[name].per_layer else tensor[index]
 
+    def set_start(self, start: Mapping[tuple[str, int | None], torch.Tensor]) -> None:
+        """What `gather` reads for a row with no saved state, by block and layer, each in the block's layout and
+        dtype. A block or layer it doesn't name reads zeros."""
+        if self._start is None:
+            self._start = dict(start)
+        elif start.keys() != self._start.keys() or not all(torch.equal(self._start[k], v) for k, v in start.items()):
+            raise ValueError(f"recurrent pool {self._name!r}: a start that differs from the one it holds, which every "
+                             "row of the pool reads")
+
     def gather(
         self, name: str, layer_idx: int | None = 0, *, label: str = "main",
-        start: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Block ``name`` of this step's rows under ``label``, ``[rows, *shape]``
         (a copy), in the order the step declared them.
 
         It addresses rows through the step's plan, so a captured and an eager
         forward read the same slots. A row with no saved state (a request's
-        first step, or a padding row on the sink) reads ``start``, zeros when
-        none is given. A row must declare span >= 1 to reach its own slot; a
-        zero-span row addresses the sink, so it reads ``start``. A pool without
-        a sink refuses (``_need_sink``). A block that is not per layer takes
-        ``layer_idx=None``."""
+        first step, or a padding row on the sink) reads the start, zeros when
+        none is set. A row must declare span >= 1 to reach its own slot; a
+        zero-span row addresses the sink, so it reads the start. A resident
+        step's graph reads every row's slot instead (`resident_gather`). A pool
+        without a sink refuses (``_need_sink``). A block that is not per layer
+        takes ``layer_idx=None``."""
         if self.config.disable_sink_slot:
             self._need_sink("gather")
         rows = self.addressing(label)
@@ -339,6 +351,7 @@ class RecurrentStatePool(Resource):
         if rows.every_row_has_state:
             return out
         fresh = ~rows.has_state[: rows.num_rows].view(-1, *(1,) * (out.dim() - 1))
+        start = None if self._start is None else self._start.get((name, layer_idx))
         return torch.where(fresh, 0 if start is None else start, out)
 
     def scatter_(
@@ -1148,7 +1161,14 @@ class RecurrentStatePool(Resource):
             )
             memo = self._addressing_memo.get(label)
             if memo is not None and memo[0] == memo_key:
-                return self._stage_addressing(label, segments, ctx, memo[1], memo[2])
+                if self._holds_staged(label, memo[3], ctx):
+                    # a capture records its own cast of the index (`scatter_`)
+                    memo[3].scatter_index.pop(True, None)
+                    return memo[3]
+                return self._stage_memoized(label, segments, ctx, *memo[:3])
+        else:
+            # staged over the memo's buffers with the forks pending, which is no later step's addressing
+            self._addressing_memo.pop(label, None)
         pending_forks = pending_forks or {}
         indices = []
         has_state = []
@@ -1167,9 +1187,27 @@ class RecurrentStatePool(Resource):
                 has_state.append(
                     pending_forks.get((seg.request_id, label), slot.has_state)
                 )
-        if memo_key is not None:
-            self._addressing_memo[label] = (memo_key, indices, has_state)
-        return self._stage_addressing(label, segments, ctx, indices, has_state)
+        if memo_key is None:
+            return self._stage_addressing(label, segments, ctx, indices, has_state)
+        return self._stage_memoized(label, segments, ctx, memo_key, indices, has_state)
+
+    def _stage_memoized(
+        self, label: str, segments: list[Segment], ctx: StepContext, memo_key: tuple,
+        indices: list[int], has_state: list[bool],
+    ) -> RecurrentAddressing:
+        """Stage the addressing and keep it with its memo, for the next step addressed the same way."""
+        staged = self._stage_addressing(label, segments, ctx, indices, has_state)
+        # Only an eager buffer holds what its last staging wrote: a resident replay fills a captured one itself.
+        kept = staged if ctx.slot_lease is None and not ctx.capture and not staged.snapshots else None
+        self._addressing_memo[label] = (memo_key, indices, has_state, kept)
+        return staged
+
+    def _holds_staged(self, label: str, staged: RecurrentAddressing | None, ctx: StepContext) -> bool:
+        """Whether this step's buffers are ``staged``'s, as the memo's staging left them, with no snapshot to add."""
+        if staged is None or ctx.slot_lease is not None or self._snap_writes:
+            return False
+        held = self._eager_addressing.get(label)
+        return held is not None and held.slot_indices is staged.slot_indices
 
     def _stage_addressing(
         self, label: str, segments: list[Segment], ctx: StepContext,
@@ -1284,6 +1322,8 @@ class RecurrentStatePool(Resource):
     def resident_refusal(self) -> str | None:
         if self.config.disable_sink_slot:
             return "a pool with no sink slot has nowhere for a padding row"
+        if self._start:
+            return "a row with nothing written reads the pool's start, and a resident step reads each row's slot"
         return None
 
     def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
@@ -1302,6 +1342,10 @@ class RecurrentStatePool(Resource):
         table = self._resident_table
         # a padding row reads the trash row's zero, which is SINK_SLOT
         gather_column(self._resident.store, step.slots, table.stride, table.col, self._cg_addressing[key].slot_indices)
+        # A replay never writes `has_state`, which the capture left False on every row. A resident row reads its own
+        # slot, which holds zeros until its first write, as the default start does, so the capture's `gather` selects
+        # no start.
+        self._current[stream.label] = replace(self._current[stream.label], every_row_has_state=True)
 
     # Engine lifecycle
 

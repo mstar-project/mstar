@@ -6,12 +6,13 @@ layer, so capacity is a slot count and a fork is a fixed-size copy.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 import torch
 
-from mstar.engine.resources.spec import NodeResourceSpec, check_sizes
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, check_sizes
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -366,6 +367,20 @@ class RecurrentStateSpec(NodeResourceSpec):
     @property
     def restores_prefix(self) -> bool:
         return True
+
+    def capacity_problem(
+        self, requests: int, request: ResourceReqConfig | None, axis_sizes: Sequence[Mapping[str, int]] = (),
+    ) -> str | None:
+        """A request keeps a slot for each label until it is torn down, and offloading frees none."""
+        state = self.config
+        need = requests * len(state.labels)
+        if need <= state.usable_slots:
+            return None
+        return (
+            f"{requests} concurrent requests (max_concurrent_requests) need {need} slots of resources."
+            f"{self.resource_key} ({len(state.labels)} per request), which leaves {state.usable_slots} of its "
+            f"{state.max_slots} to requests; raise max_slots or lower max_concurrent_requests"
+        )
 
     def apply_yaml_overrides(
         self, max_slots: int | None = None, state_dtype: str | None = None,
