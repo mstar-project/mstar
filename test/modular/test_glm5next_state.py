@@ -17,6 +17,7 @@ sys.path.insert(0, "test/modular")
 import pytest
 import torch
 import yaml
+from request_walks import walk_runtime
 from test_state_ports import _assert_equal_per_key, _assert_steps_equal, _published, _StubResource
 
 from mstar.engine.node_dtype import resolve_model_dtype
@@ -251,3 +252,14 @@ def test_only_the_first_decode_step_reads_the_prompt_length():
     info.step_metadata = {}
     later = node.prepare_inputs("decode", info, {**signals, COUNT: [torch.tensor([4, 0, 16, 1, 5])]})
     assert later.kwargs["prompt_len"] == 5, "a later step would read the prompt's length through its info again"
+
+
+def test_an_mtp_decode_row_loops_back_its_count_alone():
+    """The worker holds a tensor a row for each signal a step outputs. The verify step's input token stays in the
+    seed, so a row outputs its tokens and its count, and loops back the count alone."""
+    model = _model("reduced", 3, kda_conv_dtype=torch.float32)
+    consumed = walk_runtime(model.get_graph_walk_graphs()).get_consumed_edges("LLM", "LLM", "decode")
+    assert {name for name, _ in consumed} == {COUNT}, "the decode loop carries a second edge a row"
+    node, row = _node(model), {"new_token": [torch.tensor([11, 12])], COUNT: [torch.tensor([3, 0, 16, 1, 5])]}
+    node.postprocess("r", SimpleNamespace(), row)
+    assert set(row) == {"new_token", COUNT}, f"a verify step's row outputs {sorted(row)}"
