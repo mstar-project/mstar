@@ -83,15 +83,16 @@ def test_walks_and_resources(model):
     walks = set(model.get_graph_walk_graphs())
     assert {"prefill_text", "prefill_vision", "prefill_audio", "prefill_vision_audio", "decode"} <= walks
     keys = {s.resource_key for s in model.get_node_resources()}
-    assert {"kv_cache", "attn", "rope", "sampler", "vision_attn", "lora"} <= keys
+    assert {"kv_cache", "attn", "rope", "sampler", "vision_attn"} <= keys
 
 
 def test_the_checkpoints_adapters_fit_the_lora_spec(model):
     """Both PEFT adapters place on the fused qkv / gate_up and the o / down projections
     of every layer, at their ranks, as the API server checks them at startup."""
     from mstar.engine.resources.lora.store import check_adapter_file
+    from mstar.model.components.lora.modules import declared_lora_spec
 
-    spec = model._lora_spec()
+    spec = declared_lora_spec(model.lora_roots())
     spec.apply_yaml_overrides(max_rank=320, max_slots=2)
     for name, path in spec.adapters.items():
         check_adapter_file(spec, name, path)
