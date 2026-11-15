@@ -1,5 +1,5 @@
 {
- "_about": "Each LoRA model's spec as it built it by hand from get_node_resources, before Model.lora_roots: what test_lora_declarations.py holds each declared spec to.",
+ "_about": "Each LoRA model's spec as serving reads it, first recorded from the specs built by hand before Model.lora_roots. test_lora_declarations.py holds each declared spec to it, and running that file writes it again.",
  "models": {
   "chatterbox": {
    "adapters": {},

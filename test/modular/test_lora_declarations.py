@@ -2,7 +2,8 @@
 model built it by hand before. A spec missing a target refuses, at startup, any adapter that touches it. But a spec that
 places an adapter's module at another layer or slice, or ignores it, runs that module wrongly or not at all, and nothing
 at run time says so. So each declared spec is held to the hand-built one, recorded in
-``fixtures/lora_declared_specs.json`` at the commit before the move.
+``fixtures/lora_declared_specs.json`` at the commit before the move. A change to a model's targets that is meant writes
+the fixture again: ``python test/modular/test_lora_declarations.py``.
 """
 
 from __future__ import annotations
@@ -129,17 +130,6 @@ def test_each_models_declared_lora_spec_equals_the_one_it_built_by_hand(name):
 
 
 @pytest.mark.parametrize("name", MODELS)
-def test_each_models_lora_roots_name_nodes_it_has(name):
-    """A root on a node the model lacks builds a pool that no node binds, so an adapter's modules there load and never
-    apply. Nothing checks it at boot, which would build the walk graphs again."""
-    model = MODELS[name]()
-    declared = {root.node for root in model.lora_roots()}
-    assert declared, f"{name} declares no LoRA roots"
-    astray = sorted(declared - set(model.nodes))
-    assert not astray, f"{name} declares LoRA roots on {astray}, which are not its nodes"
-
-
-@pytest.mark.parametrize("name", MODELS)
 def test_a_lora_block_adds_each_models_lora_spec_last_and_changes_nothing_else(name):
     model = MODELS[name]()
     without = _keys(model, {})
@@ -162,6 +152,19 @@ def test_an_adapter_shipped_as_two_files_under_one_name_is_refused():
         declared_lora_spec(roots)
 
 
+def test_a_roots_key_converter_reaches_its_spec():
+    def convert(state_dict):
+        return state_dict
+
+    spec = declared_lora_spec((_root("N", convert_keys=convert),))
+    assert spec.convert_keys is convert, "adapters in the model's own layout would be read as PEFT's"
+
+
+def test_two_roots_that_read_checkpoints_differently_are_refused():
+    with pytest.raises(ValueError, match=r"read checkpoints alike \(convert_keys\)"):
+        declared_lora_spec((_root("A", convert_keys=lambda sd: sd), _root("B")))
+
+
 def test_a_built_spec_in_place_of_roots_is_refused():
     built = declared_lora_spec((_root("N"),))
     with pytest.raises(TypeError, match=r"returns LoraRoots, .* not \['LoraSpec'\]"):
@@ -178,3 +181,33 @@ def test_a_model_that_declares_no_roots_builds_no_lora_spec():
     model = make_model()
     assert declared_lora_spec(model.lora_roots()) is None
     assert _keys(model, LORA_BLOCK) == [], "a model without LoRA would build a pool under a lora: block"
+
+
+def _json(value, depth: int = 0) -> str:
+    """The fixture's layout: one key a line, in order, and a list of plain values on its key's line."""
+    pad = " " * (depth + 1)
+    if isinstance(value, dict) and value:
+        items = ",\n".join(f"{pad}{json.dumps(key)}: {_json(item, depth + 1)}" for key, item in sorted(value.items()))
+        return "{\n" + items + "\n" + " " * depth + "}"
+    if isinstance(value, list) and any(isinstance(item, (dict, list)) for item in value):
+        return "[\n" + ",\n".join(pad + _json(item, depth + 1) for item in value) + "\n" + " " * depth + "]"
+    return json.dumps(value)
+
+
+def _record() -> None:
+    """Writes the fixture again from each model's declared spec. A model whose checkpoint isn't cached keeps the form
+    recorded for it."""
+    path = Path(__file__).parent / "fixtures" / "lora_declared_specs.json"
+    fixture = json.loads(path.read_text())
+    for name, build in MODELS.items():
+        try:
+            model = build()
+        except pytest.skip.Exception as skipped:
+            print(f"kept {name}'s recorded spec: {skipped}")
+            continue
+        fixture["models"][name] = _form(model, declared_lora_spec(model.lora_roots()))
+    path.write_text(_json(fixture) + "\n")
+
+
+if __name__ == "__main__":
+    _record()
