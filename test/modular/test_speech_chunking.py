@@ -27,11 +27,13 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from mstar.api_server.entrypoint import APIServer  # noqa: E402
 from mstar.api_server.openai import adapters  # noqa: E402
-from mstar.api_server.openai.speech_chunking import split_sentences  # noqa: E402
+from mstar.api_server.openai.speech_chunking import _is_mark, split_sentences  # noqa: E402
+from mstar.api_server.openai.unicode_marks import MARK_RANGES, UCD_VERSION  # noqa: E402
 from mstar.testing_utils.model import StubModel  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MARK_TABLE = REPO_ROOT / "rust/server/src/unicode_marks.rs"
+PYTHON_MARK_TABLE = REPO_ROOT / "mstar/api_server/openai/unicode_marks.py"
 GENERATOR = REPO_ROOT / "scripts/gen_unicode_marks.py"
 
 LONG_TEXT = (
@@ -108,41 +110,40 @@ def test_max_chars_must_be_positive():
         split_sentences("a. b.", max_chars=0)
 
 
-def test_an_even_cut_lands_where_this_interpreters_unicodedata_puts_it():
-    """A cut that falls on a combining mark moves back off it, so where this
-    input is cut depends on the table the splitter reads: U+0897 is unassigned
-    up to Unicode 15.1.0 and a mark from 16.0.0. The Rust frontend reads a
-    table generated from ``unicodedata`` so that it answers the same way
-    (``rust/server/src/unicode_marks.rs``)."""
+def test_an_even_cut_uses_the_checked_in_mark_set():
+    """U+0897 changes category in UCD 16, but the checked-in table keeps
+    the cut at the UCD 15 position on every supported interpreter."""
     text = "a" * 267 + "\u0897" + "b" * 533
     chunks = split_sentences(text, max_chars=400, min_chars=24)
-    moves = unicodedata.category("\u0897").startswith("M")
-    assert [len(c) for c in chunks] == ([266, 268, 267] if moves else [267, 267, 267])
+    assert UCD_VERSION == "15.0.0"
+    assert [len(c) for c in chunks] == [267, 267, 267]
     assert "".join(chunks) == text
 
 
-def test_the_rust_mark_table_is_this_interpreters_unicodedata():
-    """The Rust frontend cannot ask ``unicodedata``, so it reads a table
-    generated from it. Both frontends must call the same code points marks, or
-    they cut long text in different places; this fails when a CPython upgrade
-    moves the categories and the table has not been regenerated."""
+def test_even_cut_uses_checked_in_marks_when_interpreter_categories_move(monkeypatch):
+    original_category = unicodedata.category
+    monkeypatch.setattr(
+        unicodedata,
+        "category",
+        lambda c: "Mn" if c == "\u0897" else original_category(c),
+    )
+    text = "a" * 267 + "\u0897" + "b" * 533
+    chunks = split_sentences(text, max_chars=400, min_chars=24)
+    assert [len(c) for c in chunks] == [267, 267, 267]
+
+
+def test_both_frontends_use_the_same_generated_mark_table():
     source = MARK_TABLE.read_text()
     ranges = [(int(low, 16), int(high, 16))
               for low, high in re.findall(r"\(0x([0-9a-f]+), 0x([0-9a-f]+)\)", source)]
     assert len(ranges) > 100, f"no table parsed out of {MARK_TABLE}"
-    tabled = {code for low, high in ranges for code in range(low, high + 1)}
-    marks = {code for code in range(sys.maxunicode + 1)
-             if unicodedata.category(chr(code)).startswith("M")}
-    disagree = sorted(tabled ^ marks)
-    assert not disagree, (
-        f"{len(disagree)} code points disagree with unicodedata "
-        f"{unicodedata.unidata_version} (first {[hex(c) for c in disagree[:8]]}): regenerate "
-        f"with `python {GENERATOR.relative_to(REPO_ROOT)}`, which moves Rust cut points"
-    )
-    # and the checked-in file is what the generator writes, so regenerating it
-    # is the whole fix when this does fail
+    assert ranges == list(MARK_RANGES)
+    assert all(high + 1 < next_low for (_, high), (next_low, _) in zip(ranges, ranges[1:], strict=False))
     generator = runpy.run_path(str(GENERATOR))
-    assert source == generator["render"](generator["mark_ranges"]())
+    assert source == generator["render"](ranges, UCD_VERSION)
+    assert PYTHON_MARK_TABLE.read_text() == generator["render_python"](ranges, UCD_VERSION)
+    if unicodedata.unidata_version == UCD_VERSION:
+        assert ranges == generator["mark_ranges"]()
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +509,7 @@ def test_text_with_no_break_points_is_still_cut_to_max_chars(text):
     assert len(chunks) > 1
     assert max(len(c) for c in chunks) <= 400
     assert min(len(c) for c in chunks) >= 24
-    assert not any(unicodedata.category(c[0]).startswith("M") for c in chunks)
+    assert not any(_is_mark(c[0]) for c in chunks)
     assert "".join(chunks).replace(" ", "") == text.replace(" ", "")
 
 

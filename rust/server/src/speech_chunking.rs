@@ -22,14 +22,10 @@ fn is_space(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 
-/// `unicodedata.category(c).startswith("M")`, over the table
-/// `scripts/gen_unicode_marks.py` reads out of CPython's `unicodedata` (Unicode
-/// 15.0.0 on the 3.12 the repository tests on, and on 3.13). `regex`'s `\p{M}`
-/// asks the same question of the crate's own Unicode tables, which are newer
-/// and differ on 51 code points, so the two frontends would cut long text in
-/// different places whenever one of those lands on a cut.
-/// `test/modular/test_speech_chunking.py` compares the table with the running
-/// interpreter's `unicodedata`, over every code point.
+/// The repository's checked-in category M table, generated alongside the
+/// Python frontend's table from the source UCD version recorded there. Both
+/// frontends use these ranges regardless of the running interpreter's Unicode
+/// version.
 fn is_mark(c: char) -> bool {
     let c = c as u32;
     // the ranges are sorted and disjoint, so the last one starting at or below
