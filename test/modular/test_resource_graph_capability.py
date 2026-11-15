@@ -12,6 +12,7 @@ from mstar.engine.accelerator_graph_config import (
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
     PiecewiseAcceleratorGraphRunner,
+    blocked_capture_resources,
     fail_if_graphs_required,
 )
 from mstar.model.submodule_base import NodeInputs
@@ -146,3 +147,18 @@ def test_empty_capture_batch_sizes_capture_nothing(piecewise):
         assert runner.max_batch_size_for("decode") is None and runner.max_capture_bs({"decode"}) == 0
     assert not runner.prepare_for_capture()
     declare.assert_not_called()
+
+
+def test_a_resource_that_overrides_can_capture_alone_still_blocks_each_step():
+    """A resource written before `can_capture_step` answers for every step through `can_capture`."""
+    step = SimpleNamespace(steps={"attention": object()})
+    blocked = blocked_capture_resources(step, {"attention": make_resource(can_capture=lambda: False)})
+    assert blocked == ["attention"], "an override of can_capture alone no longer reaches the runner"
+
+
+def test_a_resource_can_block_one_kind_of_step_and_not_another():
+    kda = make_resource(can_capture_step=lambda step: step == "decode")
+    assert blocked_capture_resources(SimpleNamespace(steps={"kda": "prefill"}), {"kda": kda}) == ["kda"]
+    assert blocked_capture_resources(SimpleNamespace(steps={"kda": "decode"}), {"kda": kda}) == [], (
+        "the step's own answer should decide, not can_capture's"
+    )
