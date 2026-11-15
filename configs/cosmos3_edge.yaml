@@ -15,6 +15,10 @@ knobs:
 resources:
   kv:
     max_num_pages: 1024
+  # Each windowed stream's VAE decoder cache, held between its windows: 1.33 GiB at 832x480 in bf16. Eight
+  # 832x480 streams decode at once (three at 1280x720), and a stream past them waits for one to end.
+  decode_cache:
+    max_bytes: 11401728000
 model_kwargs:
   # Denoise CUDA-graph capture knobs (serving). cuda_graph=false serves eager;
   # graph_max_latent_area caps which resolutions are captured (latent H*W).

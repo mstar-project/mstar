@@ -2142,8 +2142,10 @@ own ``window_decoder`` partition; a request opts in per call:
 The streaming decoder keeps each stream's VAE decoder cache between windows, 1.33 GiB at
 832x480 in bf16, and the engine admits a stream's decode by those bytes. Its budget holds
 one stream at 1280x720 (3.06 GiB) by default, so two 832x480 streams decode at once and a
-third waits for one to end; ``resources: decode_cache: max_bytes`` raises it. A windowed
-request past ``windowed_decode_max_latent_area`` (3600 latent pixels, 1280x720) is a 400.
+third waits for one to end; ``resources: decode_cache: max_bytes`` raises it. The windowed
+configs (``cosmos3_edge``, its ``sp2`` and ``dp2`` variants, and ``cosmos3_nano_ar``) set it to
+eight 832x480 streams (three at 1280x720). A windowed request past
+``windowed_decode_max_latent_area`` (3600 latent pixels, 1280x720) is a 400.
 ``windowed_decode_warm_cache: false`` keeps no cache and decodes every window behind
 re-decoded context.
 
