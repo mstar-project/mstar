@@ -15,7 +15,8 @@ transcripts:
 Client events
     ``transcription_session.update``  ``{"session": {"input_audio_transcription":
     {"model", "language", "prompt"}, "input_audio_format", "turn_detection",
-    "mstar": {"chunk_seconds", "unfixed_chunks", "unfixed_tokens"}}}``
+    "mstar": {"chunk_seconds", "unfixed_chunks", "unfixed_tokens",
+              "min_interrupt_ms", "assistant_speaking"}}}``
     ``input_audio_buffer.append``      ``{"audio": <base64 PCM16 mono>}``
     ``input_audio_buffer.commit``      end of the utterance: flush and finish
     ``input_audio_buffer.clear``       drop buffered audio and start over
@@ -201,6 +202,9 @@ class RealtimeSession:
     # the resampler, spans turns, so a commit does not reset either
     turn_detection: realtime_vad.ServerVAD | realtime_vad.SemanticVAD | None = None
     segmenter: realtime_vad.TurnSegmenter | None = None
+    min_interrupt_ms: int = 0
+    assistant_speaking: bool = False
+    backchannel: bool = False
     stream_samples: int = 0    # SAMPLE_RATE samples written this session: the event timeline
     # the input clock: stream_samples at the last rate change, and input samples since
     clock_base: int = 0
@@ -299,6 +303,7 @@ class RealtimeSession:
         """Start a new item; the stream state (resampler, segmenter, odd byte) goes on."""
         self.pending, self.pending_samples, self.heard, self.short = [], 0, [], 0
         self.chunk_id, self.raw_hypothesis, self.emitted = 0, "", ""
+        self.backchannel = False
         self.item_id = f"item_{uuid.uuid4().hex[:12]}"
 
 
@@ -656,6 +661,8 @@ class RealtimeTranscription:
                 "chunk_seconds": s.chunk_seconds,
                 "unfixed_chunks": s.unfixed_chunks,
                 "unfixed_tokens": s.unfixed_tokens,
+                "min_interrupt_ms": s.min_interrupt_ms,
+                "assistant_speaking": s.assistant_speaking,
                 "max_item_seconds": s.max_item_seconds,
                 "sample_rate": s.input_format.rate,
             },
@@ -748,10 +755,13 @@ class RealtimeTranscription:
         for i, op in enumerate(ops):
             if op[0] == "audio":
                 s.add(op[1])
-                if i == len(ops) - 1 and (chunk := s.take_chunk()) is not None:
+                if (i == len(ops) - 1 and (s.segmenter is None or not s.segmenter.pending_start)
+                        and (chunk := s.take_chunk()) is not None):
                     await self.step(chunk)
             elif op[0] == "commit":
                 await self.commit()
+            elif op[0] == "backchannel":
+                s.backchannel = True
             elif op[0] == "speech_started":
                 await self.send(server_event("input_audio_buffer.speech_started", audio_start_ms=op[1],
                                              item_id=s.item_id))
@@ -784,10 +794,11 @@ class RealtimeTranscription:
         else:
             # nothing left to hear: what was held back is final now
             await self.emit(self.current_text(), hold=0)
-        await self.send(server_event("input_audio_buffer.committed", item_id=s.item_id))
+        marker = {"mstar": {"backchannel": True}} if s.backchannel else {}
+        await self.send(server_event("input_audio_buffer.committed", item_id=s.item_id, **marker))
         await self.send(server_event(
             "conversation.item.input_audio_transcription.completed",
-            item_id=s.item_id, transcript=self.current_text(),
+            item_id=s.item_id, transcript=self.current_text(), **marker,
         ))
         s.clear()
 
@@ -822,6 +833,10 @@ class RealtimeTranscription:
                                 clamp_low=True)
         unfixed_chunks = _number(knobs, "unfixed_chunks", s.unfixed_chunks, 0, integer=True)
         unfixed_tokens = _number(knobs, "unfixed_tokens", s.unfixed_tokens, 0, integer=True)
+        min_interrupt_ms = _number(knobs, "min_interrupt_ms", s.min_interrupt_ms, 0, MAX_VAD_MS, integer=True)
+        assistant_speaking = knobs.get("assistant_speaking", s.assistant_speaking)
+        if not isinstance(assistant_speaking, bool):
+            raise ValueError(f"mstar.assistant_speaking must be a boolean; got {_excerpt(assistant_speaking)}")
         transcription = _object(session.get("input_audio_transcription"), "input_audio_transcription")
         fields = {k: v for k, v in transcription.items() if k in ("language", "prompt")}
         for name, value in fields.items():
@@ -836,6 +851,7 @@ class RealtimeTranscription:
         request = TranscriptionRequest.model_validate({**s.request.model_dump(), **fields}) if fields else s.request
         s.request = request
         s.chunk_seconds, s.unfixed_chunks, s.unfixed_tokens = chunk_seconds, unfixed_chunks, unfixed_tokens
+        s.min_interrupt_ms, s.assistant_speaking = min_interrupt_ms, assistant_speaking
         if fmt != s.input_format:
             s.set_input_format(fmt)
         if td != s.turn_detection:
@@ -848,6 +864,11 @@ class RealtimeTranscription:
                     s.segmenter.take_over(old)
                 else:
                     s.add(old.unscored())
+        if s.segmenter is not None:
+            s.segmenter.set_overlap_rule(
+                s.min_interrupt_ms if isinstance(s.turn_detection, realtime_vad.ServerVAD) else 0,
+                s.assistant_speaking,
+            )
 
     def current_text(self) -> str:
         return self.adapter.parse_transcript(self.session.raw_hypothesis, self.session.request).text

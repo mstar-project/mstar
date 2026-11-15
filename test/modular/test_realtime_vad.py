@@ -353,6 +353,123 @@ def _open_with(ws, session):
     assert updated["type"] == "transcription_session.updated", updated
 
 
+def test_short_overlap_keeps_transcript_without_interrupting(vad_client):
+    client, stub = vad_client
+    heard = _step_samples(stub)
+    stream = np.concatenate([_speech(3), _silence(16)])
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        _open_with(ws, {"turn_detection": {"type": "server_vad", "prefix_padding_ms": 0},
+                        "mstar": {"chunk_seconds": 300, "min_interrupt_ms": 160, "assistant_speaking": True}})
+        _send(ws, stream, step=stream.size)
+        events = _barrier(ws)
+    kinds = [e["type"] for e in events]
+    assert "input_audio_buffer.speech_started" not in kinds
+    assert "input_audio_buffer.speech_stopped" not in kinds
+    committed = [e for e in events if e["type"] == "input_audio_buffer.committed"]
+    completed = [e for e in events if e["type"] == "conversation.item.input_audio_transcription.completed"]
+    assert len(committed) == len(completed) == 1
+    assert committed[0]["mstar"] == completed[0]["mstar"] == {"backchannel": True}
+    assert heard and heard[-1].size == stream.size
+
+
+def test_long_overlap_sends_delayed_start_with_original_time(vad_client):
+    client, _ = vad_client
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        _open_with(ws, {"turn_detection": {"type": "server_vad", "prefix_padding_ms": 64},
+                        "mstar": {"chunk_seconds": 300, "min_interrupt_ms": 160, "assistant_speaking": True}})
+        _send(ws, np.concatenate([_silence(10), _speech(4)]), step=14 * FRAME)
+        assert not [e for e in _barrier(ws) if e["type"] == "input_audio_buffer.speech_started"]
+        _send(ws, _speech(2), step=2 * FRAME)
+        started = [e for e in _barrier(ws) if e["type"] == "input_audio_buffer.speech_started"]
+        assert len(started) == 1 and started[0]["audio_start_ms"] == 8 * 32
+        _send(ws, _silence(16), step=16 * FRAME)
+        ended = _barrier(ws)
+    assert [e["type"] for e in ended if e["type"] in TURN_EVENTS] == list(TURN_EVENTS[1:])
+    assert not [e for e in ended if e.get("mstar", {}).get("backchannel")]
+
+
+@pytest.mark.parametrize("settings", [
+    {"min_interrupt_ms": 0, "assistant_speaking": True},
+    {"min_interrupt_ms": 160, "assistant_speaking": False},
+])
+def test_backchannel_rule_is_off_without_both_settings(vad_client, settings):
+    client, _ = vad_client
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        _open_with(ws, {"turn_detection": {"type": "server_vad", "prefix_padding_ms": 0},
+                        "mstar": {"chunk_seconds": 300, **settings}})
+        _send(ws, np.concatenate([_speech(3), _silence(16)]), step=19 * FRAME)
+        events = _barrier(ws)
+    assert [e["type"] for e in events if e["type"] in TURN_EVENTS] == list(TURN_EVENTS)
+    assert not [e for e in events if e.get("mstar", {}).get("backchannel")]
+
+
+def test_explicit_commit_marks_a_short_overlap_once(vad_client):
+    client, _ = vad_client
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        _open_with(ws, {"turn_detection": {"type": "server_vad", "prefix_padding_ms": 0},
+                        "mstar": {"chunk_seconds": 300, "min_interrupt_ms": 160, "assistant_speaking": True}})
+        _send(ws, _speech(3), step=3 * FRAME)
+        assert not [e for e in _barrier(ws) if e["type"] == "input_audio_buffer.speech_started"]
+        ws.send_text(json.dumps({"type": "input_audio_buffer.commit"}))
+        events = _barrier(ws)
+    committed = [e for e in events if e["type"] == "input_audio_buffer.committed"]
+    assert len(committed) == 1 and committed[0]["mstar"] == {"backchannel": True}
+    assert len([e for e in events if e["type"] == "conversation.item.input_audio_transcription.completed"]) == 1
+
+
+def test_backchannel_settings_echo_and_reject_invalid_updates_atomically(vad_client):
+    client, _ = vad_client
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        _open_with(ws, {"turn_detection": {"type": "server_vad"},
+                        "mstar": {"min_interrupt_ms": 160, "assistant_speaking": True}})
+        for knobs, needle in (({"min_interrupt_ms": -1}, "mstar.min_interrupt_ms"),
+                              ({"min_interrupt_ms": 10_001}, "mstar.min_interrupt_ms"),
+                              ({"assistant_speaking": 1}, "mstar.assistant_speaking")):
+            ws.send_text(json.dumps({"type": "transcription_session.update", "session": {"mstar": knobs}}))
+            error = json.loads(ws.receive_text())
+            assert error["type"] == "error" and needle in error["error"]["message"]
+            ws.send_text(json.dumps({"type": "transcription_session.update", "session": {}}))
+            view = json.loads(ws.receive_text())["session"]["mstar"]
+            assert view["min_interrupt_ms"] == 160 and view["assistant_speaking"] is True
+
+
+def test_playback_update_during_a_turn_applies_to_the_next_turn(vad_client):
+    client, _ = vad_client
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        _open_with(ws, {"turn_detection": {"type": "server_vad", "prefix_padding_ms": 0},
+                        "mstar": {"chunk_seconds": 300, "min_interrupt_ms": 160, "assistant_speaking": True}})
+        _send(ws, _speech(3), step=3 * FRAME)
+        ws.send_text(json.dumps({"type": "transcription_session.update", "session": {
+            "mstar": {"assistant_speaking": False}}}))
+        events = []
+        while (event := json.loads(ws.receive_text()))["type"] != "transcription_session.updated":
+            events.append(event)
+        assert not [e for e in events if e["type"] == "input_audio_buffer.speech_started"]
+        _send(ws, _silence(16), step=16 * FRAME)
+        first = _barrier(ws)
+        assert len([e for e in first if e.get("mstar", {}).get("backchannel")]) == 2
+        _send(ws, np.concatenate([_speech(3), _silence(16)]), step=19 * FRAME)
+        second = _barrier(ws)
+    assert [e["type"] for e in second if e["type"] in TURN_EVENTS] == list(TURN_EVENTS)
+    assert not [e for e in second if e.get("mstar", {}).get("backchannel")]
+
+
+def test_pending_overlap_does_not_emit_a_partial_before_its_start(vad_client):
+    client, _ = vad_client
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        _open_with(ws, {"turn_detection": {"type": "server_vad", "prefix_padding_ms": 0},
+                        "mstar": {"chunk_seconds": 0.5, "min_interrupt_ms": 1000,
+                                  "assistant_speaking": True}})
+        _send(ws, _speech(20), step=20 * FRAME)
+        pending = _barrier(ws)
+        assert not [e for e in pending if e["type"] in
+                    ("input_audio_buffer.speech_started", "mstar.transcription.partial")]
+        _send(ws, _speech(12), step=12 * FRAME)
+        promoted = _barrier(ws)
+    assert any(e["type"] == "input_audio_buffer.speech_started" for e in promoted)
+    assert any(e["type"] == "mstar.transcription.partial" for e in promoted)
+
+
 def test_settings_change_keeps_audio_not_scored_yet(vad_client):
     """A partial frame waiting for its VAD decision survives a turn_detection
     change (into the new segmenter, or into the item when it goes to null)."""

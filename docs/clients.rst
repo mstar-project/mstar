@@ -712,6 +712,19 @@ Per-model notes:
   exports take other inputs, and with one of them ``server_vad`` is refused); weights are
   never downloaded. The Dynamo bridge has no turn detection yet and
   refuses it.
+
+  A transcription client can opt into a duration rule during assistant playback
+  with ``session.mstar.min_interrupt_ms`` (integer, 0 to 10,000; default 0) and
+  ``session.mstar.assistant_speaking`` (boolean, default false). With both set,
+  ``server_vad`` waits for at least that many milliseconds of VAD-positive frames
+  before sending ``speech_started``. The event keeps the turn's original
+  ``audio_start_ms``. Incremental transcripts wait for that decision. A shorter
+  turn is still committed and transcribed, without
+  ``speech_started`` or ``speech_stopped``; its ``committed`` and transcription
+  ``completed`` events carry ``"mstar": {"backchannel": true}``. This duration
+  rule is an advisory signal, not a word classifier. It does not affect
+  ``semantic_vad`` or manual turns. Updates during an open turn apply to the
+  next turn.
 - **Semantic turn detection** — ``"turn_detection": {"type": "semantic_vad", "eagerness":
   "auto"}`` ends a turn when the speaker sounds finished rather than after a fixed
   silence, as OpenAI's semantic VAD does. When a pause reaches the eagerness' pause

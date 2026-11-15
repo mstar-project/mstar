@@ -291,6 +291,8 @@ class TurnSegmenter:
     ``feed`` takes audio of any length and returns operations in stream
     order: ``("speech_started", audio_start_ms)``, ``("audio", samples)`` for
     the open turn, ``("speech_stopped", audio_end_ms)``, ``("commit",)``,
+    or ``("backchannel",)`` before a short turn's commit when the opt-in
+    overlap rule held back its start,
     and ``("end_of_turn_failed", exc)`` when the end-of-turn model raises.
     Times are milliseconds from the start of the session's audio. A turn
     starts on a frame at or above ``threshold`` and takes up to
@@ -330,6 +332,19 @@ class TurnSegmenter:
         self.speaking = False
         self._silence = 0                            # trailing silent samples in the turn
         self._turn = 0                               # samples in the turn
+        self.min_interrupt_ms = 0
+        self.assistant_speaking = False
+        self._pending_start_ms: int | None = None
+        self._spoken = 0
+
+    def set_overlap_rule(self, min_interrupt_ms: int, assistant_speaking: bool) -> None:
+        """Set the rule for future turns; an open turn keeps its start decision."""
+        self.min_interrupt_ms = min_interrupt_ms
+        self.assistant_speaking = assistant_speaking
+
+    @property
+    def pending_start(self) -> bool:
+        return self._pending_start_ms is not None
 
     def feed(self, audio: np.ndarray) -> list[tuple]:
         ops: list[tuple] = []
@@ -357,6 +372,11 @@ class TurnSegmenter:
                     self._prefix = np.concatenate([self._prefix, frame])[-self._prefix_cap:]
                 return
             self._open(start, ops)
+        if self._pending_start_ms is not None and p >= self.threshold:
+            self._spoken += FRAME
+            if self._spoken * 1000 >= self.min_interrupt_ms * SAMPLE_RATE:
+                ops.append(("speech_started", self._pending_start_ms))
+                self._pending_start_ms = None
         ops.append(("audio", frame))
         self._turn += FRAME
         paused = self._silence
@@ -398,8 +418,12 @@ class TurnSegmenter:
         keep = min(self._prefix.size, max(self.max_turn - FRAME, 0))
         prefix = self._prefix[self._prefix.size - keep:]
         self.speaking, self._turn, self._silence = True, prefix.size, 0
+        self._spoken = 0
         self._prefix = np.zeros(0, dtype=np.float32)
-        ops.append(("speech_started", samples_to_ms(start - prefix.size)))
+        start_ms = samples_to_ms(start - prefix.size)
+        self._pending_start_ms = start_ms if self.assistant_speaking and self.min_interrupt_ms else None
+        if self._pending_start_ms is None:
+            ops.append(("speech_started", start_ms))
         if prefix.size:
             ops.append(("audio", prefix))
         if self._eot is not None:
@@ -407,9 +431,13 @@ class TurnSegmenter:
             self._recent.append(prefix.copy())
 
     def _stop(self, end: int, ops: list) -> None:
-        ops.append(("speech_stopped", samples_to_ms(end)))
+        if self._pending_start_ms is None:
+            ops.append(("speech_stopped", samples_to_ms(end)))
+        else:
+            ops.append(("backchannel",))
         ops.append(("commit",))
         self.speaking, self._silence, self._turn = False, 0, 0
+        self._pending_start_ms, self._spoken = None, 0
         if self._eot is not None:
             self._recent.clear()
 
@@ -440,6 +468,7 @@ class TurnSegmenter:
         self._rest = np.zeros(0, dtype=np.float32)
         self._prefix = np.zeros(0, dtype=np.float32)
         self.speaking, self._silence, self._turn = False, 0, 0
+        self._pending_start_ms, self._spoken = None, 0
         if self._eot is not None:
             self._recent.clear()
         self.vad.reset()
