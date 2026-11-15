@@ -983,12 +983,16 @@ pub fn json_type_name(v: &serde_json::Value) -> &'static str {
     }
 }
 
+fn python_is_printable(c: char) -> bool {
+    let code = c as u32;
+    let ranges = crate::unicode_printable::UNPRINTABLE_RANGES;
+    let after = ranges.partition_point(|&(low, _)| low <= code);
+    after == 0 || code > ranges[after - 1].1
+}
+
 /// Python's `repr` of a str, for a refusal that quotes the client's value as
 /// the Python frontend's does.
 pub fn py_repr(s: &str) -> String {
-    static UNPRINTABLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let unprintable = UNPRINTABLE
-        .get_or_init(|| regex::Regex::new(r"[\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]").unwrap());
     let quote = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
     let mut out = String::from(quote);
     for c in s.chars() {
@@ -1001,7 +1005,7 @@ pub fn py_repr(s: &str) -> String {
                 out.push('\\');
                 out.push(c);
             }
-            c if c != ' ' && unprintable.is_match(c.encode_utf8(&mut [0; 4])) => {
+            c if !python_is_printable(c) => {
                 out.push_str(&match c as u32 {
                     n @ ..=0xff => format!("\\x{n:02x}"),
                     n @ ..=0xffff => format!("\\u{n:04x}"),
@@ -1112,6 +1116,9 @@ mod tests {
             ("'\"", "'\\'\"'"),
             ("a\\b\n\t", "'a\\\\b\\n\\t'"),
             ("\u{0}\u{7f}\u{a0}\u{200b}", "'\\x00\\x7f\\xa0\\u200b'"),
+            ("\u{0897}", "'\\u0897'"),
+            ("\u{2ffc}", "'\\u2ffc'"),
+            ("\u{2028}\u{e000}", "'\\u2028\\ue000'"),
             ("海 é", "'海 é'"),
         ] {
             assert_eq!(py_repr(s), want, "{s:?}");

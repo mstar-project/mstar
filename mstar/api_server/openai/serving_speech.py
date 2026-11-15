@@ -41,6 +41,7 @@ from mstar.api_server import media_io
 from mstar.api_server.openai._util import error_type, release_unread, rid, sse
 from mstar.api_server.openai.protocol import VoiceCard, VoiceList
 from mstar.api_server.openai.speech_chunking import split_sentences
+from mstar.api_server.pinned_repr import pinned_repr
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
 from mstar.utils.generation_kwargs import offset_seed
 
@@ -100,7 +101,7 @@ def describe_rejected(value):
     value read back.
     """
     if isinstance(value, str):
-        return repr(value)
+        return pinned_repr(value)
     if value is None:
         return "null"
     if isinstance(value, bool):  # before int: bool is a subclass of it

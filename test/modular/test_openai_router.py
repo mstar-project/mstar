@@ -1307,6 +1307,8 @@ def test_speech_refuses_an_unknown_stream_format(client_and_stub):
     [
         ("SSE", "'SSE'"),
         ("", "''"),
+        ("it's", '"it\'s"'),
+        ("\u2ffc", "'\\u2ffc'"),
         (True, "a boolean"),
         (False, "a boolean"),  # == 0, and the guard compares with ==
         (0, "a number"),

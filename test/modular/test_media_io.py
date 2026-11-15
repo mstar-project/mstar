@@ -38,6 +38,12 @@ def test_check_audio_format_defaults_and_refusals():
             media_io.check_audio_format(fmt, **kwargs)
 
 
+def test_format_refusal_uses_pinned_printability():
+    with pytest.raises(ValueError) as error:
+        media_io.check_audio_format("\u2ffc")
+    assert "response_format '\\u2ffc' cannot be produced" in str(error.value)
+
+
 def test_compressed_containers_encode_for_real():
     sf = pytest.importorskip("soundfile")
     import io
