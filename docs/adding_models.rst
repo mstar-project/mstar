@@ -21,7 +21,9 @@ A model in ``mstar`` has several separate responsibilities:
   and its layers reach it through handles. The engine builds the resources
   (``mstar/engine/resources/``) that hold each declaration and binds a handle into the
   submodule and its layers. A node that declares no state was called a "stateless" node
-  in earlier versions.
+  in earlier versions. Per-request LoRA adapters stand outside it: they are weights that
+  no request writes, and a model declares them in ``lora_roots()`` (see
+  `Per-request LoRA adapters`_).
 - **The engine** (``mstar/engine/engine.py``) is a single class that runs every node. It
   compiles forwards, captures CUDA graphs, batches requests, and runs each step's
   resource lifecycle (admit, plan, forward, commit). You never write an engine. Earlier
@@ -790,7 +792,10 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
 - ``Positions(rope=)``: a position counter per request and label, on an append-only array
   that keeps entries. ``rope=None`` is a counter only. ``Rope`` carries ``theta``,
   ``rotary_dim``, ``interleave``, ``scale``, the Llama 3.1 factors (all three or none), the
-  rotation's ``dtype`` and a ``table_dtype`` for a cos/sin table built once. On the contract
+  rotation's ``dtype`` and a ``table_dtype`` for a cos/sin table built once. ``longrope`` takes
+  a ``LongRoPE``'s short and long factor sets, and a request rotates with the long set when the
+  prompt length ``process_prompt`` sets under ``MAX_POSITION_KWARG`` passes the original context
+  (Phi-4-multimodal). On the contract
   this picks the kernel, and a shared layer's ``rope_*`` arguments have no effect, so a port
   declares what its layer passed before. The counter is
   separate from log positions: a kept step advances it by each row's advance, a fork copies
@@ -908,7 +913,7 @@ a refused admit draws the same noise.
 ``kernel_settings(self)`` is a temporary hook for what the engine doesn't pick itself yet:
 ``splits``, ``decode_fmha`` and ``decode_tensor_cores`` on a read of a paged array,
 ``splits`` on a ``GatedDeltaNet``, and ``max_segments_per_request``, ``max_segments_per_step``,
-``compile_op`` and ``workspace_mb`` on a ``Block`` read. Under an array's name it sets the default size of the array's pool, ``max_num_pages``
+``compile_op``, ``workspace_mb`` and ``backend`` on a ``Block`` read. Under an array's name it sets the default size of the array's pool, ``max_num_pages``
 on a paged array and ``max_slots`` on a ``Value`` with tensor fields or an unbounded array, which a deployment's
 ``resources:`` block overrides. A cross read on an array that keeps entries takes
 ``decode_tensor_cores`` alone, and two reads that share a resource can't set one field to two
@@ -920,7 +925,14 @@ Resource specs
 The engine builds these specs from ``declare_state``, and a deployment tunes them under the
 declared names. A model that hasn't moved to declarations still writes them by hand in
 ``get_node_resources``, which returns a flat list of ``NodeResourceSpec`` objects and is
-``[]`` by default. Every spec has these common members:
+``[]`` by default. A new model package declares its state through the contract and is listed
+in ``PORTED`` in ``test/modular/test_state_lint.py``, which fails a package that is on
+neither ``PORTED`` nor its frozen ``UNPORTED`` list. ``get_node_resources`` remains for the
+packages on ``UNPORTED``. A ported file defines it only for a spec the contract can't
+declare, such as the sequence shard on MiniMax-H3's video decoder, a node with no arrays, and
+the lint lists that function with its reason. When the contract can't declare a model's state
+yet, the mask or op and its binding in ``adapters.py`` land first, in their own PR. Every spec
+has these common members:
 
 - ``resource_key`` is the name of this resource. Three places use this name, and all three
   must agree: the layers bind to it, ``declare_step`` uses it as the key of its
@@ -1208,12 +1220,13 @@ The spec types are:
        ValueError at load. The torch reference's prefill can't be captured
        (``KDAManager.prefill_capturable`` is False), so the resource refuses a prefill
        bucket on it and the model leaves those buckets out.
-   * - ``LoraSpec`` (built by ``module_lora_spec``)
+   * - ``LoraSpec`` (built from ``lora_roots``)
      - Per-request LoRA adapters on the node's LoRA-capable linears: a pool of device
        slots, a pinned host tier, and the per-step addressing a LoRA kernel reads.
-       Opt-in (``NodeResourceSpec.opt_in``): declared in this list, built only when
-       the serving YAML has a ``resources: lora:`` block. One spec spans every node
-       adapters reach, with a pool per node. See `Per-request LoRA adapters`_.
+       Opt-in (``NodeResourceSpec.opt_in``): built from the model's ``lora_roots()``
+       rather than this list, and only when the serving YAML has a ``resources: lora:``
+       block. One spec spans every node adapters reach, with a pool per node. See
+       `Per-request LoRA adapters`_.
 
 **Lean captures.** A resource whose kernels can be left out of a step whose rows all
 allow it sets ``Resource.lean_capture``, answers ``lean_for(request_ids)`` from state
@@ -1613,31 +1626,41 @@ one batch can run different adapters, or none. The engine owns the adapter weigh
 model declares which linears adapters may touch; it never indexes the pool itself.
 
 A model declares LoRA from its own modules: the shared linears add the delta
-themselves once bound, and ``module_lora_spec`` builds the spec by walking each node's
-weights root. The spec is opt-in (``NodeResourceSpec.opt_in``), declared in
-``get_node_resources`` beside the model's other resources and built only when the
-serving YAML has a ``resources: lora:`` block. Orpheus is the reference
-(``OrpheusModel.get_node_resources``):
+themselves once bound, and the bridge builds the spec by walking each node's weights
+root. LoRA stands outside the state contract, as weights do: no request writes an
+adapter, a request picks one by its kwargs, and each step's rows come from its segments,
+so nothing per request is left for ``declare_state`` to hold. A model declares a
+``LoraRoot`` for each node adapters reach in ``lora_roots()``, and ``declared_lora_spec``
+builds the one spec from them. The spec is opt-in (``NodeResourceSpec.opt_in``), built
+only when the serving YAML has a ``resources: lora:`` block. Orpheus is the reference
+(``OrpheusModel.lora_roots``):
 
 .. code-block:: python
 
-   from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
+   from mstar.model.components.lora.modules import PER_SEGMENT, LoraRoot
 
-   def get_node_resources(self) -> list[NodeResourceSpec]:
-       return [
-           ...,  # KV, attention, positions, sampler
-           module_lora_spec(
-               # builds the module the node's weight loader fills, at one rank, on the
-               # meta device: only once the spec is read, which a deployment without
-               # a `lora:` block never does
-               lambda group: OrpheusForCausalLM(self.config, comm_group=group),
-               nodes={"LLM"},
-               root_path="model",               # the root's attribute path in the node submodule
-               adapter_roots=[("", "model.")],  # adapters saved on the bare LlamaModel
-               rows={"lm_head": PER_SEGMENT},    # rows that are not the step's tokens
-               embeddings=True,                  # every embedding call is in the forward
-           ),
-       ]
+   def lora_roots(self) -> tuple[LoraRoot, ...]:
+       return (LoraRoot(
+           node="LLM",
+           # builds the module the node's weight loader fills, at one rank, on the
+           # meta device: only once the spec is read, which a deployment without
+           # a `lora:` block never does
+           build=lambda group: OrpheusForCausalLM(self.config, comm_group=group),
+           adapter_roots=[("", "model.")],  # adapters saved on the bare LlamaModel
+           rows={"lm_head": PER_SEGMENT},    # rows that are not the step's tokens
+           embeddings=True,                  # every embedding call is in the forward
+       ),)
+
+``root_path`` is the root's attribute path in the node submodule (``"model"`` by
+default), and ``adapters`` names the adapters a checkpoint ships for the root
+(Phi-4-multimodal's ``vision`` and ``speech``). No model builds a ``LoraSpec`` itself.
+The state lint (``test/modular/test_state_lint.py``) refuses ``get_node_resources`` in a
+ported model, and any import in a ported model from ``mstar.model.components.lora`` or
+below but ``LoraRoot``, ``AdapterRoot`` and ``PER_SEGMENT``. It also refuses, in any model
+file outside the bridge (``mstar/model/base.py`` and
+``mstar/model/components/lora/modules.py``, with ``tests`` folders skipped), a call to
+``declared_lora_spec``, ``module_lora_spec`` or ``join_lora_specs`` and a built
+``LoraSpec``.
 
 The weights root states how the checkpoint lands on it once
 (``checkpoint_rules() -> CheckpointRules``: a prefix, a remap, the stacked-shard
@@ -1687,8 +1710,8 @@ placed exactly as weights are.
   split projections adapters write, rewritten to the checkpoint's before the
   root's rules place them. ``ignore``: modules an adapter may carry that never run.
 - **Several nodes.** A model whose adapters reach several nodes (an LLM and its vision
-  encoder, which a TP config may put on different ranks) builds a spec per node with
-  ``module_lora_spec`` and declares one, ``join_lora_specs(llm, vision)``: its targets
+  encoder, which a TP config may put on different ranks) declares a root on each, and
+  the bridge joins their specs into one (``join_lora_specs``): its targets
   name their nodes, a checkpoint module belongs to the node that places it (the one whose
   ``adapter_roots`` claim it most specifically, when several do), so one adapter file
   serves both, and each node gets a pool of its own (``LoraSpec.per_node``, keyed
@@ -1720,7 +1743,7 @@ placed exactly as weights are.
   names the pool) and leases it only for a step none of whose rows runs an adapter; a
   step with one runs the region eagerly under the node's step.
 
-``module_lora_spec`` produces an ordinary ``LoraSpec``, whose parts follow.
+``declared_lora_spec`` produces an ordinary ``LoraSpec``, whose parts follow.
 
 - **Targets.** ``LoraTarget`` gives the unsharded linear's shape and how the base layer is
   split under tensor parallelism. For a column-parallel linear, A is replicated and B is
@@ -2571,8 +2594,9 @@ row whose last step did not keep its value on the device (its first decode step,
 the prefill) still brings it routed, and that read puts it over the slot's.
 ``SampledTokenDecoder`` declares it for Qwen3.5, Muse Glimmer, Higgs Audio, Qwen3-ASR and the Cosmos3 reasoner,
 and a node on it that reads the routed token sets ``device_loopback = None``; Whisper and
-Qwen3-Omni's Thinker declare their own. Qwen3.5, Qwen3-ASR and Whisper read the tokens with
-``last_sampled``, and put a row's routed token over its slot's with ``splice_loopback_ids``.
+Qwen3-Omni's Thinker declare their own. A node on ``DeclaredTokenDecoder`` and Whisper's decoder
+read the tokens with ``last_sampled``, and put a row's routed token over its slot's with
+``splice_loopback_ids``.
 Its ``walk`` may be a ``frozenset`` of walks when several decode walks read the token back; a
 combined step's rows each follow their own walk, and naming a combined walk is refused at
 startup.
@@ -3866,8 +3890,8 @@ There are three graph walks: ``prefill`` and a ``decode`` ``Loop`` on the LLM, p
 ``process_prompt`` formats the string ``"{voice}: {text}"``, tokenizes it, wraps the ids in
 the model's start and end tokens, and returns ``{"text_inputs": [ids]}``, with its layout under
 ``state_layout``.
-``get_submodule`` builds either the Llama LLM submodule, a ``SampledTokenDecoder`` that
-declares little beyond its walk names, the state its steps list and capture buckets, or the SNAC
+``get_submodule`` builds either the Llama LLM submodule, a ``DeclaredTokenDecoder`` that
+declares little beyond its walk names and capture buckets, or the SNAC
 decoder submodule, and caches the result. The SNAC submodule emits int16
 PCM, which the default ``postprocess`` passes through as raw bytes.
 
@@ -4273,7 +4297,9 @@ submodule cache and where the files come from. A model sets ``NAME`` and
 ``METADATA_FILES`` and writes ``__init__`` (setting
 ``config``, ``tokenizer`` and ``media``), its resources (the sampler from
 ``_sampler_spec``; ``MIXED_SPLIT`` is the attention resources' split of a mixed step),
-``_prompt_ids`` and ``_create_submodule``. The scaffold's
+``_prompt_ids`` and ``_create_submodule``. A model on the state contract subclasses
+``DeclaredDecoderModel``, which returns the layout as ``state_layout`` and the request's
+settings as ``SampleSettings``. The scaffold's
 ``rebuild_policies`` lets the KV cache drop a request and reprefill its ids on its prefill
 walk, a media prompt's with host copies of its encoders' outputs. A model whose LLM node
 holds a resource that can't drop returns ``{}``, or the engine refuses to start; Muse
@@ -4338,8 +4364,10 @@ Its decoder module provides ``embed(ids)``, ``forward(input_embeds, *, label, **
 ``Qwen3_5ForCausalLM`` and ``Qwen3DenseLM`` do. The sampler is declared under
 ``mstar.model.keys``' ``SAMPLER``, and the positions under the node's ``POS_KEY``
 (``ROPE`` unless the model's layers name another ``pos_key``). A model on the state contract
-overrides ``node_step``, ``next_position``, ``loopback_tokens``, ``last_token_hidden`` and
-``sample_tokens`` with its handle calls, as Qwen3.5 does. ``MSTAR_DECODE_BUCKETS`` sets the
+subclasses ``DeclaredTokenDecoder`` instead and sets none of ``ATTN_KEY``, ``POS_KEY`` or
+``layer_steps``, since its positions are the array's: its ``node_step``, ``next_position``,
+``loopback_tokens``, ``last_token_hidden`` and ``sample_tokens`` make the handle calls, and a model
+overrides ``node_step`` only when it steps a second array, as Qwen3.5 does. ``MSTAR_DECODE_BUCKETS`` sets the
 default decode ladder, ``MIXED_MAX_PREFILL_ROWS`` caps a mixed step's prompt rows, ``capture_compile_mode(walk)`` names a capture's ``compile_mode`` (``None``, the default,
 takes the deployment's compile level), and ``CAPTURE_PREFILL = False`` captures decode
 only. A lone encoder's ``MediaEncoder.walk`` names its media walk when the model's graph
