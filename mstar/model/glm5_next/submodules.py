@@ -214,8 +214,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         configs: list[AcceleratorGraphConfig] = [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
+                # one id in; under MTP the seed holds it
                 single_request_inputs=ARNodeInputs(
-                    input_ids=torch.zeros(1, dtype=torch.long, device=device),
+                    input_ids=None if self.mtp_k else torch.zeros(1, dtype=torch.long, device=device),
                     input_seq_len=self.mtp_block,
                 ),
                 capture_batch_sizes=batch_sizes,
@@ -265,18 +266,19 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         **kwargs,
     ) -> ARNodeInputs:
-        text_inputs = inputs["text_inputs"][0]
-        seq_len = text_inputs.shape[0]
-        if graph_walk == "decode" and seq_len != 1:
-            raise RuntimeError(
-                f"request {fwd_info.request_id}: a decode row of {seq_len} ids, and a decode step is declared and "
-                "captured over rows of one id"
-            )
+        if self.mtp_k > 0 and graph_walk == "decode":
+            # the step verifies the last emitted token, which the step before it left in the seed, and k drafts
+            text_inputs, seq_len = None, self.mtp_block
+        else:
+            text_inputs = inputs["text_inputs"][0]
+            seq_len = text_inputs.shape[0]
+            if graph_walk == "decode" and seq_len != 1:
+                raise RuntimeError(
+                    f"request {fwd_info.request_id}: a decode row of {seq_len} ids, and a decode step is declared and "
+                    "captured over rows of one id"
+                )
         if self.mtp_k > 0:
             self._check_mtp_sampling(fwd_info)
-            if graph_walk == "decode":
-                # one id in, the last emitted token: the step verifies it and k drafts
-                seq_len = self.mtp_block
         # dsa_long_context is refused at model __init__, so the serving
         # regime is ALWAYS ctx <= index_topk, where dense MLA computes
         # exactly what GLM-5.3-Flash's DSA would — refuse beyond it rather
@@ -358,6 +360,11 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
+        if self.mtp_k > 0 and graph_walk == "decode":
+            # the step's tokens are in the seed, and it sets the flag once its verdict has landed
+            self._staged = self._mailbox(engine_inputs)
+            self._staged.ready.zero_()
+            return {}
         # The per-replay-varying inputs. Everything else the forward reads
         # is a resource plan (slot index, KV write slots, planned kernels).
         out = {"input_ids": torch.cat([inp.input_ids for inp in inputs])}
@@ -365,10 +372,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             out["last_rows"] = self._last_rows(inputs)
         if self.mtp_k > 0 and graph_walk == "prefill":
             out["mtp_keep"] = self._mtp_keep(inputs, out["input_ids"].shape[0])
-        if self.mtp_k > 0 and graph_walk == "decode":
-            # the step sets the flag once its verdict has landed
-            self._staged = self._mailbox(engine_inputs)
-            self._staged.ready.zero_()
         return out
 
     def _mtp_keep(self, inputs: list[ARNodeInputs], num_tokens: int) -> torch.Tensor:
@@ -461,10 +464,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         del prev  # the tests' oracle drafts read it
         return self._argmax(hidden)
 
-    def _mtp_seed(self, hidden: torch.Tensor, prev: torch.Tensor) -> None:
-        """The next step's draft seed: the MTP state and d1, the draft for the token after
-        ``prev`` (the step's next input)."""
-        self.seed.write(0, hidden=hidden, draft=self._draft_tokens(hidden, prev))
+    def _mtp_seed(self, hidden: torch.Tensor, token: torch.Tensor) -> None:
+        """The next verify step's seed: ``token``, the input it verifies, the MTP state and d1,
+        the draft for the token after ``token``."""
+        self.seed.write(0, token=token, hidden=hidden, draft=self._draft_tokens(hidden, token))
 
     def _mtp_prefill(self, input_ids, hidden, last, new_tokens, mtp_keep) -> None:
         """The MTP pass over the prompt: row i pairs the trunk's state at token i with the
@@ -476,20 +479,20 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         nxt = torch.roll(input_ids, -1)
         nxt.index_copy_(0, last, _real_row_values(last, new_tokens).to(nxt.dtype))
         embeds = lm.model.embed_tokens(nxt) * mtp_keep[:, None]
-        self._mtp_seed(lm.mtp(embeds, hidden).index_select(0, last), new_tokens)
+        self._mtp_seed(lm.mtp(embeds, hidden).index_select(0, last), new_tokens.long())
 
-    def _mtp_decode(self, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor) -> torch.Tensor:
+    def _mtp_decode(self, engine_inputs: ModelInputsFromEngine) -> None:
         """One verify step: draft k tokens, verify ``[last | drafts]`` with the trunk, then run
-        the MTP layer over the block to seed the next step. The verdict (the target's argmax
-        per block row, then the accepted count) goes to the host's mailbox; returns the next
-        input token per row."""
+        the MTP layer over the block to seed the next step, its input token included. The
+        verdict (the target's argmax per block row, then the accepted count) goes to the host's
+        mailbox."""
         lm, k, block = self.language_model, self.mtp_k, self.mtp_block
-        n = input_ids.shape[0]
 
         # Drafts: d1 was seeded by the last step; each further one is an MTP pass whose
         # query sits at its row of this step's block.
         seed = self.seed.read(0).fields
-        h, drafts = seed["hidden"], [seed["draft"]]
+        last, h, drafts = seed["token"], seed["hidden"], [seed["draft"]]
+        n = last.shape[0]
         attn = lm.mtp.transformer_layer.self_attn
         latents = h.new_zeros(n, block, attn.kv_lora_rank)
         for row in range(k - 1):
@@ -498,7 +501,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         drafts = self._broadcast(torch.stack(drafts, 1))
 
         # Verify: greedy, the longest prefix of drafts the target agrees with.
-        ids = torch.cat([input_ids.view(n, 1), drafts], 1).view(-1)
+        ids = torch.cat([last.view(n, 1), drafts], 1).view(-1)
         hidden = lm.model(ids, decode=True)
         target = self._argmax(hidden).view(n, block)
         accepted = (drafts == target[:, :k]).long().cumprod(1).sum(1)
@@ -519,7 +522,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         h_block = lm.mtp(lm.model.embed_tokens(target.reshape(-1)), hidden)
         self._mtp_seed(h_block.view(n, block, -1)[each, accepted], next_input)
         settle(self.kv, accepted + 1)
-        return next_input
 
     def forward(
         self,
@@ -531,7 +533,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         **kwargs,
     ) -> NameToTensorList:
         if self.mtp_k > 0 and graph_walk == "decode":
-            return self.forward_batched(graph_walk, engine_inputs, input_ids)[engine_inputs.request_ids[0]]
+            return self.forward_batched(graph_walk, engine_inputs)
         return {"new_token": self._forward(
             graph_walk, engine_inputs, input_ids, last_rows, mtp_keep)}
 
@@ -542,19 +544,15 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
         last_rows: torch.Tensor | None = None,
         mtp_keep: torch.Tensor | None = None,
         **kwargs,
     ) -> dict[str, NameToTensorList] | BatchedModelOutput:
         if self.mtp_k > 0 and graph_walk == "decode":
-            # the emitted tokens are cut on the host (unpack_packed_outputs); the next input
-            # is the token after the accepted drafts
-            next_input = self._mtp_decode(engine_inputs, input_ids)
-            return {
-                rid: {"text_inputs": [next_input[i : i + 1]]}
-                for i, rid in enumerate(engine_inputs.request_ids)
-            }
+            # the emitted tokens are cut on the host (unpack_packed_outputs), and the next input stays in the seed
+            self._mtp_decode(engine_inputs)
+            return {}
         new_tokens = self._forward(graph_walk, engine_inputs, input_ids, last_rows, mtp_keep)
         # row i is request i: one clone out of the graph and one host copy a step
         return BatchedModelOutput(
@@ -653,11 +651,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         inputs: ARNodeInputs | None = None,
         **kwargs,
     ):
-        # the decode loop's text_inputs edge carries the emitted token; an MTP verify step set
-        # it already, to the token after the accepted drafts
-        if "new_token" not in outputs:
-            return
-        outputs.setdefault("text_inputs", outputs["new_token"])
+        # the decode loop's text_inputs edge carries the emitted token, which under MTP stays in the seed
+        if not self.mtp_k and "new_token" in outputs:
+            outputs.setdefault("text_inputs", outputs["new_token"])
 
     def check_stop(
         self, request_id: str,

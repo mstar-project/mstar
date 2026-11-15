@@ -175,9 +175,11 @@ class Glm5NextModel(ByteLevelTextOutput, Model):
             ),
         ]
         if k:
+            # the token the next verify step verifies first, the state it drafts from, and its first draft
             state.append(Value(
                 MTP_SEED, nodes=nodes, layers={0},
                 entry=Entry({
+                    "token": TensorType((), dtype=torch.long),
                     "hidden": TensorType((cfg.hidden_size,), dtype=self.kda_conv_dtype),
                     "draft": TensorType((), dtype=torch.long),
                 }),
@@ -241,9 +243,10 @@ class Glm5NextModel(ByteLevelTextOutput, Model):
             ),
         ]
         if self.config.mtp_num_draft_tokens > 0:
+            # the step's input token stays in the seed, so the count is the loop's one loop-back edge
             prefill_outputs.append(GraphEdge(next_node=EMPTY_DESTINATION, name=COUNT, persist=True))
-            decode_inputs.append(COUNT)
-            decode_outputs.append(GraphEdge(next_node="LLM", name=COUNT))
+            decode_inputs = [COUNT]
+            decode_outputs[0] = GraphEdge(next_node="LLM", name=COUNT)
         prefill = GraphNode(name="LLM", input_names=["text_inputs"], outputs=prefill_outputs)
 
         decode = Loop(
@@ -267,11 +270,12 @@ class Glm5NextModel(ByteLevelTextOutput, Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict,
     ) -> list[WalkStep]:
-        # one prefill over the prompt, then decode until the stop check ends it
+        # one prefill over the prompt, then decode until the stop check ends it. Under MTP the first decode step reads
+        # its input token from the seed the prefill wrote.
+        bind = {} if self.config.mtp_num_draft_tokens > 0 else {"text_inputs": "new_token"}
         return [
             WalkStep("prefill", step_metadata={FINAL_PREFILL: True}),
-            WalkStep("decode", bind={"text_inputs": "new_token"},
-                     step_metadata={PROMPT_LEN: model_kwargs[PROMPT_LEN]}),
+            WalkStep("decode", bind=bind, step_metadata={PROMPT_LEN: model_kwargs[PROMPT_LEN]}),
         ]
 
     # -------------------------------------------------------------------

@@ -103,6 +103,7 @@ def _reference(model: Glm5NextModel) -> list:
         del kda.blocks["mtp_hidden"], kda.blocks["mtp_draft"]
         specs.append(RecurrentStateSpec(resource_key=MTP_SEED, nodes={"LLM"}, config=RecurrentStateConfig(
             num_layers=1, max_slots_of=KDA_STATE, blocks={
+                "token": RecurrentBlockConfig(shape=(), dtype=torch.long),
                 "hidden": RecurrentBlockConfig(shape=(cfg.hidden_size,), dtype=model.kda_conv_dtype),
                 "draft": RecurrentBlockConfig(shape=(), dtype=torch.long),
             },
@@ -225,14 +226,16 @@ def test_a_decode_row_from_prepare_inputs_has_the_template_row_s_span(k):
     info = SimpleNamespace(
         request_id="r", resource_configs={}, dynamic_loop_iter_counts={}, step_metadata={PROMPT_LEN: 5},
     )
-    signals = {"text_inputs": [torch.tensor([7])], COUNT: [torch.tensor([5, 0, 16, 1, 5])]}
+    # under MTP the row's input token is in the seed, and the loop carries the count alone
+    signals = {COUNT: [torch.tensor([5, 0, 16, 1, 5])]} if k else {"text_inputs": [torch.tensor([7])]}
     row = node.prepare_inputs("decode", info, signals)
     declared, real = (node.declare_step("decode", ["a"], [one]) for one in (template, row))
     assert (declared.segments, declared.state) == (real.segments, real.state), (
         "the pre-plan's step is not the one the forward would declare for this row"
     )
-    with pytest.raises(RuntimeError, match="a decode row of 2 ids"):
-        node.prepare_inputs("decode", info, {**signals, "text_inputs": [torch.tensor([7, 8])]})
+    if not k:
+        with pytest.raises(RuntimeError, match="a decode row of 2 ids"):
+            node.prepare_inputs("decode", info, {"text_inputs": [torch.tensor([7, 8])]})
 
 
 def test_only_the_first_decode_step_reads_the_prompt_length():
@@ -242,7 +245,7 @@ def test_only_the_first_decode_step_reads_the_prompt_length():
     info = SimpleNamespace(
         request_id="r", resource_configs={}, dynamic_loop_iter_counts={}, step_metadata={PROMPT_LEN: 5},
     )
-    signals = {"text_inputs": [torch.tensor([7])], COUNT: [torch.tensor([1, -1, 16, 1, -1])]}
+    signals = {COUNT: [torch.tensor([1, -1, 16, 1, -1])]}
     first = node.prepare_inputs("decode", info, signals)
     assert first.kwargs == {"emitted": 1, "max_tokens": 16, "ignore_eos": 1, "prompt_len": 5}
     info.step_metadata = {}
