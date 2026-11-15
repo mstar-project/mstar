@@ -11,8 +11,8 @@ import json
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
-# the LLM's attention resource; its KV, position and sampler keys are
-# `mstar.model.keys`', as the shared decoder reads them
+# the read of the LLM's KV cache; the cache and the sampler are under
+# `mstar.model.keys`' names, as the shared decoder binds them
 ATTN = "attn"
 
 

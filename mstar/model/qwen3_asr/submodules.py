@@ -13,29 +13,17 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
-from typing import Any
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.state import (
-    ArrayStep,
-    SampleStep,
-    Segment,
-    SubmoduleStep,
-    at_last_token,
-    last_sampled,
-    position,
-    sample,
-)
 from mstar.model.components.audio_features import LogMelSpectrogram
 from mstar.model.components.aut_encoder import AuTEncoder
 from mstar.model.components.aut_submodule import AuTEncoderSubmodule
-from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
-from mstar.model.qwen3_asr.config import AUT_TOKENS, KV_CACHE, SAMPLER, Qwen3ASRModelConfig
-from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
+from mstar.model.components.sampled_token_decoder import DeclaredTokenDecoder
+from mstar.model.qwen3_asr.config import AUT_TOKENS, Qwen3ASRModelConfig
+from mstar.model.submodule_base import NodeInputs
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +76,7 @@ class Qwen3ASREncoderSubmodule(AuTEncoderSubmodule):
 # ===================================================================
 
 
-class Qwen3ASRLLMSubmodule(SampledTokenDecoder):
+class Qwen3ASRLLMSubmodule(DeclaredTokenDecoder):
     """Dense Qwen3 decoder. Prefill is captured on packed token buckets, decode
     on batch size."""
 
@@ -104,27 +92,3 @@ class Qwen3ASRLLMSubmodule(SampledTokenDecoder):
         # a captured prefill is capped by its largest capture, an eager one not
         # at all, as before the scaffold
         return None
-
-    def bind_state(self, handles: Mapping[str, Any]) -> None:
-        self.kv = handles[KV_CACHE]
-        self.sampler = handles[SAMPLER]
-
-    def node_step(
-        self, segments: list[Segment], prefill_tokens: Mapping[int, torch.Tensor], advance: tuple[int, ...] | None,
-    ) -> SubmoduleStep:
-        return SubmoduleStep(
-            segments=segments,
-            state={KV_CACHE: ArrayStep(advance=advance), SAMPLER: SampleStep(prompt_tokens=prefill_tokens)},
-        )
-
-    def next_position(self, rid_handle: int) -> int:
-        return position(self.kv, rid_handle, "main")
-
-    def loopback_tokens(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
-        return last_sampled(self.sampler)
-
-    def last_token_hidden(self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor) -> torch.Tensor:
-        return at_last_token(self.kv, hidden)
-
-    def sample_tokens(self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor) -> torch.Tensor:
-        return sample(self.sampler, logits)
