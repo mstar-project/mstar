@@ -30,6 +30,7 @@ from mstar.engine.state import (
     Entry,
     GatedDeltaNet,
     KVEntry,
+    LongRoPE,
     Positions,
     Read,
     Rope,
@@ -274,6 +275,16 @@ def test_positions_sit_only_on_an_append_only_array_that_keeps_entries(array):
 def test_a_rope_sets_all_three_llama_fields_or_none(rope):
     problem = _one_problem(_array(positions=Positions(rope=rope)))
     assert problem.startswith("Array 'kv'.positions.rope") and "all set or all None" in problem
+
+
+def test_a_longrope_on_the_whole_head_takes_half_the_head_dim_in_factors():
+    """``Rope`` can't count against a ``rotary_dim`` of None, so the head dim is read off the entry."""
+    longrope = LongRoPE(
+        short_factor=(1.0,) * 8, long_factor=(4.0,) * 8, original_max_position_embeddings=8, max_position_embeddings=16,
+    )
+    problem = _one_problem(_array(positions=Positions(rope=Rope(longrope=longrope))))
+    assert problem.startswith("Array 'kv'.positions.rope.longrope")
+    assert "needs 4 factors per set for the head dim 8" in problem, "the GPU would build the tables from 8 factors"
 
 
 @pytest.mark.parametrize("positions", [
