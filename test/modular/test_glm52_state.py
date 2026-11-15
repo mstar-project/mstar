@@ -295,6 +295,19 @@ def test_a_verify_step_s_stop_check_reads_one_output():
     assert sub.check_stop("r0", _info("decode", 64, 5), out["r0"]), "a row that reached its budget keeps running"
 
 
+def test_an_mtp_decode_row_loops_back_its_count_alone():
+    """The worker holds a tensor a row for each signal a step outputs, and a third per row put the main thread's
+    collector in most decode steps. The verify step's input token stays in the seed, so a row outputs its tokens
+    and its count, two as on ``main``, and loops back the count alone."""
+    consumed = walk_runtime(_model(mtp_num_draft_tokens=3).get_graph_walk_graphs()).get_consumed_edges(
+        "LLM", "LLM", "decode")
+    assert {name for name, _ in consumed} == {"count"}, "the decode loop carries a second edge a row"
+    sub, out = _verify_step(2)
+    for rid, row in out.items():
+        sub.postprocess(rid, _info("decode", 64, 5), row)
+        assert set(row) == {"new_token", "count"}, f"a verify step's row outputs {sorted(row)}"
+
+
 def test_a_captured_and_padded_prefill_reads_no_prompt_length():
     """A capture's and a padded replay's dummy rows carry no step metadata, and preprocess reads none."""
     sub = _submodule(3)
