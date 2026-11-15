@@ -1,8 +1,7 @@
-"""Exercise cold, warm, reset and end on a disposable Praxis session server.
+"""Exercise cold, warm, reset and end on a Praxis DROID session server.
 
-The diagnostic server must enable episode arrays and the Positronic readiness
-gate only in its temporary source copy. This checks the live wire and graph;
-the generated frames are not a robot or simulation quality test.
+This checks the live wire and graph; the generated frames are not a robot or
+simulation quality test.
 """
 
 from __future__ import annotations

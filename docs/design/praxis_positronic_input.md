@@ -27,8 +27,8 @@ explicitly reset request. The data worker checks the camera stacks. If a
 camera has too few prior rows, it sends `reset_episode` and
 `executed_rows=0` to the conductor before admission, and gives the model empty
 prior tensors. A first or explicitly reset call also gets empty prior tensors,
-even if the client sent a frame stack. The startup capability gate remains
-closed until the Praxis model and episode state can consume these tensors.
+even if the client sent a frame stack. The DROID session adapter consumes these
+tensors; YAM serving remains gated.
 
 The pinned single-arm reference's `executed_clip(obs, need)` uses rows
 `[-(need + 1):-1]` from both camera stacks. `pose8_history` selects the same
@@ -51,7 +51,6 @@ cache or frame data in `step_metadata`
 is needed.
 
 The parser, data-worker and binary transport tests cover cold, subsequent,
-short-stack reset and explicit reset requests. They do not establish warm
-model output parity. That gate needs the episode-aware Praxis model and a CPU
-reference test for executed-frame encoding before
-`POSITRONIC_SESSION_READY` can be set.
+short-stack reset and explicit reset requests. The DROID adapter is enabled
+for the validated recipe, but warm action quality and latency still need
+current-head H200 and simulation checks before the PR is ready for review.

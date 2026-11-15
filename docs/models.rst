@@ -104,11 +104,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        (see :doc:`clients`).
        ``LLM`` and ``action_expert`` share a KV cache, so ``node_groups`` must list them in
        one entry; the server refuses to start otherwise.
-   * - ``praxis1_{droid,yam}`` *(Not served yet)*
+   * - ``praxis1_droid`` *(YAM still gated)*
      - ``runwayml/praxis-1-{droid,yam}``
-     - **Not served yet.** This build has the graph and native towers, but serving
-       remains gated while the full session path is checked. ``mstar serve praxis1_droid``
-       (or ``praxis1_yam``) refuses to start before it downloads anything.
+     - ``mstar serve praxis1_droid`` serves the single-arm checkpoint with cold
+       openpi and Positronic sessions. ``praxis1_yam`` still refuses to start
+       before downloading weights while its session path is checked.
        Praxis-1 video-action policy: one call answers one chunk of the future, 6 video
        latents and 6 action tokens. Both rigs have a cold openpi adapter returning 21
        denormalized relative Cartesian action rows at 15 Hz. DROID also has a

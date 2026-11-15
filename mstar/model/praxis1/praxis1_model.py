@@ -109,9 +109,9 @@ TEXT_STATE_NAME = "text_embeds"
 STATE_KWARG = "robot_state"
 MODEL_POSE_KWARG = "_praxis_model_pose"
 
-# Serving remains disabled while live session and simulation checks finish.
-# Refuse startup before any process downloads the checkpoint.
-_SERVABLE = False
+# Only the DROID checkpoint has a live session and simulation check. Reject
+# other rigs before any process downloads the checkpoint.
+_SERVABLE_RIGS = frozenset({"single_arm"})
 
 # The denoise loop's ceiling when the checkpoint names none.
 DEFAULT_MAX_DENOISE_STEPS = 8
@@ -120,9 +120,8 @@ DEFAULT_MAX_DENOISE_STEPS = 8
 class Praxis1Model(Model):
     """The served Praxis-1 policy.
 
-    Serves the single-arm (DROID) and bimanual (YAM) checkpoints; the rig and
-    every width come from the checkpoint's own config, so the two differ in
-    numbers rather than in code.
+    Loads the single-arm (DROID) and bimanual (YAM) checkpoints for component
+    checks. Live serving is limited to the validated DROID layout and recipe.
     """
 
     ENCODE_TEXT_WALK = "encode_text"
@@ -136,7 +135,10 @@ class Praxis1Model(Model):
         """Only the DROID episode recipe checked with the live session may serve."""
         recipe = self.sampler_defaults
         return (
-            _SERVABLE and self.config.embodiment == "single_arm"
+            "single_arm" in _SERVABLE_RIGS and self.config.embodiment == "single_arm"
+            and self.config.tile_height == 224
+            and self.config.tile_width == 416
+            and self.config.num_cameras == 2
             and recipe["max_context_chunks"] == 1
             and self.max_text_tokens == 256
             and all(
@@ -175,10 +177,10 @@ class Praxis1Model(Model):
         self.max_text_tokens = kwargs.pop("max_text_tokens", None)
         self._yaml_config_overrides: dict = dict(kwargs)
 
-        if not skip_weight_loading and not _SERVABLE:
+        if not skip_weight_loading and self._rig() not in _SERVABLE_RIGS:
             raise NotImplementedError(
                 f"Praxis-1 ({model_path_hf}) is not servable yet: this build has its "
-                "tower code, but published checkpoint and session validation are pending. "
+                "tower code, but this rig's checkpoint and session validation are pending. "
                 "Nothing was downloaded."
             )
 
@@ -186,6 +188,10 @@ class Praxis1Model(Model):
         self._submodule_cache: dict = {}
         self._tokenizer_cache = None
         self.config: Praxis1Config = self._load_config()
+        if not skip_weight_loading and self.config.embodiment != self._rig():
+            raise Praxis1ConfigError(
+                f"checkpoint rig {self.config.embodiment!r} does not match deployment rig {self._rig()!r}"
+            )
         context_chunks = self.sampler_defaults["max_context_chunks"]
         if type(context_chunks) is not int or not 0 <= context_chunks < self.config.n_chunks:
             raise Praxis1ConfigError(

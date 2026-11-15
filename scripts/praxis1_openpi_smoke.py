@@ -1,7 +1,6 @@
 """One real cold DROID request over M*'s openpi WebSocket.
 
-Run only against an isolated diagnostic server whose Praxis serving guard was
-temporarily lifted. A finite 21x10 reply proves the full request and graph
+Run against a Praxis DROID server. A finite 21x10 reply proves the full request and graph
 path completed; it does not establish policy quality or simulation parity.
 """
 

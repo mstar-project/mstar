@@ -1,7 +1,7 @@
 model: "praxis1_droid"
 
-# Serving remains gated while live session and simulation checks finish.
-# This config can be checked without downloading model weights.
+# The DROID checkpoint can serve cold openpi and Positronic sessions. The
+# model checks the checkpoint rig before loading weights.
 
 # max_seq_len bounds the backbone's widest encoder sequence:
 # 4 registers + the anchor and the window's video tokens after the (1,2,2) patch

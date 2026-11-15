@@ -52,6 +52,11 @@ class PositronicPolicy:
             raise ValueError("positronic: meta must be JSON serializable") from None
         if not getattr(model, "POSITRONIC_SESSION_READY", False):
             raise ValueError("positronic: this model has no ready Positronic session adapter")
+        if observation_format == "praxis1" and hasattr(model, "model_path_hf"):
+            if meta.get("checkpoint") != model.model_path_hf:
+                raise ValueError("positronic: ready checkpoint does not match the loaded model")
+            if meta.get("rig") != model.config.embodiment:
+                raise ValueError("positronic: ready rig does not match the loaded model")
         return cls(meta, prompt_key, observation_format, control_mode)
 
 

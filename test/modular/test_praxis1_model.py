@@ -127,15 +127,16 @@ def _model(
     """The model as serving builds it, from the checkpoint's config.json.
 
     ``_ensure_repo`` is the only download the constructor makes, so pointing
-    it at ``tmp_path`` keeps this offline, and lifting ``_SERVABLE`` stands in
-    for the compute port. Nothing here calls ``get_submodule``, so no node is
-    built.
+    it at ``tmp_path`` keeps this offline. This helper also permits the YAM
+    config for component checks; nothing here builds a node.
     """
     (tmp_path / "config.json").write_text(json.dumps(config))
     monkeypatch.setattr(Praxis1Model, "_ensure_repo", lambda self: tmp_path)
-    monkeypatch.setattr(praxis1_model, "_SERVABLE", True)
+    monkeypatch.setattr(praxis1_model, "_SERVABLE_RIGS", frozenset({"single_arm", "bimanual"}))
     return Praxis1Model(
-        model_path_hf="runwayml/praxis-1-droid", skip_weight_loading=False, **model_kwargs
+        model_path_hf=("runwayml/praxis-1-yam" if config["embodiment"] == "bimanual"
+                       else "runwayml/praxis-1-droid"),
+        skip_weight_loading=False, **model_kwargs,
     )
 
 
@@ -232,13 +233,20 @@ def test_droid_session_config_is_sized_and_gated(tmp_path, monkeypatch):
     # Both Python and Rust send this same packed first WebSocket frame.
     assert unpack(base64.b64decode(openpi_facts(openpi_policy)["metadata"])) == openpi_policy.metadata
 
+    wrong_meta = {**shipped["positronic"], "meta": {**policy.meta, "checkpoint": "other/checkpoint"}}
+    with pytest.raises(ValueError, match="ready checkpoint"):
+        PositronicPolicy.from_config(wrong_meta, model)
+    wrong_meta = {**shipped["positronic"], "meta": {**policy.meta, "rig": "bimanual"}}
+    with pytest.raises(ValueError, match="ready rig"):
+        PositronicPolicy.from_config(wrong_meta, model)
+
     cold = _model(tmp_path, DROID_CONFIG, monkeypatch, max_context_chunks=0)
     with pytest.raises(ValueError, match="no ready Positronic session adapter"):
         PositronicPolicy.from_config(shipped["positronic"], cold)
     yam = _model(tmp_path, _yam_config(), monkeypatch, max_context_chunks=1, max_text_tokens=256)
     with pytest.raises(ValueError, match="no ready Positronic session adapter"):
         PositronicPolicy.from_config(shipped["positronic"], yam)
-    monkeypatch.setattr(praxis1_model, "_SERVABLE", False)
+    monkeypatch.setattr(praxis1_model, "_SERVABLE_RIGS", frozenset())
     with pytest.raises(ValueError, match="no ready Positronic session adapter"):
         PositronicPolicy.from_config(shipped["positronic"], model)
 
@@ -258,6 +266,19 @@ def test_droid_session_config_keeps_idless_openpi_cold(tmp_path, monkeypatch):
     assert steps[-1].walk == model.CHUNK_WALK
     assert steps[-1].step_metadata["history_held"] == 0
     assert steps[-1].step_metadata["history_append"] == 0
+
+
+def test_droid_session_refuses_a_different_checkpoint_canvas(tmp_path, monkeypatch):
+    shipped = yaml.safe_load((ROOT / "configs/praxis1_droid.yaml").read_text())
+    config = json.loads(json.dumps(DROID_CONFIG))
+    config["video"]["tile_height"] = 256
+    config["video"]["height"] = 256
+    model = _model(
+        tmp_path, config, monkeypatch,
+        max_context_chunks=1, max_text_tokens=256,
+    )
+    with pytest.raises(ValueError, match="no ready Positronic session adapter"):
+        PositronicPolicy.from_config(shipped["positronic"], model)
 
 
 @pytest.mark.parametrize("changed", [
@@ -515,7 +536,7 @@ def test_local_checkpoint_directory_needs_no_hub_fetch(tmp_path, monkeypatch, no
         "weight_map": {"action_expert.marker": "expert.safetensors"},
     }))
     (root / "expert.safetensors").write_bytes(b"")
-    monkeypatch.setattr(praxis1_model, "_SERVABLE", True)
+    monkeypatch.setattr(praxis1_model, "_SERVABLE_RIGS", frozenset({"single_arm"}))
     model = Praxis1Model(str(root), skip_weight_loading=False)
     assert model._ensure_repo() == root
     assert model._ensure_component_weights("action_expert.") == root
@@ -527,7 +548,7 @@ def test_local_checkpoint_directory_needs_no_hub_fetch(tmp_path, monkeypatch, no
 
 
 def test_missing_local_checkpoint_does_not_turn_into_a_hub_id(tmp_path, monkeypatch, no_download):
-    monkeypatch.setattr(praxis1_model, "_SERVABLE", True)
+    monkeypatch.setattr(praxis1_model, "_SERVABLE_RIGS", frozenset({"single_arm"}))
     with pytest.raises(FileNotFoundError, match="Praxis checkpoint directory does not exist"):
         Praxis1Model(str(tmp_path / "praxis-1-droid"), skip_weight_loading=False)
     assert no_download == []
@@ -603,7 +624,7 @@ def test_the_config_read_fetches_config_json_only(tmp_path, monkeypatch):
         return str(tmp_path)
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", fetch)
-    monkeypatch.setattr(praxis1_model, "_SERVABLE", True)
+    monkeypatch.setattr(praxis1_model, "_SERVABLE_RIGS", frozenset({"single_arm"}))
     Praxis1Model(model_path_hf="runwayml/praxis-1-droid", skip_weight_loading=False)
     assert [call["allow_patterns"] for call in calls] == [["config.json"]]
 
@@ -634,14 +655,42 @@ def test_shipped_vae_config_selects_diffusers_subfolder(tmp_path, monkeypatch, n
     assert calls[0][1]["torch_dtype"] == torch.bfloat16
 
 
-@pytest.mark.parametrize("name", ["praxis1_droid", "praxis1_yam"])
-def test_serving_is_refused_before_anything_is_downloaded(name, no_download):
-    """``mstar serve`` builds the model from the registry and the shipped
-    config, as here; with no node computation yet that has to stop at once,
-    not after a download and every process's startup."""
-    shipped = yaml.safe_load((ROOT / "configs" / f"{name}.yaml").read_text())
+def test_yam_serving_is_refused_before_anything_is_downloaded(no_download):
+    """The unvalidated YAM rig must stop before a checkpoint download."""
+    name = "praxis1_yam"
+    shipped = yaml.safe_load((ROOT / "configs/praxis1_yam.yaml").read_text())
     with pytest.raises(NotImplementedError, match="not servable yet"):
         get_model_class(name)(**{**model_init_kwargs(name), **shipped["model_kwargs"]})
+    assert no_download == []
+
+
+def test_shipped_droid_passes_the_serving_gate(tmp_path, monkeypatch, no_download):
+    """The actual DROID allowlist reads its checkpoint config on startup."""
+    shipped = yaml.safe_load((ROOT / "configs/praxis1_droid.yaml").read_text())
+    (tmp_path / "config.json").write_text(json.dumps(DROID_CONFIG))
+    monkeypatch.setattr(Praxis1Model, "_ensure_repo", lambda self: tmp_path)
+    model = get_model_class("praxis1_droid")(
+        **{**model_init_kwargs("praxis1_droid"), **shipped["model_kwargs"]}
+    )
+    assert model.config.embodiment == "single_arm"
+    assert model.POSITRONIC_SESSION_READY
+    assert no_download == []
+
+
+def test_a_mislabeled_droid_checkpoint_is_refused(tmp_path, monkeypatch, no_download):
+    """A DROID deployment cannot silently run bimanual checkpoint widths."""
+    (tmp_path / "config.json").write_text(json.dumps(_yam_config()))
+    monkeypatch.setattr(Praxis1Model, "_ensure_repo", lambda self: tmp_path)
+    with pytest.raises(Praxis1ConfigError, match="checkpoint rig .* does not match deployment rig"):
+        Praxis1Model("runwayml/praxis-1-droid", skip_weight_loading=False)
+    assert no_download == []
+
+
+def test_a_yam_checkpoint_cannot_use_the_droid_rig_override(tmp_path, monkeypatch, no_download):
+    (tmp_path / "config.json").write_text(json.dumps(_yam_config()))
+    monkeypatch.setattr(Praxis1Model, "_ensure_repo", lambda self: tmp_path)
+    with pytest.raises(Praxis1ConfigError, match="checkpoint rig .* does not match deployment rig"):
+        Praxis1Model("runwayml/praxis-1-yam", rig="single_arm", skip_weight_loading=False)
     assert no_download == []
 
 
