@@ -31,6 +31,7 @@ from mstar.engine.state.adapters import (
     node_handles,
     state_steps,
 )
+from mstar.engine.state.analysis import _array_problems
 
 
 def _array() -> Array:
@@ -91,6 +92,14 @@ def test_ordinary_attend_binding_selects_chunk_resource():
     specs = build_specs([array])
     assert len(specs) == 1 and isinstance(specs[0], RaggedChunkCausalAttentionSpec)
     assert specs[0].resource_key == "attn"
+
+
+def test_chunk_mask_refuses_unbounded_array():
+    array = replace(_array(), max_len=None)
+    problems = _array_problems(array)
+    assert len(problems) == 1 and "ChunkCausal needs max_len 0, and max_len is None" in problems[0]
+    with pytest.raises(ValueError, match="an unbounded array reads through one Window read"):
+        build_specs([array])
 
 
 def test_request_layout_checks_read_key_before_dropping_within_step_kv_layout():

@@ -29,6 +29,21 @@ from mstar.engine.state.adapters import EXPERT_LAYOUT_KWARG, build_specs, node_h
 from mstar.engine.state.analysis import _array_problems
 
 
+@pytest.mark.parametrize("mask", [
+    ExpertSelf(2, future_per_chunk=1),
+    ExpertCross(2, future_per_chunk=1, tokens_per_frame=1, window_frames=2),
+])
+def test_expert_mask_refuses_unbounded_array(mask) -> None:
+    array = Array(
+        "expert_q", nodes={"expert"}, layers={0}, entry=KVEntry(heads=2, head_dim=32), max_len=None,
+        reads={"attn": Read(mask=mask, op=Attend(q_heads=2))},
+    )
+    problems = _array_problems(array)
+    assert len(problems) == 1 and f"{type(mask).__name__} needs max_len 0, and max_len is None" in problems[0]
+    with pytest.raises(ValueError, match="an unbounded array reads through one Window read"):
+        build_specs([array])
+
+
 @pytest.mark.parametrize("chunks,clean", [(1, 0), (1, 2), (2, 2)])
 def test_declared_expert_reads_match_reference(chunks: int, clean: int) -> None:
     reference = pytest.importorskip("praxis.action_expert")
