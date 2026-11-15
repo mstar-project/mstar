@@ -11,6 +11,7 @@ import torch
 
 from mstar.engine.resources.attn.config import SP_EXCHANGES
 from mstar.engine.resources.kv.config import Span
+from mstar.engine.resources.position.config import LongRoPE
 from mstar.engine.resources.step import Segment
 
 
@@ -52,8 +53,21 @@ def _is_host_type(kind) -> bool:
 
 
 @dataclass(frozen=True)
+class Size:
+    """An axis each request sets: ``scale`` times its size ``name``, from the request's `Layout.sizes`."""
+
+    name: str
+    _: KW_ONLY
+    scale: int = 1
+
+    def __post_init__(self):
+        if not _is_positive(self.scale):
+            raise ValueError(f"Size.scale must be a positive int, got {self.scale!r}")
+
+
+@dataclass(frozen=True)
 class TensorType:
-    shape: tuple[int, ...]       # global, before sharding; () is one scalar per entry
+    shape: tuple[int | Size, ...]    # global, before sharding; () is one scalar per entry; a `Size` in a sized Value
     _: KW_ONLY
     dtype: torch.dtype | None    # math dtype, None is the engine's compute dtype
     shard: int | None = None     # axis split across TP ranks, None is replicated
@@ -307,6 +321,21 @@ class Rope:
     old_context_len: int | None = None
     dtype: torch.dtype | None = None           # None: q's
     table_dtype: torch.dtype | None = None     # None: angles in the kernel
+    longrope: LongRoPE | None = None           # None: one table for every request
+
+    def __post_init__(self):
+        llama31 = (self.low_freq_factor, self.high_freq_factor, self.old_context_len)
+        if self.longrope is not None and (self.scale != 1.0 or any(f is not None for f in llama31)):
+            raise ValueError(
+                f"Rope.longrope divides the frequencies by its own factors, so it takes scale 1.0 and no Llama 3.1 "
+                f"factors, and got scale={self.scale}, (low_freq_factor, high_freq_factor, old_context_len)={llama31}"
+            )
+        factors = None if self.longrope is None else len(self.longrope.short_factor)
+        if factors is not None and self.rotary_dim is not None and factors != self.rotary_dim // 2:
+            raise ValueError(
+                f"Rope.longrope needs {self.rotary_dim // 2} factors per set for rotary_dim {self.rotary_dim}, "
+                f"and got {factors}"
+            )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -331,6 +360,9 @@ class Array:
     With ``max_len`` None the log has no bound, and the engine keeps what the reads can still reach. Its rows may begin
     from starts the handle holds (`set_starts`), entries kept once and read where they live, of the lengths
     ``start_lengths`` allows, and each step names each row's (`ArrayStep.starts`).
+    A Value with ``largest`` is sized: its fields' `Size` axes take each request's sizes from its layout, and the
+    engine holds each request's tensors from admission to its end. A request whose fields take more bytes than at
+    ``largest`` is refused at intake, whatever each size is.
     """
 
     name: str
@@ -346,8 +378,10 @@ class Array:
     positions: Positions | None = None
     start_lengths: range | None = None                 # with max_len None: the lengths a row's start may have
     kept_windows: Mapping[str, "KeptWindow"] = EMPTY   # with max_len None: by read key, each kept window's base
+    largest: Mapping[str, int] = EMPTY    # a sized Value: the sizes of the request whose fields take the most bytes
 
     def __post_init__(self):
+        object.__setattr__(self, "largest", FrozenMap(self.largest))
         object.__setattr__(self, "nodes", frozenset(self.nodes))
         object.__setattr__(self, "layers", frozenset(self.layers))
         object.__setattr__(self, "labels", frozenset(self.labels))
@@ -378,11 +412,12 @@ class Array:
         for name, tensor in self.entry.tensors.items():
             where = f"Array {self.name!r}.entry.tensors[{name!r}]"
             if not (isinstance(tensor.shape, tuple) and all(
-                type(axis) is int and axis >= least for axis in tensor.shape
+                (type(axis) is int and axis >= least) or isinstance(axis, Size) for axis in tensor.shape
             )):
                 raise ValueError(f"{where}.shape must be a tuple of ints >= {least}, got {tensor.shape!r}")
             if tensor.shard is not None and not (type(tensor.shard) is int and 0 <= tensor.shard < len(tensor.shape)):
                 raise ValueError(f"{where}.shard must be None or an axis of shape {tensor.shape}, got {tensor.shard!r}")
+        self._check_sizes()
         if self.entry.host and not is_value(self):
             raise ValueError(f"Array {self.name!r}.entry.host: only a Value (rewritable, max_len 1) holds host fields")
         for name, kind in self.entry.host.items():
@@ -426,6 +461,32 @@ class Array:
         if read.op is not None:
             self._check_op(f"{where}.op", read.op)
 
+    def _check_sizes(self) -> None:
+        where = f"Array {self.name!r}"
+        tensors = self.entry.tensors
+        named = {axis.name for tensor in tensors.values() for axis in tensor.shape if isinstance(axis, Size)}
+        if not self.largest:
+            if named:
+                raise ValueError(f"{where}.entry.tensors name the sizes {sorted(named)}, and only a Value that "
+                                 "declares largest takes a Size axis")
+            return
+        if not is_value(self):
+            raise ValueError(f"{where}.largest: only a Value (rewritable, max_len 1) is sized by its requests")
+        if named != self.largest.keys():
+            raise ValueError(f"{where}.largest gives {sorted(self.largest)}, and its fields' Size axes name "
+                             f"{sorted(named)}")
+        if not all(_is_positive(size) for size in self.largest.values()):
+            raise ValueError(f"{where}.largest must give positive ints, got {dict(self.largest)}")
+        if self.entry.host:
+            raise ValueError(f"{where}.entry.host: a sized Value holds tensors only")
+        for name, tensor in tensors.items():
+            if tensor.dtype is None:
+                raise ValueError(f"{where}.entry.tensors[{name!r}].dtype is None, and a sized field's bytes are "
+                                 "counted before any worker resolves the compute dtype")
+            if tensor.shard is not None:
+                raise ValueError(f"{where}.entry.tensors[{name!r}].shard is {tensor.shard}, and the store holds each "
+                                 "request's tensors whole, on one rank")
+
     def _check_update(self, key: str, update: Op) -> None:
         where = f"Array {self.name!r}.updates[{key!r}]"
         if not is_value(self):
@@ -453,9 +514,10 @@ def read_layers(array: Array, read: Read) -> frozenset[int]:
     return read.layers or array.layers
 
 
-def Value(name, *, nodes, layers, entry, updates=EMPTY) -> Array:
+def Value(name, *, nodes, layers, entry, updates=EMPTY, largest=EMPTY) -> Array:
     """A rewritable array of one entry."""
-    return Array(name, nodes=nodes, layers=layers, entry=entry, updates=updates, max_len=1, rewritable=True)
+    return Array(name, nodes=nodes, layers=layers, entry=entry, updates=updates, max_len=1, rewritable=True,
+                 largest=largest)
 
 
 @dataclass(frozen=True)
@@ -607,8 +669,9 @@ class Layout:
     spans: tuple[Span, ...] = ()
     growth: tuple[tuple[str, int], ...] = ()    # (loop, entries per iteration)
     scratch: int = 0                            # most one scratch step writes past the kept length
+    max_growth: int | None = None                     # most entries the growth reserves; None: the loops' caps
     kept_windows: Mapping[str, KeptWindow] = EMPTY    # by read key, each kept-window read's sizes
-    max_growth: int | None = None               # most entries the growth reserves; None: the loops' caps
+    sizes: Mapping[str, int] = EMPTY                  # a sized Value's sizes for this request and label
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -641,3 +704,11 @@ class Reached:
     fields: Mapping[str, torch.Tensor]    # field -> (entries, *shape on this rank), in the field's declared dtype
     _: KW_ONLY
     row_offsets: torch.Tensor             # (rows + 1,) int32 on the device
+
+
+@dataclass(frozen=True)
+class RowTensors:
+    """What a sized Value's read hands over: the row's tensor for each field, None where nothing is written. The
+    engine keeps none of them until the step writes them back."""
+
+    fields: Mapping[str, torch.Tensor | None]

@@ -296,8 +296,8 @@ class ArrayHandle(StepHandle):
         """Append each row's span at its next log positions, before or after a read of the layer. A kept add happens
         once per layer per step, as the layer's last add. ``keep`` False is scratch: it can repeat, and lasts until the
         next add or the end of the step. None takes the step's ``keep``. The resources keep or drop a step's adds as a
-        whole, so a step that keeps needs each layer to end on a kept add, or each row it lists at span 1 or more to
-        get its adds from a region whose own step lists it, and a step with ``keep`` False refuses ``keep=True``."""
+        whole, so a step that keeps needs each layer to end on a kept add, or each row it lists at span 1 or more to get
+        its adds from a region whose own step lists it, and a step with ``keep`` False refuses ``keep=True``."""
         raise self._unsupported("add")
 
     @overload
@@ -334,6 +334,11 @@ class ArrayHandle(StepHandle):
         if self._write_refused is not None:
             raise self._refusal(self._write_refused)
         raise self._unsupported("write")
+
+    def clear(self, layer: int | torch.Tensor, *fields: str) -> None:
+        """Drop ``fields`` for the step's row and give their bytes back, on a sized Value. A cleared field stays unset
+        for the rest of the request."""
+        raise self._unsupported("clear")
 
     def set_start(self, start: Mapping[str, torch.Tensor]) -> None:
         """What a row of this Value reads while it has nothing written, has span 0 or pads a step: ``start``'s tensor

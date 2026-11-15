@@ -10,7 +10,6 @@ Import by module name (``from lora_module_helpers import ...``).
 from __future__ import annotations
 
 import math
-import threading
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -28,70 +27,12 @@ from mstar.engine.resources.lora.pool import LoraAdapterPool
 from mstar.engine.resources.lora.store import classify_adapter
 from mstar.engine.resources.step import ResourceStep, Segment, StepContext, SubmoduleStep
 from mstar.engine.state import ArrayStep
+from mstar.model.components.lora.modules import declared_lora_spec
 from mstar.model.qwen3_5.config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config
 from mstar.model.submodule_base import ARNodeInputs, engine_step, with_segment_steps
+from mstar.testing_utils.comm import ThreadGroup, run_ranks  # noqa: F401  (re-exported)
 
 DTYPE = torch.float64
-
-
-class _Exchange:
-    def __init__(self, world: int):
-        self.barrier = threading.Barrier(world)
-        self.slots: list = [None] * world
-
-    def share(self, rank: int, value):
-        self.slots[rank] = value
-        self.barrier.wait()
-        out = list(self.slots)
-        self.barrier.wait()
-        return out
-
-
-class ThreadGroup(CommGroup):
-    """One rank of a simulated group: collectives across the ranks' threads, summed in
-    rank order (deterministic)."""
-
-    def __init__(self, rank: int, world: int, exchange: _Exchange):
-        super().__init__(my_global_rank=rank, my_group_rank=rank, group_members=list(range(world)))
-        self._exchange = exchange
-
-    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
-        if self.world_size == 1:
-            return input_
-        parts = self._exchange.share(self.rank, input_)
-        out = parts[0].clone()
-        for p in parts[1:]:
-            out += p
-        return out
-
-    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        if self.world_size == 1:
-            return input_
-        return torch.cat(self._exchange.share(self.rank, input_), dim=dim)
-
-
-def run_ranks(world: int, fn: Callable[[int, CommGroup], object]) -> list:
-    """``fn(rank, group)`` on every rank of a simulated group, concurrently; the results
-    in rank order. A rank's exception aborts the others' collectives and is raised."""
-    exchange = _Exchange(world)
-    results: list = [None] * world
-    errors: list = []
-
-    def body(rank: int):
-        try:
-            results[rank] = fn(rank, ThreadGroup(rank, world, exchange))
-        except BaseException as exc:  # noqa: BLE001 - re-raised below
-            errors.append(exc)
-            exchange.barrier.abort()
-
-    threads = [threading.Thread(target=body, args=(r,)) for r in range(world)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    if errors:
-        raise errors[0]
-    return results
 
 
 def rand(*shape, seed: int, scale: float = 1.0) -> torch.Tensor:
@@ -330,6 +271,16 @@ class _Unread:
         return True
 
 
+class _AtZero:
+    """The step's tokens at position 0, which the layers' fused RoPE leaves unrotated."""
+
+    def __init__(self, rows: _Rows):
+        self.rows = rows
+
+    def pos_ids(self, label):
+        return torch.zeros(sum(self.rows.lengths), dtype=torch.long)
+
+
 # -- Llama-shaped checkpoints -------------------------------------------------------------------
 
 def llama_layers(c, prefix: str) -> dict[str, tuple[int, int]]:
@@ -482,14 +433,14 @@ def write_peft_adapter(directory, rank, projs, alpha=None, text_only=False, seed
 
 
 def _declared(model) -> LoraSpec:
-    """The model's LoRA spec, as it declares it beside its other resources."""
-    return next(s for s in model.get_node_resources() if isinstance(s, LoraSpec))
+    """The model's LoRA spec, as the bridge builds it from its roots."""
+    return declared_lora_spec(model.lora_roots())
 
 
 def lora_spec(paths, **kw) -> LoraSpec:
-    from mstar.model.qwen3_5.lora import qwen3_5_lora_spec
+    from mstar.model.qwen3_5.lora import qwen3_5_lora_roots
 
-    return serve(qwen3_5_lora_spec(tiny_config()), paths, **kw)
+    return serve(declared_lora_spec(qwen3_5_lora_roots(tiny_config())), paths, **kw)
 
 
 class _GatedNorm(nn.Module):
@@ -638,16 +589,6 @@ def _declare(walk):
     )
 
 
-def _ids_run(stub_root, embed, stack, head):
-    """A node run as embed -> stack -> head on each row's last token."""
-    def run(sub, rows):
-        lengths = [len(r) for r in rows]
-        stub_attention(stub_root(sub), lengths)
-        hidden = stack(sub, embed(sub, torch.cat(rows)))
-        return _per_row(hidden, head(sub, _last(hidden, lengths)), lengths)
-    return run
-
-
 def _subset(modules, *ends):
     return {k: v for k, v in modules.items() if k.endswith(ends)}
 
@@ -715,17 +656,27 @@ def _higgs():
     prompt), its LoRA rows planned by the walk it serves (``prefill_audio``). The forward
     is this test's own embed, splice, stack and head, over prompts that open with one
     audio pad (served prompts carry one per audio token) whose row replaces its embedding."""
-    from mstar.model.higgs_audio.config import HiggsAudioModelConfig
+    from mstar.engine.state.adapters import node_handles
+    from mstar.model.higgs_audio.config import ATTN, HiggsAudioModelConfig
     from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel, audio_encoder
     from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
+    from mstar.model.keys import KV_CACHE, ROPE, SAMPLER
     from mstar.model.multimodal import splice_media
+
+    def stub_cores(sub, rows: _Rows):
+        """``sub`` with its handles on Higgs's declared state bound over stubs of the kernels, which read ``rows``."""
+        resources = {KV_CACHE: _Unread(), ATTN: _AttendCore(rows), ROPE: _AtZero(rows), SAMPLER: None}
+        sub.bind_node_state(node_handles(model_object(HiggsAudioModel, sub.config), "LLM", resources))
+        return sub
 
     def build(c, group, weights):
         model = model_object(HiggsAudioModel, c)
         llm = model.build_llm(group).to(DTYPE)
         llm.load_weights((name, w) for k, w in weights.items() if (name := model._llm_remap(k)) is not None)
         encoders = (audio_encoder(),)
-        return HiggsAudioLLMSubmodule(llm.requires_grad_(False).eval(), c, encoders, text_prompts=False)
+        return stub_cores(
+            HiggsAudioLLMSubmodule(llm.requires_grad_(False).eval(), c, encoders, text_prompts=False), _Rows(),
+        )
 
     def inputs(c, n, seed):
         ids = torch.randint(0, c.vocab_size - 1, (n,), generator=torch.Generator().manual_seed(seed))
@@ -747,6 +698,14 @@ def _higgs():
             for i in rows
         ])
 
+    def run_(sub, rows):
+        lengths = _Rows([len(r) for r in rows])
+        stub_cores(sub, lengths)
+        x = embed(sub, torch.cat(rows))
+        with step_over(sub, lengths, (KV_CACHE,)):
+            hidden = sub.model(x)
+        return _per_row(hidden, sub.model.logits(_last(hidden, lengths.lengths)), lengths.lengths)
+
     head = "audio_decoder_proj.text_lm_head"
     return Stack(
         config=lambda: HiggsAudioModelConfig(
@@ -758,9 +717,7 @@ def _higgs():
         weights=lambda c: llama_weights(c, "", head, qk_norm=True),
         a1=lambda c: {**llama_layers(c, ""), head: (c.vocab_size, c.hidden_size)},
         a2=lambda c: _subset(llama_layers(c, ""), "0.self_attn.k_proj", "1.mlp.up_proj", "1.self_attn.o_proj"),
-        run=_ids_run(lambda s: s.model, embed,
-                     lambda s, x: s.model(input_embeds=x, label="main"), lambda s, x: s.model.logits(x)),
-        declare=declare, inputs=inputs,
+        run=run_, declare=declare, inputs=inputs,
         released=lambda: (model_object(HiggsAudioModel, HiggsAudioModelConfig()),
                           lambda c, g: model_object(HiggsAudioModel, c).build_llm(g)),
         a2_rename=lambda m: f"model.{m}",  # a Qwen3ForCausalLM-shaped adapter
@@ -890,21 +847,12 @@ def _qwen3_tts():
     dims = dict(num_attention_heads=4, num_key_value_heads=2, hidden_size=16, intermediate_size=32,
                 head_dim=4, vocab_size=64)
 
-    class AtZero:
-        """The step's tokens at position 0, which the layers' fused RoPE leaves unrotated."""
-
-        def __init__(self, rows: _Rows):
-            self.rows = rows
-
-        def pos_ids(self, label):
-            return torch.zeros(sum(self.rows.lengths), dtype=torch.long)
-
     def stub_cores(sub, rows: _Rows):
         """``sub`` with its handles on the Talker's declared state bound over stubs of the kernels, which read
         ``rows``."""
         declaring = model_object(Qwen3TTSModel, sub.config, codec_dtype=torch.float32)
         resources = {
-            TALKER_KV: _Unread(), TALKER_ATTN: _AttendCore(rows), "talker_pos": AtZero(rows), TALKER_SAMPLER: None,
+            TALKER_KV: _Unread(), TALKER_ATTN: _AttendCore(rows), "talker_pos": _AtZero(rows), TALKER_SAMPLER: None,
             CODE_PRED_SAMPLER: None,
         }
         sub.bind_node_state(node_handles(declaring, "Talker", resources))
@@ -1031,7 +979,7 @@ def _qwen3_5():
     ``[q|k|v|z|a|pad|b]`` in-projection (``a`` padded per rank), the LM head (one row
     per request) and the token embedding. Its
     released sizes, with the vision tower's spec, are the models test's own."""
-    from mstar.model.qwen3_5.lora import qwen3_5_lora_spec
+    from mstar.model.qwen3_5.lora import qwen3_5_lora_roots
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
     def a1(c):
@@ -1047,7 +995,7 @@ def _qwen3_5():
         return _per_row(hidden, lm.lm_head(_last(hidden, lengths.lengths)), lengths.lengths)
 
     return Stack(
-        config=tiny_config, lora_spec=qwen3_5_lora_spec,
+        config=tiny_config, lora_spec=lambda c: declared_lora_spec(qwen3_5_lora_roots(c)),
         build=lambda c, group, w: _stub_cores(LLMSubmodule(build_stack(w, group, c), c), _Rows()),
         weights=lambda c: hf_text_weights(), a1=a1,
         # leaves `in_proj_qkv` and `in_proj_a` out: slices of one fused target on and off it

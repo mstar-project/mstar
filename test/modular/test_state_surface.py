@@ -21,7 +21,7 @@ from mstar.engine.state.adapters import BoundedHandle, PagedArrayHandle, RingHan
 from mstar.engine.state.calls import ArrayHandle
 
 # Today's types the surface re-exports, and a NamedTuple, whose fields stay positional.
-_POSITIONAL = {"PagedNHDTarget", "Segment", "SlotLease", "Span"}
+_POSITIONAL = {"LongRoPE", "PagedNHDTarget", "Segment", "SlotLease", "Span"}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
     "add_read", "at_last_token", "causal_conv", "gated_delta_net", "gather", "host", "last_sampled", "mamba2",
@@ -42,6 +42,7 @@ SNAPSHOT = {
         ["positions", "KEYWORD_ONLY", 'None'],
         ["start_lengths", "KEYWORD_ONLY", 'None'],
         ["kept_windows", "KEYWORD_ONLY", '{}'],
+        ["largest", "KEYWORD_ONLY", '{}'],
     ],
     "ArrayStep": [
         ["segments", "KEYWORD_ONLY", 'None'],
@@ -102,11 +103,18 @@ SNAPSHOT = {
         ["spans", "KEYWORD_ONLY", '()'],
         ["growth", "KEYWORD_ONLY", '()'],
         ["scratch", "KEYWORD_ONLY", '0'],
-        ["kept_windows", "KEYWORD_ONLY", '{}'],
         ["max_growth", "KEYWORD_ONLY", 'None'],
+        ["kept_windows", "KEYWORD_ONLY", '{}'],
+        ["sizes", "KEYWORD_ONLY", '{}'],
     ],
     "Mamba2": [
         ["time_step_limit", "KEYWORD_ONLY", '(0.0, inf)'],
+    ],
+    "LongRoPE": [
+        ["short_factor", "POSITIONAL_OR_KEYWORD", None],
+        ["long_factor", "POSITIONAL_OR_KEYWORD", None],
+        ["original_max_position_embeddings", "POSITIONAL_OR_KEYWORD", None],
+        ["max_position_embeddings", "POSITIONAL_OR_KEYWORD", None],
     ],
     "PagedNHD": [
         ["dtypes", "KEYWORD_ONLY", 'None'],
@@ -144,6 +152,10 @@ SNAPSHOT = {
         ["old_context_len", "KEYWORD_ONLY", 'None'],
         ["dtype", "KEYWORD_ONLY", 'None'],
         ["table_dtype", "KEYWORD_ONLY", 'None'],
+        ["longrope", "KEYWORD_ONLY", 'None'],
+    ],
+    "RowTensors": [
+        ["fields", "POSITIONAL_OR_KEYWORD", None],
     ],
     "SampleSettings": [
         ["temperature", "KEYWORD_ONLY", '0.6'],
@@ -189,6 +201,10 @@ SNAPSHOT = {
         ["walks", "KEYWORD_ONLY", 'None'],
         ["exchange", "KEYWORD_ONLY", "'auto'"],
     ],
+    "Size": [
+        ["name", "POSITIONAL_OR_KEYWORD", None],
+        ["scale", "KEYWORD_ONLY", '1'],
+    ],
     "SlotLease": [
         ["slot", "POSITIONAL_OR_KEYWORD", None],
         ["bucket", "POSITIONAL_OR_KEYWORD", None],
@@ -214,6 +230,7 @@ SNAPSHOT = {
         ["layers", "KEYWORD_ONLY", None],
         ["entry", "KEYWORD_ONLY", None],
         ["updates", "KEYWORD_ONLY", '{}'],
+        ["largest", "KEYWORD_ONLY", '{}'],
     ],
     "Window": [
         ["size", "POSITIONAL_OR_KEYWORD", None],
@@ -357,7 +374,7 @@ def test_the_surface_equals_the_snapshot():
 
 
 @pytest.mark.parametrize(
-    "handle", [ArrayHandle, PagedArrayHandle, ValueHandle, WithinStepHandle, RingHandle, BoundedHandle],
+    "handle", [ArrayHandle, PagedArrayHandle, ValueHandle, WithinStepHandle, BoundedHandle, RingHandle],
 )
 def test_a_handles_calls_equal_the_snapshot(handle):
     surface = {

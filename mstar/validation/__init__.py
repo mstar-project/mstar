@@ -73,6 +73,16 @@ class Deployment(NamedTuple):
     sharding_config: ShardingConfig
 
 
+def _lora_root_problems(model: Model) -> list[str]:
+    astray = sorted({root.node for root in model.lora_roots()} - set(model.nodes))
+    if not astray:
+        return []
+    return [
+        f"lora_roots() declares roots on {astray}, which are not nodes of the model: a pool there binds no node, "
+        "so an adapter's modules on them would load and never apply"
+    ]
+
+
 def validate_deployment(
     model: Model, config: Mapping[str, Any], config_path: str,
 ) -> Deployment:
@@ -196,6 +206,7 @@ def validate_deployment(
             # failed, and reading it again would raise again
             specs = [spec for spec in specs if not spec.per_node]
     # after get_worker_graphs too: a model may shape its walks from the deployment (BAGEL)
+    problems += _checked("checking the LoRA roots", _lora_root_problems, model)
     problems += _checked(
         "checking the client streams", check_client_streams,
         model, config, deployment.sharding_config if deployment is not None else None,

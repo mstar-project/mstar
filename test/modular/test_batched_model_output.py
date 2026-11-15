@@ -12,6 +12,9 @@ everything still looks like it works. So the row mapping is what these pin.
 
 from __future__ import annotations
 
+import gc
+import weakref
+
 import pytest
 import torch
 
@@ -95,6 +98,21 @@ def test_a_stop_buffer_under_two_names_is_cloned_once():
     rows = out.clone_row_outputs(3)
     cloned = out.clone_check_stop_buffers(reuse=rows)
     assert cloned["text_inputs"] is cloned["new_token"] is rows["new_token"], "one tensor was cloned twice"
+
+
+def test_a_dropped_clone_is_freed_without_a_collection():
+    """Every decode step clones its stop buffers. A clone a reference cycle holds outlives the step until the
+    collector runs, and the cycles themselves are what fill the young generation and start that collection inside
+    a later step."""
+    out = BatchedModelOutput(check_stop_buffers={"tok": torch.arange(3)})
+    gc.disable()
+    try:
+        cloned = out.clone_check_stop_buffers()
+        clone = weakref.ref(cloned["tok"])
+        del cloned
+        assert clone() is None, "a cycle keeps the stop buffer's clone until a collection"
+    finally:
+        gc.enable()
 
 
 def test_check_stop_falls_back_to_per_rid():

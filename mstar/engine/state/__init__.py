@@ -1,6 +1,10 @@
 """The model-facing state contract. ``__all__`` is its whole surface, and after release the surface only grows."""
 
 from mstar.engine.resources.kv.config import Span
+from mstar.engine.resources.position.config import (
+    MAX_POSITION_KWARG,  # noqa: F401
+    LongRoPE,
+)
 from mstar.engine.resources.sampler.utils import FusedDrawArgs  # noqa: F401
 from mstar.engine.resources.step import (
     Segment,
@@ -49,10 +53,12 @@ from mstar.engine.state.contract import (
     Reached,
     Read,
     Rope,
+    RowTensors,
     Sampler,
     SampleSettings,
     SampleStep,
     SeqShard,
+    Size,
     TensorType,
     Value,
     Window,
@@ -63,7 +69,8 @@ from mstar.engine.state.state_op import state_op
 # release. `kernel_setting` is temporary. `SubmoduleStep` is the engine's own dataclass, and the rebuild after release
 # replaces its `steps`, `cg_key_info` and `_ctx`. One model uses the fused draw: `FusedDrawArgs`, `fused_draw_args`,
 # `drew`, `draw_row` and `draw_row_layout`. They're frozen together once a second model draws in place, or a state op
-# on a sampler replaces `drew`.
+# on a sampler replaces `drew`. `MAX_POSITION_KWARG` stays out too: it names the prompt length a `LongRoPE` request
+# picks its table by, until the engine reads that length off the request's layout.
 __all__ = [
     "Array",
     "ArrayStep",
@@ -80,6 +87,7 @@ __all__ = [
     "KVEntry",
     "KeptWindow",
     "Layout",
+    "LongRoPE",
     "Mamba2",
     "PagedNHD",
     "PagedNHDTarget",
@@ -87,11 +95,13 @@ __all__ = [
     "Reached",
     "Read",
     "Rope",
+    "RowTensors",
     "SampleSettings",
     "SampleStep",
     "Sampler",
     "Segment",
     "SeqShard",
+    "Size",
     "SlotLease",
     "Span",
     "TensorType",
