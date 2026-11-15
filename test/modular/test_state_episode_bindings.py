@@ -9,10 +9,11 @@ from mstar.conductor.episodes import EpisodeRecords
 from mstar.conductor.routing import Placement
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources.base import EngineResourceInfo
+from mstar.engine.resources.kv.bounded.config import BoundedKVSpec
 from mstar.engine.resources.recurrent.dense_window import DenseWindowPool, DenseWindowSpec
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
-from mstar.engine.state import Array, ArrayStep, Block, Entry, KVEntry, Read, TensorType, Window
-from mstar.engine.state.adapters import DENSE_WINDOW, PAGED, build_specs, node_handles, state_steps, storage_of
+from mstar.engine.state import Array, ArrayStep, Attend, Block, Entry, KVEntry, Read, TensorType, Window
+from mstar.engine.state.adapters import BOUNDED, DENSE_WINDOW, PAGED, build_specs, node_handles, state_steps, storage_of
 from mstar.engine.state.episodes import EpisodeRowBindings
 from mstar.utils.ipc_format import EndEpisode, RemoveRequest, WorkerMessage, WorkerMessageType
 from mstar.worker.input_ingest import InputIngest
@@ -119,6 +120,34 @@ def test_unbounded_dense_log_has_finite_read_derived_retention():
     assert storage_of(frames) is DENSE_WINDOW
     with pytest.raises(ValueError, match="exactly one read"):
         build_specs([frames])
+
+
+def test_unbounded_noop_window_keeps_kv_attention_contract():
+    for lifetime in ("request", "episode"):
+        frames = _frames(lifetime=lifetime)
+        assert storage_of(frames) is DENSE_WINDOW
+        assert isinstance(build_specs([frames])[0], DenseWindowSpec)
+
+    kv = Array(
+        "kv", nodes={"decoder"}, layers={0}, entry=KVEntry(heads=2, head_dim=8),
+        max_len=None, reads={"context": Read(mask=Window(4))},
+    )
+    with pytest.raises(ValueError, match="op must be Attend"):
+        build_specs([kv])
+
+
+def test_bounded_request_and_dense_episode_windows_use_their_own_storages():
+    frames = _frames(lifetime="episode")
+    kv = Array(
+        "kv", nodes={"llm"}, layers={0}, entry=KVEntry(heads=4, head_dim=16),
+        max_len=None, reads={"attn": Read(mask=Window(5), op=Attend(q_heads=4), packed=False)},
+    )
+    assert storage_of(frames) is DENSE_WINDOW
+    assert storage_of(kv) is BOUNDED
+    specs = {spec.resource_key: spec for spec in build_specs([frames, kv])}
+    assert set(specs) == {"frames", "kv"}
+    assert isinstance(specs["frames"], DenseWindowSpec)
+    assert isinstance(specs["kv"], BoundedKVSpec)
 
 
 def test_dense_window_keeps_only_latest_executed_frames_across_calls():
@@ -796,4 +825,10 @@ def test_idle_end_then_new_in_one_worker_batch_waits_for_slot_release():
 ])
 def test_unbounded_log_refuses_declarations_without_provable_dense_retention(override, match):
     with pytest.raises(ValueError, match=match):
-        _frames(**override)
+        _frames(lifetime="episode", **override)
+
+
+def test_request_dense_window_refuses_positions_it_cannot_serve():
+    frames = _frames(positions=object())
+    with pytest.raises(ValueError, match="append-only tensor log"):
+        storage_of(frames)

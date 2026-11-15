@@ -476,6 +476,12 @@ def test_kernel_refuses_a_head_dim_it_cannot_tile():
         bounded_attention(q, q, q, cache, None, torch.zeros(1, ROW_INTS, dtype=torch.int32))
 
 
+def test_the_kernels_tile_a_head_dim_that_is_a_power_of_two_from_16():
+    from mstar.engine.resources.kv.bounded.layout import tiles_head_dim
+
+    assert [d for d in range(1, 300) if tiles_head_dim(d)] == [16, 32, 64, 128, 256]
+
+
 def test_per_query_window_config():
     from mstar.engine.resources.kv.bounded.config import BoundedKVConfig
 
@@ -554,3 +560,30 @@ def test_max_slots_override_is_checked():
     spec = BoundedKVSpec(resource_key="kv", nodes={"node"}, config=config)
     with pytest.raises(ValueError):
         spec.apply_yaml_overrides(max_slots=0)
+
+
+def test_written_counts_the_committed_entries():
+    mgr = _manager(4, True, torch.float32, "cpu", heads=1, head_dim=4)
+    assert mgr.written(1) == 0, "a request with no slot has written nothing"
+    step, ctx = _step([1], [0], [3])
+    assert mgr.admit(step, ctx).ok
+    mgr.plan(step, ctx)
+    assert mgr.written(1) == 0, "an admitted step counts nothing until it commits"
+    mgr.commit(step, ctx)
+    assert mgr.written(1) == 3
+    mgr.remove_request(1)
+    assert mgr.written(1) == 0, "a torn-down request reads 0, as one never admitted does"
+
+
+def test_a_bounded_pool_holds_as_many_requests_as_its_slots():
+    """The manager keeps no sink slot, so every one of ``max_slots`` holds a request."""
+    from mstar.engine.resources.kv.bounded.config import BoundedKVConfig, BoundedKVSpec
+
+    config = BoundedKVConfig(num_layers=1, num_heads=1, head_dim=16, rows_per_request=1, max_source_len=0,
+                             retention=SinkWindow(0, 4), max_slots=4)
+    spec = BoundedKVSpec(resource_key="enc", nodes={"enc"}, config=config)
+    assert spec.capacity_problem(4, None) is None
+    assert spec.capacity_problem(5, None) == (
+        "5 concurrent requests (max_concurrent_requests) need 5 slots of resources.enc, which holds 4; raise "
+        "max_slots or lower max_concurrent_requests"
+    )
