@@ -1123,6 +1123,37 @@ def test_utmos_cache_reloads_when_local_weights_change(tmp_path):
     assert second.model.weight.item() == 2
 
 
+def test_utmos_rejects_a_checkpoint_replaced_during_load(tmp_path, monkeypatch):
+    import torch
+
+    from benchmark.eval import judges
+
+    repo = tmp_path / "SpeechMOS"
+    repo.mkdir()
+    (repo / "hubconf.py").write_text(
+        "import torch\n"
+        "def utmos22_strong(pretrained=True):\n"
+        "    assert not pretrained\n"
+        "    return torch.nn.Linear(1, 1)\n"
+    )
+    checkpoint = tmp_path / "utmos.pt"
+    original = torch.nn.Linear(1, 1)
+    replacement = torch.nn.Linear(1, 1)
+    with torch.no_grad():
+        original.weight.fill_(1)
+        replacement.weight.fill_(2)
+    torch.save(original.state_dict(), checkpoint)
+    load = torch.load
+
+    def replace_then_load(path, **kwargs):
+        torch.save(replacement.state_dict(), checkpoint)
+        return load(path, **kwargs)
+
+    monkeypatch.setattr(torch, "load", replace_then_load)
+    with pytest.raises(RuntimeError, match="local UTMOS files changed while loading"):
+        judges.mos_judge("cpu", repo, checkpoint)
+
+
 def test_utmos_default_hub_path_still_reuses_the_judge(monkeypatch):
     import torch
 

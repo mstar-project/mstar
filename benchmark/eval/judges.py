@@ -132,6 +132,8 @@ class MosJudge:
             self.id = mos_local_id(repo, checkpoint)
             model = torch.hub.load(str(repo), "utmos22_strong", source="local", pretrained=False)
             model.load_state_dict(torch.load(checkpoint, map_location="cpu", weights_only=True))
+            if mos_local_id(repo, checkpoint) != self.id:
+                raise RuntimeError("local UTMOS files changed while loading")
         self.model = model.to(self.device).eval()
         self.torch = torch
 
