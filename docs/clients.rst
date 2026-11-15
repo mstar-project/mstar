@@ -723,8 +723,8 @@ Per-model notes:
   ``speech_started`` or ``speech_stopped``; its ``committed`` and transcription
   ``completed`` events carry ``"mstar": {"backchannel": true}``. This duration
   rule is an advisory signal, not a word classifier. It does not affect
-  ``semantic_vad`` or manual turns. Updates during an open turn apply to the
-  next turn.
+  ``semantic_vad`` or manual turns. Changes to ``min_interrupt_ms`` or
+  ``assistant_speaking`` during an open turn apply to the next turn.
 - **Semantic turn detection** — ``"turn_detection": {"type": "semantic_vad", "eagerness":
   "auto"}`` ends a turn when the speaker sounds finished rather than after a fixed
   silence, as OpenAI's semantic VAD does. When a pause reaches the eagerness' pause
