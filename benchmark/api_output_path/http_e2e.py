@@ -122,8 +122,9 @@ def run_client(args):
     itls: list[float] = []
     ttfts: list[float] = []
     done_reqs = 0
-    # completed streams that did not carry exactly --tokens content deltas
-    # (the token ids are ASCII words, so each token is one delta)
+    # completed streams that did not carry exactly --tokens text deltas
+    # (the token ids are ASCII words, so each token is one delta; with
+    # thinking on, Qwen3.5's default, each is a ``reasoning`` delta)
     wrong_count = 0
 
     async def one(session):
@@ -136,7 +137,7 @@ def run_client(args):
                 async for line in resp.content:
                     if not line.startswith(b"data: ") or line.startswith(b"data: [DONE]"):
                         continue
-                    if b'"content"' not in line:
+                    if b'"content"' not in line and b'"reasoning"' not in line:
                         continue
                     n += 1
                     now = time.time()
@@ -190,6 +191,9 @@ class _NoSendTensorManager:
 
     def get_ready_tensors(self):
         return {}
+
+    def take_failed_reads(self):
+        return []
 
     def has_inflight_reads(self, request_id):
         return False
