@@ -22,8 +22,10 @@ from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import (
     Array,
     ArrayStep,
+    Attend,
     Causal,
     Entry,
+    KVEntry,
     LatentAttend,
     LatentEntry,
     PagedLatent,
@@ -37,7 +39,7 @@ from mstar.engine.state import (
     at_last_token,
     state_op,
 )
-from mstar.engine.state.adapters import LATENT, StateSetup, _resolve, build_handle, build_specs, storage_of
+from mstar.engine.state.adapters import LATENT, PAGED, StateSetup, _resolve, build_handle, build_specs, storage_of
 from mstar.engine.state.calls import ArrayHandle
 
 state_op_module = sys.modules["mstar.engine.state.state_op"]
@@ -111,6 +113,13 @@ def test_a_latent_entry_refuses_bad_sizes():
     _refused("rank must be a positive int", lambda: LatentEntry(rank=0, rope_dim=ROPE))
     _refused("rope_dim must be an int >= 0", lambda: LatentEntry(rank=RANK, rope_dim=-1))
     assert set(LatentEntry(rank=RANK, rope_dim=0).tensors) == {"ckv"}, "a latent with no rope key has no kpe"
+
+
+def test_the_read_s_op_picks_the_latent_pool_not_a_field_name():
+    entry = Entry({**KVEntry(heads=HEADS, head_dim=RANK).tensors, "ckv": TensorType((RANK,), dtype=None)})
+    attend = _latent(entry=entry, reads={"attn": Read(mask=Causal(), op=Attend(q_heads=HEADS))})
+    assert storage_of(attend) is PAGED, "an Attend read's array is paged k and v, whatever its fields are named"
+    _refused("entry must be a KVEntry", lambda: build_specs([attend]))
 
 
 def test_latent_attend_refuses_its_own_bad_fields():
