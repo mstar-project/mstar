@@ -22,12 +22,8 @@ from mstar.engine.state import (
     SampleStep,
     Segment,
     SubmoduleStep,
-    at_last_token,
     kernel_setting,
-    last_sampled,
-    position,
     positions,
-    sample,
 )
 from mstar.model.components.block_loop_encoder import PackedBlockLoopEncoder
 from mstar.model.components.mrope import layout_position_ids, mrope_position_ids
@@ -39,14 +35,12 @@ from mstar.model.components.qwen3_vit import (
     # the tower's 2D patch grid, not the 3D MRoPE ids `mrope` places
     vision_position_ids as vision_grid_position_ids,
 )
-from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+from mstar.model.components.sampled_token_decoder import DeclaredTokenDecoder, SampledTokenDecoder
 from mstar.model.keys import MIXED
 from mstar.model.multimodal import MediaEncoder
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
 from mstar.model.qwen3_5.config import (
     GDN_STATE,
-    KV_CACHE,
-    SAMPLER,
     VISION_ATTN,
     VISION_TOKENS,
     Qwen3_5Config,
@@ -67,7 +61,7 @@ def _mixed_token_buckets(prefill_buckets, slack: int) -> list[int]:
     return [b for b in prefill_buckets if b & (b - 1) == 0 or b == slack]
 
 
-class LLMSubmodule(SampledTokenDecoder):
+class LLMSubmodule(DeclaredTokenDecoder):
     # An eager 8k prefill is launch-bound (~1,100 kernel launches, the GPU
     # idle half the time: 78 ms of wall for 36 ms of kernels on 0.8B), so the
     # ladder runs to 8192. The powers of two stay, since a batch of prompts up
@@ -144,33 +138,17 @@ class LLMSubmodule(SampledTokenDecoder):
             return None
         return DETERMINISTIC_COMPILE_MODE
 
-    def bind_state(self, handles: Mapping[str, Any]) -> None:
-        self.kv = handles[KV_CACHE]
-        self.sampler = handles[SAMPLER]
-
     def node_step(
         self, segments: list[Segment], prefill_tokens: Mapping[int, torch.Tensor], advance: tuple[int, ...] | None,
     ) -> SubmoduleStep:
         return SubmoduleStep(
             segments=segments,
             state={
-                KV_CACHE: ArrayStep(advance=advance),
+                self.KV_CACHE: ArrayStep(advance=advance),
                 GDN_STATE: ArrayStep(),
-                SAMPLER: SampleStep(prompt_tokens=prefill_tokens),
+                self.SAMPLER: SampleStep(prompt_tokens=prefill_tokens),
             },
         )
-
-    def next_position(self, rid_handle: int) -> int:
-        return position(self.kv, rid_handle, "main")
-
-    def loopback_tokens(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
-        return last_sampled(self.sampler)
-
-    def last_token_hidden(self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor) -> torch.Tensor:
-        return at_last_token(self.kv, hidden)
-
-    def sample_tokens(self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor) -> torch.Tensor:
-        return sample(self.sampler, logits)
 
     # ------------------------------------------------------------------
     # MRoPE
