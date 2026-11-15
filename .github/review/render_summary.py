@@ -135,12 +135,15 @@ SCHEMA = {
         "risk": {"type": "object", "properties": {
             "level": {"type": "string", "enum": ["low", "medium", "high"]},
             "reason": {"type": "string"},
+            "security": {"type": "boolean", "description": "the change touches security-relevant code (credentials, "
+                         "auth, API keys and secrets handling, redaction, the review bot workflows and sandbox): "
+                         "a person approves it, whatever the design"},
             # The design or direction decisions left to a human, when the risk isn't low: where each lives and why.
             "look_at": {"type": "array", "items": {"type": "object", "properties": {
                 "location": {"type": "string", "description": "path:line, or a function or class"},
                 "why": {"type": "string"},
             }, "required": ["location", "why"]}},
-        }, "required": ["level", "reason", "look_at"]},
+        }, "required": ["level", "reason", "security", "look_at"]},
         "live_test": {"type": "object", "properties": {
             "run": {"type": "string", "enum": ["none", "targeted", "full"]},
             "reason": {"type": "string"},
@@ -280,10 +283,12 @@ def carried(review, earlier, answered, pages):
     one, one this run judged fixed above carries that `fixed_in`, which judged checks, and one it judged
     still open loses any `fixed_in` from before); its risk level as a floor, with the `look_at` that names
     the decision, unless a maintainer other than the author has commented since (`answered`), when this review's
-    judgement stands; its questions, each until a maintainer's comment has answered it and this review says so
-    (`answered_questions`), so one comment can't drop the rest; and what the live test can't exercise
-    (`live_test.untestable`) when this review names nothing, whatever anyone has said, since no comment makes
-    the bot's GPUs able to run it. Everything here is carried into the next state too.
+    judgement stands (its `security` flag carries whatever anyone has said: a comment isn't an approval);
+    its questions, each until a maintainer's comment has answered it and this review says so
+    (`answered_questions`), so one comment can't drop the rest and an answered one is shown no more (a question
+    no longer holds the bot's approval, but it stays on the checklist until answered); and what the live test
+    can't exercise (`live_test.untestable`) when this review names nothing, whatever anyone has said, since no
+    comment makes the bot's GPUs able to run it. Everything here is carried into the next state too.
     An earlier finding's priority is the most severe of the bot's record of it (the tag on its thread in `pages`,
     the earlier state's items at its location) and this review's word on it (its verdict, an item restating it):
     a re-review can raise a priority, never lower it. An item at a location this review cleared (`fixed`, `moot`)
@@ -312,8 +317,10 @@ def carried(review, earlier, answered, pages):
         *[f if f["location"] in cleared else raised(f, f["location"]) for f in review["outside_diff"]],
         *[raised(with_verdict(f), f["location"]) for f in earlier.get("outside_diff", [])
           if f["location"] not in locations and f["location"] not in cleared]]}
+    old, new = earlier.get("risk"), review.get("risk")
+    if old and new:  # a comment isn't an approval: security-relevant code stays a person's to approve
+        review["risk"] = new = {**new, "security": bool(new.get("security") or old.get("security"))}
     if not answered:
-        old, new = earlier.get("risk"), review.get("risk")
         if old and new and RISK_ORDER[old["level"]] > RISK_ORDER[new["level"]]:
             review["risk"] = {**new, "level": old["level"], "reason": f"Kept from the earlier review: {old['reason']}",
                               "look_at": [*new.get("look_at", []), *old.get("look_at", [])]}
@@ -404,6 +411,7 @@ def status(review, pages, head, mode, stacked):
     line = f"{icon} **{text}** on `{head[:7]}`, {mode} review"
     if review.get("risk"):
         line += f" · design risk **{review['risk']['level']}**: {review['risk']['reason']}"
+        line += " · touches security-relevant code" if review["risk"].get("security") else ""
     return line
 
 
@@ -426,12 +434,13 @@ def latent(bug):
     return f"**[{bug['priority']}]** `{bug['location']}`: {bug['detail']} {issue}"
 
 
-def checklist(review, pages, stacked, extra=()):
-    """The "What's left for you" list: what a human must decide before approving, most important first,
-    one line each with its place: open P0/P1, findings a PR above fixes (merge together), then `extra`
-    (what the live-test job's rule found), the design decisions, questions, open P2s and skipped files. P3s
-    and latent bugs aren't decisions. Past ten lines the rest fold away, so a question or decision, whose
-    only home this is, is never lost."""
+def checklist(review, pages, stacked, extra=(), approving=False):
+    """The "What's left for you" list: what the review leaves to a person (the bot approves over its questions and
+    a medium design risk), most important first, one line each with its place: open P0/P1, findings a PR above
+    fixes (merge together), then `extra` (what the live-test job's rule found), the design decisions, questions,
+    open P2s and skipped files. P3s and latent bugs aren't decisions. Past ten lines the rest fold away, so a
+    question or decision, whose only home this is, is never lost. `approving`: the bot may approve over them, which
+    the closing line says."""
     found = open_findings(review, pages, stacked)
     review = inert(judged(review, stacked))
 
@@ -459,7 +468,8 @@ def checklist(review, pages, stacked, extra=()):
     if lines[10:]:
         rest = "\n".join(lines[10:])
         text += f"\n\n<details><summary>and {len(lines) - 10} more</summary>\n\n{rest}\n\n</details>"
-    return f"{text}\n\nApprove if you're OK with these."
+    return text + ("\n\nApprove if you're OK with these. If the bot approves, it does so over open questions "
+                   "and a medium design risk, so object on the PR if you aren't." if approving else "")
 
 
 def render(review, pages, head, mode, stacked, salvaged=False, team=False):
@@ -508,7 +518,7 @@ def render(review, pages, head, mode, stacked, salvaged=False, team=False):
         after = (" No live test runs: the review went past its turn limit." if salvaged
                  else " The live-test job posts its outcome in a separate comment.")
         parts.append(f"Live test: **{live['run']}**{checks}. {live['reason']}{after}")
-    left = checklist(raw, pages, stacked)
+    left = checklist(raw, pages, stacked, approving=mode == "full")
     parts.append(f"{left} The live-test comment adds its own items." if mode == "full" and not salvaged else left)
     # Only full mode can lead to an approval, by gpu_review.py's rule.
     role = ("Any approval is posted by the live-test job, by the rule in `gpu_review.py`." if mode == "full"
@@ -523,7 +533,7 @@ def render(review, pages, head, mode, stacked, salvaged=False, team=False):
     kept = [{**f, "priority": min(f["priority"], cleared[f["location"]])}
             for f in raw.get("untouched") or () if f["location"] in cleared]
     state = {"head": head, "mode": mode, "skipped": raw["skipped"], "outside_diff": [*raw["outside_diff"], *kept],
-             "risk": risk and {k: risk[k] for k in ("level", "reason", "look_at") if k in risk},
+             "risk": risk and {k: risk[k] for k in ("level", "reason", "security", "look_at") if k in risk},
              "latent": raw.get("latent", []),
              "questions": raw["questions"],
              "live_test": raw.get("live_test"),
