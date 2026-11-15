@@ -1298,7 +1298,8 @@ The rows below name specs where a declaration doesn't reach them yet.
    * - An LLM with DeepSeek sparse attention (GLM-5.2)
      - An ``Array`` with a ``LatentEntry``, ``Positions`` and a ``LatentAttend`` read. Under
        DSA its mask is ``Selected(of=...)``, naming a key ``Array`` of ``k`` with a ``TopK``
-       read. With MTP, ``verify_span`` is ``k + 1`` and a ``Value`` carries the draft's seed.
+       read. With MTP, ``verify_span`` is ``k + 1`` and a ``Value`` carries the next verify step's
+       input token and the draft's seed, so the decode loop carries only the count.
    * - A node that carries per-request state between steps of a loop (an RNN-T
        decoder, recurrent attention)
      - A ``Value`` with tensor fields, read and written whole, and for a linear-attention
