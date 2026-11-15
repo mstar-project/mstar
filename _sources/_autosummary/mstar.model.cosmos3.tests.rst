@@ -51,6 +51,7 @@ mstar.model.cosmos3.tests
    test_sound
    test_t2i
    test_time_embedder
+   test_vae_encode_compile
    test_vae_encoder_clip
    test_video
    test_video_capture
