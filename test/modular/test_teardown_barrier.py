@@ -1,21 +1,25 @@
-"""Teardown barrier (conductor side): the hard RemoveRequest that unlinks a
-segment is sent only after every reader has drained (READS_DONE).
+"""Teardown barrier (conductor side): every reader drains before hard removal.
 
-Covers the happy path (defer Remove until the preprocess worker finished
-delivering outputs, and unpersist still-held signals with correct counts) and
-the abort/fail path (drain all workers + preprocess worker, then Remove).
+Covers the happy path (drain workers and wait for output delivery, unpersist
+still-held signals with correct counts) and the abort/fail path (drain all
+workers + preprocess worker, then Remove).
 """
 
 import types
 from collections import deque
+from itertools import permutations
 
 import pytest
 import torch
+from test_worker_drain import _reads_done, _worker
 
 from mstar.conductor.conductor import Conductor, RequestData, _req_id_to_seed, _request_seed
+from mstar.distributed.base import NodeAndGraphWalk, ShardingConfig, ShardingGroup
 from mstar.graph.base import TensorPointerInfo
+from mstar.testing_utils.worker import deliver
 from mstar.utils.ipc_format import (
     FailRequests,
+    MessageSource,
     NewRequestConductor,
     ReadsDone,
     UnpersistTensors,
@@ -168,23 +172,141 @@ def test_fail_defers_client_notification_until_barrier_completes():
 
 # ── happy path ──────────────────────────────────────────────────────────────
 
-def test_done_completes_client_immediately_but_defers_remove():
+def _sharded_request_data(instances=(("w0", "w1"),)):
+    rd = _request_data()
+    rd.worker_graph_to_workers = {i: list(workers) for i, workers in enumerate(instances)}
+    rd.all_worker_graph_ids = set(rd.worker_graph_to_workers)
+    groups = [
+        ShardingGroup(nodes={f"node{i}"}, tp_size=len(workers))
+        for i, workers in enumerate(instances) if len(workers) > 1
+    ]
+    rd.sharding_config = ShardingConfig(
+        groups=groups, tp_enabled_nodes={n for g in groups for n in g.nodes}, shard_dim={},
+    )
+    rd.sharding_config.setup({
+        NodeAndGraphWalk(f"node{i}", "run"): list(workers) for i, workers in enumerate(instances)
+    })
+    return rd
+
+
+@pytest.mark.parametrize("instances", [
+    (("w0", "w1"),),
+    (("w7", "w5", "w3", "w1"), ("solo",)),
+    (("w2", "w3"), ("w4", "w5"), ("solo",)),
+    (("w2", "w3"), ("w2", "w3")),
+])
+@pytest.mark.parametrize("client_stream", [False, True])
+def test_success_drains_leaders_and_singletons_but_waits_for_every_rank(instances, client_stream):
+    c = _conductor({"r1": _sharded_request_data(instances)})
+    c._client_streams = {"input": object()} if client_stream else {}
+    c._process_request_done("r1")
+
+    assert _drain_targets(c, "r1") == {workers[0] for workers in instances}
+    assert c.draining["r1"].expected_acks == {w for workers in instances for w in workers} | {PREPROCESS}
+    assert not _remove_targets(c, "r1")
+
+
+def test_success_waits_for_forwarded_drain_and_follower_reads():
+    rd = _sharded_request_data()
+    c = _conductor({"r1": rd})
+    leader = _worker(known_rids=("r1",), in_flight=("r1",))
+    follower = _worker(
+        worker_id="w1", known_rids=("r1",), is_follower=True,
+        tp_follow=("r1",), inflight_reads=True,
+    )
+    leader_config = rd.sharding_config.clone_empty()
+    leader_config.setup(rd.sharding_config.node_to_worker)
+    leader_config.groups[0]._tp_rank = 0
+    leader._graph_runtime.get_sharding_config = lambda rid: leader_config
+    leader.communicator.send = lambda entity, msg: leader.sent.append((entity, msg))
+
+    c._process_request_done("r1")
+    [(target, drain)] = _by_type(c, WorkerMessageType.DRAIN_REQUEST)
+    assert target == "w0"
+    deliver(leader, drain)
+    assert not leader.sent  # The leader's in-flight step still holds the drain.
+
+    leader.pipeline.in_flight_rids.clear()
+    leader.pipeline._teardown(leader.pipeline.in_flight_rids)
+    [(target, forwarded), (_, ack)] = leader.sent
+    assert target == "w1" and forwarded.message_type == WorkerMessageType.DRAIN_REQUEST
+    assert forwarded.body.source == MessageSource.TP_RANK_0
+    c._handle_reads_done(ack.body)
+    c._handle_reads_done(ReadsDone("r1", PREPROCESS))
+    assert c.draining["r1"].expected_acks == {"w1"}
+    assert not _remove_targets(c, "r1")
+
+    deliver(follower, forwarded)
+    assert not _reads_done(follower)
+    follower.tensor_manager.has_inflight_reads = lambda rid: False
+    follower.pipeline._teardown(follower.pipeline.in_flight_rids)
+    assert not _reads_done(follower)  # A committed follow still precedes DRAIN.
+    follower.lockstep.pop_follow_head()
+    follower.pipeline._teardown(follower.pipeline.in_flight_rids)
+    [ack] = _reads_done(follower)
+    c._handle_reads_done(ack.body)
+    assert _remove_targets(c, "r1") == {"w0", "w1", PREPROCESS}
+    assert "r1" not in c.requests
+
+
+def test_success_sends_leader_drain_before_early_acks_finalize():
+    c = _conductor({"r1": _sharded_request_data()})
+    for worker in ("w0", "w1", PREPROCESS):
+        c._handle_reads_done(ReadsDone("r1", worker))
+    c._process_request_done("r1")
+
+    assert _drain_targets(c, "r1") == {"w0"}
+    messages = [m.message_type for _, m in c.sent]
+    assert messages.index(WorkerMessageType.DRAIN_REQUEST) < messages.index(WorkerMessageType.REMOVE_REQUEST)
+    assert _remove_targets(c, "r1") == {"w0", "w1", PREPROCESS}
+    assert "r1" not in c.requests
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_unsuccessful_tp_request_still_drains_every_participant(failed):
+    c = _conductor({"r1": _sharded_request_data()})
+    if failed:
+        c._fail_requests(FailRequests(errors={"r1": "ingest failed"}))
+    else:
+        c._abort_request("r1")
+    assert _drain_targets(c, "r1") == {"w0", "w1", PREPROCESS}
+    assert c.draining["r1"].expected_acks == {"w0", "w1", PREPROCESS}
+
+
+@pytest.mark.parametrize("ack_order", list(permutations(("w0", "w1", PREPROCESS))))
+def test_done_completes_client_immediately_but_defers_remove(ack_order):
     c = _conductor({"r1": _request_data(workers=("w0", "w1"))})
     c._process_request_done("r1")
 
-    # Client told right away; workers assumed done so only the preprocess worker
-    # must ACK — no Remove yet.
+    # The client hears immediately; the API worker finishes delivery on its own.
     completes = [m for e, m in c.sent if e == "api_server"
                  and m.message_type == "request_complete"]
     assert len(completes) == 1
+    assert _drain_targets(c, "r1") == {"w0", "w1"}
     assert _remove_targets(c, "r1") == set()
-    assert c.draining["r1"].expected_acks == {PREPROCESS}
+    assert c.draining["r1"].expected_acks == {"w0", "w1", PREPROCESS}
     assert "r1" in c.requests
 
-    c._handle_reads_done(ReadsDone(request_id="r1", entity_id=PREPROCESS))
+    for entity in ack_order[:-1]:
+        c._handle_reads_done(ReadsDone(request_id="r1", entity_id=entity))
+        assert _remove_targets(c, "r1") == set()
+    c._handle_reads_done(ReadsDone(request_id="r1", entity_id=ack_order[-1]))
     assert _remove_targets(c, "r1") == {"w0", "w1", PREPROCESS}
     assert "r1" not in c.requests
     assert c.admits == 1
+
+
+def test_success_sends_all_drains_before_early_acks_can_finalize():
+    c = _conductor({"r1": _request_data(workers=("w0", "w1"))})
+    for entity in ("w0", "w1", PREPROCESS):
+        c._handle_reads_done(ReadsDone(request_id="r1", entity_id=entity))
+    c._process_request_done("r1")
+    kinds = [m.message_type for _, m in c.sent]
+    first_remove = kinds.index(WorkerMessageType.REMOVE_REQUEST)
+    assert kinds[:first_remove].count(WorkerMessageType.DRAIN_REQUEST) == 2
+    assert WorkerMessageType.DRAIN_REQUEST not in kinds[first_remove:]
+    assert _remove_targets(c, "r1") == {"w0", "w1", PREPROCESS}
+    assert "r1" not in c.requests
 
 
 def test_done_unpersists_still_held_signals_with_ref_counts():
