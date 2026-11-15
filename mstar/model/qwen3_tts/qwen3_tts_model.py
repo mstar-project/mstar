@@ -44,7 +44,6 @@ from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import PartitionDefinition
-from mstar.engine.resources.lora import LoraSpec
 from mstar.engine.state import (
     Array,
     Attend,
@@ -78,6 +77,7 @@ from mstar.model.base import (
     TensorAndMetadata,
     WalkStep,
 )
+from mstar.model.components.lora.modules import PER_SEGMENT, LoraRoot
 from mstar.model.qwen3_tts.config import (
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
     CHATML_ASSISTANT_SUFFIX_TOKEN_IDS,
@@ -557,23 +557,18 @@ class Qwen3TTSModel(Model):
             ),
         ]
 
-    def _lora_spec(self) -> LoraSpec:
+    def lora_roots(self) -> tuple[LoraRoot, ...]:
         """Per-request adapters on the Talker: every linear of its stack and the
         codec-group-0 head (one row per request: the last token's), named as the
         checkpoint does (``talker.*``) or as the Talker alone does. The text projection
         takes none: the prefill runs it in ``prepare_inputs``, outside the step. The CodePredictor's
         depth loop and the speaker / codec models are not served."""
-        from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
         from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
-        return module_lora_spec(
-            lambda group: Qwen3TTSTalkerModel(self.config, comm_group=group),
-            nodes={"Talker"}, root_path="model",
+        return (LoraRoot(
+            node="Talker", build=lambda group: Qwen3TTSTalkerModel(self.config, comm_group=group),
             rows={"codec_head": PER_SEGMENT},
             exclude={"text_projection": "the prefill projects it in prepare_inputs, outside the planned step"},
-        )
-
-    def get_node_resources(self):
-        return [self._lora_spec()]
+        ),)
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
         return {
