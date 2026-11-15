@@ -368,19 +368,22 @@ def test_none_in_a_field_with_a_non_none_default_survives():
     assert out.top_p == 1
 
 
-def test_a_rolling_kv_request_config_crosses_the_wire_typed():
+def test_a_request_pool_request_config_crosses_the_wire_typed():
     from mstar.communication.wire import _encoder
-    from mstar.engine.resources.kv.rolling import RollingKVReqConfig
+    from mstar.engine.resources.request_pool import RequestPoolReqConfig
 
-    assert _encoder(RollingKVReqConfig).__name__ == "_encode_dataclass"
+    assert _encoder(RequestPoolReqConfig).__name__ == "_encode_dataclass"
+    wants = RequestPoolReqConfig.of({"dit_kv": ((30, 2, 27144, 12, 128), torch.bfloat16),
+                                     "dec.31": ((1, 96, 2, 464, 832), torch.bfloat16)})
     fi = _fwd_info()
-    fi.resource_configs = {"dit_kv": RollingKVReqConfig(tokens=27144)}
+    fi.resource_configs = {"dit_pool": wants}
     msg = WorkerMessage(
         message_type=WorkerMessageType.INPUT_SIGNALS,
         body=InputSignals(request_id="r", partition_name="p",
                           request_info=fi, inputs=[]),
     )
-    assert roundtrip(msg).body.request_info.resource_configs == {"dit_kv": RollingKVReqConfig(tokens=27144)}
+    back = roundtrip(msg).body.request_info.resource_configs["dit_pool"]
+    assert back == wants and back.layout() == wants.layout()
 
 
 def test_non_mstar_types_are_refused_rather_than_imported_from_the_wire():
