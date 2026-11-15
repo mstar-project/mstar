@@ -632,8 +632,33 @@ models:
   # ---------------- newer models (optional until their PRs are on main) ----------------
   # Each adds an engine path none of the models above covers (#577). Base must serve the model too, so these stay
   # optional (out of `all`, select with `tag:new-model` or by name) until the model's PR is on main; until then
-  # compare them with a base that has the model, e.g. `--base 515 --head <a PR stacked on it>`. No entry yet for
-  # Fish S2-Pro (#491: its PR #492 is closed) or MiniCPM-o (#382 serves it on /generate only, with no chat adapter).
+  # compare them with a base that has the model, e.g. `--base 515 --head <a PR stacked on it>`. MiniCPM-o still
+  # has no chat adapter for the client kinds used here.
+  fish_s2_pro:            # slow/fast AR and streamed 44.1 kHz DAC; plain and reference-audio requests
+    serve: fish_s2_pro
+    optional: true
+    family: TTS
+    tags: [new-model, tts, speech-out, clone]
+    requires: [soundfile]
+    est_min: 10
+    cases:
+      - id: tts
+        modality: tts
+        suite: tts
+        data: tts
+        args: [--seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
+      - id: clone
+        modality: tts (voice clone)
+        suite: tts
+        data: clone
+        args: [--clone, --seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        quality: [mos, speaker_sim]
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, sim_mean]}
+
   cosyvoice3:            # #495: speech codes streamed into a flow-matching decoder at 24 kHz; clone from an upload
     serve: cosyvoice3
     optional: true

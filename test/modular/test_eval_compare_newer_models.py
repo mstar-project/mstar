@@ -21,7 +21,8 @@ from benchmark.eval.e2e import arm, checks, compare  # noqa: E402
 from benchmark.eval.e2e import manifest as mf  # noqa: E402
 from benchmark.eval.suites import e2e  # noqa: E402
 
-NEW = {"cosyvoice3": "cosyvoice3", "voxcpm2": "voxcpm2", "omnilingual_asr_ctc_300m": "omnilingual_asr_ctc_300m",
+NEW = {"fish_s2_pro": "fish_s2_pro", "cosyvoice3": "cosyvoice3", "voxcpm2": "voxcpm2",
+       "omnilingual_asr_ctc_300m": "omnilingual_asr_ctc_300m",
        "lingbot_world_1_3b": "lingbot_world_1_3b"}
 
 
@@ -35,10 +36,14 @@ def test_newer_models_are_optional_entries_picked_by_their_own_tag():
     # a shared tag does not pull them in; a name does
     assert not {x.name for x in m.select("tag:tts")} & set(NEW)
     assert [x.name for x in m.select("voxcpm2")] == ["voxcpm2"]
-    assert "fish_s2_pro" not in m.models and "minicpm_o" not in m.models
+    assert "minicpm_o" not in m.models
     cases = {x.name: [c.id for c in x.cases] for x in picked}
-    assert cases == {"cosyvoice3": ["clone"], "voxcpm2": ["tts", "clone", "design"],
+    assert cases == {"fish_s2_pro": ["tts", "clone"], "cosyvoice3": ["clone"],
+                     "voxcpm2": ["tts", "clone", "design"],
                      "omnilingual_asr_ctc_300m": ["upload"], "lingbot_world_1_3b": ["world"]}
+    fish = m.models["fish_s2_pro"].cases
+    assert fish[0].data == "tts" and fish[1].data == "clone" and "--clone" in fish[1].args
+    assert fish[1].quality == ["mos", "speaker_sim"]
     clone = m.models["cosyvoice3"].cases[0]
     assert clone.data == "clone" and "--clone" in clone.args and clone.check == {"kind": "wer", "max_increase": 2.0}
     world = m.models["lingbot_world_1_3b"].cases[0]
