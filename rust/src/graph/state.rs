@@ -1267,7 +1267,10 @@ mod tests {
         let mut st = run_flow_once(&g);
         // `flow` is not the loop's last member, so its loop-back arrives
         // before the loop advances, and its current slot is empty by now.
-        assert!(st.ingest(&g, flow, 1, &[t(10)], true, false).is_some());
+        assert_eq!(
+            st.ingest(&g, flow, 1, &[t(10)], true, false), Some(true),
+            "a speculative step's undo would take it from the current slot",
+        );
         assert!(st.has_input(flow, 1, true));
         assert!(!st.has_input(flow, 1, false), "the iteration that ran would drop it on advance");
 
