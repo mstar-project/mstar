@@ -54,24 +54,26 @@ class ChunkPolicy(ABC):
         return False
 
     def continue_after_producer_done(self) -> bool:
-        """Whether the buffer should keep producing (empty) chunks after the
-        producer signals done and all buffered items have been consumed.
+        """Whether the consumer keeps running after the stream ends.
 
-        Default ``False``: partition-done is propagated to the conductor after
-        the last item is flushed.
+        Default ``False``: the step that takes the final chunk ends the
+        consumer's loop, and the partition once every stream into it ended.
 
-        Set to ``True`` for connections where the consumer must keep running
-        after the producer finishes (e.g., Thinker→Talker: the Talker
-        continues generating codec tokens after the Thinker hits text EOS).
-        In this case the buffer produces empty chunks (``_collate([])`` →
-        ``{"data": None}``), and the consumer's partition-done is determined
-        by its own model logic, not by the StreamBuffer.
+        ``True`` for connections where the consumer must keep running after
+        the producer finishes (e.g., Thinker→Talker: the Talker continues
+        generating codec tokens after the Thinker hits text EOS). The stream
+        still ends with one final chunk, but that ends nothing: from then on
+        the input counts as present for the consumer's readiness and is
+        absent from its inputs, so the model reads an ended stream as a
+        missing input, and its own logic decides when it is done.
         """
         return False
 
     def continues_in(self, consumer_walk: str | None) -> bool:
-        """Whether empty chunks keep coming, after the producer is done, while
-        the consumer is in ``consumer_walk``."""
+        """Whether the stream continues past its end in ``consumer_walk``.
+        Elsewhere it ends only once the consumer is in a walk where it does,
+        and a chunk for another walk is not final. Structural: compiled once
+        into each walk's graph."""
         return self.continue_after_producer_done()
 
 
@@ -153,10 +155,13 @@ class FixedChunkPolicy(ChunkPolicy):
 
     Args:
         chunk_size: number of items per chunk.
-        continue_after_done: if True, keep producing empty chunks after
-            the producer finishes and all buffered items are consumed. A set
-            of consumer walks does so only while the consumer is in one of
-            them; in its other walks the stream just waits.
+        continue_after_done: if True, the consumer keeps running after the
+            stream ends, reading the input as absent
+            (``ChunkPolicy.continue_after_producer_done``). A set of consumer
+            walks continues only in those walks; the stream ends only while
+            the consumer is in one of them, and in its other walks just waits.
+            Only a connection that drives its consumer's walk
+            (``Connection.consumer_walk``) takes one: refused at load otherwise.
         allow_partial: if True, take a chunked prefill's pieces as they
             land (``ChunkPolicy.allow_partial_input``).
     """

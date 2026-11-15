@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from mstar.conductor.conductor import Conductor, RequestData
+from mstar.conductor.conductor import Conductor, RequestData, _walk_io
 from mstar.conductor.request_info import (
     FINAL_PREFILL,
     CurrentForwardPassInfo,
@@ -81,17 +81,35 @@ def test_an_incomplete_run_waits_for_more_items():
     assert sbuf.peek_walk() == "talker_decode"
 
 
-def test_empty_chunks_after_the_producer_ends_come_only_in_the_listed_walks():
+@pytest.mark.parametrize("last_walk", [None, "talker_last_prefill", "talker_decode"])
+def test_a_stream_continuing_in_some_walks_ends_only_in_one_of_them(last_walk):
+    """Qwen3-Omni's Thinker states end once, in the Talker's decode walk: a last
+    item for a prefill walk is not the end, and the end comes as an empty
+    chunk once the consumer is in a listed walk. A prefill pass on an empty
+    chunk would have nothing to run on."""
     sbuf = StreamBuffer(
         request_id=0, edge_name="thinker_states", from_partition="Thinker",
         policy=FixedChunkPolicy(1, continue_after_done=frozenset({"talker_decode"})),
         walk_tagged=True,
     )
+    if last_walk:
+        _feed(sbuf, [last_walk])
     sbuf.signal_done()
-    # A prefill pass on an empty chunk would have nothing to run on
+    if last_walk:
+        # popped while the consumer is still in its prefill walk, as
+        # ``pop_edge`` reads it before entering the chunk's walk: the item's
+        # own walk decides
+        assert sbuf.has_chunk_ready("talker_last_prefill")
+        last = sbuf.pop_chunk("talker_last_prefill")
+        assert (last.num_items, last.is_final) == (1, last_walk == "talker_decode")
+        if last.is_final:
+            assert not sbuf.has_chunk_ready("talker_decode"), "a stream ends once"
+            return
     assert not sbuf.has_chunk_ready("talker_last_prefill")
     assert sbuf.has_chunk_ready("talker_decode")
-    assert not sbuf.pop_chunk().is_final
+    end = sbuf.pop_chunk("talker_decode")
+    assert (end.num_items, end.is_final) == (0, True)
+    assert not sbuf.has_chunk_ready("talker_decode"), "a stream ends once"
 
 
 def test_an_untagged_buffer_is_unchanged():
@@ -135,6 +153,37 @@ def test_a_walk_driving_edge_needs_non_overlapping_chunks():
     )
     with pytest.raises(ValueError, match="LeftContextChunkPolicy"):
         topology.check_walk_driving_connections()
+
+
+def test_a_stream_continuing_in_some_walks_must_drive_its_consumers_walk():
+    """Its buffer would ask ``continues_in(None)``, and so never end, while
+    the walk's graph latches it as continuing."""
+    topology = PartitionTopology(partitions=["Thinker", "Talker"], connections=[_conn(
+        "thinker_states", walk=None,
+        policy=lambda: FixedChunkPolicy(1, continue_after_done=frozenset({"talker_decode"})),
+    )])
+    with pytest.raises(ValueError, match="thinker_states"):
+        topology.check_walk_scoped_continuation({"talker_decode": "Talker"})
+
+
+def test_a_walk_run_once_per_chunk_cannot_take_a_continuing_stream():
+    """Its final chunk ends nothing, and the walk's graph resets after each
+    pass, so the re-sent step would wait on the closed buffer forever."""
+    topology = PartitionTopology(partitions=["Thinker", "Talker"], connections=[_conn(
+        "thinker_states", policy=lambda: FixedChunkPolicy(1, continue_after_done=True),
+    )])
+    graph = SimpleNamespace(
+        get_nodes=lambda: {"Talker": SimpleNamespace(name="Talker", input_names={"thinker_states"}, outputs=[])},
+        get_loops=dict,
+        get_inputs_outputs=lambda: SimpleNamespace(ext_inputs=set(), loop_back=set()),
+    )
+    model = SimpleNamespace(
+        get_graph_walk_graphs=lambda: {"talker_decode": graph},
+        get_partitions=lambda: [SimpleNamespace(name="Talker", graph_walks=["talker_decode"])],
+        get_partition_topology=lambda: topology,
+    )
+    with pytest.raises(ValueError, match="talker_decode.*thinker_states"):
+        _walk_io(model)
 
 
 # --- idle --------------------------------------------------------------------

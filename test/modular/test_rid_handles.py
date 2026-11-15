@@ -184,14 +184,14 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     w._rebuilds._writes = {a: {"n": ["kv"]}, b: {"n": ["kv"]}}
     w._rebuilds._cursors[("n", a)] = None
     w.preemption._preempted[a] = Preempted()
-    w.streams._rids.add(a)
+    w.streams._open["n"] = {a}
     w.scheduler.admission.held_until[a] = float("inf")
 
     deliver(w, WorkerMessage(
         WorkerMessageType.REMOVE_REQUEST, RemoveRequest(request_id="req-a", source=MessageSource.SELF),
     ))
 
-    assert not w.streams.possible(), "the stream manager forgets the handle"
+    assert not w.streams.open_into("n"), "the stream manager forgets the handle"
 
     assert w.removed_in_runtime == [a]
     assert b in w.request_state.per_request_info

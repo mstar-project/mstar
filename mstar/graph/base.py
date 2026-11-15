@@ -250,6 +250,9 @@ class GraphNode(GraphSection):
     _in_flight: bool = False
 
     _streaming_inputs: set[str] = field(default_factory=set)
+    # the streaming inputs that continue past their stream's end in this
+    # node's walk: an ended one counts as present (``ChunkPolicy.continues_in``)
+    _continuing_inputs: set[str] = field(default_factory=set)
 
     _managing_registry: "GraphStateRegistry | None" = None
 
@@ -282,7 +285,9 @@ class GraphNode(GraphSection):
             communication_manager, request_id
         )
 
-    def _register_streaming(self, streaming_inputs: set[str]):
+    def _register_streaming(
+        self, streaming_inputs: set[str], continuing: set[str] = frozenset(),
+    ):
         # Mutate the existing set in place so that the ReadySignals instances
         # built in __post_init__ (which capture self._streaming_inputs by
         # reference) stay in sync. Rebinding the attribute would leave them
@@ -292,6 +297,7 @@ class GraphNode(GraphSection):
         self.consumes_stream = True
         self._streaming_inputs.clear()
         self._streaming_inputs.update(streaming_inputs)
+        self._continuing_inputs = set(continuing)
 
     def ingest_input(self, edge: GraphEdge, can_buffer: bool=True) -> bool:
         """Try to ingest an arriving edge.

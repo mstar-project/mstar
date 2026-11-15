@@ -5,7 +5,8 @@ it is final for the node (``is_final_stream_chunk``) only if every other stream
 into the node already ended, and it reports the partition done only if every
 stream into the partition did. Streams end in any order, over several steps; a
 speculative step that hands its final chunk back reopens that stream; a
-``continue_after_producer_done`` stream never ends and holds nothing back.
+``continue_after_producer_done`` stream's end ends nothing and holds nothing
+back.
 """
 
 import sys
@@ -104,6 +105,16 @@ def test_a_step_with_no_final_chunk_is_never_final():
     assert _step(worker, "vocoder", {}) == (set(), set())
 
 
+def test_a_continuing_streams_end_ends_neither_node_nor_partition():
+    """Qwen3-TTS's Talker keeps decoding past its text stream's end, until
+    codec EOS: ending it there would cut the audio short."""
+    worker = _worker()
+    _step(worker, "captioner", {"r": {"captions"}})
+    _step(worker, "vocoder", {"r": {"codes", "pitch"}})
+
+    assert _step(worker, "vocoder", {"r": {"speaker"}}) == (set(), set())
+
+
 def test_requests_in_one_batch_are_tracked_apart():
     worker = _worker(rids=("a", "b"))
     _step(worker, "vocoder", {"a": {"codes"}})
@@ -181,15 +192,36 @@ def test_a_rows_only_step_threads_its_loop_back_signal_as_present():
     assert batch.request_ids == ["r"] and "s" not in batch.per_request_input_tensors
 
 
-def test_stream_polls_are_skipped_only_while_no_request_owns_a_buffer():
+def test_a_request_is_open_into_a_node_until_every_stream_into_it_ended():
+    """A speculation polls only the rows with a stream into its node still
+    open, and takes the columns when none is: Qwen3-TTS's Talker once its text
+    ended, though the Codec's stream on the same worker is still open."""
     request_state = SimpleNamespace(per_request_info={})
-    streams = StreamBufferManager(request_state, None, [Connection(
-        from_partition="LLM", to_partition=PARTITION, edge_name="codes",
-        chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1),
-    )])
-    assert not streams.possible()
-    request_state.per_request_info[7] = SimpleNamespace(stream_buffers={}, stream_buffers_by_consumer={})
-    streams.add_request(7, SimpleNamespace(partition_name="LLM", stream_lead_items={}))
-    assert streams.possible()
+    streams = StreamBufferManager(request_state, SimpleNamespace(), [
+        Connection(
+            from_partition="LLM", to_partition=PARTITION, edge_name=name,
+            chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1),
+        ) for name in ("codes", "pitch", "captions")
+    ])
+    streams.consumer_node = {name: TOPOLOGY[name][0] for name in ("codes", "pitch", "captions")}
+    assert not streams.open_into("vocoder")
+    request_state.per_request_info[7] = SimpleNamespace(
+        stream_buffers={}, stream_buffers_by_consumer={}, ended_streams=set(),
+    )
+    streams.add_request(7, SimpleNamespace(partition_name=PARTITION, stream_lead_items={}))
+    buffers = request_state.per_request_info[7].stream_buffers
+    for name in ("codes", "pitch"):
+        buffers[name].signal_done()
+    final = streams.pop_edge(buffers["codes"], "codes", 7)
+    assert final.chunk.is_final
+    assert streams.open_into("vocoder") == {7}, "pitch has not ended"
+    streams.pop_edge(buffers["pitch"], "pitch", 7)
+    assert not streams.open_into("vocoder")
+    assert streams.open_into("captioner") == {7}
+
+    streams.return_edge(7, final)  # refused: open again
+    assert streams.open_into("vocoder") == {7}
+    assert streams.pop_edge(buffers["codes"], "codes", 7) is final  # offered again: closed
+    assert not streams.open_into("vocoder") and not buffers["codes"].maybe_ready
     streams.remove_request(7)
-    assert not streams.possible(), "a removed request's handle no longer counts"
+    assert not streams.open_into("vocoder") and not streams.open_into("captioner")

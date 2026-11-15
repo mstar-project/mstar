@@ -56,13 +56,19 @@ def _drive(policy, total_frames, drain_before_done):
     return finals
 
 
+# A continuing stream (Qwen3-TTS's text, Qwen3-Omni's Thinker states) ends the
+# same way: its consumer keeps running past the end, reading the input as absent.
+@pytest.mark.parametrize("continue_after_done", [False, True])
 @pytest.mark.parametrize("drain_before_done", [True, False])
 @pytest.mark.parametrize(
     "total_frames",
     [0, 1, 29, 30, 31, 60, 90, 100],  # 30/60/90 are exact multiples of chunk
 )
-def test_fixed_policy_emits_exactly_one_final(total_frames, drain_before_done):
-    finals = _drive(FixedChunkPolicy(chunk_size=30), total_frames, drain_before_done)
+def test_fixed_policy_emits_exactly_one_final(total_frames, drain_before_done, continue_after_done):
+    finals = _drive(
+        FixedChunkPolicy(chunk_size=30, continue_after_done=continue_after_done),
+        total_frames, drain_before_done,
+    )
     # Exactly one terminal chunk, regardless of how the frame count lines up
     # with the chunk size or how eagerly the consumer drained.
     assert sum(finals) == 1, finals
@@ -88,28 +94,6 @@ def test_left_context_policy_emits_exactly_one_final(total_frames, drain_before_
     )
     assert sum(finals) == 1, finals
     assert finals[-1] is True, finals
-
-
-def test_continue_after_producer_done_never_marks_final():
-    """Policies that keep the consumer running past producer-done (e.g. the
-    Qwen Thinker->Talker handoff) must never emit a final chunk — the consumer
-    decides completion via its own model logic. The final-flush fix must not
-    change that."""
-    policy = FixedChunkPolicy(chunk_size=30, continue_after_done=True)
-    sb = StreamBuffer(
-        request_id="r", edge_name="new_token", from_partition="LLM", policy=policy,
-    )
-    for i in range(90):  # exact multiple — the trigger for the plain-policy hang
-        uid = f"t{i}"
-        sb.pre_read_register(uid)
-        sb.put(uid, torch.zeros(1, 4))
-        while sb.has_chunk_ready():
-            assert sb.pop_chunk().is_final is False
-    sb.signal_done()
-    # Keeps offering (empty) chunks, none marked final.
-    for _ in range(5):
-        assert sb.has_chunk_ready() is True
-        assert sb.pop_chunk().is_final is False
 
 
 @pytest.mark.parametrize("drain_before_done", [True, False])
