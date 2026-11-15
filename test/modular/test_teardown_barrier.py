@@ -52,6 +52,8 @@ def _new_request(rid, model_kwargs=None):
 
 def _conductor(requests, drain_ttl_s=120.0):
     c = Conductor.__new__(Conductor)
+    c._episode_array_names = frozenset()
+    c._queued_since = {}
     c.sent = []
     c.admits = 0
     c.communicator = types.SimpleNamespace(

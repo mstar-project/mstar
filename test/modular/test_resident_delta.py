@@ -1369,6 +1369,7 @@ def _pool_rank(monkeypatch, rank: int, cfg: PagedKVConfig | None = None) -> tupl
     )
     kv.local_loops = {"decode"}
     engine = Engine.__new__(Engine)
+    engine._episode_pools = {}
     engine._resources, engine._resource_nodes = {"kv": kv}, {"kv": frozenset({NODE})}
     engine._submodules = {NODE: SimpleNamespace(resources={"kv": kv}, resident=None, submodule=SimpleNamespace(
         cleanup_request=lambda rid: None))}

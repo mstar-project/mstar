@@ -84,6 +84,8 @@ def _conductor(*ticks, requests):
         flush=lambda: False,
     )
     c._declaration_digests = {}
+    c._episode_array_names = frozenset()
+    c._episode_records = conductor_mod.EpisodeRecords()
     c._walk_inputs = {"decode": ()}
     c._repeating_walks = frozenset()
 
@@ -175,7 +177,7 @@ def test_the_failing_request_gets_an_error_and_frees_its_slot():
     )
     admitted = []
     c.max_concurrent_requests = 1
-    c.waiting_queue = [SimpleNamespace(request_id="queued")]
+    c.waiting_queue = [SimpleNamespace(request_id="queued", episode=None)]
     c._admit_request = lambda body: admitted.append(body.request_id)
     _run(c)
     failed = _to_client(c, "request_failed")
