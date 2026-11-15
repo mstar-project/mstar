@@ -413,7 +413,7 @@ def deployment_problems(model: "Model", resources: Mapping[str, Mapping[str, obj
                             "itself, where only a field an update op writes takes a stored dtype")
         longer = resources.get(array.name, {}).get("max_seq_len")
         kept = any(isinstance(read.mask, Bidirectional) and read.mask.kept_window for read in array.reads.values())
-        if kept and longer is not None and longer > array.max_len:
+        if kept and longer is not None and array.max_len is not None and longer > array.max_len:
             problems.append(f"Array {array.name!r}: resources.{array.name}.max_seq_len is {longer}, past its max_len "
                             f"of {array.max_len}, which its kept window's requests are checked against; raise max_len")
     return problems
