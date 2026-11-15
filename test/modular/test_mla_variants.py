@@ -65,6 +65,12 @@ class _StubLatentHandle:
         scores = torch.einsum("qhl,kl->hqk", q_nope, self.rows) * self.m.softmax_scale
         return torch.einsum("hqk,kl->qhl", _causal_softmax(scores), self.rows)
 
+    def _add_read(self, layer, q, *, keep=None, **keywords):
+        """As `ArrayHandle._add_read`: the entry's fields go to `add`, and the rest to `read`."""
+        fields = {name: keywords.pop(name) for name in ("k", "v", "ckv", "kpe") if name in keywords}
+        self.add(layer, keep=keep, **fields)
+        return self.read(layer, q, **keywords)
+
 
 def test_nope_means_no_decoupled_dims():
     with pytest.raises(ValueError, match="no decoupled dims"):

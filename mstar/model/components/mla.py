@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.state import PagedLatent, rope, state_op
+from mstar.engine.state import PagedLatent, add_read, rope, state_op
 from mstar.model.components.distributed import ColumnParallelLinear, RowParallelLinear
 from mstar.model.components.fp8_linear import (
     COLUMN,
@@ -176,16 +176,14 @@ class MLAAttention(nn.Module):
         )
 
     def _write_and_attend(self, q, k, v, q_pe=None, *, keep=None, selected=None):
-        """``keep`` and ``selected`` reach the handle's add and read. ``v`` None: ``k`` is the absorbed
-        path's latent rows, with no rope query ``q_pe`` where there are no decoupled dims."""
+        """``keep`` and ``selected`` reach the handle's add and read, which share one graph break. ``v`` None: ``k`` is
+        the absorbed path's latent rows, with no rope query ``q_pe`` where there are no decoupled dims."""
         if v is not None:
-            self.state.add(self.layer, keep=keep, k=k, v=v)
-            return self.state.read(self.layer, q)
+            return add_read(self.state, self.layer, q, keep=keep, k=k, v=v)
         if q_pe is None:
-            self.state.add(self.layer, keep=keep, ckv=k)
-            return self.state.read(self.layer, q)
-        self.state.add(self.layer, keep=keep, ckv=k[:, :self.kv_lora_rank], kpe=k[:, self.kv_lora_rank:])
-        return self.state.read(self.layer, q, q_pe=q_pe, selected=selected)
+            return add_read(self.state, self.layer, q, keep=keep, ckv=k)
+        ckv, kpe = k[:, :self.kv_lora_rank], k[:, self.kv_lora_rank:]
+        return add_read(self.state, self.layer, q, keep=keep, ckv=ckv, kpe=kpe, q_pe=q_pe, selected=selected)
 
     def forward(
         self,
