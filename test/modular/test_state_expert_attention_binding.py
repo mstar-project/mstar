@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner, dummy_metadata
+from mstar.engine.resources.attn.ragged.config import RaggedExpertAttentionSpec
 from mstar.engine.resources.attn.ragged.expert_mask import cross_visibility, self_visibility
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
@@ -221,6 +222,52 @@ def test_two_request_cross_plan_keeps_labels_and_lengths_separate() -> None:
         for values in layouts.values()
     ))
     assert torch.equal(cross, want)
+
+
+@pytest.mark.parametrize("cross", [False, True], ids=["self", "cross"])
+def test_distinct_expert_labels_get_separate_resources(cross: bool) -> None:
+    self_mask = ExpertSelf(2, future_per_chunk=1)
+    cross_mask = ExpertCross(2, future_per_chunk=1, tokens_per_frame=1, window_frames=2)
+    arrays = []
+    state = {}
+    layouts = {}
+    if cross:
+        arrays.append(Array(
+            "queries", nodes={"expert"}, labels={"q"}, layers={0},
+            entry=KVEntry(heads=2, head_dim=32), max_len=0,
+            reads={"query_attn": Read(mask=Block(), op=Attend(q_heads=2))},
+        ))
+        state["queries"] = ArrayStep(segments=(Segment("r0", "q", 4),))
+    for suffix in ("a", "b"):
+        name, label, read_key = f"expert_{suffix}", f"{suffix}_label", f"{suffix}_attn"
+        arrays.append(Array(
+            name, nodes={"expert"}, labels={label}, layers={0},
+            entry=KVEntry(heads=2, head_dim=32), max_len=0,
+            reads={read_key: Read(
+                mask=cross_mask if cross else self_mask,
+                op=Attend(q_heads=2), queries="queries" if cross else None,
+            )},
+        ))
+        state[name] = ArrayStep(segments=(Segment("r0", label, 4),))
+        layouts[name] = {label: {read_key: [1, 2, 0, 2] if cross else [1]}}
+
+    specs = build_specs(arrays)
+    expert_specs = [spec for spec in specs if isinstance(spec, RaggedExpertAttentionSpec)]
+    assert len(expert_specs) == 2
+    resources = {
+        spec.resource_key: build_resource(
+            spec, EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.float32),
+        ) for spec in specs
+    }
+    handles = node_handles(SimpleNamespace(declare_state=lambda: arrays), "expert", resources)
+    info = CurrentForwardPassInfo(
+        request_id="r0", graph_walk="chunk", fwd_index=0, random_seed=0, max_tokens=1,
+        step_metadata={EXPERT_LAYOUT_KWARG: layouts},
+    )
+    planned = state_steps(SubmoduleStep(state=state), handles, per_request_info={"r0": info})
+    ctx = StepContext(request_ids=["r0"], graph_walk="chunk", slot=0, capture=False)
+    for spec in expert_specs:
+        resources[spec.resource_key].plan(planned.steps[spec.resource_key], ctx)
 
 
 def test_missing_expert_layout_is_refused() -> None:
