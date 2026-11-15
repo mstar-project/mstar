@@ -334,6 +334,7 @@ class TurnSegmenter:
         self._turn = 0                               # samples in the turn
         self.min_interrupt_ms = 0
         self.assistant_speaking = False
+        self._turn_min_interrupt_ms = 0
         self._pending_start_ms: int | None = None
         self._spoken = 0
 
@@ -374,7 +375,7 @@ class TurnSegmenter:
             self._open(start, ops)
         if self._pending_start_ms is not None and p >= self.threshold:
             self._spoken += FRAME
-            if self._spoken * 1000 >= self.min_interrupt_ms * SAMPLE_RATE:
+            if self._spoken * 1000 >= self._turn_min_interrupt_ms * SAMPLE_RATE:
                 ops.append(("speech_started", self._pending_start_ms))
                 self._pending_start_ms = None
         ops.append(("audio", frame))
@@ -421,7 +422,8 @@ class TurnSegmenter:
         self._spoken = 0
         self._prefix = np.zeros(0, dtype=np.float32)
         start_ms = samples_to_ms(start - prefix.size)
-        self._pending_start_ms = start_ms if self.assistant_speaking and self.min_interrupt_ms else None
+        self._turn_min_interrupt_ms = self.min_interrupt_ms if self.assistant_speaking else 0
+        self._pending_start_ms = start_ms if self._turn_min_interrupt_ms else None
         if self._pending_start_ms is None:
             ops.append(("speech_started", start_ms))
         if prefix.size:
@@ -437,7 +439,7 @@ class TurnSegmenter:
             ops.append(("backchannel",))
         ops.append(("commit",))
         self.speaking, self._silence, self._turn = False, 0, 0
-        self._pending_start_ms, self._spoken = None, 0
+        self._pending_start_ms, self._spoken, self._turn_min_interrupt_ms = None, 0, 0
         if self._eot is not None:
             self._recent.clear()
 
@@ -468,7 +470,7 @@ class TurnSegmenter:
         self._rest = np.zeros(0, dtype=np.float32)
         self._prefix = np.zeros(0, dtype=np.float32)
         self.speaking, self._silence, self._turn = False, 0, 0
-        self._pending_start_ms, self._spoken = None, 0
+        self._pending_start_ms, self._spoken, self._turn_min_interrupt_ms = None, 0, 0
         if self._eot is not None:
             self._recent.clear()
         self.vad.reset()

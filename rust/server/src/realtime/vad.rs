@@ -302,6 +302,7 @@ pub struct TurnSegmenter {
     turn: usize,
     min_interrupt_ms: i64,
     assistant_speaking: bool,
+    turn_min_interrupt_ms: i64,
     pending_start_ms: Option<i64>,
     spoken: usize,
 }
@@ -345,6 +346,7 @@ impl TurnSegmenter {
             turn: 0,
             min_interrupt_ms: 0,
             assistant_speaking: false,
+            turn_min_interrupt_ms: 0,
             pending_start_ms: None,
             spoken: 0,
         }
@@ -405,7 +407,7 @@ impl TurnSegmenter {
         if let Some(start_ms) = self.pending_start_ms {
             if p >= self.threshold {
                 self.spoken += FRAME;
-                if self.spoken * 1000 >= self.min_interrupt_ms as usize * SAMPLE_RATE {
+                if self.spoken * 1000 >= self.turn_min_interrupt_ms as usize * SAMPLE_RATE {
                     ops.push(Op::SpeechStarted(start_ms));
                     self.pending_start_ms = None;
                 }
@@ -456,7 +458,8 @@ impl TurnSegmenter {
         self.spoken = 0;
         self.prefix.clear();
         let start_ms = samples_to_ms(start - prefix.len() as i64);
-        self.pending_start_ms = (self.assistant_speaking && self.min_interrupt_ms > 0).then_some(start_ms);
+        self.turn_min_interrupt_ms = if self.assistant_speaking { self.min_interrupt_ms } else { 0 };
+        self.pending_start_ms = (self.turn_min_interrupt_ms > 0).then_some(start_ms);
         if self.pending_start_ms.is_none() {
             ops.push(Op::SpeechStarted(start_ms));
         }
@@ -481,6 +484,7 @@ impl TurnSegmenter {
         self.turn = 0;
         self.pending_start_ms = None;
         self.spoken = 0;
+        self.turn_min_interrupt_ms = 0;
         if self.eot.is_some() {
             self.recent.clear();
         }
@@ -520,6 +524,7 @@ impl TurnSegmenter {
         self.turn = 0;
         self.pending_start_ms = None;
         self.spoken = 0;
+        self.turn_min_interrupt_ms = 0;
         if self.eot.is_some() {
             self.recent.clear();
         }
@@ -794,6 +799,17 @@ mod tests {
         assert!(seg.pending_start());
         assert_eq!(kinds(&seg.feed(&speech(12, SAMPLE_RATE))), ["started"]);
         assert!(!seg.pending_start());
+    }
+
+    #[test]
+    fn a_threshold_change_during_a_turn_applies_to_the_next_turn() {
+        let mut seg = energy(&server(no_prefix()), None);
+        seg.set_overlap_rule(320, true);
+        assert!(kinds(&seg.feed(&speech(3, SAMPLE_RATE))).is_empty());
+        seg.set_overlap_rule(64, true);
+        assert!(kinds(&seg.feed(&speech(2, SAMPLE_RATE))).is_empty());
+        assert_eq!(kinds(&seg.feed(&silence(16, SAMPLE_RATE))), ["backchannel", "commit"]);
+        assert_eq!(kinds(&seg.feed(&speech(3, SAMPLE_RATE))), ["started"]);
     }
 
     #[test]

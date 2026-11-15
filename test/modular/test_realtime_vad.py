@@ -454,6 +454,26 @@ def test_playback_update_during_a_turn_applies_to_the_next_turn(vad_client):
     assert not [e for e in second if e.get("mstar", {}).get("backchannel")]
 
 
+def test_threshold_update_during_a_turn_applies_to_the_next_turn(vad_client):
+    client, _ = vad_client
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        _open_with(ws, {"turn_detection": {"type": "server_vad", "prefix_padding_ms": 0},
+                        "mstar": {"chunk_seconds": 300, "min_interrupt_ms": 320, "assistant_speaking": True}})
+        _send(ws, _speech(3), step=3 * FRAME)
+        ws.send_text(json.dumps({"type": "transcription_session.update", "session": {
+            "mstar": {"min_interrupt_ms": 64}}}))
+        assert json.loads(ws.receive_text())["type"] == "transcription_session.updated"
+        _send(ws, _speech(2), step=2 * FRAME)
+        assert not [e for e in _barrier(ws) if e["type"] == "input_audio_buffer.speech_started"]
+        _send(ws, _silence(16), step=16 * FRAME)
+        first = _barrier(ws)
+        assert len([e for e in first if e.get("mstar", {}).get("backchannel")]) == 2
+        _send(ws, np.concatenate([_speech(3), _silence(16)]), step=19 * FRAME)
+        second = _barrier(ws)
+    assert [e["type"] for e in second if e["type"] in TURN_EVENTS] == list(TURN_EVENTS)
+    assert not [e for e in second if e.get("mstar", {}).get("backchannel")]
+
+
 def test_pending_overlap_does_not_emit_a_partial_before_its_start(vad_client):
     client, _ = vad_client
     with client.websocket_connect("/v1/realtime?intent=transcription") as ws:

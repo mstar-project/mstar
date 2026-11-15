@@ -319,6 +319,22 @@ def test_overlap_rule_matches_on_both_frontends(stack, monkeypatch, min_interrup
                for e in py[0]) is backchannel
 
 
+@needs_vad
+def test_threshold_update_does_not_promote_the_open_turn_on_either_frontend(stack, monkeypatch):
+    audio = np.concatenate([np.zeros(16000, dtype=np.float32), _speech_16k()[:32000],
+                            np.zeros(16000, dtype=np.float32)])
+    events = [_session(turn_detection={"type": "server_vad", "prefix_padding_ms": 0},
+                       mstar={"min_interrupt_ms": 5000, "assistant_speaking": True}),
+              *_appends(audio[:32000], 16000, 0.1),
+              _session(mstar={"min_interrupt_ms": 100}),
+              *_appends(audio[32000:], 16000, 0.1)]
+    py, rust = _both(stack, monkeypatch, events)
+    _assert_same(py, rust)
+    assert not any(e["type"] == "input_audio_buffer.speech_started" for e in py[0])
+    assert any(e["type"] == "input_audio_buffer.committed" and e.get("mstar") == {"backchannel": True}
+               for e in py[0])
+
+
 @pytest.mark.skipif(not HAS_SMART_TURN, reason="no Smart Turn weights (hf download pipecat-ai/smart-turn-v3)")
 @pytest.mark.parametrize("eagerness", ["high", "auto"])
 def test_semantic_vad_asks_the_end_of_turn_model_alike(stack, monkeypatch, eagerness):
