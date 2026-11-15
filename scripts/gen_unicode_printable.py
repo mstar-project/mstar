@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write Rust's refusal-text printability table from this Python interpreter.
+"""Write both frontends' refusal-text printability tables from Python 3.12.
 
 ``str.isprintable`` changes when CPython updates its Unicode tables. Rust's
 ``regex`` crate has its own tables, so a category regex can disagree with the
@@ -8,8 +8,8 @@ Python frontend. Regenerate with CPython 3.12 (UCD 15.0.0)::
     python scripts/gen_unicode_printable.py
 
 ``test/rust/test_unicode_printable.py`` checks every code point when run under
-that source UCD. Newer interpreters have different printability tables; moving
-the pinned version needs an explicit review of which frontend versions agree.
+that source UCD. Both frontends read the generated ranges, so newer Python
+versions keep the same refusal text. Moving the pinned version is deliberate.
 """
 
 from __future__ import annotations
@@ -18,7 +18,9 @@ import sys
 import unicodedata
 from pathlib import Path
 
-TABLE = Path(__file__).resolve().parents[1] / "rust/server/src/unicode_printable.rs"
+ROOT = Path(__file__).resolve().parents[1]
+TABLE = ROOT / "rust/server/src/unicode_printable.rs"
+PYTHON_TABLE = ROOT / "mstar/api_server/unicode_printable_ranges.py"
 PER_LINE = 4
 SOURCE_UCD_VERSION = "15.0.0"
 
@@ -27,9 +29,16 @@ HEADER = f"""\
 //
 // Code points for which CPython's `str.isprintable` is false, as inclusive,
 // sorted, nonadjacent ranges. `media::py_repr` reads this table to quote a
-// client's rejected value like the Python 3.12 frontend does. This pins the
-// refusal text to UCD {SOURCE_UCD_VERSION}; newer interpreters can differ.
+// client's rejected value. Both frontends pin refusal text to UCD {SOURCE_UCD_VERSION}.
 """
+
+PYTHON_HEADER = f'''\
+"""Generated printability ranges pinned to CPython 3.12 (UCD {SOURCE_UCD_VERSION}).
+
+Run scripts/gen_unicode_printable.py to update both frontend tables together.
+"""
+
+'''
 
 
 def unprintable_ranges() -> list[tuple[int, int]]:
@@ -60,6 +69,21 @@ def render(ranges: list[tuple[int, int]]) -> str:
     )
 
 
+def render_python(ranges: list[tuple[int, int]]) -> str:
+    pairs = [f"(0x{low:04x}, 0x{high:04x})," for low, high in ranges]
+    lines = [
+        "    " + " ".join(pairs[i:i + PER_LINE]).rstrip()
+        for i in range(0, len(pairs), PER_LINE)
+    ]
+    return (
+        PYTHON_HEADER
+        + f'UNICODE_VERSION = "{SOURCE_UCD_VERSION}"\n'
+        + "UNPRINTABLE_RANGES = (\n"
+        + "\n".join(lines)
+        + "\n)\n"
+    )
+
+
 def main() -> None:
     if unicodedata.unidata_version != SOURCE_UCD_VERSION:
         raise SystemExit(
@@ -68,8 +92,9 @@ def main() -> None:
         )
     ranges = unprintable_ranges()
     TABLE.write_text(render(ranges))
+    PYTHON_TABLE.write_text(render_python(ranges))
     total = sum(high - low + 1 for low, high in ranges)
-    print(f"{TABLE}: {total} code points in {len(ranges)} ranges (UCD {unicodedata.unidata_version})")
+    print(f"{TABLE}, {PYTHON_TABLE}: {total} code points in {len(ranges)} ranges (UCD {unicodedata.unidata_version})")
 
 
 if __name__ == "__main__":

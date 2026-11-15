@@ -38,6 +38,7 @@ from uuid import uuid4
 
 import numpy as np
 
+from mstar.api_server.pinned_repr import pinned_repr
 from mstar.utils.threads import Thread
 
 # MIME (top-level type or full type) -> file extension used when persisting.
@@ -112,7 +113,7 @@ def check_audio_format(fmt: str | None, stream: bool = False, sample_rate: int |
     if fmt not in allowed:
         how = "streamed" if stream else "produced"
         raise ValueError(
-            f"response_format {fmt!r} cannot be {how} by this server; use one of: {', '.join(allowed)}"
+            f"response_format {pinned_repr(fmt)} cannot be {how} by this server; use one of: {', '.join(allowed)}"
         )
     return fmt
 
