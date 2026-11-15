@@ -58,6 +58,7 @@ from mstar.model.minimax_h3.config import (
     VAE_ENCODER_NODE,
     VAE_SHARD,
     H3Config,
+    H3TransformerConfig,
     align_num_frames,
     audio_latent_num_frames,
     resolve_canvas_size,
@@ -159,6 +160,32 @@ MAX_INFERENCE_STEPS = 200
 CANVAS_MULTIPLE = 32  # the VAE's 16 times the transformer's 2-wide patch
 
 
+def dit_state(t: H3TransformerConfig) -> list[Array | SeqShard]:
+    """The DiT's attention over each request's packed rows, its padding a segment of its own in the same row, the
+    token refiner's over the prompt, and the DiT's sequence shard; nothing here keeps state. On SP ranks the
+    shard splits the packed rows (one row a step, read segmented, so cut contiguously), which the attention
+    exchanges for heads (Ulysses); on SDPA it can't run there. Shared by the MiniMax-H3 family's models."""
+    heads, entry = t.num_attention_heads, dit_entry(t.num_attention_heads, t.attention_head_dim)
+    return [
+        Array(
+            DIT_ROWS, nodes={DIT_NODE}, layers=frozenset(range(t.num_layers)), entry=entry, max_len=0,
+            reads={DIT_ATTN: Read(mask=Block(), op=Attend(q_heads=heads), packed=False, segmented=True)},
+        ),
+        Array(
+            PROMPT_ROWS, nodes={TEXT_ENCODER_NODE}, layers=frozenset(range(t.token_refiner_num_layers)),
+            entry=entry, labels={TEXT_SPAN}, max_len=0,
+            reads={REFINER_ATTN: Read(mask=Block(), op=Attend(q_heads=heads), packed=False)},
+        ),
+        SeqShard(DIT_SHARD, nodes={DIT_NODE}, labels={H3DenoiseSubmodule.MAIN_SPAN}),
+    ]
+
+
+# the DiT's two segments are a request's rows and their padding
+DIT_KERNEL_SETTINGS = {
+    DIT_ATTN: {"max_segments_per_request": 2, "workspace_mb": 128}, REFINER_ATTN: {"workspace_mb": 128},
+}
+
+
 class H3Model(Model):
     """MiniMax-H3 (33B DiT, guidance-distilled) joint audio-video generation."""
 
@@ -231,28 +258,10 @@ class H3Model(Model):
 
     # ------------------------------------------------------------ structure
     def declare_state(self) -> list[Array | SeqShard]:
-        """The DiT's attention over each request's packed rows, its padding a segment of its own in the same row, the
-        token refiner's over the prompt, and the DiT's sequence shard; nothing here keeps state. On SP ranks the
-        shard splits the packed rows (one row a step, read segmented, so cut contiguously), which the attention
-        exchanges for heads (Ulysses); on SDPA it can't run there."""
-        t = self.config.transformer
-        heads, entry = t.num_attention_heads, dit_entry(t.num_attention_heads, t.attention_head_dim)
-        return [
-            Array(
-                DIT_ROWS, nodes={DIT_NODE}, layers=frozenset(range(t.num_layers)), entry=entry, max_len=0,
-                reads={DIT_ATTN: Read(mask=Block(), op=Attend(q_heads=heads), packed=False, segmented=True)},
-            ),
-            Array(
-                PROMPT_ROWS, nodes={TEXT_ENCODER_NODE}, layers=frozenset(range(t.token_refiner_num_layers)),
-                entry=entry, labels={TEXT_SPAN}, max_len=0,
-                reads={REFINER_ATTN: Read(mask=Block(), op=Attend(q_heads=heads), packed=False)},
-            ),
-            SeqShard(DIT_SHARD, nodes={DIT_NODE}, labels={H3DenoiseSubmodule.MAIN_SPAN}),
-        ]
+        return dit_state(self.config.transformer)
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
-        # the DiT's two segments are a request's rows and their padding
-        return {DIT_ATTN: {"max_segments_per_request": 2, "workspace_mb": 128}, REFINER_ATTN: {"workspace_mb": 128}}
+        return {key: dict(settings) for key, settings in DIT_KERNEL_SETTINGS.items()}
 
     def get_node_resources(self) -> list[SeqShardSpec]:
         """The video decoder's sequence shard, which splits each request's clips, which nothing exchanges

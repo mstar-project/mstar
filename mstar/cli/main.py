@@ -76,6 +76,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "flux2_klein": "flux2_klein.yaml",
     "ltx2_5": "ltx2_5.yaml",
     "minimax_h3": "minimax_h3.yaml",
+    "minimax_h3_image": "minimax_h3_image.yaml",
     # bf16 fits one 141 GB GPU; muse_glimmer_tp2.yaml for two 80 GB ones
     "muse_glimmer": "muse_glimmer.yaml",
     # bf16 on four 80 GB GPUs; ripple_65b_tp2.yaml for two 141 GB ones
@@ -162,9 +163,9 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat in a hat\"))")
     if model in ("cosmos3", "cosmos3_super"):
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a red cube on a wooden table\"))")
-    if model in ("flux2_klein", "flux2_klein_9b", "z_image_turbo"):
+    if model in ("flux2_klein", "flux2_klein_9b", "z_image_turbo", "minimax_h3_image"):
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat holding a sign\"))")
-    if model in ("flux2_klein", "flux2_klein_9b"):  # Z-Image is text-to-image only
+    if model in ("flux2_klein", "flux2_klein_9b", "minimax_h3_image"):  # Z-Image is text-to-image only
         lines.append("    open(\"edit.png\",\"wb\").write(client.edit_image(\"make it a watercolor\", \"out.png\"))")
     if model == "ltx2_5":
         lines.append("    res = client.generate(text=\"a dog barking on a beach at sunset\",")
@@ -221,7 +222,7 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
     # OpenAI-compatible snippet for the models that map to OpenAI semantics.
     if model in ("bagel", "qwen3_omni", "orpheus", "kokoro", "cosmos3", "cosmos3_super",
                  "whisper_large", "whisper_large_v3_turbo", "higgs_audio", "qwen3_asr", "qwen3_asr_realtime",
-                 "flux2_klein", "flux2_klein_9b", "z_image_turbo", "ltx2_5", "minimax_h3",
+                 "flux2_klein", "flux2_klein_9b", "z_image_turbo", "ltx2_5", "minimax_h3", "minimax_h3_image",
                  "muse_glimmer", "ripple_65b", "phi4mm"):
         lines += ["", "  OpenAI-compatible:",
                   "    from openai import OpenAI",
@@ -239,7 +240,7 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
         if model in ("whisper_large", "whisper_large_v3_turbo", "higgs_audio", "qwen3_asr", "qwen3_asr_realtime"):
             lines.append(f"    oai.audio.transcriptions.create(model=\"{model}\", "
                          "file=open(\"speech.wav\", \"rb\"), language=\"en\")")
-        if model in ("flux2_klein", "flux2_klein_9b", "z_image_turbo"):
+        if model in ("flux2_klein", "flux2_klein_9b", "z_image_turbo", "minimax_h3_image"):
             lines.append(f"    oai.images.generate(model=\"{model}\", prompt=\"a cat in a hat\", size=\"1024x1024\")")
         if model == "ltx2_5":
             lines.append("    oai.post(\"/videos/generations\", cast_to=dict, body={\"model\": \"ltx2_5\",")

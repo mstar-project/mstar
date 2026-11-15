@@ -134,19 +134,31 @@ class H3KeyframeEncoder(nn.Module):
     def encode(self, frame: torch.Tensor, seed: int) -> torch.Tensor:
         """uint8 ``[3, H, W]`` on the device -> normalized latents ``[1, 24, 1, H / 16, W / 16]``
         fp32 on that device (``encode_vae_condition``)."""
+        return self.posterior_latents(self.frame_moments(frame), torch.Generator().manual_seed(seed))
+
+    @torch.no_grad()
+    def frame_moments(self, frame: torch.Tensor) -> torch.Tensor:
+        """uint8 ``[3, H, W]`` on the device -> ``[1, 48, 1, H / 16, W / 16]``, ImageNet-normalized
+        in fp32 first."""
         device = frame.device
         # every host constant moved before the encoder runs: a pageable copy waits for the stream
-        mean, std, latents_mean, latents_std = (
-            torch.tensor(values, device=device).view(1, -1, 1, 1, 1)
-            for values in (PIXEL_MEAN, PIXEL_STD, self.vae.latents_mean, self.vae.latents_std)
-        )
+        mean, std = (torch.tensor(values, device=device).view(1, -1, 1, 1, 1) for values in (PIXEL_MEAN, PIXEL_STD))
         pixels = (frame[None, :, None].to(torch.float32).div(255.0) - mean) / std
-        moments = self.moments(pixels.to(self.quant_conv.weight.dtype))
-        # DiagonalGaussianDistribution.sample, its noise drawn on the CPU (pinned, so moving it
-        # doesn't wait for the encoder either)
+        return self.moments(pixels.to(self.quant_conv.weight.dtype))
+
+    @torch.no_grad()
+    def posterior_latents(self, moments: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+        """``DiagonalGaussianDistribution.sample`` from ``generator`` (a CPU one), rounded to fp16,
+        then normalized with the VAE's latent statistics."""
+        device = moments.device
+        latents_mean, latents_std = (
+            torch.tensor(values, device=device).view(1, -1, 1, 1, 1)
+            for values in (self.vae.latents_mean, self.vae.latents_std)
+        )
+        # the noise drawn on the CPU (pinned, so moving it doesn't wait for the encoder)
         posterior_mean, logvar = moments.chunk(2, dim=1)
         posterior_std = torch.exp(0.5 * logvar.clamp(-30.0, 20.0))
-        noise = torch.randn(posterior_mean.shape, generator=torch.Generator().manual_seed(seed), dtype=moments.dtype,
+        noise = torch.randn(posterior_mean.shape, generator=generator, dtype=moments.dtype,
                             pin_memory=device.type != "cpu").to(device, non_blocking=True)
         latents = (posterior_mean + posterior_std * noise).to(torch.float16).float()
         return (latents - latents_mean) / latents_std

@@ -743,6 +743,13 @@ def _minimax_h3(name, model_kwargs, tmp_path, monkeypatch):
     return model
 
 
+def _minimax_h3_image(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.minimax_h3_image.config import H3ImageConfig
+    model = _constructed(name, model_kwargs)
+    model.set_config(H3ImageConfig())
+    return model
+
+
 def _phi4mm(name, model_kwargs, tmp_path, monkeypatch):
     """Phi-4-mini's head and rotary geometry with two layers: the resource rules read
     the layer and head counts and the rotary width, not the other sizes."""
@@ -944,6 +951,7 @@ _FACTORIES = {
     "MiniCPMOModel": _minicpm_o,
     "LTX25Model": _ltx2_5,
     "H3Model": _minimax_h3,
+    "H3ImageModel": _minimax_h3_image,
     "MuseGlimmerModel": _muse_glimmer,
     "RippleModel": _ripple,
     "OrpheusModel": _orpheus,

@@ -14,6 +14,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import torch
+from safetensors import safe_open
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.bigvgan import fold_weight_norm
@@ -48,6 +49,7 @@ _FUSED_RULES = [
     StackedParamRule(".mlp.fc1", ".mlp.value_proj", 1),
 ]
 _TEXT_PREFIXES = ("token_refiner.", "condition_proj.")
+_VIDEO_HEAD = "final_layer.video_out."
 _VISION_PREFIX = "model.visual."
 
 
@@ -78,27 +80,36 @@ def _check_inv_freq(stored: torch.Tensor, config: H3Config) -> None:
 
 def build_transformer(
     config: H3Config, snapshot: Path, device, comm_group: CommGroup | None = None,
-    dtype: torch.dtype = torch.bfloat16,
+    dtype: torch.dtype = torch.bfloat16, partition: str = PARTITION, output_heads: str | None = None,
 ) -> H3DiT:
+    """``output_heads`` names a file under ``partition`` holding the per-step video heads
+    (``video_out.weight [n, out, in]``, ``video_out.bias``), which replace the transformer's
+    own ``final_layer.video_out``."""
     cfg = config.transformer
     with torch.device("meta"):
         dit = H3DiT(cfg, comm_group)
     dit.to(dtype)
     dit.keep_fp32()  # on meta: the fp32 modules are allocated in fp32, never rounded
     dit.to_empty(device=device)
+    root = Path(snapshot) / partition
+
+    def unread(name: str) -> bool:
+        # the refiner's keys stay on disk, and the single head the step heads replace
+        return name.startswith(_TEXT_PREFIXES) or (output_heads is not None and name.startswith(_VIDEO_HEAD))
 
     def skip(name: str) -> bool:
         return name.startswith(_TEXT_PREFIXES) or name == "rope.inv_freq"
 
     def weights():
-        # the refiner's keys stay on disk; the stored rope table is checked, then dropped
-        unread = lambda name: name.startswith(_TEXT_PREFIXES)  # noqa: E731
-        for name, tensor in iter_transformers_component(
-            Path(snapshot) / PARTITION / "transformer", device, skip=unread,
-        ):
+        # the stored rope table is checked, then dropped
+        for name, tensor in iter_transformers_component(root / "transformer", device, skip=unread):
             if name == "rope.inv_freq":
                 _check_inv_freq(tensor, config)
             yield name, tensor
+        if output_heads is not None:
+            with safe_open(str(root / output_heads), framework="pt", device=str(device)) as heads:
+                for name in heads.keys():
+                    yield "final_layer." + name, heads.get_tensor(name)
 
     return load_native(
         dit, split_fused(weights(), cfg.num_attention_heads, cfg.attention_head_dim), lambda n: n,
@@ -106,7 +117,8 @@ def build_transformer(
     )
 
 
-def build_text_conditioner(config: H3Config, snapshot: Path, device, dtype: torch.dtype = torch.bfloat16):
+def build_text_conditioner(config: H3Config, snapshot: Path, device, dtype: torch.dtype = torch.bfloat16,
+                           partition: str = PARTITION):
     cfg = config.transformer
     with torch.device("meta"):
         module = H3TextConditioner(cfg)
@@ -115,15 +127,15 @@ def build_text_conditioner(config: H3Config, snapshot: Path, device, dtype: torc
     def skip(name: str) -> bool:
         return not name.startswith(_TEXT_PREFIXES)
 
-    weights = iter_transformers_component(Path(snapshot) / PARTITION / "transformer", device, skip=skip)
+    weights = iter_transformers_component(Path(snapshot) / partition / "transformer", device, skip=skip)
     return load_native(
         module, split_fused(weights, cfg.num_attention_heads, cfg.attention_head_dim), lambda n: n,
         "MiniMax-H3 text conditioner", stacked_params=_FUSED_RULES, skip=skip,
     )
 
 
-def build_text_encoder(config: H3Config, snapshot: Path, device, dtype: torch.dtype = torch.bfloat16
-                       ) -> Qwen3HiddenStateEncoder:
+def build_text_encoder(config: H3Config, snapshot: Path, device, dtype: torch.dtype = torch.bfloat16,
+                       partition: str = PARTITION) -> Qwen3HiddenStateEncoder:
     """Qwen3-VL-32B's language model through layer 50; the vision tower, the 14 layers
     after the tap, the final norm and the LM head stay on disk."""
     with torch.device("meta"):
@@ -131,17 +143,18 @@ def build_text_encoder(config: H3Config, snapshot: Path, device, dtype: torch.dt
     materialize(encoder, dtype, device)
     skip = qwen3_vl_text_skip(config.text)
     return load_native(
-        encoder, iter_transformers_component(Path(snapshot) / PARTITION / "text_encoder", device, skip=skip),
+        encoder, iter_transformers_component(Path(snapshot) / partition / "text_encoder", device, skip=skip),
         remap_qwen3_vl_text_key, "MiniMax-H3 Qwen3-VL text encoder", stacked_params=qkv_rules(config.text),
         skip=skip,
     )
 
 
-def build_vision_tower(snapshot: Path, device, dtype: torch.dtype = torch.bfloat16) -> QwenVisionModel:
+def build_vision_tower(snapshot: Path, device, dtype: torch.dtype = torch.bfloat16,
+                       partition: str = PARTITION) -> QwenVisionModel:
     """Qwen3-VL-32B's vision tower with its deepstack mergers (FL2VA keyframes), from the
     text encoder's shards (``model.visual.``). Its rotary ``inv_freq`` is derived, fp32 as
     the reference keeps it, so completeness is over the persistent state."""
-    source = Path(snapshot) / PARTITION / "text_encoder"
+    source = Path(snapshot) / partition / "text_encoder"
     config = QwenVisionConfig.from_hf(source)
     with torch.device("meta"):
         tower = QwenVisionModel(config)

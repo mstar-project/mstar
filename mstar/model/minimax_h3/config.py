@@ -90,6 +90,11 @@ class H3TransformerConfig:
     # not in the config: diffusers' MiniMaxH3RotaryPosEmbed default, and the stored
     # ``rope.inv_freq`` agrees with it
     rope_theta: float = 10000.0
+    # MiniMax-H3-Image's transformer has no audio stream (``audio_enabled: false``)
+    audio_enabled: bool = True
+    # One video output head per sampling step (MiniMax-H3-Image's distilled heads); 1 is H3's
+    # single head
+    num_output_heads: int = 1
 
     @property
     def inner_dim(self) -> int:
@@ -111,6 +116,8 @@ class H3TransformerConfig:
             raise ValueError(f"final_adaln_out_features {self.final_adaln_out_features} is not 2 x hidden")
         if self.patch_size[0] != 1:
             raise NotImplementedError(f"temporal patch {self.patch_size[0]}: only 1 is implemented")
+        if self.num_output_heads < 1:
+            raise ValueError(f"num_output_heads must be positive, got {self.num_output_heads}")
 
 
 @dataclass(frozen=True)
@@ -132,6 +139,8 @@ class H3VideoVAEConfig:
     decoder_head_dim: int = 64
     decoder_rope_theta: float = 100.0
     decoder_rope_dim_ratio: float = 0.75
+    # MiniMax-H3-Image's decoder: one latent frame, rotary over (h, w) only, no temporal patch
+    decoder_2d: bool = False
 
     @property
     def latents_per_chunk(self) -> int:
