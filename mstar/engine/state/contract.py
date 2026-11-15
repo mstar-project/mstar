@@ -5,7 +5,7 @@ Declarations are values: mappings are read-only, sets are frozensets, and everyt
 
 from collections.abc import Iterator, Mapping
 from dataclasses import KW_ONLY, dataclass
-from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, get_args, get_origin
+from typing import ClassVar, Literal, NamedTuple, get_args, get_origin
 
 import torch
 
@@ -13,9 +13,6 @@ from mstar.engine.resources.attn.config import SP_EXCHANGES
 from mstar.engine.resources.kv.config import Span
 from mstar.engine.resources.position.config import LongRoPE
 from mstar.engine.resources.step import Segment
-
-if TYPE_CHECKING:
-    from mstar.engine.resources.sampler.grammar import GrammarRequest
 
 
 class FrozenMap(Mapping):
@@ -471,9 +468,10 @@ class SampleSettings:
     top_p_min_keep: int = 1
     return_logprobs: bool = False
     logprobs_mode: str = "raw"
-    # the request's ``structured_outputs`` grammar, which a model that declares ``STRUCTURED_OUTPUTS`` attaches
-    # (`request_grammar`); it needs the sampler's ``enable_grammar``
-    grammar: "GrammarRequest | None" = None
+    # the request's ``structured_outputs`` grammar, which a model that declares ``STRUCTURED_OUTPUTS`` attaches: the
+    # `GrammarRequest` `request_grammar` returns, opaque here (the contract imports no resource type). It needs the
+    # sampler's ``enable_grammar``
+    grammar: object = None
 
 
 @dataclass(frozen=True, kw_only=True)
