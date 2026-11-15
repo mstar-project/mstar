@@ -64,6 +64,8 @@ def test_the_wait_for_messages_ends_at_the_summary():
 def _serving_conductor(max_concurrent=None) -> Conductor:
     """Enough state for the real ingest and done paths, sending into a list."""
     c = _conductor()
+    c._episode_array_names = frozenset()
+    c._queued_since = {}
     c.sent = []
     c.communicator = types.SimpleNamespace(send=lambda entity_id, msg: c.sent.append((entity_id, msg)))
     c.max_concurrent_requests = max_concurrent
@@ -93,3 +95,15 @@ def test_a_request_done_and_one_queued_at_capacity_are_counted():
     c._process_request_done("a")
     assert [b.request_id for b in c.waiting_queue] == ["b"]
     assert (c._done_since_summary, c._queued_since_summary) == (1, 1)
+
+
+def test_full_non_episode_queue_is_not_scanned():
+    class NoScan(list):
+        def __iter__(self):
+            raise AssertionError("a full queue should wait for a free request slot")
+
+    c = _serving_conductor(max_concurrent=1)
+    c.requests["running"] = object()
+    c.waiting_queue = NoScan([_request("waiting")])
+    c._try_admit_waiting()
+    assert [body.request_id for body in c.waiting_queue[:]] == ["waiting"]

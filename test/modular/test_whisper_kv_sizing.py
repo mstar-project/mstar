@@ -93,13 +93,19 @@ def _conductor(max_concurrent_requests: int | None) -> Conductor:
     """Just the admission gate: ``_ingest_request`` and ``_try_admit_waiting``
     as they are, with dispatch reduced to recording the request in flight."""
     c = object.__new__(Conductor)
+    c._episode_array_names = frozenset()
+    c._queued_since = {}
     c.requests = {}
     c.waiting_queue = []
     c._client_streams = {}
     c.max_concurrent_requests = max_concurrent_requests
     c._early_abort_requests = set()
     c.enable_nvtx = False
-    c._admit_request = lambda body: c.requests.__setitem__(body.request_id, body)
+    def admit(body):
+        c.requests[body.request_id] = body
+        return True
+
+    c._admit_request = admit
     return c
 
 
@@ -126,7 +132,7 @@ def _serve(model: WhisperModel, conductor: Conductor, arrivals: int) -> tuple[in
     batch_size = WhisperDecoderSubmodule.MAX_PREFILL_BATCH_SIZE
     for i in range(arrivals):
         conductor._ingest_request(SimpleNamespace(
-            request_id=f"r{i}", model_kwargs={}, client_request_id=None, input_open=False))
+            request_id=f"r{i}", model_kwargs={}, client_request_id=None, input_open=False, episode=None))
 
     running: list[str] = []
     refused = peak = finished = 0
