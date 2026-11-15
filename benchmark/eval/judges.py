@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
-from functools import cache
+from functools import cache, lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -175,11 +175,23 @@ def sim_judge(model_id: str, device: str | None = None) -> SpeakerSimJudge:
     return SpeakerSimJudge(model_id, device)
 
 
-@cache
 def mos_judge(
     device: str | None = None, repo_path: str | Path | None = None, checkpoint_path: str | Path | None = None
 ) -> MosJudge:
-    return MosJudge(device, repo_path=repo_path, checkpoint_path=checkpoint_path)
+    local_id = None
+    if repo_path is not None and checkpoint_path is not None:
+        local_id = mos_local_id(repo_path, checkpoint_path)
+    return _cached_mos_judge(device, repo_path, checkpoint_path, local_id)
+
+
+@lru_cache(maxsize=4)
+def _cached_mos_judge(
+    device: str | None, repo_path: str | Path | None, checkpoint_path: str | Path | None, local_id: str | None
+) -> MosJudge:
+    judge = MosJudge(device, repo_path=repo_path, checkpoint_path=checkpoint_path)
+    if local_id is not None and judge.id != local_id:
+        raise RuntimeError("local UTMOS files changed while loading")
+    return judge
 
 
 def _file_digest(path: Path) -> str:

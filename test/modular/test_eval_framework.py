@@ -1081,6 +1081,76 @@ def test_utmos_loads_explicit_local_code_and_weights_without_a_hub_fetch(tmp_pat
     assert judge.id.startswith("utmos22_strong:local:")
 
 
+def test_utmos_cache_reloads_when_local_weights_change(tmp_path):
+    import argparse
+
+    import torch
+
+    from benchmark.eval import judges
+    from benchmark.eval.suites.tts import TTSSuite
+
+    repo = tmp_path / "SpeechMOS"
+    repo.mkdir()
+    (repo / "hubconf.py").write_text(
+        "import torch\n"
+        "def utmos22_strong(pretrained=True):\n"
+        "    assert not pretrained\n"
+        "    return torch.nn.Linear(1, 1)\n"
+    )
+    checkpoint = tmp_path / "utmos.pt"
+    model = torch.nn.Linear(1, 1)
+    parser = argparse.ArgumentParser()
+    TTSSuite.add_args(parser)
+    args = parser.parse_args(["--mos", "--mos-repo", str(repo), "--mos-checkpoint", str(checkpoint)])
+    args.model_name = "test"
+
+    with torch.no_grad():
+        model.weight.fill_(1)
+    torch.save(model.state_dict(), checkpoint)
+    suite = TTSSuite(args)
+    first_id = suite.config()["mos_judge"]
+    first = judges.mos_judge("cpu", repo, checkpoint)
+    assert first.model.weight.item() == 1
+
+    with torch.no_grad():
+        model.weight.fill_(2)
+    torch.save(model.state_dict(), checkpoint)
+    second_id = suite.config()["mos_judge"]
+    second = judges.mos_judge("cpu", repo, checkpoint)
+    assert second_id != first_id
+    assert second.id == second_id
+    assert second is not first
+    assert second.model.weight.item() == 2
+
+
+def test_utmos_default_hub_path_still_reuses_the_judge(monkeypatch):
+    import torch
+
+    from benchmark.eval import judges
+
+    calls = []
+
+    class FakeModel:
+        def to(self, device):
+            return self
+
+        def eval(self):
+            return self
+
+    def load(*args, **kwargs):
+        calls.append((args, kwargs))
+        return FakeModel()
+
+    monkeypatch.setattr(torch.hub, "load", load)
+    judges._cached_mos_judge.cache_clear()
+    try:
+        first = judges.mos_judge("cpu")
+        assert judges.mos_judge("cpu") is first
+        assert calls == [(("tarepan/SpeechMOS:v1.2.0", "utmos22_strong"), {"trust_repo": True})]
+    finally:
+        judges._cached_mos_judge.cache_clear()
+
+
 def test_tts_offline_utmos_paths_reach_the_judge_and_are_checked(tmp_path, monkeypatch):
     import argparse
 
