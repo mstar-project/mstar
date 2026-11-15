@@ -10,10 +10,15 @@ import sys
 import unicodedata
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 TABLE = ROOT / "rust/server/src/unicode_printable.rs"
 GENERATOR = ROOT / "scripts/gen_unicode_printable.py"
 SOURCE_UCD_VERSION = "15.0.0"
+
+if not TABLE.is_file() or not GENERATOR.is_file():
+    pytest.skip("needs the checkout's Rust source (wheel tests copy test/ alone)", allow_module_level=True)
 
 
 def test_rust_printability_table_matches_source_python():
