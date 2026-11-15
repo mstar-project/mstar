@@ -270,6 +270,7 @@ pub enum Op {
     SpeechStarted(i64),
     Audio(Vec<f32>),
     SpeechStopped(i64),
+    Backchannel,
     Commit,
     EndOfTurnFailed(String),
 }
@@ -299,6 +300,11 @@ pub struct TurnSegmenter {
     pub speaking: bool,
     silence: usize,
     turn: usize,
+    min_interrupt_ms: i64,
+    assistant_speaking: bool,
+    turn_min_interrupt_ms: i64,
+    pending_start_ms: Option<i64>,
+    spoken: usize,
 }
 
 impl TurnSegmenter {
@@ -338,7 +344,22 @@ impl TurnSegmenter {
             speaking: false,
             silence: 0,
             turn: 0,
+            min_interrupt_ms: 0,
+            assistant_speaking: false,
+            turn_min_interrupt_ms: 0,
+            pending_start_ms: None,
+            spoken: 0,
         }
+    }
+
+    /// Apply to future turns; an open turn keeps its start decision.
+    pub fn set_overlap_rule(&mut self, min_interrupt_ms: i64, assistant_speaking: bool) {
+        self.min_interrupt_ms = min_interrupt_ms;
+        self.assistant_speaking = assistant_speaking;
+    }
+
+    pub fn pending_start(&self) -> bool {
+        self.pending_start_ms.is_some()
     }
 
     fn remember(&mut self, piece: Vec<f32>) {
@@ -383,6 +404,15 @@ impl TurnSegmenter {
             }
             self.open(start, ops);
         }
+        if let Some(start_ms) = self.pending_start_ms {
+            if p >= self.threshold {
+                self.spoken += FRAME;
+                if self.spoken * 1000 >= self.turn_min_interrupt_ms as usize * SAMPLE_RATE {
+                    ops.push(Op::SpeechStarted(start_ms));
+                    self.pending_start_ms = None;
+                }
+            }
+        }
         ops.push(Op::Audio(frame.to_vec()));
         self.turn += FRAME;
         let paused = self.silence;
@@ -425,8 +455,14 @@ impl TurnSegmenter {
         self.speaking = true;
         self.turn = prefix.len();
         self.silence = 0;
+        self.spoken = 0;
         self.prefix.clear();
-        ops.push(Op::SpeechStarted(samples_to_ms(start - prefix.len() as i64)));
+        let start_ms = samples_to_ms(start - prefix.len() as i64);
+        self.turn_min_interrupt_ms = if self.assistant_speaking { self.min_interrupt_ms } else { 0 };
+        self.pending_start_ms = (self.turn_min_interrupt_ms > 0).then_some(start_ms);
+        if self.pending_start_ms.is_none() {
+            ops.push(Op::SpeechStarted(start_ms));
+        }
         if !prefix.is_empty() {
             ops.push(Op::Audio(prefix.clone()));
         }
@@ -437,11 +473,18 @@ impl TurnSegmenter {
     }
 
     fn stop(&mut self, end: i64, ops: &mut Vec<Op>) {
-        ops.push(Op::SpeechStopped(samples_to_ms(end)));
+        if self.pending_start_ms.is_none() {
+            ops.push(Op::SpeechStopped(samples_to_ms(end)));
+        } else {
+            ops.push(Op::Backchannel);
+        }
         ops.push(Op::Commit);
         self.speaking = false;
         self.silence = 0;
         self.turn = 0;
+        self.pending_start_ms = None;
+        self.spoken = 0;
+        self.turn_min_interrupt_ms = 0;
         if self.eot.is_some() {
             self.recent.clear();
         }
@@ -479,6 +522,9 @@ impl TurnSegmenter {
         self.speaking = false;
         self.silence = 0;
         self.turn = 0;
+        self.pending_start_ms = None;
+        self.spoken = 0;
+        self.turn_min_interrupt_ms = 0;
         if self.eot.is_some() {
             self.recent.clear();
         }
@@ -635,6 +681,7 @@ mod tests {
                         *end = Some(ms);
                     }
                     Op::Commit => self.close(),
+                    Op::Backchannel => {},
                     Op::EndOfTurnFailed(e) => self.failures.push(e),
                 }
             }
@@ -686,6 +733,7 @@ mod tests {
             .filter_map(|op| match op {
                 Op::SpeechStarted(_) => Some("started"),
                 Op::SpeechStopped(_) => Some("stopped"),
+                Op::Backchannel => Some("backchannel"),
                 Op::Commit => Some("commit"),
                 Op::EndOfTurnFailed(_) => Some("failed"),
                 Op::Audio(_) => None,
@@ -711,6 +759,58 @@ mod tests {
     }
 
     // ── server_vad ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn short_overlap_commits_without_an_interrupt() {
+        let mut seg = energy(&server(no_prefix()), None);
+        seg.set_overlap_rule(160, true);
+        let stream = cat(&[speech(3, SAMPLE_RATE), silence(16, SAMPLE_RATE)]);
+        let ops = seg.feed(&stream);
+        assert_eq!(kinds(&ops), ["backchannel", "commit"]);
+        assert_eq!(ops.iter().filter_map(|op| match op { Op::Audio(a) => Some(a.len()), _ => None }).sum::<usize>(), stream.len());
+    }
+
+    #[test]
+    fn long_overlap_delays_start_but_keeps_its_original_time() {
+        let cfg = ServerVad { prefix_padding_ms: 64, ..ServerVad::default() };
+        let mut seg = energy(&server(cfg), None);
+        seg.set_overlap_rule(160, true);
+        let first = seg.feed(&cat(&[silence(10, SAMPLE_RATE), speech(4, SAMPLE_RATE)]));
+        assert!(kinds(&first).is_empty());
+        let next = seg.feed(&speech(2, SAMPLE_RATE));
+        assert_eq!(kinds(&next), ["started"]);
+        assert!(next.iter().any(|op| *op == Op::SpeechStarted(8 * 32)));
+        assert_eq!(kinds(&seg.feed(&silence(16, SAMPLE_RATE))), ["stopped", "commit"]);
+    }
+
+    #[test]
+    fn an_explicit_commit_marks_a_short_overlap() {
+        let mut seg = energy(&server(no_prefix()), None);
+        seg.set_overlap_rule(160, true);
+        assert!(kinds(&seg.feed(&speech(3, SAMPLE_RATE))).is_empty());
+        assert_eq!(kinds(&seg.end_turn()), ["backchannel"]);
+    }
+
+    #[test]
+    fn a_pending_overlap_holds_incremental_decoding_until_promoted() {
+        let mut seg = energy(&server(no_prefix()), None);
+        seg.set_overlap_rule(1000, true);
+        assert!(kinds(&seg.feed(&speech(20, SAMPLE_RATE))).is_empty());
+        assert!(seg.pending_start());
+        assert_eq!(kinds(&seg.feed(&speech(12, SAMPLE_RATE))), ["started"]);
+        assert!(!seg.pending_start());
+    }
+
+    #[test]
+    fn a_threshold_change_during_a_turn_applies_to_the_next_turn() {
+        let mut seg = energy(&server(no_prefix()), None);
+        seg.set_overlap_rule(320, true);
+        assert!(kinds(&seg.feed(&speech(3, SAMPLE_RATE))).is_empty());
+        seg.set_overlap_rule(64, true);
+        assert!(kinds(&seg.feed(&speech(2, SAMPLE_RATE))).is_empty());
+        assert_eq!(kinds(&seg.feed(&silence(16, SAMPLE_RATE))), ["backchannel", "commit"]);
+        assert_eq!(kinds(&seg.feed(&speech(3, SAMPLE_RATE))), ["started"]);
+    }
 
     #[test]
     fn one_append_with_speech_silence_speech() {
@@ -1216,6 +1316,7 @@ mod tests {
                 events.push(match op {
                     Op::SpeechStarted(ms) => json!(["s", ms]),
                     Op::SpeechStopped(ms) => json!(["p", ms]),
+                    Op::Backchannel => json!(["b"]),
                     Op::Commit => json!(["c"]),
                     Op::EndOfTurnFailed(_) => json!(["f"]),
                     Op::Audio(_) => unreachable!(),

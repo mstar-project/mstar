@@ -304,6 +304,49 @@ def test_server_vad_cuts_the_same_turns(stack, monkeypatch, rate):
     assert any(e["type"] == "input_audio_buffer.speech_started" for e in py[0])
 
 
+@needs_vad
+@pytest.mark.parametrize("min_interrupt_ms, backchannel", [(500, False), (5000, True)])
+def test_overlap_rule_matches_on_both_frontends(stack, monkeypatch, min_interrupt_ms, backchannel):
+    audio = np.concatenate([np.zeros(16000, dtype=np.float32), _speech_16k()[:32000],
+                            np.zeros(16000, dtype=np.float32)])
+    events = [_session(turn_detection={"type": "server_vad", "prefix_padding_ms": 0},
+                       mstar={"min_interrupt_ms": min_interrupt_ms, "assistant_speaking": True}),
+              *_appends(audio, 16000, 0.1)]
+    py, rust = _both(stack, monkeypatch, events)
+    _assert_same(py, rust)
+    assert any(e["type"] == "input_audio_buffer.speech_started" for e in py[0]) is not backchannel
+    assert any(e["type"] == "input_audio_buffer.committed" and e.get("mstar") == {"backchannel": True}
+               for e in py[0]) is backchannel
+
+
+@needs_vad
+def test_threshold_update_does_not_promote_the_open_turn_on_either_frontend(stack, monkeypatch):
+    audio = np.concatenate([np.zeros(16000, dtype=np.float32), _speech_16k()[:32000],
+                            np.zeros(16000, dtype=np.float32)])
+    initial = _session(turn_detection={"type": "server_vad", "prefix_padding_ms": 0},
+                       mstar={"min_interrupt_ms": 5000, "assistant_speaking": True})
+    prefix = _appends(audio[:32000], 16000, 0.1)
+    # The same prefix must have opened a pending turn before the update.
+    probe_py, probe_rust = _both(stack, monkeypatch, [initial, *prefix, {"type": "input_audio_buffer.commit"}])
+    _assert_same(probe_py, probe_rust)
+    assert any(e["type"] == "input_audio_buffer.committed" and e.get("mstar") == {"backchannel": True}
+               for e in probe_py[0])
+    assert probe_py[1] and probe_py[1][-1]["seconds"] > 0
+
+    events = [initial, *prefix,
+              _session(mstar={"min_interrupt_ms": 100}),
+              *_appends(audio[32000:], 16000, 0.1)]
+    py, rust = _both(stack, monkeypatch, events)
+    _assert_same(py, rust)
+    updates = [e["session"]["mstar"] for e in py[0] if e["type"] == "transcription_session.updated"]
+    assert len(updates) == 2
+    assert [e["min_interrupt_ms"] for e in updates] == [5000, 100]
+    assert not any(e["type"] == "input_audio_buffer.speech_started" for e in py[0])
+    committed = [e for e in py[0] if e["type"] == "input_audio_buffer.committed"]
+    assert len(committed) == 1 and committed[0].get("mstar") == {"backchannel": True}
+    assert py[1] and py[1][-1]["seconds"] > 0
+
+
 @pytest.mark.skipif(not HAS_SMART_TURN, reason="no Smart Turn weights (hf download pipecat-ai/smart-turn-v3)")
 @pytest.mark.parametrize("eagerness", ["high", "auto"])
 def test_semantic_vad_asks_the_end_of_turn_model_alike(stack, monkeypatch, eagerness):
@@ -340,6 +383,9 @@ REFUSED_UPDATES = {
     "chunk-cap": {"mstar": {"chunk_seconds": 1000}},
     "unfixed": {"mstar": {"unfixed_tokens": -1}},
     "unfixed-float": {"mstar": {"unfixed_chunks": 1.5}},
+    "min-interrupt-negative": {"mstar": {"min_interrupt_ms": -1}},
+    "min-interrupt-large": {"mstar": {"min_interrupt_ms": 10_001}},
+    "assistant-speaking-number": {"mstar": {"assistant_speaking": 1}},
     "language": {"input_audio_transcription": {"language": 5}},
     "language-long": {"input_audio_transcription": {"language": "x" * 40}},
     "not-objects": {"mstar": [1, 2, 3, 4, 5, 6]},

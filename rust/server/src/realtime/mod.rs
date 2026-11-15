@@ -427,6 +427,9 @@ struct Session {
     short: usize,
     turn_detection: Option<TurnDetection>,
     segmenter: Option<TurnSegmenter>,
+    min_interrupt_ms: i64,
+    assistant_speaking: bool,
+    backchannel: bool,
     stream_samples: i64,
     clock_base: i64,
     clock_in: i64,
@@ -523,6 +526,7 @@ impl Session {
         self.chunk_id = 0;
         self.raw_hypothesis.clear();
         self.emitted.clear();
+        self.backchannel = false;
         self.item_id = item_id();
     }
 
@@ -542,6 +546,8 @@ impl Session {
                 "chunk_seconds": crate::adapters::json_num(self.chunk_seconds),
                 "unfixed_chunks": self.unfixed_chunks,
                 "unfixed_tokens": self.unfixed_tokens,
+                "min_interrupt_ms": self.min_interrupt_ms,
+                "assistant_speaking": self.assistant_speaking,
                 "max_item_seconds": crate::adapters::json_num(self.max_item_seconds),
                 "sample_rate": self.input_format.rate,
             },
@@ -714,13 +720,14 @@ impl Realtime {
             match op {
                 Op::Audio(audio) => {
                     self.s.add(&audio);
-                    if i == n - 1 {
+                    if i == n - 1 && self.s.segmenter.as_ref().is_none_or(|seg| !seg.pending_start()) {
                         if let Some(chunk) = self.s.take_chunk() {
                             self.step(chunk, false).await;
                         }
                     }
                 }
                 Op::Commit => self.commit().await,
+                Op::Backchannel => self.s.backchannel = true,
                 Op::SpeechStarted(ms) => {
                     let e = event("input_audio_buffer.speech_started", json!({"audio_start_ms": ms, "item_id": self.s.item_id}));
                     self.send(e).await;
@@ -757,12 +764,18 @@ impl Realtime {
                 self.emit(&text, 0).await;
             }
         }
-        let committed = event("input_audio_buffer.committed", json!({"item_id": self.s.item_id}));
+        let marker = self.s.backchannel.then(|| json!({"backchannel": true}));
+        let mut committed_fields = json!({"item_id": self.s.item_id});
+        if let Some(mstar) = marker.as_ref() {
+            committed_fields["mstar"] = mstar.clone();
+        }
+        let committed = event("input_audio_buffer.committed", committed_fields);
         self.send(committed).await;
-        let completed = event(
-            "conversation.item.input_audio_transcription.completed",
-            json!({"item_id": self.s.item_id, "transcript": self.current_text()}),
-        );
+        let mut completed_fields = json!({"item_id": self.s.item_id, "transcript": self.current_text()});
+        if let Some(mstar) = marker {
+            completed_fields["mstar"] = mstar;
+        }
+        let completed = event("conversation.item.input_audio_transcription.completed", completed_fields);
         self.send(completed).await;
         self.s.clear();
     }
@@ -814,6 +827,12 @@ impl Realtime {
         let chunk_seconds = number(knobs, "chunk_seconds", s.chunk_seconds, MIN_CHUNK_SECONDS, s.max_item_seconds, false, true, "mstar")?;
         let unfixed_chunks = number(knobs, "unfixed_chunks", s.unfixed_chunks as f64, 0.0, f64::INFINITY, true, false, "mstar")? as i64;
         let unfixed_tokens = number(knobs, "unfixed_tokens", s.unfixed_tokens as f64, 0.0, f64::INFINITY, true, false, "mstar")? as i64;
+        let min_interrupt_ms = number(knobs, "min_interrupt_ms", s.min_interrupt_ms as f64, 0.0, MAX_VAD_MS, true, false, "mstar")? as i64;
+        let assistant_speaking = match knobs.and_then(|k| k.get("assistant_speaking")) {
+            None => s.assistant_speaking,
+            Some(Value::Bool(b)) => *b,
+            Some(other) => return Err(format!("mstar.assistant_speaking must be a boolean; got {}", excerpt(other))),
+        };
         let transcription = object(session.get("input_audio_transcription"), "input_audio_transcription")?;
         let mut request = s.request.clone();
         for name in ["language", "prompt"] {
@@ -843,6 +862,8 @@ impl Realtime {
         s.chunk_seconds = chunk_seconds;
         s.unfixed_chunks = unfixed_chunks;
         s.unfixed_tokens = unfixed_tokens;
+        s.min_interrupt_ms = min_interrupt_ms;
+        s.assistant_speaking = assistant_speaking;
         if fmt != s.input_format {
             s.set_input_format(fmt);
         }
@@ -862,6 +883,10 @@ impl Realtime {
                     }
                 }
             }
+        }
+        if let Some(seg) = &mut s.segmenter {
+            let min_ms = if matches!(s.turn_detection.as_ref(), Some(TurnDetection::Server(_))) { s.min_interrupt_ms } else { 0 };
+            seg.set_overlap_rule(min_ms, s.assistant_speaking);
         }
         Ok(())
     }
@@ -1062,6 +1087,9 @@ pub async fn realtime(
         short: 0,
         turn_detection: None,
         segmenter: None,
+        min_interrupt_ms: 0,
+        assistant_speaking: false,
+        backchannel: false,
         stream_samples: 0,
         clock_base: 0,
         clock_in: 0,
