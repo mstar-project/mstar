@@ -150,3 +150,102 @@ def test_the_prefix_holds_the_user_name_only_when_it_is_short_and_ascii(monkeypa
     assert prefix == f"/tmp/mstar_{name if kept else os.getuid()}_65535/"
     # a 45-byte socket name, longer than any a deployment binds, still fits a socket path
     assert len((prefix + "x" * 41 + ".ipc").encode()) <= 107
+
+
+def test_launch_socket_prefix_keeps_restarts_apart_without_exceeding_unix_limit(monkeypatch):
+    monkeypatch.setattr(socket_prefix.getpass, "getuser", lambda: "a" * 32)
+    base = socket_prefix.per_port_socket_prefix(65535)
+    first = socket_prefix.launch_socket_prefix(base, "first-launch")
+    second = socket_prefix.launch_socket_prefix(base, "second-launch")
+    assert first != second
+    assert first == socket_prefix.launch_socket_prefix(base, "first-launch")
+    assert socket_prefix.launch_socket_prefix(base, None) == base
+    assert len((first + "/" + "x" * 41 + ".ipc").encode()) <= 107
+    assert not first.startswith(base + "/first-launch")
+
+
+def test_custom_prefix_reports_unix_path_limit_before_creating_sockets(tmp_path, monkeypatch):
+    monkeypatch.setenv("MSTAR_DEPLOYMENT_TOKEN", "first-launch")
+    target_base_bytes = 107 - len("/" + "a" * 10 + "/conductor.ipc")
+    suffix_len = target_base_bytes - len(os.fsencode(tmp_path)) - 1
+    assert suffix_len > 0
+    base = tmp_path / ("x" * suffix_len)
+    launch = socket_prefix.launch_socket_prefix(str(base), "first-launch")
+    assert len(os.fsencode(os.path.join(launch, "conductor.ipc"))) == 107
+    comm = RustZMQCommunicator(
+        my_id="conductor", push_ids=[], ipc_socket_path_prefix=str(base))
+    assert comm._endpoint("conductor").removeprefix("ipc://").endswith("/conductor.ipc")
+    del comm
+    with pytest.raises(ValueError, match="shorten ipc_socket_path_prefix"):
+        RustZMQCommunicator(
+            my_id="conductor", push_ids=["api_server_preprocess_worker"],
+            ipc_socket_path_prefix=str(base))
+
+    too_long_base = tmp_path / ("x" * (suffix_len + 1))
+    with pytest.raises(ValueError, match="shorten ipc_socket_path_prefix"):
+        RustZMQCommunicator(
+            my_id="conductor", push_ids=[], ipc_socket_path_prefix=str(too_long_base))
+    assert not too_long_base.exists()
+
+
+def test_old_worker_cannot_send_into_a_restart_on_the_same_base_prefix(tmp_path, monkeypatch):
+    base = str(tmp_path / "sockets")
+    monkeypatch.setenv("MSTAR_DEPLOYMENT_TOKEN", "first-launch")
+    first_conductor = RustZMQCommunicator(
+        my_id="conductor", push_ids=["worker_0"], ipc_socket_path_prefix=base)
+    old_worker = RustZMQCommunicator(
+        my_id="worker_0", push_ids=["conductor"], ipc_socket_path_prefix=base)
+    first_conductor_lock = first_conductor._deployment_lock_fd
+    try:
+        assert old_worker._endpoint("conductor") == first_conductor._endpoint("conductor")
+        first_dir = old_worker.ipc_socket_path_prefix
+        # The conductor exits; its worker can still have reports to send.
+        del first_conductor
+        os.close(first_conductor_lock)
+
+        monkeypatch.setenv("MSTAR_DEPLOYMENT_TOKEN", "second-launch")
+        new_conductor = RustZMQCommunicator(
+            my_id="conductor", push_ids=["worker_0"], ipc_socket_path_prefix=base)
+        try:
+            assert old_worker.ipc_socket_path_prefix == first_dir
+            assert old_worker._endpoint("conductor") != new_conductor._endpoint("conductor")
+            assert old_worker._endpoint("worker_0") != new_conductor._endpoint("worker_0")
+            old_worker.send("conductor", {"from": "old worker"})
+            assert not new_conductor.poll_for_messages(timeout_ms=250)
+            assert new_conductor.get_all_new_messages() == []
+            new_conductor.send("worker_0", {"from": "new conductor"})
+            assert not old_worker.poll_for_messages(timeout_ms=250)
+            assert old_worker.get_all_new_messages() == []
+        finally:
+            os.close(new_conductor._deployment_lock_fd)
+    finally:
+        del old_worker
+
+
+def test_private_rust_frontend_bridge_keeps_its_fixed_endpoint(tmp_path, monkeypatch):
+    monkeypatch.setenv("MSTAR_DEPLOYMENT_TOKEN", "first-launch")
+    bridge_dir = str(tmp_path / "bridge")
+    bridge = RustZMQCommunicator(
+        my_id="bridge", push_ids=["frontend"], ipc_socket_path_prefix=bridge_dir,
+        launch_scoped_ipc=False)
+    assert bridge._endpoint("bridge") == f"ipc://{bridge_dir}/bridge.ipc"
+
+
+def test_dynamo_removes_its_launch_socket_directory_at_exit(monkeypatch):
+    from mstar.integrations.dynamo import worker
+
+    monkeypatch.setenv("MSTAR_DEPLOYMENT_TOKEN", "dynamo-launch")
+    seen = {}
+
+    def fake_build_server(args):
+        seen["base"] = args.socket_path_prefix
+        seen["launch"] = socket_prefix.launch_socket_prefix(args.socket_path_prefix, "dynamo-launch")
+        os.makedirs(seen["launch"])
+        raise _StopError
+
+    monkeypatch.setattr(worker, "build_server", fake_build_server)
+    monkeypatch.setattr("mstar.utils.logging_config.log_off_thread", lambda: None)
+    with pytest.raises(_StopError):
+        worker.main(["--config", "c.yaml", "--model-path", "/m"])
+    assert not os.path.exists(seen["launch"])
+    assert not os.path.exists(seen["base"])

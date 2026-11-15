@@ -24,7 +24,7 @@ EXPECTED_MSTAR_RUST_VERSION = "0.1.1"
 #: notably the tensor-file namespace in ``mstar.communication.tensors``.
 DEPLOYMENT_ANCHOR_ENTITY = "conductor"
 
-#: The entities that lock the deployment's IPC prefix when they bind: the
+#: The entities that lock the deployment's configured IPC prefix when they bind: the
 #: anchor, and the first one the API-server process binds, so a second
 #: ``mstar serve`` on the prefix is refused before it takes over the first
 #: deployment's API-server sockets (its conductor starts later).
@@ -80,7 +80,7 @@ class BaseCommunicator(ABC):
         raise NotImplementedError(f"Protocol {self.protocol} not yet supported yet")
 
     def _lock_deployment(self, my_id: str) -> None:
-        """Claim this deployment, so a second one on the same IPC prefix fails
+        """Claim this deployment, so a second one on the same configured IPC prefix fails
         here instead of corrupting the first.
 
         Only ``DEPLOYMENT_LOCK_ENTITIES`` lock, each on its own file, and only
@@ -99,7 +99,8 @@ class BaseCommunicator(ABC):
         """
         if self.protocol != CommProtocol.IPC or my_id not in DEPLOYMENT_LOCK_ENTITIES:
             return
-        path = self._endpoint(my_id).removeprefix("ipc://") + ".lock"
+        lock_prefix = getattr(self, "_deployment_lock_prefix", self.ipc_socket_path_prefix)
+        path = os.path.join(lock_prefix, f"{my_id}.ipc.lock")
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -108,9 +109,8 @@ class BaseCommunicator(ABC):
             raise RuntimeError(
                 f"another mstar deployment already holds {path}: its "
                 f"{my_id} is bound to the same IPC prefix "
-                f"({self.ipc_socket_path_prefix!r}). Two deployments cannot "
-                "share a prefix -- the second would take over the first's "
-                "sockets and tensor files. Give this one its own "
+                f"({lock_prefix!r}). Two live deployments cannot "
+                "share a configured prefix. Give this one its own "
                 "ipc_socket_path_prefix, or run it over TCP."
             ) from exc
         # Never unlinked: another process may already hold an fd on this inode,

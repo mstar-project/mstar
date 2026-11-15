@@ -1,16 +1,44 @@
 """Default IPC socket prefixes for the server entry points.
 
-Every process of a deployment binds fixed names under its prefix
+Every process of a deployment binds fixed names under its launch directory
 (``conductor.ipc``, ``api_server.ipc``, ``worker_0.ipc``, ...), and libzmq
 replaces an existing socket file on ``bind``. Two servers on one prefix
-therefore take over each other's inboxes, so each default here is unique to
-one server on the host.
+therefore take over each other's inboxes. The launch token keeps restarts on
+the same base prefix in separate directories.
 """
 
 import getpass
+import hashlib
 import os
 import re
 import tempfile
+
+DEPLOYMENT_TOKEN_ENV = "MSTAR_DEPLOYMENT_TOKEN"
+MAX_UNIX_SOCKET_PATH_BYTES = 107
+
+
+def launch_socket_prefix(base: str, token: str | None) -> str:
+    """Keep a restarted launch's IPC sockets away from surviving workers.
+
+    The token is shared by this launch's processes and differs on restart.
+    Hashing it keeps launcher-provided values out of paths and leaves room
+    for the longest entity name under the Unix socket path limit.
+    """
+    if not token:
+        return base
+    return os.path.join(base, hashlib.sha1(token.encode()).hexdigest()[:10])
+
+
+def check_ipc_socket_path(prefix: str, entity_id: str) -> None:
+    """Fail before binding when a configured base leaves too little path space."""
+    path = os.path.join(prefix, f"{entity_id}.ipc")
+    length = len(os.fsencode(path))
+    if length > MAX_UNIX_SOCKET_PATH_BYTES:
+        raise ValueError(
+            f"IPC socket path for {entity_id!r} is {length} bytes, above the "
+            f"Linux limit of {MAX_UNIX_SOCKET_PATH_BYTES}; shorten "
+            "ipc_socket_path_prefix"
+        )
 
 
 def _user() -> str:

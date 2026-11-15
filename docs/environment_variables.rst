@@ -43,11 +43,14 @@ Communication
        ERROR with a per-runner summary and the rest keeps running.
    * - ``MSTAR_DEPLOYMENT_TOKEN``
      - random per launch
-     - Mixed into the namespace of the SHM tensor files and arena segments,
+     - Mixed into the namespace of IPC control sockets, SHM tensor files and arena segments,
        so no two launches share names: not a restart on the same socket
        prefix, and not two deployments that share ``/dev/shm`` from different
        containers (``--ipc=host``, hostIPC) with the same socket prefix and
-       ports. The API server mints a new one at every launch unless a
+       ports. An explicit IPC socket prefix needs room for the 10-byte
+       launch component and its separator under Linux's 107-byte socket
+       path limit; too-long paths fail before binding. The API server mints
+       a new one at every launch unless a
        launcher set it (one an API server minted is replaced, also when
        inherited), and the conductor and workers inherit it. Set it only
        when a launcher starts a deployment's processes separately: the same
