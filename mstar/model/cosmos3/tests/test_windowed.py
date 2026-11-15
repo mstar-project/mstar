@@ -31,6 +31,7 @@ from mstar.model.cosmos3.submodules import (
     UNCOND_LABEL,
     Cosmos3DiTSubmodule,
     Cosmos3VAEDecoderARSubmodule,
+    GenStepInfo,
 )
 from mstar.model.cosmos3.tests.stubs import StubSampler
 from mstar.model.cosmos3.tests.test_rotary_table import stand_in_rotary
@@ -978,3 +979,19 @@ def test_long_rollout_state_stays_flat(monkeypatch) -> None:
                 assert int(frame_mask.sum()) == (8 if kv else 6)
         assert len(st["ar_statics"]) == (0 if kv else 1)
         assert len(st.get("noisy_masks")) == 3
+
+
+def test_action_batches_only_rows_that_agree_on_guidance() -> None:
+    """A batched action step runs both guidance branches for every row once
+    any row guides, so rows inside and outside their guidance_interval at this
+    step run apart."""
+    sub = _dit()
+    for rid in ("a", "b"):
+        sub.request_state(rid).add_all(uncond={}, cond={"num_vision_tokens": 4})
+    batch = SimpleNamespace(graph_walk=C.ACTION_GEN_WALK, request_ids=["a", "b"])
+    row = lambda active: SimpleNamespace(  # noqa: E731
+        resource_step_info=GenStepInfo(cfg=True, cfg_active=active, capture_key=None),
+    )
+    assert sub.can_batch(batch, [row(True), row(True)])
+    assert sub.can_batch(batch, [row(False), row(False)])
+    assert not sub.can_batch(batch, [row(True), row(False)])

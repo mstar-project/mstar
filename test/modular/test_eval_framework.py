@@ -316,8 +316,13 @@ def test_open_loop_is_seeded_poisson():
         starts.append((i, t0))
         return i
 
+    before = time.perf_counter()
     results, _ = asyncio.run(run_load(list(range(6)), fn, LoadSpec("open", 0, 200.0, seed=3)))
-    assert results == list(range(6)) and [i for i, _ in sorted(starts, key=lambda s: s[1])] == list(range(6))
+    assert results == list(range(6)) and sorted(i for i, _ in starts) == list(range(6))
+    # Open loop only promises that no request starts before its arrival. Arrivals that
+    # an event-loop stall makes overdue all start at once, in no particular order.
+    arrivals = poisson_offsets(6, 200.0, 3)
+    assert all(t0 - before >= arrivals[i] - 1e-4 for i, t0 in starts)
     with pytest.raises(ValueError):
         LoadSpec("open", 0, None)
 

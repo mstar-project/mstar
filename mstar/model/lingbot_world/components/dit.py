@@ -33,9 +33,9 @@ the cross-attention adds the text K/V to ``TEXT`` and reads them. Under
 entries it reaches, which the reference's FA2 varlen attends, as it does the
 text K/V; the forward is then bit-identical to the reference's on the same
 inputs. The other differences from the reference are structural only: batch 1
-without the list wrapping, and the rolling K/V held in the engine's pages,
-which keep the sink and the latest window as the reference's shift-left
-eviction does, gathered in stream order for each read.
+without the list wrapping, and the rolling K/V held by the engine's rolling
+store, which keeps the reference's layout (sink, then the latest window,
+compacted by the same shift-left eviction) and hands each read that one range.
 
 ``wan22.components.dit`` is not reused: it is the diffusers layout and its
 numerics (explicit ``type_as`` casts, SDPA, fp32-island weights) are the
