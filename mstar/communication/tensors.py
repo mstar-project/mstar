@@ -142,11 +142,15 @@ class _KeptRead:
     running: dict[int, int] = field(default_factory=dict)
 
 
-#: Earlier Mooncake releases let any host that reaches the TCP data port read
-#: or write arbitrary process memory (CVE-2026-103764). NVD lists "before
-#: 0.3.13" because it points at a later refactor; the fix (Mooncake #2314)
-#: shipped in 0.3.12.post1, see https://github.com/kvcache-ai/Mooncake/issues/4626.
-MOONCAKE_PATCHED_VERSION = "0.3.12.post1"
+#: Earlier Mooncake releases let any host that reaches the handshake port stall
+#: the handshake listener or grow its notify queue until the process is
+#: OOM-killed (CVE-2026-103760 and CVE-2026-103761, fixed by Mooncake #4451 and
+#: #4453). Before ``_MOONCAKE_DATA_PORT_FIXED``, any host that reaches the TCP
+#: data port can also read or write arbitrary process memory (CVE-2026-103764;
+#: NVD lists "before 0.3.13" because it points at a later refactor). See
+#: https://github.com/kvcache-ai/Mooncake/issues/4626.
+MOONCAKE_PATCHED_VERSION = "0.3.14"
+_MOONCAKE_DATA_PORT_FIXED = "0.3.12.post1"
 _MOONCAKE_DISTRIBUTIONS = (
     "mooncake-transfer-engine",
     "mooncake-transfer-engine-cuda13",
@@ -187,7 +191,7 @@ def _mooncake_dists_owning(engine_file: str | None, dists: list[str]) -> set[str
 
 
 def _warn_if_mooncake_unpatched() -> None:
-    """Warn once per process if the installed Mooncake predates that fix.
+    """Warn once per process if the installed Mooncake predates those fixes.
 
     The extras require a patched release, so this only fires where the
     environment was built without resolving them (``--no-deps``, a prebuilt
@@ -226,18 +230,23 @@ def _warn_if_mooncake_unpatched() -> None:
         logger.warning(
             "Several Mooncake distributions are installed (%s) and none can be "
             "matched to the imported engine; if it comes from one that predates "
-            "%s, any host that can reach the transfer engine's TCP data port can "
-            "read or write this process's memory (CVE-2026-103764). Uninstall the "
-            "old ones, and keep the TCP and RDMA transports on a trusted network.",
+            "%s, any host that can reach the transfer engine's handshake port can "
+            "take this process down (CVE-2026-103760, CVE-2026-103761), and before "
+            "%s read or write its memory through the TCP data port "
+            "(CVE-2026-103764). Uninstall the old ones, and keep the TCP and RDMA "
+            "transports on a trusted network.",
             ", ".join(f"{d} {v}" for d, v in installed), MOONCAKE_PATCHED_VERSION,
+            _MOONCAKE_DATA_PORT_FIXED,
         )
     elif installed and len(unpatched) == len(installed):
         logger.warning(
             "Installed Mooncake (%s) predates %s: any host that can reach the "
-            "transfer engine's TCP data port can read or write this process's "
-            "memory (CVE-2026-103764). Upgrade it, and keep the TCP and RDMA "
-            "transports on a trusted network.",
+            "transfer engine's handshake port can take this process down "
+            "(CVE-2026-103760, CVE-2026-103761), and before %s read or "
+            "write its memory through the TCP data port (CVE-2026-103764). Upgrade "
+            "it, and keep the TCP and RDMA transports on a trusted network.",
             ", ".join(f"{d} {v}" for d, v in installed), MOONCAKE_PATCHED_VERSION,
+            _MOONCAKE_DATA_PORT_FIXED,
         )
 
 

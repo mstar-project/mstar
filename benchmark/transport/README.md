@@ -34,7 +34,7 @@ Per path the tool prints p50 and p99 per size, throughput, the p50 of each phase
 ## Use cases
 
 - **Choosing inline thresholds**: the `control` vs `tcp` crossover is the size below which carrying a tensor in the message beats a transfer; `--interference` bounds how many bytes one step may put on the control channel.
-- **Comparing Mooncake versions** (for example 0.3.13.post1 against 0.3.14 when it ships): run the same command in two environments and diff the JSON.
+- **Comparing Mooncake versions** (for example the 0.3.14 floor against a newer release): run the same command in two environments and diff the JSON.
 - **Validating RDMA or Kubernetes networking**: the two-machine mode between two nodes or pods shows the fixed cost and bandwidth M\* will see.
 - **Regression-checking transport changes**: the same sweep before and after a change to `mstar/communication`.
 

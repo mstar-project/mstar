@@ -21,7 +21,7 @@ Keep it short enough to read in a minute: aim for under ~3,500 characters, about
 
 **<verdict in one or two sentences, e.g. "Works; no regressions outside noise." / "The port works, but claim 2 doesn't hold.">**
 
-<N>x <GPU>, <TP/config>, <tensor transport>, <runtime(s): Rust / Python; frontend(s)> · PR head `<sha>` vs <base> `<sha>`, <and merged with base `<sha>` if run> · <only if any: a dependency below the repo's floor, e.g. "Mooncake 0.3.8.post1, below the 0.3.13.post1 floor">
+<N>x <GPU>, <TP/config>, <tensor transport>, <runtime(s): Rust / Python; frontend(s)> · PR head `<sha>` vs <base> `<sha>`, <and merged with base `<sha>` if run> · <only if any: a dependency below the repo's floor, e.g. "Mooncake 0.3.8.post1, below the 0.3.14 floor">
 
 ### Claims
 
