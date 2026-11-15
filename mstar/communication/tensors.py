@@ -52,6 +52,7 @@ from mstar.communication.tensor_uuid import TensorUuidMinter
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.utils.ipc_format import TensorReceived, WorkerMessage, WorkerMessageType
 from mstar.utils.profiler import PHASE_PERIOD, phase_record
+from mstar.utils.socket_prefix import DEPLOYMENT_TOKEN_ENV
 
 logger = logging.getLogger(__name__)
 
@@ -2486,7 +2487,6 @@ def _default_shm_dir() -> str:
     return "/tmp/mstar_shm"
 
 
-DEPLOYMENT_TOKEN_ENV = "MSTAR_DEPLOYMENT_TOKEN"
 #: The token the last API server in this environment minted.
 _MINTED_TOKEN_ENV = "MSTAR_DEPLOYMENT_TOKEN_MINTED"
 

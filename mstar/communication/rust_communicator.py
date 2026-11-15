@@ -30,6 +30,11 @@ from mstar.communication.codec import (  # noqa: F401  (re-exported)
 )
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
 from mstar.communication.event import EventWakeup
+from mstar.utils.socket_prefix import (
+    DEPLOYMENT_TOKEN_ENV,
+    check_ipc_socket_path,
+    launch_socket_prefix,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +54,7 @@ class RustZMQCommunicator(BaseCommunicator):
         protocol: CommProtocol = CommProtocol.IPC,
         ipc_socket_path_prefix: str = "/tmp/mstar/",
         codec: type[Codec] | None = None,
+        launch_scoped_ipc: bool = True,
     ):
         if _RustZmq is None:
             raise RuntimeError(
@@ -59,16 +65,24 @@ class RustZMQCommunicator(BaseCommunicator):
         transport = os.getenv("MSTAR_ZMQ_TRANSPORT", protocol.value).upper()
         self.protocol = CommProtocol(transport)
         self.my_id = my_id
-        self.ipc_socket_path_prefix = ipc_socket_path_prefix
+        # Keep the deployment lock on the configured base prefix. Distinct
+        # launch directories must not let two live servers claim one prefix.
+        self._deployment_lock_prefix = ipc_socket_path_prefix
+        self.ipc_socket_path_prefix = (
+            launch_socket_prefix(ipc_socket_path_prefix, os.environ.get(DEPLOYMENT_TOKEN_ENV))
+            if self.protocol == CommProtocol.IPC and launch_scoped_ipc else ipc_socket_path_prefix
+        )
         self.codec = codec or default_codec()
         self.event: EventWakeup | None = None
         # Messages consumed by a readiness poll, awaiting get_all_new_messages.
         self._buffered: deque = deque()
 
         if self.protocol == CommProtocol.IPC:
-            os.makedirs(ipc_socket_path_prefix, exist_ok=True)
+            for entity_id in (my_id, *push_ids):
+                check_ipc_socket_path(self.ipc_socket_path_prefix, entity_id)
+            os.makedirs(self.ipc_socket_path_prefix, exist_ok=True)
             self._lock_deployment(my_id)
-            self._inner = _RustZmq(my_id, ipc_socket_path_prefix)
+            self._inner = _RustZmq(my_id, self.ipc_socket_path_prefix)
         elif self.protocol == CommProtocol.TCP:
             self._inner = _RustZmq.bind_endpoint(my_id, self._endpoint(my_id))
             # TCP has no directory scheme: register every peer explicitly

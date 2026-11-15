@@ -472,7 +472,9 @@ class RustFrontendBridge:
         # "bridge", not "conductor", to avoid confusion with M*'s Conductor.
         self.comm = RustZMQCommunicator(
             "bridge", push_ids=["frontend"], protocol=CommProtocol.IPC,
-            ipc_socket_path_prefix=bridge_dir, codec=MsgpackCodec)
+            ipc_socket_path_prefix=bridge_dir, codec=MsgpackCodec,
+            # bridge_dir is already private; the Rust frontend expects bridge.ipc there.
+            launch_scoped_ipc=False)
         self.running = True
         # sub -> its submission's key, until its relay ends.
         self._keys: dict[int, str] = {}

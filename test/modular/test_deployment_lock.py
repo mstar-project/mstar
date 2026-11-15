@@ -33,6 +33,18 @@ def test_second_conductor_on_one_prefix_is_refused():
         del first
 
 
+@pytest.mark.parametrize("my_id", (DEPLOYMENT_ANCHOR_ENTITY, "api_server_preprocess_worker"))
+def test_second_live_launch_on_one_base_prefix_is_refused(monkeypatch, my_id):
+    """A new token isolates old workers, but cannot bypass the live-server lock."""
+    with tempfile.TemporaryDirectory() as prefix:
+        monkeypatch.setenv("MSTAR_DEPLOYMENT_TOKEN", "first-launch")
+        first = _comm(prefix, my_id)
+        monkeypatch.setenv("MSTAR_DEPLOYMENT_TOKEN", "second-launch")
+        with pytest.raises(RuntimeError, match="already holds"):
+            _comm(prefix, my_id)
+        del first
+
+
 def test_a_second_api_server_is_refused_before_it_binds_over_the_first():
     """Its conductor, which would be refused, starts only after the API server
     has bound its sockets in the first deployment's prefix."""
