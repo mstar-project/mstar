@@ -442,6 +442,9 @@ def test_a_replay_s_counts_are_read_after_its_own_copy_lands():
     kept = torch.zeros(2, dtype=torch.int64, device="cuda")
     k = torch.randn(2 * SPAN, HEADS, DIM, device="cuda")
     work = torch.randn(4096, 4096, device="cuda")
+    # cuBLAS makes its handle on the first mm, which it can't do under capture
+    torch.mm(work, work)
+    torch.cuda.synchronize()
     step = _step(h, ctx=_ctx(lease=lease, capture=True))
     h.begin_step(step)
     graph = torch.cuda.CUDAGraph()
