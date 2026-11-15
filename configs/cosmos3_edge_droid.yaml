@@ -34,6 +34,9 @@ model_kwargs:
   # robot_state, a forward-dynamics action, the predicted rows), the same state
   # a pi0.5 DROID policy takes.
   inverted_action_dims: [7]
+  # The observation size NVIDIA's RoboLab server sends: its one-frame encode
+  # compiles once, in the warmup below; other encodes run eager.
+  compile_vae_encode_size: [736, 544]
 node_groups:
   # No reasoner: the policy checkpoint ships no vision encoder, so the chat
   # walks are not built and the DiT runs alone.
@@ -42,9 +45,10 @@ node_groups:
   - node_names: ["vae_encoder", "vae_decoder"]
     ranks: [0]
 # The first policy request of a fresh server compiles the action denoise step
-# (about 9 s); this warms it at startup with the model card's example frame as
-# the observation, in the layout NVIDIA's RoboLab server sends (the robot state
-# and the 736x544 bucket; the chunk, fps and domain come from checkpoint.json).
+# (about 9 s) and the observation encode; this warms both at startup with the
+# model card's example frame as the observation, in the layout NVIDIA's RoboLab
+# server sends (the robot state and the 736x544 bucket; the chunk, fps and
+# domain come from checkpoint.json).
 warmup_requests:
   - text: warmup
     files: [hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg]

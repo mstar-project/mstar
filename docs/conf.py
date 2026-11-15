@@ -45,6 +45,7 @@ myst_enable_extensions = [
     "linkify",
 ]
 myst_heading_anchors = 3
+myst_fence_as_directive = ["mermaid"]
 
 templates_path = ["_templates"]
 source_suffix = {
