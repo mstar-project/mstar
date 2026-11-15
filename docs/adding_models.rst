@@ -929,8 +929,10 @@ a refused admit draws the same noise.
 
 ``kernel_settings(self)`` is a temporary hook for what the engine doesn't pick itself yet:
 ``splits``, ``decode_fmha`` and ``decode_tensor_cores`` on a read of a paged array,
-``splits`` on a ``GatedDeltaNet``, and ``max_segments_per_request``, ``max_segments_per_step``,
-``compile_op``, ``workspace_mb`` and ``backend`` on a ``Block`` read. Under an array's name it sets the default size of the array's pool, ``max_num_pages``
+``splits`` on a ``GatedDeltaNet``, ``ieee`` on a read of an unbounded array, and
+``max_segments_per_request``, ``max_segments_per_step``, ``compile_op``, ``workspace_mb`` and
+``backend`` on a ``Block`` or ``BlockCausal`` read of an array with ``max_len=0``. Under an
+array's name it sets the default size of the array's pool, ``max_num_pages``
 on a paged array and ``max_slots`` on a ``Value`` with tensor fields or an unbounded array, which a deployment's
 ``resources:`` block overrides. A cross read on an array that keeps entries takes
 ``decode_tensor_cores`` alone, and two reads that share a resource can't set one field to two
