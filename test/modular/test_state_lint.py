@@ -181,16 +181,40 @@ def _violations(source: str, path: str = "") -> tuple[list[str], set[tuple[str, 
     return found, used
 
 
-def _hook_violations(source: str, path: str) -> tuple[list[str], set[tuple[str, str, str]]]:
-    """The handle hooks a scaffold node in ``source``, the file at ``path``, writes itself, and the exceptions used."""
+def _bases(sources: list[Path]) -> dict[str, set[str]]:
+    """The bases of each class ``sources`` define, by name, joined where two files define one name."""
+    bases: dict[str, set[str]] = {}
+    for path in sources:
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ClassDef):
+                bases.setdefault(node.name, set()).update(ast.unparse(base).rsplit(".", 1)[-1] for base in node.bases)
+    return bases
+
+
+def _descendants(bases: dict[str, set[str]], root: str) -> set[str]:
+    """``root`` and the classes in ``bases`` that descend from it."""
+    found = {root}
+    while grown := {name for name, of in bases.items() if name not in found and of & found}:
+        found |= grown
+    return found
+
+
+def _hook_violations(
+    source: str, path: str, bases: dict[str, set[str]],
+) -> tuple[list[str], set[tuple[str, str, str]]]:
+    """The handle hooks a scaffold node in ``source``, the file at ``path``, writes itself, and the exceptions used.
+    ``bases`` gives the bases of the classes the ported files define, so a node under a ported scaffold node counts
+    too."""
     found, used = [], set()
+    declared = _descendants(bases, "DeclaredTokenDecoder")
+    sampled = _descendants(bases, "SampledTokenDecoder") | declared
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.ClassDef):
             continue
-        bases = {ast.unparse(base).rsplit(".", 1)[-1] for base in node.bases}
-        if not bases & {"SampledTokenDecoder", "DeclaredTokenDecoder"}:
+        own = {ast.unparse(base).rsplit(".", 1)[-1] for base in node.bases}
+        if not own & sampled:
             continue
-        if "DeclaredTokenDecoder" not in bases:
+        if not own & declared:
             found.append(f"{node.name} subclasses SampledTokenDecoder")
         for item in node.body:
             if isinstance(item, ast.FunctionDef) and item.name in _HOOKS:
@@ -218,12 +242,20 @@ def test_a_ported_package_reaches_the_engine_only_through_the_contract(path):
 
 def test_a_ported_scaffold_node_writes_no_handle_hook_itself():
     found, used = [], set()
+    bases = _bases(_sources())
     for path in _sources():
-        in_file, used_in_file = _hook_violations(path.read_text(), str(path))
+        in_file, used_in_file = _hook_violations(path.read_text(), str(path), bases)
         found += [f"{path}: {violation}" for violation in in_file]
         used |= used_in_file
     assert not found, f"these repeat DeclaredTokenDecoder's handle calls: {found}"
     assert OWN_HOOKS.keys() <= used, f"delete these exceptions: {sorted(OWN_HOOKS.keys() - used)}"
+
+
+def test_a_node_under_a_ported_scaffold_node_is_checked_too():
+    source = "class CanaryDecoderSubmodule(EncoderDecoderNode):\n    def node_step(self):\n        pass\n"
+    bases = {"EncoderDecoderNode": {"DeclaredTokenDecoder"}, "CanaryDecoderSubmodule": {"EncoderDecoderNode"}}
+    found, _ = _hook_violations(source, "x.py", bases)
+    assert found == ["CanaryDecoderSubmodule.node_step at line 2"], "a hook under EncoderDecoderNode would pass"
 
 
 @pytest.mark.parametrize("entry", PORTED)
