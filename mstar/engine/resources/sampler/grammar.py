@@ -35,6 +35,9 @@ if TYPE_CHECKING:
 # The request field: vLLM's ``structured_outputs`` shape (one of these keys), plus
 # ``after``, the text that opens the constrained part (a reasoning model's think-end tag).
 STRUCTURED_OUTPUTS_KWARG = "structured_outputs"
+# the text after which the request's grammar starts (`GrammarRequest.after`): only the data worker
+# sets it (`after_reasoning`), dropping a client's value, and ``structured_outputs`` takes no `after`
+GRAMMAR_AFTER_KWARG = "structured_outputs_after"
 GRAMMAR_KINDS = ("json", "json_object", "regex", "choice", "grammar")
 # a grammar compiles while its request waits for admission, so its size is bounded
 MAX_GRAMMAR_CHARS = 1 << 17
@@ -113,16 +116,17 @@ def _regex_escape(text: str) -> str:
 XGRAMMAR_INSTALL = "pip install 'mstar-ai[grammar]'"
 
 
-def grammar_request(value: Any) -> GrammarRequest | None:
-    """The request's ``structured_outputs`` as a ``GrammarRequest``, checked; None
-    when unset. ``ValueError`` (the client's 400) for a bad shape or grammar."""
+def grammar_request(value: Any, after: str | None = None) -> GrammarRequest | None:
+    """The request's ``structured_outputs`` as a ``GrammarRequest`` starting after ``after`` (the
+    data worker's, never the client's), checked; None when unset. ``ValueError`` (the client's
+    400) for a bad shape or grammar."""
     if value is None:
         return None
     if not isinstance(value, dict):
         raise ValueError(f"structured_outputs must be an object; got {value!r}")
-    unknown = set(value) - {*GRAMMAR_KINDS, "after"}
+    unknown = set(value) - set(GRAMMAR_KINDS)
     if unknown:
-        raise ValueError(f"structured_outputs takes one of {GRAMMAR_KINDS} and 'after'; got {sorted(unknown)}")
+        raise ValueError(f"structured_outputs takes one of {GRAMMAR_KINDS}; got {sorted(unknown)}")
     kinds = [k for k in GRAMMAR_KINDS if value.get(k) not in (None, False)]
     if len(kinds) != 1:
         raise ValueError(f"structured_outputs takes exactly one of {GRAMMAR_KINDS}; got {kinds or 'none'}")
@@ -140,7 +144,6 @@ def grammar_request(value: Any) -> GrammarRequest | None:
         raw = json.dumps(raw)
     elif not isinstance(raw, str):
         raise ValueError(f"structured_outputs {kind} must be a string")
-    after = value.get("after")
     if after is not None and (not isinstance(after, str) or not after):
         raise ValueError("structured_outputs after must be a non-empty string")
     size = len(raw) + len(after or "")
@@ -155,23 +158,26 @@ def grammar_request(value: Any) -> GrammarRequest | None:
 
 
 def request_grammar(model_kwargs: dict | None) -> GrammarRequest | None:
-    """The grammar a request's kwargs ask for (``structured_outputs``), checked, for a model to
-    attach to its `SampleSettings`; None when unset. ``ValueError`` (the client's 400) for a bad one."""
-    return grammar_request((model_kwargs or {}).get(STRUCTURED_OUTPUTS_KWARG))
+    """The grammar a request's kwargs ask for (``structured_outputs``, starting where the data
+    worker set), checked, for a model to attach to its `SampleSettings`; None when unset.
+    ``ValueError`` (the client's 400) for a bad one."""
+    kwargs = model_kwargs or {}
+    return grammar_request(kwargs.get(STRUCTURED_OUTPUTS_KWARG), after=kwargs.get(GRAMMAR_AFTER_KWARG))
 
 
-def after_reasoning(structured: Any, text_output: TextOutput | None, prompt_ids: torch.Tensor) -> Any:
-    """``structured`` with ``after`` the model's ``reasoning_end`` when the prompt opens a
-    reasoning block it doesn't close (in its last 32 ids, the last ``reasoning_start`` comes after
-    the last ``reasoning_end``), so a thinking turn reasons freely and then answers in its grammar;
-    as it came otherwise, a turn whose template opens no reasoning included."""
+def after_reasoning(text_output: TextOutput | None, prompt_ids: torch.Tensor) -> str | None:
+    """Where a reply's grammar starts (``GRAMMAR_AFTER_KWARG``): the model's ``reasoning_end``
+    when the prompt opens a reasoning block it doesn't close (in its last 32 ids, the last
+    ``reasoning_start`` comes after the last ``reasoning_end``), so a thinking turn reasons freely
+    and then answers in its grammar; None otherwise, a turn whose template opens no reasoning
+    included."""
     start = None if text_output is None else text_output.reasoning_start
     end = None if text_output is None else text_output.reasoning_end
-    if start is None or end is None or not isinstance(structured, dict) or "after" in structured:
-        return structured
+    if start is None or end is None:
+        return None
     tail = b"".join(map(text_output.detokenizer.token_bytes, prompt_ids[-32:].tolist()))
     text = tail.decode("utf-8", errors="replace")
-    return {**structured, "after": end} if text.rfind(start) > text.rfind(end) else structured
+    return end if text.rfind(start) > text.rfind(end) else None
 
 
 

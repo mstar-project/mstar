@@ -468,7 +468,7 @@ def test_only_rank_0_fills_masks_and_every_rank_fails_a_refused_draw_alike(monke
 def test_after_starts_the_grammar_once_the_reply_holds_its_text():
     """``after`` may span tokens: the reply is free text until it holds it."""
     res = _resource(graph=False)
-    res.ingest_request(0, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"], "after": "</think>x"})))
+    res.ingest_request(0, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"]}, after="</think>x")))
     x, think = VOCAB.index(b"x"), VOCAB.index(b"</think>")
     favoured = [x, think, x, x, x, x]  # free text, the two tokens of the trigger, then the grammar's
     drawn = []
@@ -490,14 +490,13 @@ def test_after_starts_the_grammar_only_where_the_prompt_leaves_a_reasoning_block
     grammar from its first token."""
     tok = fast_tokenizer
     detok = TextChunkDetokenizer(tok)
-    ask = {"json_object": True}
     ids = {t: tok.convert_tokens_to_ids(t) for t in ("<think>", "</think>", "<|im_end|>")}
     nl, nl2, hi = (tok.encode(t) for t in ("\n", "\n\n", "hi"))
     think, close, special = ids["<think>"], ids["</think>"], ids["<|im_end|>"]
 
     def after(*seq):
         out = SimpleNamespace(detokenizer=detok, reasoning_start="<think>", reasoning_end="</think>")
-        return grammar.after_reasoning(ask, out, torch.tensor([*hi, *seq])).get("after")
+        return grammar.after_reasoning(out, torch.tensor([*hi, *seq]))
 
     assert after(think, *nl) == "</think>"
     assert after(think, *nl, special) == "</think>"
@@ -506,7 +505,7 @@ def test_after_starts_the_grammar_only_where_the_prompt_leaves_a_reasoning_block
     assert after(close, *hi, special) is None
     assert after(*nl) is None, "a template that opens no reasoning"
     no_start = SimpleNamespace(detokenizer=detok, reasoning_start=None, reasoning_end="</think>")
-    assert "after" not in grammar.after_reasoning(ask, no_start, torch.tensor([*hi, think]))
+    assert grammar.after_reasoning(no_start, torch.tensor([*hi, think])) is None
 
 
 @pytest.mark.parametrize("value, error", [
@@ -514,13 +513,15 @@ def test_after_starts_the_grammar_only_where_the_prompt_leaves_a_reasoning_block
     ({"regex": "(("}, "structured_outputs regex"),
     ({"choice": []}, "non-empty list"),
     ({"grammar": "root ::= nothing_defined"}, "structured_outputs grammar"),
-    ({"json_object": True, "after": ""}, "after must be"),
+    ({"json_object": True, "after": "</think>"}, r"takes one of .*; got \['after'\]"),
     ({"regex": "a" * (MAX_GRAMMAR_CHARS + 1)}, "at most"),
-    ({"regex": "a", "after": "x" * MAX_GRAMMAR_CHARS}, "at most"),
 ])
 def test_a_bad_grammar_is_refused(value, error):
+    """A client's ``after`` is one of them: only the data worker says where a grammar starts."""
     with pytest.raises(ValueError, match=error):
         grammar_request(value)
+    with pytest.raises(ValueError, match="at most"):
+        grammar_request({"regex": "a"}, after="x" * MAX_GRAMMAR_CHARS)
 
 
 @pytest.mark.parametrize("response_format, want", [

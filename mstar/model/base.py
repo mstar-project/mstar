@@ -689,7 +689,7 @@ class Model(ABC):
     # Request keys the conductor or data worker reads for every model, never logged as ignored.
     ENGINE_KWARGS: tuple[str, ...] = (
         "seed", "prefix_cache", "return_token_ids", "return_logprobs", LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG,
-        "structured_outputs",
+        "structured_outputs", "structured_outputs_after",
     )
     # Whether a deployment may turn on ``enable_grammar`` (structured outputs) for this model. A model
     # declares it once its reasoning end, stop tokens and tests are in place; on any other, the switch is

@@ -194,9 +194,8 @@ Model families and some output formats need extra packages, exposed as pip *extr
    * - ``.[grammar]``
      - ``xgrammar`` for structured outputs (a sampler's ``enable_grammar``, serving
        ``response_format`` and ``structured_outputs``; see **Structured output** in
-       :doc:`models`). A serving feature rather than a model's runtime, so not part of
-       ``.[all]``; a deployment that sets ``enable_grammar`` without it fails at startup
-       with this install hint.
+       :doc:`models`). Part of ``.[all]``; a deployment that sets ``enable_grammar``
+       without it fails at startup with this install hint.
    * - ``.[dev]``
      - ``ruff`` + ``pytest`` for linting and the test suite, and ``xgrammar`` for the
        structured-output tests.
