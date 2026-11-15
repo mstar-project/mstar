@@ -2,9 +2,8 @@
 //
 // Code points for which CPython's `str.isprintable` is false, as inclusive,
 // sorted, nonadjacent ranges. `media::py_repr` reads this table to quote a
-// client's rejected value like the Python frontend does. Regenerate when the
-// tested interpreter's Unicode tables change.
-// Generated from CPython `str.isprintable` with UCD 15.0.0.
+// client's rejected value like the Python 3.12 frontend does. This pins the
+// refusal text to UCD 15.0.0; newer interpreters can differ.
 
 /// 965114 code points in 712 ranges.
 pub const UNPRINTABLE_RANGES: &[(u32, u32)] = &[
