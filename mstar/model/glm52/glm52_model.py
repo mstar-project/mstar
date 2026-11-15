@@ -5,6 +5,7 @@ import logging
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
+from typing import Any
 
 import torch
 from jinja2 import TemplateError
@@ -244,6 +245,10 @@ class Glm52Model(ByteLevelTextOutput, Model):
                 "hidden": TensorType((cfg.hidden_size,), dtype=None), "draft": TensorType((), dtype=torch.long),
             })))
         return state
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        # each request's draft seed sits beside its KV, so the seed pool admits every request the KV pool can
+        return {MTP_SEED: {"max_slots_of": KV}} if self.config.mtp_num_draft_tokens else {}
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         super().validate_config_yaml(config, config_path)
