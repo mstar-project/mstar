@@ -41,8 +41,8 @@ PORTED = (
 # The list only shrinks: a package leaves it when its port lands, and nothing is added to it.
 UNPORTED = (
     "mstar/model/cosmos3", "mstar/model/cosyvoice3", "mstar/model/glm52", "mstar/model/glm5_next",
-    "mstar/model/higgs_audio", "mstar/model/minicpm_o", "mstar/model/muse",
-    "mstar/model/phi4mm", "mstar/model/ripple",
+    "mstar/model/higgs_audio", "mstar/model/minicpm_o", "mstar/model/muse", "mstar/model/phi4mm",
+    "mstar/model/ripple",
 )
 # shared code under mstar/model/ that holds no model
 SHARED = ("mstar/model/components", "mstar/model/loader")
