@@ -424,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn the_mark_table_is_canonical_and_answers_for_the_interpreter() {
+    fn the_mark_table_is_canonical_and_pinned_to_ucd15() {
         for (i, &(low, high)) in MARK_RANGES.iter().enumerate() {
             assert!(low <= high && high <= char::MAX as u32, "{i}: {low:#x}..={high:#x}");
             if i > 0 {
@@ -435,16 +435,15 @@ mod tests {
         // the ends of a range, a code point between two, and non-marks around them
         assert!(is_mark('\u{300}') && is_mark('\u{36f}') && is_mark('\u{310}'));
         assert!(!is_mark('\u{2ff}') && !is_mark('\u{370}') && !is_mark('a'));
-        // unassigned in the interpreter's Unicode 15.0.0, a mark in the one
-        // `regex` carries: the table answers for the interpreter. A table
-        // regenerated from an interpreter whose Unicode has U+0897 assigned
-        // moves this case and the even-cut one below.
+        // U+0897 is unassigned in the source UCD 15.0.0 and absent from the
+        // pinned table. U+0898 is a mark in that same table. Changing the
+        // running interpreter or Rust dependency does not move either case.
         assert!(!is_mark('\u{897}') && is_mark('\u{898}'));
     }
 
     #[test]
-    fn an_even_cut_on_a_code_point_only_regex_calls_a_mark_does_not_move() {
-        // `unicodedata` has U+0897 unassigned, so Python cuts at 267 and so must we
+    fn an_even_cut_on_a_code_point_excluded_from_the_pinned_table_does_not_move() {
+        // U+0897 is absent from the pinned UCD 15.0.0 table, so both frontends cut at 267.
         let text = format!("{}\u{897}{}", "a".repeat(267), "b".repeat(533));
         let chunks = split_sentences(&text, 400, 24);
         assert_eq!(chunks.iter().map(|c| c.chars().count()).collect::<Vec<_>>(), [267, 267, 267]);
