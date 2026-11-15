@@ -337,7 +337,7 @@ def _position_spec(array: Array) -> PositionSpec:
             config, rotary_dim=rope.rotary_dim, interleave=rope.interleave, rope_scale=rope.scale,
             rope_theta=rope.theta, rope_dtype=rope.dtype, rope_table_dtype=rope.table_dtype,
             low_freq_factor=rope.low_freq_factor, high_freq_factor=rope.high_freq_factor,
-            old_context_len=rope.old_context_len,
+            old_context_len=rope.old_context_len, longrope=rope.longrope,
         )
     return PositionSpec(resource_key=position_key(array), nodes=array.nodes, config=config)
 
@@ -1275,6 +1275,12 @@ class RaggedAttend(WithinStepAttend):
     """`Attend` within a step, on a ragged resource that the reads of one kind, nodes and config share."""
 
     read_back = frozenset({"max_segments_per_request", "max_segments_per_step"})
+
+    def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
+        """``backend`` goes through the spec's own YAML path, so it takes the names `resources:` takes."""
+        super().apply(spec, {field: value for field, value in settings.items() if field != "backend"})
+        if "backend" in settings:
+            spec.apply_yaml_overrides(backend=settings["backend"])
 
     def attend(self, run: Any, label: str, rows: "RowLayout") -> Callable[..., torch.Tensor]:
         return functools.partial(joint_attention, ragged=functools.partial(run.run, label=label))

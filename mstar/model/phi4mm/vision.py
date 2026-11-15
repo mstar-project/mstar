@@ -21,7 +21,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from functools import lru_cache
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -29,17 +29,13 @@ import torch.nn.functional as F
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.engine.accelerator_graph_config import PiecewiseAcceleratorGraphConfig
-from mstar.engine.resources.attn.ragged.config import (
-    RaggedAttentionConfig,
-    RaggedAttentionSpec,
-    RaggedAttnBackend,
-)
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.state import Array, ArrayStep, Attend, Block, KVEntry, Read, SubmoduleStep, kernel_setting
 from mstar.model.components.block_loop_encoder import PackedBlockLoopEncoder
 from mstar.model.keys import VISION_ATTN
 from mstar.model.multimodal import MediaEncoder, as_uint8_chw
 from mstar.model.multimodal_decoder import PreparedMedia
 from mstar.model.phi4mm.components.vision import Phi4MMVisionConfig, Phi4MMVisionModel
+from mstar.model.phi4mm.config import VISION_TOKENS
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
 from mstar.utils.h2d import to_device_nonblocking
 
@@ -300,8 +296,8 @@ class Phi4MMVisionEncoderSubmodule(PackedBlockLoopEncoder):
     """Images -> one LLM-width row per image pad, every image of the step's
     requests packed into one call (STATELESS).
 
-    Each crop attends to itself alone, a segment of the ragged attention
-    resource under ``VISION_ATTN``; only valid patches are packed. The grid maths
+    Each crop attends to itself alone, a segment of the vision array's
+    ``VISION_ATTN`` read; only valid patches are packed. The grid maths
     runs on the host from the walk's ``MEDIA_LAYOUT`` (`image_plan`, cached by
     grid), so nothing reads the device.
     """
@@ -320,6 +316,18 @@ class Phi4MMVisionEncoderSubmodule(PackedBlockLoopEncoder):
     def __init__(self, model: Phi4MMVisionModel, config: Phi4MMVisionConfig):
         super().__init__(model, _NodeConfig(config.hidden_size, config.head_dim), output=VISION_OUTPUT)
         self.vision_config = config
+
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.vision = handles[VISION_TOKENS]
+
+    def _declare(
+        self, rows: Sequence[tuple[Any, Mapping[str, Sequence[int]]]], attention: bool = True,
+    ) -> SubmoduleStep:
+        state = {VISION_TOKENS: ArrayStep()} if attention else {}
+        return SubmoduleStep(segments=super()._declare(rows).segments, state=state)
+
+    def max_segments_per_step(self) -> int:
+        return kernel_setting(self.vision, VISION_ATTN, "max_segments_per_step")
 
     def get_piecewise_accelerator_graph_configs(self, *args, **kwargs) -> dict[str, PiecewiseAcceleratorGraphConfig]:
         # the block loop runs eagerly until its capture has a parity test
@@ -376,25 +384,25 @@ class Phi4MMVisionEncoderSubmodule(PackedBlockLoopEncoder):
         return {rid: {self.output: [r]} for rid, r in zip(engine_inputs.request_ids, rows, strict=True)}
 
 
-def vision_resources(config: Phi4MMVisionConfig, node: str = VISION_NODE) -> list[NodeResourceSpec]:
-    """The tower's attention, its only resource: one segment per crop and per
-    global view, every request's in a step."""
-    return [
-        RaggedAttentionSpec(
-            resource_key=VISION_ATTN, nodes={node},
-            config=RaggedAttentionConfig(
-                num_qo_heads=config.num_attention_heads,
-                num_kv_heads=config.num_attention_heads,
-                head_dim=config.head_dim,
-                # a step's requests, an image each with its global view and crops; a
-                # step with more runs its requests apart (`_fits_capture`)
-                max_segments_per_step=Phi4MMVisionEncoderSubmodule.MAX_BATCH_SIZE * (1 + config.max_crops),
-                # FA3 varlen takes head_dim 72 as it is; FlashInfer pads it to 128.
-                # Falls back to FlashInfer where FA3 can't load.
-                backend=RaggedAttnBackend.DENSE,
-            ),
-        ),
-    ]
+def vision_array(config: Phi4MMVisionConfig) -> Array:
+    """The tower's keys and values, which its attention reads within one segment per
+    crop and per global view, every request's in a step."""
+    return Array(
+        VISION_TOKENS, nodes={VISION_NODE}, layers=frozenset(range(config.layers_run)),
+        entry=KVEntry(heads=config.num_attention_heads, head_dim=config.head_dim), max_len=0,
+        reads={VISION_ATTN: Read(mask=Block(), op=Attend(q_heads=config.num_attention_heads))},
+    )
+
+
+def vision_kernel_settings(config: Phi4MMVisionConfig) -> dict[str, Any]:
+    return {
+        # a step's requests, an image each with its global view and crops; a
+        # step with more runs its requests apart (`_fits_capture`)
+        "max_segments_per_step": Phi4MMVisionEncoderSubmodule.MAX_BATCH_SIZE * (1 + config.max_crops),
+        # FA3 varlen takes head_dim 72 as it is; FlashInfer pads it to 128.
+        # Falls back to FlashInfer where FA3 can't load.
+        "backend": "dense",
+    }
 
 
 def create_vision_submodule(

@@ -143,8 +143,9 @@ if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
 if TYPE_CHECKING:
-    from mstar.engine.state import Array, Sampler, SampleSettings, SeqShard
+    from mstar.engine.state import Array, Layout, Sampler, SampleSettings, SeqShard
     from mstar.engine.state.adapters import StateSetup
+    from mstar.model.components.lora.modules import LoraRoot
     from mstar.worker.scheduling_policy import WalkPriority
 
 DECODE = "decode"
@@ -260,6 +261,35 @@ class LabelLayout(NamedTuple):
             self.keyed_count(),
             self.max_growth,
         ]
+
+
+class StateLayouts(NamedTuple):
+    """What a model on the state contract returns from `process_prompt` for its paged labels."""
+    state_layout: "dict[str, dict[str, Layout]]"
+    keyed_spans: dict[str, dict[str, int]]
+
+
+def state_layouts(kv_layout: Mapping[str, Mapping[str, LabelLayout]]) -> StateLayouts:
+    """``kv_layout`` as a ``state_layout``, with the ``keyed_spans`` of each label that sets them.
+    `PagedStorage.layouts` converts back, and both go when `LabelLayout` goes.
+
+    `Layout` has no field for ``retention`` or ``max_growth`` yet, so a label that sets one raises
+    ``RuntimeError``, a 500, rather than lose it.
+    """
+    from mstar.engine.state import Layout
+
+    state_layout, keyed_spans = {}, {}
+    for array, by_label in kv_layout.items():
+        for label, layout in by_label.items():
+            for name, value in (("retention", layout.retention), ("max_growth", layout.max_growth)):
+                if value is not None:
+                    raise RuntimeError(f"kv_layout[{array!r}][{label!r}].{name} is set, and a Layout can't hold it")
+            state_layout.setdefault(array, {})[label] = Layout(
+                spans=layout.spans, growth=layout.growth, scratch=layout.scratch,
+            )
+            if layout.keyed_spans is not None:
+                keyed_spans.setdefault(array, {})[label] = layout.keyed_spans
+    return StateLayouts(state_layout, keyed_spans)
 
 
 def prompt_spans(
@@ -551,18 +581,21 @@ def streamed_inputs(model: "Model", graph_walk: str, graph: GraphSection) -> set
 
 def enabled_resources(model: "Model", model_config: dict, setup: "StateSetup") -> list[NodeResourceSpec]:
     """The resource specs a deployment's YAML turns on, before its ``resources:``
-    overrides: the model's declaration, less the opt-in specs (``NodeResourceSpec.opt_in``)
-    its ``resources:`` block does not name. Raises the first problem with the declaration,
-    for callers that skip ``validate_deployment``, which reports them all."""
+    overrides: the model's declaration and the LoRA spec of its `lora_roots`, less the
+    opt-in specs (``NodeResourceSpec.opt_in``) its ``resources:`` block does not name.
+    Raises the first problem with the declaration, for callers that skip
+    ``validate_deployment``, which reports them all."""
     from mstar.engine.state.adapters import node_resources
     from mstar.engine.state.analysis import state_declaration_problems
+    from mstar.model.components.lora.modules import declared_lora_spec
 
     problems = state_declaration_problems(model)
     if problems:
         raise ValueError(problems[0])
     named = (model_config.get("resources") or {}).keys()
+    lora = declared_lora_spec(model.lora_roots())
     return [
-        spec for spec in node_resources(model, setup=setup)
+        spec for spec in [*node_resources(model, setup=setup), *([lora] if lora is not None else [])]
         if not spec.opt_in or spec.resource_key in named
     ]
 
@@ -800,10 +833,15 @@ class Model(ABC):
         The whole declaration, apart from what `declare_state` declares: a KV
         cache's shape, the attention backend over it, positions, samplers. The
         engine builds one resource per spec and hands each node the subset naming it.
-        An opt-in spec (per-request LoRA adapters) is declared here too, and built
-        only for a deployment whose ``resources:`` block names it.
+        Per-request LoRA adapters are declared in `lora_roots`.
         """
         return []
+
+    def lora_roots(self) -> "tuple[LoraRoot, ...]":
+        """The weights roots per-request LoRA adapters may reach, one per node, from which the bridge builds the
+        opt-in LoRA spec. LoRA stands outside `declare_state`: adapters are weights that no request writes, and a
+        request picks one by its kwargs."""
+        return ()
 
     def declare_state(self) -> "list[Array | Sampler | SeqShard]":
         """The state the model keeps between steps, from which the engine builds the specs for it.
@@ -815,8 +853,8 @@ class Model(ABC):
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
         """By read, update or array name, what the engine doesn't pick itself yet: ``splits``, ``decode_fmha`` and
         ``decode_tensor_cores`` on a read of an array that keeps entries, ``splits`` on a GatedDeltaNet, the capture
-        sizes of a ``Block`` read, and a pool's default size, ``max_num_pages`` on a paged array and ``max_slots`` on a
-        Value with tensor fields. A deployment's ``resources:`` block overrides each pool size.
+        sizes and the ``backend`` of a ``Block`` read, and a pool's default size, ``max_num_pages`` on a paged array
+        and ``max_slots`` on a Value with tensor fields. A deployment's ``resources:`` block overrides each pool size.
 
         A pure function of the model's config and the deployment's settings, as `declare_state` is, since each process
         calls it.

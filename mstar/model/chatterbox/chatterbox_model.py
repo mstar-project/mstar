@@ -40,7 +40,6 @@ import torch
 from mstar.api_server.media_io import check_resample_rate
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import PartitionDefinition
-from mstar.engine.resources.lora import LoraSpec
 from mstar.engine.state import (
     Array,
     Attend,
@@ -76,6 +75,7 @@ from mstar.model.chatterbox.config import (
     ChatterboxConfig,
 )
 from mstar.model.chatterbox.loader import resolve_snapshot
+from mstar.model.components.lora.modules import PER_SEGMENT, LoraRoot
 from mstar.model.media_limits import decoding_upload
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import check_kv_pools_fit
@@ -297,7 +297,7 @@ class ChatterboxModel(Model):
             loop_caps={self.DECODE_LOOP: self.config.max_new_tokens_limit or t3.max_speech_tokens},
         )
 
-    def _lora_spec(self) -> LoraSpec | None:
+    def lora_roots(self) -> tuple[LoraRoot, ...]:
         """Per-request adapters on T3: every linear of its Llama backbone and the speech
         head (one row per segment: each stream's last token). Under classifier-free
         guidance a request's cond and uncond rows both run its adapter, as one model
@@ -306,19 +306,13 @@ class ChatterboxModel(Model):
         Turbo serves none: its GPT-2 checkpoint fuses q, k and v into one ``c_attn``
         tensor in Conv1D layout, which an adapter cannot be placed on per slice."""
         if self.config.t3.backbone.is_gpt2:
-            return None
+            return ()
         from mstar.model.chatterbox.components.t3 import T3Model
-        from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
-        return module_lora_spec(
-            lambda group: T3Model(self.config.t3, comm_group=group),
-            nodes={T3_NODE}, root_path="model",
+        return (LoraRoot(
+            node=T3_NODE, build=lambda group: T3Model(self.config.t3, comm_group=group),
             rows={"speech_head": PER_SEGMENT},
             exclude={"cond_enc": "the conditioning encoder runs in prepare_inputs, outside the planned step"},
-        )
-
-    def get_node_resources(self):
-        lora = self._lora_spec()
-        return [lora] if lora is not None else []
+        ),)
 
     def declare_state(self) -> list[Array | Sampler]:
         from mstar.model.chatterbox.submodules import max_reference_tokens

@@ -29,7 +29,7 @@ Nodes:
                                  packed image/video patches to text-space
                                  tokens for the reasoner prefill.
   Cosmos3ReasonerSubmodule    -- the understanding tower as a causal VLM, a
-                                 ``SampledTokenDecoder`` on the VLM scaffold
+                                 ``DeclaredTokenDecoder`` on the VLM scaffold
                                  (shares the DiT's transformer instance and
                                  kv/attn resources, plus its own sampler and
                                  positions): ``prefill_text`` /
@@ -67,17 +67,12 @@ from mstar.engine.fp32_precision import cudnn_benchmark
 from mstar.engine.state import (
     ArrayStep,
     Entry,
-    SampleStep,
     Segment,
     SlotLease,
     SubmoduleStep,
-    at_last_token,
     host,
     kernel_setting,
-    last_sampled,
-    position,
     positions,
-    sample,
 )
 from mstar.engine.windowing import WindowSchedule
 from mstar.model.components.block_loop_encoder import PackedBlockLoopEncoder
@@ -91,7 +86,7 @@ from mstar.model.components.diffusion.unipc import (
     unipc_step,
 )
 from mstar.model.components.mrope import layout_position_ids, mrope_position_ids
-from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+from mstar.model.components.sampled_token_decoder import DeclaredTokenDecoder
 from mstar.model.cosmos3.components.packing import (
     action_start_frame_offset,
     build_action_static_inputs,
@@ -3365,7 +3360,7 @@ class Cosmos3TextTower(torch.nn.Module):
         return self.transformer.lm_head(hidden).float()
 
 
-class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
+class Cosmos3ReasonerSubmodule(DeclaredTokenDecoder):
     """The understanding tower served as a causal VLM, on the VLM scaffold.
 
     Shares the DiT node's ``Cosmos3OmniTransformer`` instance and its ``kv``
@@ -3377,6 +3372,7 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
     layout (`prompt_positions`) and moves the counter to ``max(position) + 1``.
     """
 
+    KV_CACHE = KV_CACHE
     # Eager steps stay uncompiled; the captures compile their own forward.
     disable_torch_compile = True
     # Ladders trimmed from the scaffold's: every capture here is extra startup
@@ -3404,30 +3400,6 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
 
     def __init__(self, transformer, config, encoders: Sequence[MediaEncoder] = ()):
         super().__init__(Cosmos3TextTower(transformer), config, encoders)
-
-    def bind_state(self, handles: Mapping[str, Any]) -> None:
-        self.kv = handles[KV_CACHE]
-        self.sampler = handles[SAMPLER]
-
-    def node_step(
-        self, segments: list[Segment], prefill_tokens: Mapping[int, torch.Tensor], advance: tuple[int, ...] | None,
-    ) -> SubmoduleStep:
-        return SubmoduleStep(
-            segments=segments,
-            state={KV_CACHE: ArrayStep(advance=advance), SAMPLER: SampleStep(prompt_tokens=prefill_tokens)},
-        )
-
-    def next_position(self, rid_handle: int) -> int:
-        return position(self.kv, rid_handle, REASONER_LABEL)
-
-    def loopback_tokens(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
-        return last_sampled(self.sampler)
-
-    def last_token_hidden(self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor) -> torch.Tensor:
-        return at_last_token(self.kv, hidden)
-
-    def sample_tokens(self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor) -> torch.Tensor:
-        return sample(self.sampler, logits)
 
     def capture_compile_mode(self, graph_walk: str) -> str | None:
         # Decode keeps the mode it was tuned with; prefills take the

@@ -23,11 +23,8 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCallInputs,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep
-from mstar.engine.resources.step import ResourceStep
-from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
-from mstar.model.higgs_audio.config import ATTN, HiggsAudioModelConfig
-from mstar.model.keys import KV_CACHE
+from mstar.model.components.sampled_token_decoder import DeclaredTokenDecoder
+from mstar.model.higgs_audio.config import HiggsAudioModelConfig
 from mstar.model.multimodal import MEDIA_LAYOUT, media_grids
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.utils.h2d import to_device_nonblocking
@@ -223,8 +220,7 @@ class HiggsAudioEncoderSubmodule(NodeSubmodule):
         return self.forward_batched(graph_walk, engine_inputs, **kwargs)[rid]
 
 
-class HiggsAudioLLMSubmodule(SampledTokenDecoder):
-    ATTN_KEY = ATTN
+class HiggsAudioLLMSubmodule(DeclaredTokenDecoder):
     # the ladders higgs captured before moving onto the scaffold
     PREFILL_MEDIA_TOKEN_BUCKETS = [64, 128, 256, 512, 1024, 2048]
     PREFILL_MEDIA_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
@@ -233,6 +229,3 @@ class HiggsAudioLLMSubmodule(SampledTokenDecoder):
     def capture_compile_mode(self, graph_walk: str) -> str | None:
         # max-autotune until the default compile level (mstar serve -O) is measured on this model
         return "max-autotune-no-cudagraphs"
-
-    def layer_steps(self) -> dict[str, ResourceStep]:
-        return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}
