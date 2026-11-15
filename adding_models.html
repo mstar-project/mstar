@@ -1638,7 +1638,14 @@ values. It refuses anything else.</p>
 <p>The engine builds these specs from <code class="docutils literal notranslate"><span class="pre">declare_state</span></code>, and a deployment tunes them under the
 declared names. A model that hasn’t moved to declarations still writes them by hand in
 <code class="docutils literal notranslate"><span class="pre">get_node_resources</span></code>, which returns a flat list of <code class="docutils literal notranslate"><span class="pre">NodeResourceSpec</span></code> objects and is
-<code class="docutils literal notranslate"><span class="pre">[]</span></code> by default. Every spec has these common members:</p>
+<code class="docutils literal notranslate"><span class="pre">[]</span></code> by default. A new model package declares its state through the contract and is listed
+in <code class="docutils literal notranslate"><span class="pre">PORTED</span></code> in <code class="docutils literal notranslate"><span class="pre">test/modular/test_state_lint.py</span></code>, which fails a package that is on
+neither <code class="docutils literal notranslate"><span class="pre">PORTED</span></code> nor its frozen <code class="docutils literal notranslate"><span class="pre">UNPORTED</span></code> list. <code class="docutils literal notranslate"><span class="pre">get_node_resources</span></code> remains for the
+packages on <code class="docutils literal notranslate"><span class="pre">UNPORTED</span></code>. A ported file defines it only for a spec the contract can’t
+declare, such as the sequence shard on MiniMax-H3’s video decoder, a node with no arrays, and
+the lint lists that function with its reason. When the contract can’t declare a model’s state
+yet, the mask or op and its binding in <code class="docutils literal notranslate"><span class="pre">adapters.py</span></code> land first, in their own PR. Every spec
+has these common members:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">resource_key</span></code> is the name of this resource. Three places use this name, and all three
 must agree: the layers bind to it, <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> uses it as the key of its
