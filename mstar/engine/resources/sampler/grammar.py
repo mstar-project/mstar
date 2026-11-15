@@ -161,25 +161,17 @@ def request_grammar(model_kwargs: dict | None) -> GrammarRequest | None:
 
 
 def after_reasoning(structured: Any, text_output: TextOutput | None, prompt_ids: torch.Tensor) -> Any:
-    """``structured`` with ``after`` the model's ``reasoning_end`` when the prompt
-    leaves the reasoning open, so a thinking turn reasons freely and then answers
-    in its grammar; as it came on a turn whose prompt ends past the reasoning.
-    The check reads the last 8 ids and the whitespace before the end does not
-    count. While they do not end in ``reasoning_end``, it drops trailing special
-    tokens one at a time, reading again after each, so a template may add special tokens after the end
-    (MiniCPM-o's ``<|tts_bos|>``) and an end made of special tokens still matches."""
+    """``structured`` with ``after`` the model's ``reasoning_end`` when the prompt opens a
+    reasoning block it doesn't close (in its last 32 ids, the last ``reasoning_start`` comes after
+    the last ``reasoning_end``), so a thinking turn reasons freely and then answers in its grammar;
+    as it came otherwise, a turn whose template opens no reasoning included."""
+    start = None if text_output is None else text_output.reasoning_start
     end = None if text_output is None else text_output.reasoning_end
-    if end is None or not isinstance(structured, dict) or "after" in structured:
+    if start is None or end is None or not isinstance(structured, dict) or "after" in structured:
         return structured
-    detokenizer = text_output.detokenizer
-    ids = prompt_ids[-32:].tolist()
-    while True:
-        tail = b"".join(map(detokenizer.token_bytes, ids[-8:]))
-        if tail.decode("utf-8", errors="replace").rstrip().endswith(end):
-            return structured
-        if not ids or ids[-1] not in detokenizer.kept_special_ids:
-            return {**structured, "after": end}
-        ids.pop()
+    tail = b"".join(map(text_output.detokenizer.token_bytes, prompt_ids[-32:].tolist()))
+    text = tail.decode("utf-8", errors="replace")
+    return {**structured, "after": end} if text.rfind(start) > text.rfind(end) else structured
 
 
 def response_format_request(response_format: Any) -> dict | None:

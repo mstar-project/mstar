@@ -448,10 +448,11 @@ def test_after_starts_the_grammar_once_the_reply_holds_its_text():
     assert drawn[:3] == [x, think, x] and _text(drawn[3:5]) == "ab" and drawn[5] == EOS
 
 
-def test_after_reasoning_ignores_trailing_special_tokens(fast_tokenizer):  # noqa: F811
-    """MiniCPM-o's audio prompt closes the think block, then adds ``<|tts_bos|>``
-    (kept in its detokenizer's bytes): the reasoning is closed, as for a text prompt.
-    An end that itself contains a special token still reads as closed."""
+def test_after_starts_the_grammar_only_where_the_prompt_leaves_a_reasoning_block_open(fast_tokenizer):  # noqa: F811
+    """A prompt that opens a think block and doesn't close it reasons freely first, a special
+    token after it included; one that closed it (thinking off, or MiniCPM-o's audio prompt with
+    ``<|tts_bos|>`` after the end), or whose template opens no reasoning at all, is held to its
+    grammar from its first token."""
     tok = fast_tokenizer
     detok = TextChunkDetokenizer(tok)
     ask = {"json_object": True}
@@ -459,14 +460,18 @@ def test_after_reasoning_ignores_trailing_special_tokens(fast_tokenizer):  # noq
     nl, nl2, hi = (tok.encode(t) for t in ("\n", "\n\n", "hi"))
     think, close, special = ids["<think>"], ids["</think>"], ids["<|im_end|>"]
 
-    def after(end, *seq):
-        out = SimpleNamespace(detokenizer=detok, reasoning_end=end)
+    def after(*seq):
+        out = SimpleNamespace(detokenizer=detok, reasoning_start="<think>", reasoning_end="</think>")
         return grammar.after_reasoning(ask, out, torch.tensor([*hi, *seq])).get("after")
 
-    assert after("</think>", think, *nl) == "</think>"
-    assert after("</think>", close, *nl2, special) is None
-    assert after("</think>", close, *hi, special) == "</think>"
-    assert after("</think><|im_end|>", close, special) is None
+    assert after(think, *nl) == "</think>"
+    assert after(think, *nl, special) == "</think>"
+    assert after(think, *nl, close, *nl2) is None
+    assert after(close, *nl2, special) is None
+    assert after(close, *hi, special) is None
+    assert after(*nl) is None, "a template that opens no reasoning"
+    no_start = SimpleNamespace(detokenizer=detok, reasoning_start=None, reasoning_end="</think>")
+    assert "after" not in grammar.after_reasoning(ask, no_start, torch.tensor([*hi, think]))
 
 
 @pytest.mark.parametrize("value, error", [
