@@ -26,17 +26,19 @@ from mstar.model.components.fastconformer import FastConformerConfig
 NANO_KV = "nano_kv"                 # paged KV cache of the 4 attention layers
 NANO_ATTN = "nano_attn"             # attention planned over NANO_KV (NoPE: no position resource)
 NANO_SAMPLER = "nano_sampler"       # agent-text channel sampler
-MAMBA_STATE = "mamba_state"         # recurrent-state pool: conv + SSM state of the 27 Mamba-2 layers
+MAMBA_STATE = "mamba_state"         # each call's conv + SSM state of the 27 Mamba-2 layers
 MAMBA = "mamba"                     # the Mamba-2 (SSD) resource planned against MAMBA_STATE
+MAMBA_CONV = "mamba_conv"           # the Mamba-2 layers' causal conv, which runs inside MAMBA
 TALKER_KV = "talker_kv"             # paged KV of the talker's 28 Gemma3 layers (labels: main, uncond)
 TALKER_ATTN = "talker_attn"         # attention planned over TALKER_KV
-TALKER_POS = "talker_pos"           # positions / RoPE for the talker (per-layer theta at call time)
-TALKER_CFG_LABEL = "_cfg"           # the two talker streams combined into one plan (cond rows, then uncond)
+TALKER_PREV = "talker_prev"         # each call's previous frame of RVQ codes, which the talker's next frame reads
 AUDIO_IN = "audio_in"               # the client stream carrying the user's audio into the Encoder
-ENCODER_STATE = "encoder_state"     # recurrent-state pool: each call's streaming-encoder conv tails
-ENCODER_FRONT = "encoder_front"     # recurrent-state pool: each call's streaming-encoder audio and mel tails
-CODEC_STATE = "codec_state"         # recurrent-state pool: each call's streaming codec decoder state
-ENCODER_KV = "encoder_kv"           # bounded KV: each call's streaming-encoder attention window, per layer
+ENCODER_STATE = "encoder_state"     # each call's streaming-encoder conv tails
+ENCODER_FRONT = "encoder_front"     # each call's streaming-encoder audio and mel tails
+CODEC_STATE = "codec_state"         # each call's streaming codec decoder state
+ENCODER_KV = "encoder_kv"           # each call's streaming-encoder keys, which its attention window reads, per layer
+ENCODER_ATTN = "encoder_attn"       # the streaming encoder's window read of ENCODER_KV
+ENCODER_STREAM = "encoder_stream"   # how far each call's samples and mel frames run ahead of its encoder frames
 
 # Every node's CUDA-graph batch sizes: a row per live session, up to the sessions
 # a deployment serves by default (``NemotronDuplexModel.DEFAULT_SESSIONS``).
