@@ -423,8 +423,9 @@ class Array:
             if tensor.dtype is None:
                 raise ValueError(f"{where}.entry.tensors[{name!r}].dtype is None, and a sized field's bytes are "
                                  "counted before any worker resolves the compute dtype")
-            if tensor.shard is not None and isinstance(tensor.shape[tensor.shard], Size):
-                raise ValueError(f"{where}.entry.tensors[{name!r}].shard is a Size axis, and ranks split a fixed one")
+            if tensor.shard is not None:
+                raise ValueError(f"{where}.entry.tensors[{name!r}].shard is {tensor.shard}, and the store holds each "
+                                 "request's tensors whole, on one rank")
 
     def _check_update(self, key: str, update: Op) -> None:
         where = f"Array {self.name!r}.updates[{key!r}]"
