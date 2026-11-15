@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 
 from mstar.api_server import media_io
 from mstar.api_server.openai.speech_chunking import _cut_evenly, split_sentences
+from mstar.api_server.tool_fields import check_tools
 from mstar.engine.resources.sampler.grammar import STRUCTURED_OUTPUTS_KWARG
 from mstar.model.multimodal import PromptPart
 from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG
@@ -206,9 +207,12 @@ def _message_text(content) -> str:
 
 
 def turn_extras(tool_calls, reasoning) -> str | None:
-    """An assistant message's ``tool_calls`` and reasoning, as the chat template reads them
-    (``PromptPart.extras``): each call's ``arguments`` an object (sent as its JSON text), and
-    ``reasoning_content``. Canonical JSON, as the Rust frontend writes it. None when it has neither."""
+    """An assistant message's ``tool_calls`` and reasoning, for the chat template
+    (``PromptPart.extras``, read back by `messages_from_parts`): each call's name and its
+    ``arguments`` as the client's JSON text, checked to be an object and kept as sent, so the
+    template writes the parameters in the order the model wrote them; and ``reasoning_content``.
+    Canonical JSON, as the Rust frontend writes it (arguments sent as an object are written with
+    sorted keys, as Rust holds them). None when it has neither."""
     extras: dict = {}
     if tool_calls not in (None, []):
         if not isinstance(tool_calls, list):
@@ -220,15 +224,18 @@ def turn_extras(tool_calls, reasoning) -> str | None:
                 raise ValueError("each of an assistant message's tool_calls needs a function name")
             args = fn.get("arguments")
             if args is None or (isinstance(args, str) and not args.strip()):
-                args = {}
+                text, args = "{}", {}
             elif isinstance(args, str):
+                text = args
                 try:
                     args = json.loads(args)
                 except json.JSONDecodeError:
                     args = None
+            else:
+                text = json.dumps(args, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
             if not isinstance(args, dict):
                 raise ValueError(f"tool call {fn['name']!r}'s arguments must be a JSON object")
-            calls.append({"function": {"arguments": args, "name": fn["name"]}, "type": "function"})
+            calls.append({"function": {"arguments": text, "name": fn["name"]}, "type": "function"})
         extras["tool_calls"] = calls
     if isinstance(reasoning, str) and reasoning:
         extras["reasoning_content"] = reasoning
@@ -255,54 +262,6 @@ def response_format_request(response_format: Any) -> dict | None:
     raise ValueError(f"response_format type must be text, json_object or json_schema; got {kind!r}")
 
 
-_TOOL_CHOICE_SHAPE = 'tool_choice must be none, auto, required or {"type": "function", "function": {"name": ...}}'
-
-
-def _check_tools(mk: dict) -> None:
-    """A chat's tool fields, checked and kept, for an adapter whose models may call tools
-    (`submit_request` refuses a call for a model with no ``Model.TOOL_FORMAT``). ``tools`` empty
-    drops them all; ``tool_choice`` ``none`` keeps ``tools`` in the prompt and asks for no call.
-    The older ``functions`` / ``function_call`` aren't served. The Rust frontend's
-    ``check_tools`` is the same, word for word."""
-    function_call = mk.get("function_call")
-    if (mk.get("functions") not in (None, []) and function_call != "none") \
-            or function_call not in (None, "none", "auto"):
-        raise ValueError("functions and function_call are not supported; send tools and tool_choice")
-    tools, choice, parallel = mk.get("tools"), mk.get("tool_choice"), mk.get("parallel_tool_calls")
-    if tools in (None, []):
-        if choice == "required" or isinstance(choice, dict):
-            raise ValueError("tool_choice asks for a call, but tools lists none")
-        for name in ("tools", "tool_choice", "parallel_tool_calls"):
-            mk.pop(name, None)
-        return
-    shape = 'each of tools must be {"type": "function", "function": {"name": ...}}'
-    if not isinstance(tools, list):
-        raise ValueError(shape)
-    names = []
-    for tool in tools:
-        fn = tool.get("function") if isinstance(tool, dict) and tool.get("type") == "function" else None
-        if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
-            raise ValueError(shape)
-        if fn.get("parameters") is not None and not isinstance(fn["parameters"], dict):
-            raise ValueError(f"tool {fn['name']!r}'s parameters must be a JSON schema object")
-        if fn.get("strict") is not None and not isinstance(fn["strict"], bool):
-            raise ValueError(f"tool {fn['name']!r}'s strict must be true or false")
-        names.append(fn["name"])
-    if isinstance(choice, dict):
-        fn = choice.get("function") if choice.get("type") == "function" else None
-        name = fn.get("name") if isinstance(fn, dict) else None
-        if not isinstance(name, str) or not name:
-            raise ValueError(_TOOL_CHOICE_SHAPE)
-        if name not in names:
-            raise ValueError(f"tool_choice names {name!r}, which tools doesn't list")
-    elif choice not in (None, "none", "auto", "required"):
-        raise ValueError(_TOOL_CHOICE_SHAPE)
-    if parallel is not None and not isinstance(parallel, bool):
-        raise ValueError("parallel_tool_calls must be true or false")
-    if mk.get(STRUCTURED_OUTPUTS_KWARG) is not None:
-        raise ValueError("send tools or a JSON response_format (structured_outputs), not both")
-
-
 def _refuse_unserved_chat(req, mk: dict, tools: bool = False) -> None:
     """Refuse a chat that asks for more than one plain reply: more choices, stop
     sequences, log probs, sampling penalties, or a tool call. A JSON
@@ -321,7 +280,7 @@ def _refuse_unserved_chat(req, mk: dict, tools: bool = False) -> None:
     by default. A ``tool_choice`` of ``none`` asks for no call even when
     ``tools`` lists some. Their older names, ``functions`` and
     ``function_call``, follow the same rules. With ``tools`` (an adapter whose models
-    may call tools), the tool fields are checked and kept instead (`_check_tools`).
+    may call tools), the tool fields are checked and kept instead (`check_tools`).
     """
     if req.n not in (None, 1):
         raise ValueError(f"n={req.n}: this model returns one choice")
@@ -340,7 +299,7 @@ def _refuse_unserved_chat(req, mk: dict, tools: bool = False) -> None:
             raise ValueError("send response_format or structured_outputs, not both")
         mk[STRUCTURED_OUTPUTS_KWARG] = structured
     if tools:
-        _check_tools(mk)
+        check_tools(mk)
         for name in ("functions", "function_call", *CHAT_ENVELOPE_KEYS):
             if name != "parallel_tool_calls":
                 mk.pop(name, None)
@@ -423,7 +382,7 @@ class OpenAIAdapter:
 
     # Each flag gates exactly one OpenAI surface:
     supports_chat: bool = False     # POST /v1/chat/completions
-    # whether its models may call tools: its chat keeps ``tools`` and tool turns (`_check_tools`),
+    # whether its models may call tools: its chat keeps ``tools`` and tool turns (`check_tools`),
     # and `submit_request` refuses them for a model with no ``Model.TOOL_FORMAT``
     serves_tools: bool = False
     supports_speech: bool = False   # POST /v1/audio/speech

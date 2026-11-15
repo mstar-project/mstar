@@ -127,3 +127,24 @@ def test_qwen3_5s_call_format_is_xgrammars():
     (call,) = calls["tags"] if "tags" in calls else calls["tag"]
     assert call["begin"] == QWEN.begin + "get_weather" + QWEN.name_end
     assert call["end"].lstrip("\n") == QWEN.end
+
+
+@pytest.mark.parametrize("parameters", [
+    {"type": "object", "properties": {"city": "string", "days": "integer"}},
+    {"type": "object", "properties": ["city", "days"]},
+    {"type": "object", "properties": None},
+    None,
+], ids=["property-not-an-object", "properties-a-list", "properties-null", "no-parameters"])
+def test_a_tool_whose_schema_is_malformed_is_parsed_as_one_with_none(parameters):
+    """The client wrote the schema, and the parser runs on the thread every request shares: a
+    schema it can't read types nothing, and raises nothing."""
+    tools = [{"type": "function", "function": {"name": "get_weather", "parameters": parameters}}]
+    reply = "x</think>\n\n" + _call(city="Paris", days="3")
+    assert _feed([reply.encode()], tools=tools) == ("x", "", [(0, "get_weather", {"city": "Paris", "days": 3})])
+
+
+def test_nan_and_infinity_stay_text():
+    """Python's JSON reads them, strict JSON parsers don't: the arguments stay strict JSON."""
+    reply = "x</think>\n\n" + _call(days="NaN", extra="-Infinity")
+    (call,) = ReplyParser(END, True, QWEN, TOOLS).feed(reply.encode())[2]
+    assert call["function"]["arguments"] == '{"days": "NaN", "extra": "-Infinity"}'

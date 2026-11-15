@@ -57,6 +57,7 @@ from mstar.api_server.request_types import (
 )
 from mstar.api_server.served_models import Selected, ServedModels
 from mstar.api_server.streaming_response import ReleasingStreamingResponse, errors_in_band
+from mstar.api_server.tool_fields import asks_for_tools, check_tools, without_tools
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.tensors import ensure_deployment_token
 from mstar.conductor.workers import accelerator_type, deployment_workers
@@ -411,6 +412,9 @@ class _SinkBatch(NamedTuple):
 def _set_events(wakes: list) -> None:
     for wake in wakes:
         wake.set()
+
+
+_REPLY_PARSE_FAILED = "the reply could not be parsed"
 
 
 def _split_chunk(chunk: ResultChunk, reasoning: str, answer: str, calls: list[dict]) -> None:
@@ -835,17 +839,23 @@ class APIServer:
     # Submitting a request
     # ----------------------------------------------------------
 
-    def _refuse_unserved_tools(self, model_kwargs: dict, prompt_parts: list[PromptPart] | None) -> None:
-        """A chat's tools on a model with no ``Model.TOOL_FORMAT``: an adapter serves several
-        models, and a frontend can't tell them apart, so the call it asks for, or a tool turn, is
-        refused here, as the adapter refused it before; with ``tool_choice`` none the tools are dropped."""
+    def _serve_tool_fields(
+        self, model_kwargs: dict, prompt_parts: list[PromptPart] | None, chat: bool,
+    ) -> list[PromptPart] | None:
+        """A request's tool fields, on every path: checked for a model that calls tools
+        (``Model.TOOL_FORMAT``), since ``chat_template_kwargs`` and ``/generate`` reach it past the
+        chat adapter's check. On a chat to a model that calls none, a call or a tool turn is refused
+        (an adapter serves several models, and a frontend can't tell them apart), and the rest is
+        dropped, an assistant turn's reasoning included, as before tools were served. ``/generate``
+        on such a model is as before: tool kwargs it doesn't read."""
         if getattr(getattr(self, "model", None), "TOOL_FORMAT", None) is not None:
-            return
-        turns = any(p.role == "tool" or p.extras is not None for p in prompt_parts or ())
-        if model_kwargs.get("tools") not in (None, []) and model_kwargs.get("tool_choice") != "none" or turns:
+            check_tools(model_kwargs)
+            return prompt_parts
+        if not chat:
+            return prompt_parts
+        if asks_for_tools(model_kwargs, prompt_parts):
             raise ValueError("tool calling is not supported for this model")
-        for name in ("tools", "tool_choice", "parallel_tool_calls"):
-            model_kwargs.pop(name, None)
+        return without_tools(model_kwargs, prompt_parts)
 
     def _reply_reasoning_end(self) -> str | None:
         """The text that ends the model's reasoning (`TextOutput.reasoning_end`), read once; None
@@ -858,23 +868,38 @@ class APIServer:
             self._reasoning_end = None if text is None else text.reasoning_end
             return self._reasoning_end
 
-    def _parse_reply_chunk(self, req: PendingRequest, chunk: ResultChunk) -> None:
+    def _parse_reply_chunk(self, req: PendingRequest, chunk: ResultChunk) -> ResultChunk:
         """A parsed chat reply's text chunk, split: its answer stays the chunk's text, its reasoning
-        moves to ``metadata["reasoning"]``. On the message thread, in the request's chunk order."""
-        if req.parser is None:
-            starts = bool(chunk.metadata.pop(REPLY_IN_REASONING, False))
-            tool_format = TOOL_FORMATS.get(getattr(self.model, "TOOL_FORMAT", None)) if req.reply_tools else None
-            if not starts and tool_format is None:
-                # all answer (thinking off, no tools): its chunks pass through unparsed
-                req.parse_reply = False
-                return
-            req.parser = ReplyParser(self._reply_reasoning_end(), starts, tool_format, req.reply_tools)
-        _split_chunk(chunk, *req.parser.feed(chunk.data))
+        moves to ``metadata["reasoning"]``, its closed calls to ``metadata["tool_calls"]``. On the
+        message thread, in the request's chunk order. The thread carries every request's chunks, so
+        a parser error fails only its own request: the chunk becomes the error that ends it."""
+        try:
+            if req.parser is None:
+                starts = bool(chunk.metadata.pop(REPLY_IN_REASONING, False))
+                tool_format = TOOL_FORMATS.get(getattr(self.model, "TOOL_FORMAT", None)) if req.reply_tools else None
+                if not starts and tool_format is None:
+                    # all answer (thinking off, no tools): its chunks pass through unparsed
+                    req.parse_reply = False
+                    return chunk
+                req.parser = ReplyParser(self._reply_reasoning_end(), starts, tool_format, req.reply_tools)
+            _split_chunk(chunk, *req.parser.feed(chunk.data))
+            return chunk
+        except Exception:  # noqa: BLE001 - one request's reply, never the thread
+            logger.exception("Parsing the reply of %s failed", chunk.request_id)
+            req.parse_reply, req.parser = False, None
+            return ResultChunk(request_id=chunk.request_id, modality="error", data=_REPLY_PARSE_FAILED.encode(),
+                               metadata={"status": 500})
 
     @staticmethod
     def _finish_reply(req: PendingRequest, rid: str) -> None:
-        """What a parsed reply's parser still holds, as its last text chunk."""
-        reasoning, answer, calls = req.parser.finish()
+        """What a parsed reply's parser still holds, as its last text chunk; a parser error fails
+        the request instead."""
+        try:
+            reasoning, answer, calls = req.parser.finish()
+        except Exception:  # noqa: BLE001 - one request's reply, never the thread
+            logger.exception("Parsing the reply of %s failed", req.request_id or rid)
+            req.error, req.error_status = _REPLY_PARSE_FAILED, 500
+            return
         if reasoning or answer or calls:
             chunk = ResultChunk(request_id=req.request_id or rid, modality="text", data=b"")
             _split_chunk(chunk, reasoning, answer, calls)
@@ -971,7 +996,7 @@ class APIServer:
         # here, before anything is queued: null is unset, types and ranges are
         # checked once for every endpoint, and an over-wide seed cannot be packed
         model_kwargs = normalize_generation_kwargs(model_kwargs)
-        self._refuse_unserved_tools(model_kwargs, prompt_parts)
+        prompt_parts = self._serve_tool_fields(model_kwargs, prompt_parts, parse_reply)
         reply_tools = None
         if parse_reply and getattr(getattr(self, "model", None), "TOOL_FORMAT", None) in TOOL_FORMATS \
                 and model_kwargs.get("tool_choice") != "none":
@@ -1510,7 +1535,7 @@ class APIServer:
                                 rid, req.request_id,
                             ).encode("utf-8")
                         if req.parse_reply and result_chunk.modality == "text":
-                            self._parse_reply_chunk(req, result_chunk)
+                            result_chunk = self._parse_reply_chunk(req, result_chunk)
                         req.chunks.append(result_chunk)
                         if self.log_stats:
                             info = req.output_totals.get(result_chunk.modality)

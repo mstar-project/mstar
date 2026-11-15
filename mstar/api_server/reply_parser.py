@@ -70,11 +70,8 @@ class ReplyParser:
         self._thinking = self._in_reasoning
         self._utf8 = Utf8Stream()
         self._format = tool_format if tools else None
-        # tool name -> parameter name -> its schema
-        self._types = {
-            t["function"]["name"]: ((t["function"].get("parameters") or {}).get("properties") or {})
-            for t in tools or ()
-        }
+        # tool name -> parameter name -> its schema (a client's malformed one counts as none)
+        self._types = {t["function"]["name"]: _properties(t["function"]) for t in tools or ()}
         self._in_call = False
         # how many calls have closed so far: the next one's index
         self.calls = 0
@@ -187,15 +184,28 @@ def _marker_prefix(text: str, marker: str) -> int:
 def _typed(raw: str, schema: dict | None):
     """A parameter's text as its schema's type: a string stays as written (``94110`` included); a
     number, boolean, object, array or null is parsed, Python's ``True`` / ``False`` too (Qwen's
-    template prints booleans that way); text that doesn't parse stays a string. No schema: parsed
-    if it parses."""
-    kind = (schema or {}).get("type")
+    template prints booleans that way); text that doesn't parse, or parses only as Python's
+    ``NaN`` / ``Infinity``, stays a string. No schema: parsed if it parses."""
+    kind = schema.get("type") if isinstance(schema, dict) else None
     kinds = kind if isinstance(kind, list) else [kind]
     if kinds == ["string"]:
         return raw
     if raw in ("True", "False") and ("boolean" in kinds or kind is None):
         return raw == "True"
     try:
-        return json.loads(raw)
+        return json.loads(raw, parse_constant=_not_json)
     except ValueError:
         return raw
+
+
+def _not_json(constant: str):
+    """``NaN`` and ``Infinity``, which Python's JSON reads but strict JSON doesn't: left as text."""
+    raise ValueError(constant)
+
+
+def _properties(function: dict) -> dict:
+    """A tool's parameter schemas by name; empty when its ``parameters`` or their ``properties``
+    aren't objects."""
+    parameters = function.get("parameters")
+    properties = parameters.get("properties") if isinstance(parameters, dict) else None
+    return properties if isinstance(properties, dict) else {}

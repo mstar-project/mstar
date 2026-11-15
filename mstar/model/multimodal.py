@@ -147,7 +147,7 @@ def messages_from_parts(
             {"type": TEXT, "text": part.text or ""} if part.modality == TEXT
             else {"type": part.modality, part.modality: ""}
             for part in turn.parts
-        ], **(json.loads(turn.parts[0].extras) if turn.parts[0].extras is not None else {})}
+        ], **_turn_extras(turn.parts[0].extras)}
         for turn in chat_turns(parts)
     ]
     if default_system is not None and not any(m["role"] == "system" for m in messages):
@@ -628,3 +628,14 @@ def media_prefill_step(
             raise ValueError(f"{model_name} needs {needs}; it takes no text-only prompt")
         return WalkStep(PREFILL_TEXT, step_metadata={FINAL_PREFILL: True})
     return WalkStep(media_walk_name(present), step_metadata={MEDIA_LAYOUT: layout or {}, FINAL_PREFILL: True})
+
+
+def _turn_extras(extras: str | None) -> dict:
+    """A part's ``extras`` as the template reads them: each tool call's ``arguments``, kept as the
+    client's JSON text, parsed into an object in the order it was written."""
+    if extras is None:
+        return {}
+    fields = json.loads(extras)
+    for call in fields.get("tool_calls", ()):
+        call["function"]["arguments"] = json.loads(call["function"]["arguments"])
+    return fields

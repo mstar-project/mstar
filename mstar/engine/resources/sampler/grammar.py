@@ -41,8 +41,8 @@ GRAMMAR_AFTER_KWARG = "structured_outputs_after"
 # a forced tool call's grammar, the model's tool-call format as a structural tag: only the data worker
 # builds it (`tool_call_grammar`), dropping a client's value
 GRAMMAR_TOOLS_KWARG = "structured_outputs_tools"
-# the `GrammarRequest.kind` of a forced tool call; no client sends it
-TOOL_CALLS = "tool_calls"
+# the `GrammarRequest.kind` of an xgrammar structural tag (a forced tool call's); no client sends it
+STRUCTURAL_TAG = "structural_tag"
 GRAMMAR_KINDS = ("json", "json_object", "regex", "choice", "grammar")
 # a grammar compiles while its request waits for admission, so its size is bounded
 MAX_GRAMMAR_CHARS = 1 << 17
@@ -91,7 +91,7 @@ class GrammarRequest:
         """The xgrammar ``Grammar``; tokenizer-free, so it checks the request
         anywhere. ``ValueError`` names what is unsupported."""
         try:
-            if self.kind == TOOL_CALLS:
+            if self.kind == STRUCTURAL_TAG:
                 import xgrammar as xgr
 
                 return xgr.Grammar.from_structural_tag(self.value)
@@ -102,11 +102,12 @@ class GrammarRequest:
 
             return xgr.Grammar.from_structural_tag(self._structural_tag(content))
         except (RuntimeError, ValueError) as e:
-            raise ValueError(f"{'tools' if self.kind == TOOL_CALLS else f'structured_outputs {self.kind}'}: {e}") from e
+            what = "tools" if self.kind == STRUCTURAL_TAG else f"structured_outputs {self.kind}"
+            raise ValueError(f"{what}: {e}") from e
 
     def compile(self, compiler):
         """Compiled against ``compiler``'s vocabulary, through the calls its cache keys by text."""
-        if self.kind == TOOL_CALLS:
+        if self.kind == STRUCTURAL_TAG:
             return compiler.compile_structural_tag(self.value)
         if self.after is not None:
             return compiler.compile_structural_tag(self._structural_tag(self._content()))
@@ -202,7 +203,7 @@ def request_grammar(model_kwargs: dict | None) -> GrammarRequest | None:
     if tools is not None:
         if len(tools) > MAX_GRAMMAR_CHARS:
             raise ValueError(f"the tools' grammar is {len(tools)} characters; at most {MAX_GRAMMAR_CHARS} are served")
-        request = GrammarRequest(TOOL_CALLS, tools)
+        request = GrammarRequest(STRUCTURAL_TAG, tools)
         try:
             request.grammar()
         except ImportError as e:

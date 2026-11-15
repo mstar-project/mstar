@@ -91,7 +91,8 @@ TOOLS = [{"type": "function", "function": {
     "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
                    "required": ["city"]},
 }}]
-# a tool loop as a client sends it back: the reply's reasoning and calls (arguments as JSON text),
+# a tool loop as a client sends it back: the reply's reasoning and calls (arguments as JSON text, one
+# not in alphabetical order, as the model may write them),
 # then each result, then a question about them
 TOOL_LOOP = [
     {"role": "system", "content": "Use tools when they help."},
@@ -99,7 +100,7 @@ TOOL_LOOP = [
     {"role": "assistant", "content": None, "reasoning": "I should check both cities.", "tool_calls": [
         {"id": "c0", "type": "function", "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'}},
         {"id": "c1", "type": "function",
-         "function": {"name": "get_weather", "arguments": '{"city": "Rome", "days": 2}'}},
+         "function": {"name": "get_weather", "arguments": '{"days": 2, "city": "Rome"}'}},
     ]},
     {"role": "tool", "tool_call_id": "c0", "content": "sunny, 24C"},
     {"role": "tool", "tool_call_id": "c1", "content": "rainy, 15C"},
@@ -109,7 +110,7 @@ TOOL_LOOP_TEMPLATE = [
     TOOL_LOOP[0], TOOL_LOOP[1],
     {"role": "assistant", "content": "", "reasoning_content": "I should check both cities.", "tool_calls": [
         {"type": "function", "function": {"name": "get_weather", "arguments": {"city": "Paris"}}},
-        {"type": "function", "function": {"name": "get_weather", "arguments": {"city": "Rome", "days": 2}}},
+        {"type": "function", "function": {"name": "get_weather", "arguments": {"days": 2, "city": "Rome"}}},
     ]},
     {"role": "tool", "content": "sunny, 24C"},
     {"role": "tool", "content": "rainy, 15C"},

@@ -587,8 +587,10 @@ _TOOL = {"type": "function", "function": {"name": "get_weather", "parameters": {
 _LOOP = [
     {"role": "user", "content": "Weather in Paris and Rome?"},
     {"role": "assistant", "content": None, "reasoning": "Check both.", "tool_calls": [
-        {"id": "c0", "type": "function", "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'}},
-        {"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": {"city": "Rome"}}}]},
+        {"id": "c0", "type": "function",
+         "function": {"name": "get_weather", "arguments": '{"units": "C",  "city": "Paris"}'}},
+        {"id": "c1", "type": "function",
+         "function": {"name": "get_weather", "arguments": {"units": "C", "city": "Rome"}}}]},
     {"role": "tool", "tool_call_id": "c0", "content": "sunny"},
     {"role": "tool", "tool_call_id": "c1", "content": [{"type": "text", "text": "rainy"}]},
 ]
@@ -606,6 +608,8 @@ TOOL_CASES = {
     "functions": {"functions": [{"name": "get_weather"}]},
     "bad-arguments": {"tools": [_TOOL], "messages": [_LOOP[0], {"role": "assistant", "tool_calls": [
         {"type": "function", "function": {"name": "get_weather", "arguments": "[1]"}}]}]},
+    "reasoning-only-turn": {"messages": [_LOOP[0], {"role": "assistant", "content": "Hi", "reasoning_content": "r"},
+                                         {"role": "user", "content": "and Rome?"}]},
 }
 
 

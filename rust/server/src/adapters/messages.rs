@@ -179,8 +179,9 @@ fn message_text(content: &Option<Content>) -> String {
     }
 }
 
-/// `turn_extras` in `api_server/openai/adapters.py`: an assistant message's `tool_calls` and
-/// reasoning as the chat template reads them, canonical JSON (keys sorted, no spaces).
+/// `turn_extras` in `api_server/openai/adapters.py`: an assistant message's `tool_calls` (each
+/// call's `arguments` as the client's JSON text, checked to be an object and kept as sent) and
+/// reasoning, canonical JSON (keys sorted, no spaces).
 fn turn_extras(tool_calls: Option<&Value>, reasoning: Option<&Value>) -> Result<Option<String>, String> {
     let mut extras = Map::new();
     match tool_calls {
@@ -195,17 +196,17 @@ fn turn_extras(tool_calls: Option<&Value>, reasoning: Option<&Value>) -> Result<
                     (Some(f), Some(n)) => (f, n),
                     _ => return Err("each of an assistant message's tool_calls needs a function name".to_string()),
                 };
-                let args = match f.get("arguments") {
-                    None | Some(Value::Null) => Some(Value::Object(Map::new())),
-                    Some(Value::String(s)) if s.trim().is_empty() => Some(Value::Object(Map::new())),
-                    Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok(),
-                    Some(other) => Some(other.clone()),
+                let (text, args) = match f.get("arguments") {
+                    None | Some(Value::Null) => ("{}".to_string(), Some(Value::Object(Map::new()))),
+                    Some(Value::String(s)) if s.trim().is_empty() => ("{}".to_string(), Some(Value::Object(Map::new()))),
+                    Some(Value::String(s)) => (s.clone(), serde_json::from_str::<Value>(s).ok()),
+                    // an object as sent, keys sorted (serde_json's map), as Python writes it
+                    Some(other) => (other.to_string(), Some(other.clone())),
                 };
-                let args = match args {
-                    Some(Value::Object(o)) => Value::Object(o),
-                    _ => return Err(format!("tool call {}'s arguments must be a JSON object", crate::media::py_repr(name))),
-                };
-                out.push(serde_json::json!({"function": {"arguments": args, "name": name}, "type": "function"}));
+                if !matches!(args, Some(Value::Object(_))) {
+                    return Err(format!("tool call {}'s arguments must be a JSON object", crate::media::py_repr(name)));
+                }
+                out.push(serde_json::json!({"function": {"arguments": text, "name": name}, "type": "function"}));
             }
             extras.insert("tool_calls".to_string(), Value::Array(out));
         }

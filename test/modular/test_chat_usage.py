@@ -21,10 +21,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 from api_server_helpers import make_test_api_server
+from fastapi import HTTPException
 from test_ingest_unpersist import _conductor, _info, _msg, _run, _ToyModel
 
 from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread, RequestOutputState
-from mstar.api_server.reply_parser import REASONING, REPLY_IN_REASONING, TOOL_CALLS
+from mstar.api_server.reply_parser import REASONING, REPLY_IN_REASONING, TOOL_CALLS, ReplyParser
 from mstar.api_server.request_types import (
     USAGE,
     APIServerMessage,
@@ -469,6 +470,21 @@ def test_with_tool_choice_none_a_call_stays_text():
     chunks = _parsed(["ok</think>\n\n" + CALL], True, model_kwargs={"tools": WEATHER, "tool_choice": "none"})
     assert b"".join(c.data for c in chunks if c.modality == "text") == CALL.encode()
     assert chunks[-1].metadata["finish_reason"] == "stop"
+
+
+def test_a_parser_error_fails_only_its_own_request(monkeypatch):
+    """The message thread carries every request's chunks: a parser that raises turns its chunk into
+    the error that ends its own request, and the thread goes on."""
+    def broken(self, data):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(ReplyParser, "feed", broken)
+    chunks = _parsed(["I think", "</think>Hi"], True, _streamed)
+    assert [c.modality for c in chunks] == ["error"]
+    assert chunks[0].metadata["status"] == 500
+    with pytest.raises(HTTPException) as failed:
+        _parsed(["I think"], True)
+    assert failed.value.status_code == 500
 
 
 def test_a_reply_with_nothing_to_split_passes_through_unparsed():

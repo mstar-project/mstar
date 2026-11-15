@@ -24,7 +24,7 @@ from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, Samp
 from mstar.engine.resources.sampler.grammar import (  # noqa: E402
     GRAMMAR_TOOLS_KWARG,
     MAX_GRAMMAR_CHARS,
-    TOOL_CALLS,
+    STRUCTURAL_TAG,
     GrammarRequest,
     grammar_request,
     request_grammar,
@@ -575,7 +575,7 @@ def test_the_conductor_serves_structured_outputs_only_where_a_sampler_enables_it
     with pytest.raises(ValueError, match="does not serve forced tool calls"):
         _conductor(False)._get_resource_configs(["text"], ["text"], {GRAMMAR_TOOLS_KWARG: tag})
     assert _conductor(True)._get_resource_configs(
-        ["text"], ["text"], {GRAMMAR_TOOLS_KWARG: tag})["sampler"].grammar.kind == TOOL_CALLS
+        ["text"], ["text"], {GRAMMAR_TOOLS_KWARG: tag})["sampler"].grammar.kind == STRUCTURAL_TAG
 
 
 @pytest.mark.parametrize("knob", [{"min_tokens": 4}, {"ignore_eos": True}], ids=str)
@@ -682,7 +682,7 @@ def test_a_forced_call_holds_the_reply_to_qwen3_5s_call_format():
 def test_a_tool_grammar_is_the_requests_own_kind_and_a_bad_one_is_a_400():
     tag = tool_call_grammar("qwen_3_5", {"tools": _tools(), "tool_choice": "required"}, True)
     request = request_grammar({GRAMMAR_TOOLS_KWARG: tag, "structured_outputs": {"regex": "a"}})
-    assert (request.kind, request.after) == (TOOL_CALLS, None), "the tools' grammar wins, with no `after` of its own"
+    assert (request.kind, request.after) == (STRUCTURAL_TAG, None), "the tools' grammar, with no `after` of its own"
     with pytest.raises(ValueError, match="^tools: "):
         request_grammar({GRAMMAR_TOOLS_KWARG: '{"type": "structural_tag", "format": {"type": "nope"}}'})
     with pytest.raises(ValueError, match="at most"):

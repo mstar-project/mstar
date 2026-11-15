@@ -571,6 +571,19 @@ def test_tools_with_tool_choice_none_are_dropped_through_dynamo(tmp_path):
     assert not {"tools", "tool_choice", "parallel_tool_calls"} & set(sub["model_kwargs"])
 
 
+def test_an_assistant_turn_with_only_reasoning_is_served_through_dynamo(tmp_path):
+    """A client that sends a reply back with its reasoning asks for no tool call: served, the
+    reasoning dropped, as before the chat adapter kept it."""
+    server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
+    _chat_through_bridge(server, {"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "Hello!", "reasoning_content": "Greet them."},
+        {"role": "user", "content": "how are you?"},
+    ]}, ADAPTER_REGISTRY["qwen3_5_0.8b"])
+    (sub,) = server.submitted
+    assert all(p.extras is None for p in sub["prompt_parts"])
+
+
 def test_the_chat_fields_clients_send_by_default_reach_the_model(tmp_path):
     server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
     _chat_through_bridge(server, {"tools": [], "tool_choice": "auto", "presence_penalty": 0, "logprobs": False,

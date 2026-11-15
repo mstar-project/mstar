@@ -58,6 +58,7 @@ from mstar.api_server.openai.serving_realtime import (
     response_object,
     server_event,
 )
+from mstar.api_server.tool_fields import asks_for_tools, without_tools
 from mstar.utils.generation_kwargs import offset_seed
 from mstar.utils.utf8_stream import Utf8Stream
 
@@ -92,14 +93,12 @@ _STRIP_KEYS = {
 
 def _refuse_tools(args) -> None:
     """Tool calls aren't served through Dynamo yet: this bridge returns the raw reply, with no
-    ``tool_calls``. A chat asking for one, or carrying a tool turn, is refused; tools with
-    ``tool_choice`` none are dropped, as the chat adapters dropped them before they served tools."""
-    mk = args.model_kwargs or {}
-    turns = any(p.role == "tool" or p.extras is not None for p in args.prompt_parts or ())
-    if mk.get("tools") not in (None, []) and mk.get("tool_choice") != "none" or turns:
+    ``tool_calls``. A chat asking for one, or carrying a tool turn, is refused; the rest of its tool
+    fields, and its assistant turns' reasoning, are dropped, as before the chat adapters served tools."""
+    mk = args.model_kwargs if args.model_kwargs is not None else {}
+    if asks_for_tools(mk, args.prompt_parts):
         raise _BadRequestError("tool calling is not served through Dynamo")
-    for name in ("tools", "tool_choice", "parallel_tool_calls"):
-        mk.pop(name, None)
+    args.prompt_parts = without_tools(mk, args.prompt_parts)
 
 
 # Image-request fields that ride nvext (mirrors Dynamo's NvCreateImageRequest);

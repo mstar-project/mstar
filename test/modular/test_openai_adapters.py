@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from mstar.model.multimodal import messages_from_parts
+
 pytest.importorskip("pydantic")
 pytest.importorskip("numpy")
 
@@ -312,8 +314,9 @@ def test_an_adapter_that_serves_tools_checks_and_keeps_them(tmp_path, adapter):
 _TOOL_LOOP = [
     {"role": "user", "content": "Weather in Paris and Rome?"},
     {"role": "assistant", "content": None, "reasoning": "I should check both.", "tool_calls": [
-        {"id": "c0", "type": "function", "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'}},
-        {"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": {"city": "Rome"}}},
+        {"id": "c0", "type": "function",
+         "function": {"name": "get_weather", "arguments": '{"days": 2, "city": "Paris"}'}},
+        {"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": {"days": 1, "city": "Rome"}}},
     ]},
     {"role": "tool", "tool_call_id": "c0", "content": "sunny"},
     {"role": "tool", "tool_call_id": "c1", "content": [{"type": "text", "text": "rainy"}]},
@@ -321,17 +324,22 @@ _TOOL_LOOP = [
 
 
 def test_a_tool_loop_keeps_each_turn_for_an_adapter_that_serves_tools(tmp_path):
-    """The calls ride on their assistant turn as the template reads them (arguments an object,
-    the reasoning as ``reasoning_content``), and two tool results stay two turns."""
+    """The calls ride on their assistant turn, each call's arguments as the client's JSON text (an
+    object sent as one, keys sorted, as the Rust frontend holds it) and the reasoning as
+    ``reasoning_content``, and two tool results stay two turns. The template reads the arguments
+    as objects, in the order they were written."""
     req = ChatCompletionRequest(messages=_TOOL_LOOP, tools=[_TOOL])
     parts = adapters.Qwen3_5Adapter().chat_to_request(req, tmp_path).prompt_parts
     assert [(p.role, p.text) for p in parts] == [
         ("user", "Weather in Paris and Rome?"), ("assistant", ""), ("tool", "sunny"), ("tool", "rainy"),
     ]
     assert json.loads(parts[1].extras) == {"reasoning_content": "I should check both.", "tool_calls": [
-        {"function": {"arguments": {"city": "Paris"}, "name": "get_weather"}, "type": "function"},
-        {"function": {"arguments": {"city": "Rome"}, "name": "get_weather"}, "type": "function"},
+        {"function": {"arguments": '{"days": 2, "city": "Paris"}', "name": "get_weather"}, "type": "function"},
+        {"function": {"arguments": '{"city":"Rome","days":1}', "name": "get_weather"}, "type": "function"},
     ]}
+    (assistant,) = [m for m in messages_from_parts(parts) if m["role"] == "assistant"]
+    assert [list(call["function"]["arguments"].items()) for call in assistant["tool_calls"]] == [
+        [("days", 2), ("city", "Paris")], [("city", "Rome"), ("days", 1)]]
     assert parts[1].extras == json.dumps(json.loads(parts[1].extras), sort_keys=True, separators=(",", ":"))
     for adapter in (a for a in _CHAT_ADAPTERS if not a.serves_tools):
         with pytest.raises(ValueError, match="not 'tool'"):
