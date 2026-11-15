@@ -24,6 +24,7 @@ from api_server_helpers import make_test_api_server
 from test_ingest_unpersist import _conductor, _info, _msg, _run, _ToyModel
 
 from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread, RequestOutputState
+from mstar.api_server.reply_parser import REASONING, REPLY_IN_REASONING, TOOL_CALLS
 from mstar.api_server.request_types import (
     USAGE,
     APIServerMessage,
@@ -322,16 +323,17 @@ class _OnePass:
         return False
 
 
-def _served(token_counts, cap, report_usage=True, error=False, stopped=False, chunks=None):
+def _served(token_counts, cap, report_usage=True, error=False, stopped=False, chunks=None, model=None,
+            parse_reply=False, model_kwargs=None):
     """A request run through ``submit_request`` and one pass of the message
     thread: text chunks carrying ``token_counts`` tokens, the last one ended by
     a stop token when ``stopped``, or the data worker's own ``chunks``; then
     its completion."""
     worker = _DataWorker()
-    server = make_test_api_server(preprocess_worker=worker)
+    server = make_test_api_server(preprocess_worker=worker, model=model)
     server.submit_request(
         text=PROMPT, input_modalities=["text"], output_modalities=["text"],
-        request_id="r", report_usage=report_usage,
+        request_id="r", report_usage=report_usage, parse_reply=parse_reply, model_kwargs=model_kwargs,
     )
     key = worker.inputs[0].request_id
     if chunks is None:
@@ -407,6 +409,76 @@ def test_a_failed_request_gets_its_error_and_no_usage():
     assert [c.modality for c in _streamed(_served([1], 4, error=True))] == ["text", "error"]
     with pytest.raises(HTTPException):
         _collected(_served([1], 4, error=True))
+
+
+class _ReasoningModel:
+    """A model that reasons in ``<think>`` blocks and calls tools in Qwen3.5's format."""
+
+    TOOL_FORMAT = "qwen_3_5"
+
+    def text_output(self):
+        return TextOutput(None, reasoning_start="<think>", reasoning_end="</think>")
+
+    def request_kwargs(self):
+        return None
+
+
+WEATHER = [{"type": "function", "function": {"name": "get_weather", "parameters": {
+    "type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}}}}]
+CALL = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n" \
+       "<parameter=days>\n2\n</parameter>\n</function>\n</tool_call>"
+
+
+def _parsed(texts, in_reasoning, read=_collected, model_kwargs=None):
+    """A chat reply's text chunks, run through the message thread's reply parser; the data worker
+    flags the first with whether the reply starts inside its reasoning."""
+    chunks = [ResultChunk(request_id="r", modality="text", data=t.encode(), num_tokens=1) for t in texts]
+    chunks[0].metadata[REPLY_IN_REASONING] = in_reasoning
+    return read(_served(None, cap=64, chunks=chunks, model=_ReasoningModel(), parse_reply=True,
+                        model_kwargs=model_kwargs))
+
+
+@pytest.mark.parametrize("read", [_collected, _streamed])
+def test_a_reply_that_starts_in_its_reasoning_comes_back_split(read):
+    chunks = _parsed(["I should greet.\n</th", "ink>\n\nHi", " there"], True, read)
+    text = [c for c in chunks if c.modality == "text"]
+    assert "".join(c.metadata.get(REASONING, "") for c in text) == "I should greet."
+    assert b"".join(c.data for c in text) == b"Hi there"
+    assert all(REPLY_IN_REASONING not in c.metadata for c in text)
+    assert chunks[-1].metadata["finish_reason"] == "stop"
+
+
+def test_a_reply_cut_in_its_reasoning_gets_the_held_text_as_a_last_chunk():
+    """Text that could begin ``</think>`` is held until the reply ends, then sent as reasoning."""
+    chunks = _parsed(["still going </th"], True)
+    assert [(c.data, c.metadata.get(REASONING)) for c in chunks if c.modality == "text"] == [
+        (b"", "still going "), (b"", "</th")]
+
+
+@pytest.mark.parametrize("read", [_collected, _streamed])
+def test_a_reply_that_calls_a_tool_finishes_with_tool_calls(read):
+    chunks = _parsed(["ok</think>\n\n", CALL[:30], CALL[30:]], True, read, {"tools": WEATHER})
+    (call,) = [call for c in chunks if c.modality == "text" for call in c.metadata.get(TOOL_CALLS, ())]
+    assert (call["index"], call["function"]["name"], json.loads(call["function"]["arguments"])) == (
+        0, "get_weather", {"city": "Paris", "days": 2})
+    assert b"".join(c.data for c in chunks if c.modality == "text") == b""
+    assert chunks[-1].metadata["finish_reason"] == "tool_calls"
+
+
+def test_with_tool_choice_none_a_call_stays_text():
+    chunks = _parsed(["ok</think>\n\n" + CALL], True, model_kwargs={"tools": WEATHER, "tool_choice": "none"})
+    assert b"".join(c.data for c in chunks if c.modality == "text") == CALL.encode()
+    assert chunks[-1].metadata["finish_reason"] == "stop"
+
+
+def test_a_reply_with_nothing_to_split_passes_through_unparsed():
+    """Thinking off and no tools: the chunks are the data worker's, bytes split mid-character included."""
+    texts = ["caf\xe9 </think>".encode()[:4], "caf\xe9 </think>".encode()[4:]]
+    chunks = [ResultChunk(request_id="r", modality="text", data=t, num_tokens=1) for t in texts]
+    chunks[0].metadata[REPLY_IN_REASONING] = False
+    got = _collected(_served(None, cap=64, chunks=chunks, model=_ReasoningModel(), parse_reply=True))
+    assert [c.data for c in got if c.modality == "text"] == texts
+    assert got[-1].metadata["finish_reason"] == "stop"
 
 
 # -- the chat handler ---------------------------------------------------------

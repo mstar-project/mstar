@@ -864,6 +864,10 @@ class APIServer:
         if req.parser is None:
             starts = bool(chunk.metadata.pop(REPLY_IN_REASONING, False))
             tool_format = TOOL_FORMATS.get(getattr(self.model, "TOOL_FORMAT", None)) if req.reply_tools else None
+            if not starts and tool_format is None:
+                # all answer (thinking off, no tools): its chunks pass through unparsed
+                req.parse_reply = False
+                return
             req.parser = ReplyParser(self._reply_reasoning_end(), starts, tool_format, req.reply_tools)
         _split_chunk(chunk, *req.parser.feed(chunk.data))
 

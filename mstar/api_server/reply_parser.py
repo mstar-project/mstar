@@ -174,10 +174,13 @@ def _hold(text: str, marker: str) -> tuple[str, str]:
 
 
 def _marker_prefix(text: str, marker: str) -> int:
-    """The length of the longest tail of ``text`` that is a proper prefix of ``marker``."""
-    for n in range(min(len(text), len(marker) - 1), 0, -1):
-        if marker.startswith(text[-n:]):
-            return n
+    """The length of the longest tail of ``text`` that is a proper prefix of ``marker``: such a tail
+    starts with the marker's first character, so only those starts are tried (usually none)."""
+    start = text.find(marker[0], max(0, len(text) - len(marker) + 1))
+    while start >= 0:
+        if marker.startswith(text[start:]):
+            return len(text) - start
+        start = text.find(marker[0], start + 1)
     return 0
 
 
