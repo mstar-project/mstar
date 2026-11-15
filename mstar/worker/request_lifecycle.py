@@ -17,6 +17,7 @@ from collections.abc import Collection, Iterable, Set
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     DrainRequest,
+    EndEpisode,
     MessageSource,
     RemoveRequest,
     WorkerMessage,
@@ -73,6 +74,13 @@ class RequestLifecycle:
         self.pending_drains: set[str] = set()
         self.draining: set[str] = set()
         self._reads_done_sent: set[str] = set()
+        # Connection close can arrive after the conductor's REMOVE but before
+        # this worker's drained teardown has actually released the request.
+        self.pending_episode_ends: list[EndEpisode] = []
+
+    def end_episode(self, body: EndEpisode) -> None:
+        if body not in self.pending_episode_ends:
+            self.pending_episode_ends.append(body)
 
     # -- arrival ------------------------------------------------------------
 
