@@ -112,7 +112,8 @@ class Causal(Mask):
 
 @dataclass(frozen=True)
 class Window(Mask):
-    """Sees {k : q - size < k <= q}."""
+    """Sees {k : q - size < k <= q}. A read through `Attend` may pass ``distance_bias``, (rows, q_heads, T, size), whose
+    entry d is added to the score of the key at distance d before the op's scale."""
 
     uses_query_position = True
     sees_step_whole = False
@@ -232,6 +233,24 @@ class GatedDeltaNet(Op):
 
 
 @dataclass(frozen=True, kw_only=True)
+class Mamba2(Op):
+    """Mamba-2's SSD recurrence over each row's ``ssm`` state, (heads, head_dim, state_size), updated in place. Its
+    conv is a separate `CausalConv` update on the same Value."""
+
+    reads = ("ssm",)
+    writes = ("ssm",)
+    time_step_limit: tuple[float, float] = (0.0, float("inf"))    # dt's clamp after softplus, HF's time_step_limit
+
+    def check(self, where: str, entry: Entry) -> None:
+        if len(entry.tensors["ssm"].shape) != 3:
+            raise ValueError(f"{where}: Mamba2 needs entry field ssm of shape (heads, head_dim, state_size)")
+        limit = self.time_step_limit
+        if not (type(limit) is tuple and len(limit) == 2 and all(type(t) in (int, float) for t in limit)
+                and 0.0 <= limit[0] < limit[1]):
+            raise ValueError(f"{where}.time_step_limit must be a tuple (low, high) with 0 <= low < high, got {limit!r}")
+
+
+@dataclass(frozen=True, kw_only=True)
 class Read:
     """A view of the entries a row has kept. ``mask`` says which entries each query can still reach, so the engine
     can free the rest and tell when two requests can share a prefix. A read leaves the entries as they were."""
@@ -241,7 +260,9 @@ class Read:
     layers: frozenset[int] | None = None    # None: all of the array's layers
     walks: frozenset[str] | None = None     # None: all walks
     queries: str | None = None              # the array whose segments lay out the queries; None: this array
-    packed: bool = True                     # queries may come as (tokens, heads, head_dim); False: only as rows
+    # queries may come as (tokens, heads, head_dim). False: only as (rows, T, heads, head_dim), each row's span first
+    # and the rest of its T padding.
+    packed: bool = True
     segmented: bool = False                 # a request's segments lie end to end in one row
 
     def __post_init__(self):
@@ -295,8 +316,8 @@ class Array:
     the same length at the end of every step. ``nodes`` lists who may touch the array, and the engine places it.
     ``updates`` are kernels that replace a Value's entry with its next version. The version they overwrite is gone,
     so prefix caching and undo save a copy before one runs.
-    With ``max_len`` 0 an array keeps nothing between steps, so every add is scratch. ``None`` gives an unbounded
-    logical log only when all reads are no-op dense windows; storage can then keep their largest window size.
+    With ``max_len`` 0 an array keeps nothing between steps, so every add is scratch.
+    With ``max_len`` None the log has no bound, and the engine keeps what the reads can still reach.
     A Value with ``largest`` is sized: its fields' `Size` axes take each request's sizes from its layout, and the
     engine holds each request's tensors from admission to its end. A request whose fields take more bytes than at
     ``largest`` is refused at intake, whatever each size is.
@@ -333,7 +354,7 @@ class Array:
         if not self.labels:
             raise ValueError(f"{where}.labels must be non-empty")
         if self.max_len is not None and not (type(self.max_len) is int and self.max_len >= 0):
-            raise ValueError(f"{where}.max_len must be an int >= 0 or None, got {self.max_len!r}")
+            raise ValueError(f"{where}.max_len must be None or an int >= 0, got {self.max_len!r}")
         if self.lifetime not in ("request", "episode") or type(self.lifetime) is not str:
             raise ValueError(f"{where}.lifetime must be 'request' or 'episode', got {self.lifetime!r}")
         self._check_entry()
@@ -341,11 +362,11 @@ class Array:
             self._check_read(key, read)
         for key, update in self.updates.items():
             self._check_update(key, update)
-        if self.max_len is None:
+        if self.max_len is None and self.lifetime == "episode":
             self._check_unbounded()
 
     def _check_unbounded(self) -> None:
-        """Only a finite, read-derived dense window can bound an unbounded logical log."""
+        """An episode log has a finite dense window derived from its reads."""
         where = f"Array {self.name!r}"
         if self.rewritable or self.positions is not None or self.entry.host or self.updates or not self.entry.tensors:
             raise ValueError(f"{where}.max_len=None needs an append-only tensor log without positions or updates")
@@ -592,6 +613,7 @@ class Layout:
     spans: tuple[Span, ...] = ()
     growth: tuple[tuple[str, int], ...] = ()    # (loop, entries per iteration)
     scratch: int = 0                            # most one scratch step writes past the kept length
+    max_growth: int | None = None                     # most entries the growth reserves; None: the loops' caps
     kept_windows: Mapping[str, KeptWindow] = EMPTY    # by read key, each kept-window read's sizes
     sizes: Mapping[str, int] = EMPTY                  # a sized Value's sizes for this request and label
 
