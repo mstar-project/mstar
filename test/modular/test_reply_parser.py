@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from mstar.api_server.reply_parser import TOOL_FORMATS, ReplyParser
+from mstar.api_server.reply_parser import TOOL_FORMATS, ReplyParser, ToolCallFormat
 
 END = "</think>"
 QWEN = TOOL_FORMATS["qwen_3_5"]
@@ -148,3 +148,26 @@ def test_nan_and_infinity_stay_text():
     reply = "x</think>\n\n" + _call(days="NaN", extra="-Infinity")
     (call,) = ReplyParser(END, True, QWEN, TOOLS).feed(reply.encode())[2]
     assert call["function"]["arguments"] == '{"days": "NaN", "extra": "-Infinity"}'
+
+
+class _JsonFormat(ToolCallFormat):
+    """A call written as JSON between its markers, as Qwen2.5's template writes one."""
+
+    begin, end = "<tool_call>\n", "\n</tool_call>"
+
+    def parse(self, block, schemas):
+        call = json.loads(block)
+        return call["name"], call["arguments"]
+
+
+def test_another_format_needs_only_its_markers_and_its_parse():
+    """The streaming (markers held across chunks, newlines dropped, text around the call kept) is
+    the parser's; a format says only where a call starts and ends and how to read it."""
+    call = '{"name": "get_weather", "arguments": {"city": "Paris"}}'
+    reply = f"x</think>\n\nChecking.\n\n<tool_call>\n{call}\n</tool_call>"
+    for chunks in _splits(reply.encode()):
+        parser = ReplyParser(END, True, _JsonFormat(), TOOLS)
+        out = [parser.feed(c) for c in chunks] + [parser.finish()]
+        answer = "".join(a for _, a, _ in out)
+        calls = [(c["function"]["name"], json.loads(c["function"]["arguments"])) for _, _, cs in out for c in cs]
+        assert (answer, calls) == ("Checking.", [("get_weather", {"city": "Paris"})]), chunks

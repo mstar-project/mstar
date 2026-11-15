@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from dataclasses import dataclass
 
 from mstar.utils.utf8_stream import Utf8Stream
 
@@ -24,24 +23,42 @@ TOOL_CALLS = "tool_calls"
 REPLY_IN_REASONING = "reply_in_reasoning"
 
 
-@dataclass(frozen=True)
 class ToolCallFormat:
-    """How a model writes a tool call: ``begin``, the function's name up to ``name_end``, its
-    parameters (``param`` matches each, its name and its value), then ``end``. The text xgrammar's
-    structural tag for the model's format holds a forced call to (`grammar.tool_call_grammar`)."""
+    """How a model writes a tool call: the text that opens one (``begin``) and closes it (``end``),
+    which `ReplyParser` finds as the reply streams, and `parse`, which reads the text between them.
+    One subclass per format; the markers are the ones xgrammar's structural tag for the model's
+    format holds a forced call to (`grammar.tool_call_grammar`)."""
 
     begin: str
-    name_end: str
     end: str
-    param: re.Pattern
+
+    def parse(self, block: str, schemas: dict[str, dict]) -> tuple[str, dict] | None:
+        """A closed call's name and arguments, from the text between its markers; ``schemas`` maps
+        each tool's name to its parameters' schemas, by name. None for text that isn't a call."""
+        raise NotImplementedError
 
 
-TOOL_FORMATS = {
-    # Qwen3.5's chat template and xgrammar's "qwen_3_5" tag (style qwen_xml)
-    "qwen_3_5": ToolCallFormat(
-        begin="<tool_call>\n<function=", name_end=">\n", end="</function>\n</tool_call>",
-        param=re.compile(r"<parameter=([^>\n]+)>\n(.*?)\n</parameter>", re.S),
-    ),
+class QwenXmlFormat(ToolCallFormat):
+    """Qwen3.5's (xgrammar's style ``qwen_xml``): the function's name, then one
+    ``<parameter=NAME>`` block per argument, its value as text, typed by the tool's schema."""
+
+    begin = "<tool_call>\n<function="
+    name_end = ">\n"
+    end = "</function>\n</tool_call>"
+    _param = re.compile(r"<parameter=([^>\n]+)>\n(.*?)\n</parameter>", re.S)
+
+    def parse(self, block: str, schemas: dict[str, dict]) -> tuple[str, dict] | None:
+        name, sep, params = block.partition(self.name_end)
+        if not sep or not name or "\n" in name:
+            return None
+        types = schemas.get(name, {})
+        return name, {key: _typed(value, types.get(key)) for key, value in self._param.findall(params)}
+
+
+# `Model.TOOL_FORMAT` -> its format
+TOOL_FORMATS: dict[str, ToolCallFormat] = {
+    # Qwen3.5's chat template and xgrammar's "qwen_3_5" tag
+    "qwen_3_5": QwenXmlFormat(),
 }
 
 
@@ -143,13 +160,11 @@ class ReplyParser:
         return "".join(out), calls
 
     def _call(self, block: str) -> dict | None:
-        """A closed call's block (its name and parameters), as an OpenAI tool call; None for one
-        whose name doesn't parse."""
-        name, sep, params = block.partition(self._format.name_end)
-        if not sep or not name or "\n" in name:
+        """A closed call's block, as an OpenAI tool call; None for one the format doesn't read."""
+        parsed = self._format.parse(block, self._types)
+        if parsed is None:
             return None
-        schemas = self._types.get(name, {})
-        args = {key: _typed(value, schemas.get(key)) for key, value in self._format.param.findall(params)}
+        name, args = parsed
         index, self.calls = self.calls, self.calls + 1
         return {"index": index, "id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
                 "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
