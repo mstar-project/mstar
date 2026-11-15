@@ -37,7 +37,7 @@ webpki-roots = "0.26"
 url = "2"
 # Constant-time API key compare; already in the tree through rustls.
 subtle = "2"
-# The printable classes for Python's `repr` of a str; already in the tree through tokenizers.
+# Numeric fields and control-token parsing; already in the tree through tokenizers.
 regex = "1"
 # Dynamic msgpack for openpi's observations and /generate/ws's binary frames;
 # already in the tree through the transport crate.

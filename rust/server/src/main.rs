@@ -42,6 +42,7 @@ mod speech_chunking;
 mod tokenizer;
 mod transcription;
 mod unicode_marks;
+mod unicode_printable;
 mod utf8;
 mod ws;
 
