@@ -1647,8 +1647,13 @@ def test_mstar_server_exits_when_its_launcher_is_killed():
     while not gone() and time.time() < deadline:
         time.sleep(0.1)
     if not gone():
-        os.kill(pid, 9)
-        pytest.fail("mstar-server outlived its launcher")
+        try:
+            os.kill(pid, 9)
+        except ProcessLookupError:
+            # It exited between the final /proc check and our cleanup signal.
+            pass
+        else:
+            pytest.fail("mstar-server outlived its launcher")
     # the port is free again, to a server binding it as mstar-server does (mio
     # sets SO_REUSEADDR): a zombie's other threads may still hold its sockets
     # for a moment after its leader exits, so retry briefly
@@ -1663,3 +1668,47 @@ def test_mstar_server_exits_when_its_launcher_is_killed():
                 if time.time() > deadline:
                     raise
         time.sleep(0.1)
+
+
+def test_launcher_exit_cleanup_tolerates_exit_after_last_probe(monkeypatch):
+    """The server may exit after ``gone`` returns false but before cleanup kills it."""
+    import builtins
+    import io
+    import os
+    import subprocess
+    import sys
+    from types import SimpleNamespace
+
+    pid = 99999999
+    port = _free_port()
+    real_open = builtins.open
+    calls = []
+
+    class Launcher:
+        stdout = io.StringIO(f"{pid}\n")
+
+        def kill(self):
+            pass
+
+        def wait(self):
+            pass
+
+    def fake_open(path, *args, **kwargs):
+        if path == f"/proc/{pid}/stat":
+            return io.StringIO(f"{pid} (mstar-server) S 1 0 0")
+        return real_open(path, *args, **kwargs)
+
+    def exited_before_kill(target, signal):
+        calls.append((target, signal))
+        raise ProcessLookupError
+
+    clock = iter((0, 0, 0, 20, 20))
+    monkeypatch.setattr(sys.modules[__name__], "_free_port", lambda: port)
+    monkeypatch.setattr(sys.modules[__name__], "_listening", lambda _: True)
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: Launcher())
+    monkeypatch.setattr(builtins, "open", fake_open)
+    monkeypatch.setattr(os, "kill", exited_before_kill)
+    monkeypatch.setattr(sys.modules[__name__], "time", SimpleNamespace(time=lambda: next(clock), sleep=lambda _: None))
+
+    test_mstar_server_exits_when_its_launcher_is_killed()
+    assert calls == [(pid, 9)]
