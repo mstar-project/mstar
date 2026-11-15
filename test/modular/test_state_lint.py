@@ -40,7 +40,7 @@ PORTED = (
 UNPORTED = (
     "mstar/model/cosmos3", "mstar/model/cosyvoice3", "mstar/model/glm52", "mstar/model/glm5_next",
     "mstar/model/higgs_audio", "mstar/model/lingbot_world", "mstar/model/minicpm_o", "mstar/model/muse",
-    "mstar/model/phi4mm", "mstar/model/ripple", "mstar/model/waypoint",
+    "mstar/model/ripple", "mstar/model/waypoint",
 )
 # shared code under mstar/model/ that holds no model
 SHARED = ("mstar/model/components", "mstar/model/loader")
@@ -144,6 +144,7 @@ CONTRACT = "mstar/engine/state/contract.py"
 CONTRACT_RESOURCE_IMPORTS = {
     ("mstar.engine.resources.attn.config", "SP_EXCHANGES"),
     ("mstar.engine.resources.kv.config", "Span"),
+    ("mstar.engine.resources.position.config", "LongRoPE"),
     ("mstar.engine.resources.step", "Segment"),
 }
 
