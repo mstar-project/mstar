@@ -450,6 +450,9 @@ def test_a_replay_s_counts_are_read_after_its_own_copy_lands():
     kept = torch.zeros(2, dtype=torch.int64, device="cuda")
     k = torch.randn(2 * SPAN, HEADS, DIM, device="cuda")
     work = torch.randn(4096, 4096, device="cuda")
+    # cuBLAS makes its handle on the first mm, which it can't do under capture
+    torch.mm(work, work)
+    torch.cuda.synchronize()
     step = _step(h, ctx=_ctx(lease=lease, capture=True))
     h.begin_step(step)
     graph = torch.cuda.CUDAGraph()
@@ -901,7 +904,7 @@ def test_the_holed_storage_binds_its_read_and_verify_entries():
     bound = {type(each.binding) for each in adapters._bindings(adapters.HOLED, _holed())}
     assert bound == {adapters.HoledLatentAttend, adapters.Holes}, f"the holed storage binds {bound}"
     _refused("positions", lambda: build_specs([_holed(positions=Positions())]))
-    _refused("must be LatentAttend", lambda: build_specs([_holed(reads={"attn": Read(mask=Causal())})]))
+    _refused(r"reads\['attn'\]\.op must be Attend", lambda: build_specs([_holed(reads={"attn": Read(mask=Causal())})]))
 
 
 @pytest.mark.parametrize("mask", [Window(8), Selected(of="keys")], ids=["window", "selected"])

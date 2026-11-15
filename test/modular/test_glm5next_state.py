@@ -1,10 +1,9 @@
-"""GLM-5.3-Flash builds the specs, steps and layouts it wrote by hand, apart from three named differences.
+"""GLM-5.3-Flash builds the specs, steps and layouts it wrote by hand, apart from two named differences.
 
 The hand-written specs and steps below are the reference, copied from the model as it stood before the port, so the
-adapter can't pass by agreeing with itself. The differences: the KDA pool names the latent pool as its ``kv_cache``,
-which does nothing at ``prefix_slots`` 0; MTP's draft seed is its own Value's pool, where the KDA pool held it as two
-blocks; and on ``reduced`` the latent pool keeps ``64 * (k + 1)`` rows where the hand-written one kept
-``512 * (k + 1)``, since the declaration holds the context to ``min(index_topk, max_seq_len)``.
+adapter can't pass by agreeing with itself. The differences: MTP's draft seed is its own Value's pool, where the KDA
+pool held it as two blocks; and on ``reduced`` the latent pool keeps ``64 * (k + 1)`` rows where the hand-written one
+kept ``512 * (k + 1)``, since the declaration holds the context to ``min(index_topk, max_seq_len)``.
 """
 
 from __future__ import annotations
@@ -94,13 +93,12 @@ def _hand_written(model: Glm5NextModel) -> list:
 
 
 def _reference(model: Glm5NextModel) -> list:
-    """The hand-written specs with the three named differences."""
+    """The hand-written specs with the two named differences."""
     cfg, k = model.config, model.config.mtp_num_draft_tokens
     specs = _hand_written(model)
     by_key = {spec.resource_key: spec for spec in specs}
     by_key[KV_CACHE].config.max_seq_len = cfg.context_limit * (k + 1)
     kda = by_key[KDA_STATE].config
-    kda.kv_cache = KV_CACHE
     if k:
         del kda.blocks["mtp_hidden"], kda.blocks["mtp_draft"]
         specs.append(RecurrentStateSpec(resource_key=MTP_SEED, nodes={"LLM"}, config=RecurrentStateConfig(

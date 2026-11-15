@@ -4,6 +4,7 @@ seed, the prompt length rides the walk's step metadata, and a verify step's coun
 ``main``'s per-request counters did and reaches the step speculated after it."""
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -26,10 +27,12 @@ from mstar.engine.resources import (
 from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.step import StepContext
 from mstar.engine.state.adapters import node_resources
+from mstar.model.base import serving_resources
 from mstar.model.glm52.config import INDEX_KEYS, KV, MTP_SEED, PROMPT_LEN, SAMPLER, Glm52ModelConfig
 from mstar.model.glm52.glm52_model import Glm52Model
 from mstar.model.glm52.submodules import Glm52LLMSubmodule
 from mstar.model.submodule_base import END_PARTITION, ARNodeInputs
+from mstar.model.utils import check_kv_pools_fit
 from mstar.testing_utils.worker import make_worker
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.speculation import Speculation
@@ -93,6 +96,21 @@ def test_the_declarations_build_main_s_specs_but_for_three_named_differences(kwa
             assert got.config == spec.config, f"{spec.resource_key}: the engine would build another resource"
     # the third: the seed's pool, where main kept fixed buffers on the submodule
     assert set(built) == ({MTP_SEED} if model.config.mtp_num_draft_tokens else set())
+
+
+def test_the_seed_pool_admits_every_request_the_kv_pool_can():
+    """``main`` sized its seed buffers at ``max_num_pages + 1``, so the seed never capped concurrency."""
+    model, log = _model(mtp_num_draft_tokens=3), logging.getLogger(__name__)
+    config = {"max_concurrent_requests": 300, "resources": {KV: {"max_num_pages": 8192}}}
+    check_kv_pools_fit(model, config, "glm52.yaml", log)
+    seed = {spec.resource_key: spec for spec in serving_resources(model, config)}[MTP_SEED]
+    assert seed.config.max_slots == 8193, "a slot for every request the KV pool can hold, and the sink"
+    config["resources"][MTP_SEED] = {"max_slots": 256}
+    with pytest.raises(ValueError, match="300 slots of resources.mtp_seed"):
+        check_kv_pools_fit(model, config, "glm52.yaml", log)
+    config["resources"][MTP_SEED] = {"max_slots_of": SAMPLER}
+    with pytest.raises(ValueError, match="max_slots_of names 'sampler', which is neither a paged KV pool"):
+        serving_resources(model, config)
 
 
 @pytest.mark.parametrize("k", [0, 3])
@@ -172,14 +190,12 @@ def test_a_speculated_step_takes_the_count_its_verify_step_unpacked():
     sub = _submodule(k)
     sub._mailboxes = {None: (torch.tensor([[11, 12, 13, 14, 2]]), torch.ones(1, dtype=torch.long))}
     sub._verdicts = None, {"r": 0}
-    inp = ARNodeInputs(input_ids=torch.tensor([11]), input_seq_len=k + 1,
-                       kwargs={"emitted": 5, "budget": 64, "ignore_eos": True})
-    # the forward's next input, then what the engine's unpack adds
-    outputs = {"r": {"text_inputs": [torch.tensor([13])]}}
-    outputs["r"].update(sub.unpack_packed_outputs(
+    inp = ARNodeInputs(input_seq_len=k + 1, kwargs={"emitted": 5, "budget": 64, "ignore_eos": True})
+    # the forward outputs nothing per row, so the row's outputs are what the engine's unpack gives it
+    outputs = sub.unpack_packed_outputs(
         static_output={}, request_ids=["r"], real_seq_lens=[k + 1], inputs=[inp],
         per_request_info={"r": _info("decode", 64, 5)},
-    )["r"])
+    )
     spec = Speculation(
         scheduled_batch=ScheduledBatch(node_name="LLM", graph_walk="decode", request_to_worker_graph={"r": "wg"}),
         node_batch=ExecutingBatch(
@@ -245,8 +261,7 @@ def test_a_verify_step_cuts_by_the_budget_its_count_edge_carries():
     sub = _submodule(3)
     sampling = SimpleNamespace(temperature=0, repetition_penalty=1)
     info = SimpleNamespace(request_id="r", resource_configs={SAMPLER: sampling})
-    signals = {"text_inputs": [torch.tensor([7])], "count": [torch.tensor([5, 7, 6, 1])]}
-    row = sub.prepare_inputs("decode", info, signals)
+    row = sub.prepare_inputs("decode", info, {"count": [torch.tensor([5, 7, 6, 1])]})
     assert row.kwargs == {"emitted": 5, "budget": 6, "ignore_eos": 1}
     sub._mailboxes = {None: (torch.tensor([[11, 12, 13, 14, 3]]), torch.ones(1, dtype=torch.long))}
     sub._verdicts = None, {"r": 0}
@@ -278,6 +293,19 @@ def test_a_verify_step_s_stop_check_reads_one_output():
     assert row.read == ["count"], "the stop check reads a second output for every row of every step"
     sub, out = _verify_step(1, emitted=63)
     assert sub.check_stop("r0", _info("decode", 64, 5), out["r0"]), "a row that reached its budget keeps running"
+
+
+def test_an_mtp_decode_row_loops_back_its_count_alone():
+    """The worker holds a tensor a row for each signal a step outputs, and a third per row put the main thread's
+    collector in most decode steps. The verify step's input token stays in the seed, so a row outputs its tokens
+    and its count, two as on ``main``, and loops back the count alone."""
+    consumed = walk_runtime(_model(mtp_num_draft_tokens=3).get_graph_walk_graphs()).get_consumed_edges(
+        "LLM", "LLM", "decode")
+    assert {name for name, _ in consumed} == {"count"}, "the decode loop carries a second edge a row"
+    sub, out = _verify_step(2)
+    for rid, row in out.items():
+        sub.postprocess(rid, _info("decode", 64, 5), row)
+        assert set(row) == {"new_token", "count"}, f"a verify step's row outputs {sorted(row)}"
 
 
 def test_a_captured_and_padded_prefill_reads_no_prompt_length():
@@ -316,14 +344,16 @@ def test_a_decode_row_from_prepare_inputs_has_the_template_row_s_span(k):
     template = sub.get_accelerator_graph_configs(torch.device("cpu"))[0].single_request_inputs
     info = _info("decode", 16, 5)
     info.resource_configs[SAMPLER].temperature, info.resource_configs[SAMPLER].repetition_penalty = 0, 1
-    signals = {"text_inputs": [torch.tensor([7])], "count": [torch.tensor([5, 7, 16, 1])]}
+    # under MTP the row's input token is in the seed, and the loop carries the count alone
+    signals = {"count": [torch.tensor([5, 7, 16, 1])]} if k else {"text_inputs": [torch.tensor([7])]}
     row = sub.prepare_inputs("decode", info, signals)
     declared, real = (sub.declare_step("decode", ["a"], [one]) for one in (template, row))
     assert (declared.segments, declared.state) == (real.segments, real.state), (
         "the pre-plan's step is not the one the forward would declare for this row"
     )
-    with pytest.raises(RuntimeError, match="a decode row of 2 ids"):
-        sub.prepare_inputs("decode", info, {**signals, "text_inputs": [torch.tensor([7, 8])]})
+    if not k:
+        with pytest.raises(RuntimeError, match="a decode row of 2 ids"):
+            sub.prepare_inputs("decode", info, {"text_inputs": [torch.tensor([7, 8])]})
 
 
 def _reduced(monkeypatch, **fields) -> None:

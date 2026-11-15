@@ -101,12 +101,19 @@ def test_a_prompt_with_no_keyed_spans_keys_no_page():
     assert not (kwargs.get("prefix_keys") or {}).get("kv", {}).get("main"), "a vision prompt keys nothing"
 
 
-@pytest.mark.parametrize("name", ["state_layout", "keyed_spans"])
+@pytest.mark.parametrize("name", ["state_layout", "keyed_spans", "state_sizes"])
 def test_a_client_cannot_plant_a_layout_key(name):
     model = _Declaring()
     kwargs = _run(_worker(model, _deployment()), {name: {"kv": {"main": 99}}})
     assert name not in model.handed, f"process_prompt was handed a {name} the client made up"
     assert kwargs["kv_layout"]["kv"]["main"][4] == 1, "the client's value decided which spans are keyed"
+
+
+def test_a_model_with_no_sized_value_computes_no_sizes():
+    with patch("mstar.api_server.data_worker.state_sizes") as state_sizes:
+        kwargs = _run(_worker(_Declaring(), _deployment()))
+    state_sizes.assert_not_called()
+    assert "state_sizes" not in kwargs
 
 
 def test_a_layout_naming_an_undeclared_array_fails_the_request():

@@ -305,8 +305,9 @@ class RecurrentStateConfig:
     prefix_slots: int = 0
     kv_cache: str | None = None
 
-    # Another recurrent pool, whose max_slots this one takes unless the deployment sizes this one: for state every
-    # request holds beside its state there, so one key sizes both.
+    # The pool this one takes its size from, unless the deployment sizes this one, for state every request holds
+    # beside its state there: a paged KV pool, whose pages give this pool a slot per label for each request they could
+    # hold, or another recurrent pool, whose max_slots this one takes.
     max_slots_of: str | None = None
 
     def __post_init__(self):
@@ -365,13 +366,21 @@ class RecurrentStateSpec(NodeResourceSpec):
         return {self.config.kv_cache} if self.config.kv_cache else set()
 
     def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
-        key = self.config.max_slots_of
+        from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+
+        state, key = self.config, self.config.max_slots_of
         if key is None:
             return []
         other = specs.get(key)
-        if not isinstance(other, RecurrentStateSpec):
-            return [f"max_slots_of names {key!r}, which is no recurrent state pool"]
-        self.config.max_slots = other.config.max_slots
+        if isinstance(other, KVSpec) and isinstance(other.config, PagedKVConfig):
+            # a request holds at least one of its pages
+            state.max_slots = other.config.max_num_pages * len(state.labels) + (0 if state.disable_sink_slot else 1)
+        elif isinstance(other, RecurrentStateSpec):
+            if other.config.max_slots_of is not None:
+                return [f"max_slots_of names {key!r}, which takes its own size from {other.config.max_slots_of!r}"]
+            state.max_slots = other.config.max_slots
+        else:
+            return [f"max_slots_of names {key!r}, which is neither a paged KV pool nor a recurrent state pool"]
         return []
 
     def keeps_prefix_cache(self, world_size: int, checkpoint_named: bool) -> bool:

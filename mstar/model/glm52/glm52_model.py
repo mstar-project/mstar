@@ -5,6 +5,7 @@ import logging
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
+from typing import Any
 
 import torch
 from jinja2 import TemplateError
@@ -239,11 +240,16 @@ class Glm52Model(ByteLevelTextOutput, Model):
                 reads={TOPK: Read(mask=Causal(), op=TopK(count=cfg.index_topk, heads=cfg.index_n_heads))},
             ))
         if k:
-            # the state the next verify step drafts from, and its first draft
+            # the token the next verify step verifies first, the state it drafts from, and its first draft
             state.append(Value(MTP_SEED, nodes=nodes, layers=frozenset({0}), entry=Entry({
-                "hidden": TensorType((cfg.hidden_size,), dtype=None), "draft": TensorType((), dtype=torch.long),
+                "token": TensorType((), dtype=torch.long), "hidden": TensorType((cfg.hidden_size,), dtype=None),
+                "draft": TensorType((), dtype=torch.long),
             })))
         return state
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        # each request's draft seed sits beside its KV, so the seed pool admits every request the KV pool can
+        return {MTP_SEED: {"max_slots_of": KV}} if self.config.mtp_num_draft_tokens else {}
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         super().validate_config_yaml(config, config_path)
@@ -268,9 +274,10 @@ class Glm52Model(ByteLevelTextOutput, Model):
         ]
         decode_outputs = [GraphEdge(next_node="LLM", name="text_inputs")]
         if self.config.mtp_num_draft_tokens > 0:
-            # the tokens emitted so far, which a verify step cuts its verdict and checks its stop by
+            # the tokens emitted so far, which a verify step cuts its verdict and checks its stop by. The step's input
+            # token stays in the seed, so this is the loop's one loop-back edge.
             prefill_outputs.append(GraphEdge(next_node=EMPTY_DESTINATION, name="count", persist=True))
-            decode_outputs.append(GraphEdge(next_node="LLM", name="count"))
+            decode_outputs = [GraphEdge(next_node="LLM", name="count")]
         prefill = GraphNode(
             name="LLM",
             input_names=["text_inputs"],
@@ -312,10 +319,12 @@ class Glm52Model(ByteLevelTextOutput, Model):
     ) -> list[WalkStep]:
         # one prefill over the prompt, then decode until the stop check ends it. A verify step's stop reads the
         # prompt's length, and the prefill's under MTP too.
-        prompt = {PROMPT_LEN: model_kwargs[PROMPT_LEN]} if self.config.mtp_num_draft_tokens > 0 else {}
+        mtp = self.config.mtp_num_draft_tokens > 0
+        prompt = {PROMPT_LEN: model_kwargs[PROMPT_LEN]} if mtp else {}
         return [
             WalkStep("prefill", step_metadata={FINAL_PREFILL: True, **prompt}),
-            WalkStep("decode", bind={"text_inputs": "new_token"}, step_metadata=prompt),
+            # under MTP the first decode step reads its input token from the seed the prefill wrote
+            WalkStep("decode", bind={} if mtp else {"text_inputs": "new_token"}, step_metadata=prompt),
         ]
 
     # -------------------------------------------------------------------

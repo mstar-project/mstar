@@ -47,15 +47,15 @@ def _mtp_cfg(k: int) -> Glm52ModelConfig:
 
 @pytest.mark.parametrize("k", [1, 3])
 def test_mtp_decode_captures_one_graph_over_the_block(k):
-    """Under MTP the whole verify step is one decode capture of k+1 rows per request (one
-    id in), next to the same prefill captures as k=0, and no piecewise regions."""
+    """Under MTP the whole verify step is one decode capture of k+1 rows per request (its one
+    id read from the seed), next to the same prefill captures as k=0, and no piecewise regions."""
     cfg = _mtp_cfg(k)
     sub = Glm52LLMSubmodule(Glm52ForCausalLM(cfg), cfg)
     configs = sub.get_accelerator_graph_configs(CPU)
     (decode,) = [c for c in configs if isinstance(c, BatchedAcceleratorGraphConfig)]
     assert decode.capture_graph_walk == "decode"
     assert decode.single_request_inputs.input_seq_len == k + 1
-    assert decode.single_request_inputs.input_ids.numel() == 1
+    assert decode.single_request_inputs.input_ids is None, "the step's input token is in the seed, not an input"
     assert decode.get_total_tokens(4) == [4 * (k + 1)]
     cfg.mtp_num_draft_tokens = 0
     plain = Glm52LLMSubmodule(Glm52ForCausalLM(cfg), cfg).get_accelerator_graph_configs(CPU)
@@ -91,7 +91,7 @@ def test_the_draft_chain_and_the_seed_carry_the_post_norm_stream(monkeypatch):
     mtp = _ChainMTP()
     embed = lambda ids: ids.float()[:, None].expand(-1, hidden)  # noqa: E731
     seed_h = torch.randn(n, hidden)
-    seed = SimpleNamespace(fields={"hidden": seed_h, "draft": torch.tensor([3, 5])})
+    seed = SimpleNamespace(fields={"token": torch.tensor([1, 2]), "hidden": seed_h, "draft": torch.tensor([3, 5])})
     ns = SimpleNamespace(language_model=SimpleNamespace(model=SimpleNamespace(embed_tokens=embed), mtp=mtp),
                          mtp_k=k, mtp_block=block, kv=None, seed=SimpleNamespace(read=lambda slot: seed))
     ns._draft_tokens = lambda h_head, prev: h_head.sum(-1).abs().long() % vocab
@@ -101,8 +101,8 @@ def test_the_draft_chain_and_the_seed_carry_the_post_norm_stream(monkeypatch):
     ns._stage_verdict = lambda *a: None
     ns._write_seed = lambda h_head, prev: None
     monkeypatch.setattr(submodules, "settle", lambda h, kept: None)
-    Glm52LLMSubmodule._mtp_decode(ns, SimpleNamespace(request_ids=["r0", "r1"]), torch.tensor([1, 2]),
-                                  torch.arange(n * block))
+    monkeypatch.setattr(submodules, "positions", lambda h: torch.arange(n * block))
+    Glm52LLMSubmodule._mtp_decode(ns, SimpleNamespace(request_ids=["r0", "r1"]))
     # k - 1 chained passes: the first reads the seed, the second the first pass's head input
     assert len(mtp.prev_hidden) == k - 1
     assert torch.equal(mtp.prev_hidden[0], seed_h)
@@ -112,5 +112,6 @@ def test_the_draft_chain_and_the_seed_carry_the_post_norm_stream(monkeypatch):
     store = SimpleNamespace(seed=SimpleNamespace(write=lambda slot, **fields: written.update(fields)),
                             lm_head=SimpleNamespace(weight=torch.zeros(1)), _draft_tokens=ns._draft_tokens)
     h_head = torch.randn(n, hidden)
-    Glm52LLMSubmodule._write_seed(store, h_head, torch.tensor([0, 0]))
+    Glm52LLMSubmodule._write_seed(store, h_head, torch.tensor([4, 6]))
     assert torch.equal(written["hidden"], h_head)
+    assert torch.equal(written["token"], torch.tensor([4, 6])), "the next step would verify another token"

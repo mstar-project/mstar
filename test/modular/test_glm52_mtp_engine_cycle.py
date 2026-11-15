@@ -85,7 +85,7 @@ def _fwd_info(rid, max_tokens: int, ignore_eos: bool, wire: str | None = None, p
 
 
 def _next(out: dict) -> dict:
-    """The signals a decode step takes from the step before it: its next input and, under MTP, the count."""
+    """The signals a decode step takes from the step before it: its next input, or under MTP the count alone."""
     return {name: out[name] for name in ("text_inputs", "count") if name in out}
 
 
@@ -346,7 +346,7 @@ def test_kv_length_tracks_the_verified_stream(wrong_every):
         assert length() == total - 1 + k + 1
         accepted = out["new_token"][0].numel() - 1
         assert int(out["count"][0][0]) == total + accepted + 1 - prompt.numel()
-        assert out["text_inputs"][0].numel() == 1
+        assert "text_inputs" not in out, "the next input token rides the seed"
         total += accepted + 1
 
 
