@@ -60,7 +60,8 @@ Suites
   after the WAV header), end-to-end latency, audio seconds, RTF, and the playback
   stalls a real-time player fed by the stream would hit (``--stall-prebuffer-ms``,
   ``--stall-min-ms``). Per repeat, optionally: round-trip WER (``--asr-judge``, Whisper
-  large-v3 by default; CER for zh/ja/ko/th), speaker similarity to each item's
+  large-v3 by default; CER for zh/ja/ko/th; failed requests score as empty
+  transcripts), speaker similarity to each item's
   reference clip (``--clone`` sends it as ``ref_audio``; ``--sim-judge``) and UTMOS
   (``--mos``). ``--engine vllm-omni|sglang-omni`` reads their raw PCM streams.
   ``--engine nanovllm-voxcpm`` posts to Nano-vLLM-VoxCPM's ``/generate`` in the mode
@@ -153,7 +154,13 @@ should only compare runs scored by the same judge and normalizer.
   Seed-TTS-eval publishes) are kept.
 * Speaker similarity uses ``microsoft/wavlm-base-plus-sv`` x-vectors; Seed-TTS-eval's
   published SIM uses a WavLM-large ECAPA checkpoint, so absolute values differ.
-* UTMOS is UTMOS22 strong from ``tarepan/SpeechMOS`` on torch.hub.
+* UTMOS is UTMOS22 strong from ``tarepan/SpeechMOS`` on torch.hub. For an
+  offline TTS judge, supply a local SpeechMOS v1.2.0 checkout and its
+  ``utmos22_strong_step7459_v1.pt`` checkpoint with ``--mos-repo`` and
+  ``--mos-checkpoint`` alongside ``--mos``. Both paths are required; the
+  results record fingerprints of the local Python code and checkpoint. A run
+  rejects changes to either file set before MOS scoring. Restart the judge process
+  after changing the local code or switching to a different local checkout.
 
 Judges run between repeats, after the load has finished, so they never compete with
 measured requests; ``--judge-device`` moves them to another GPU or the CPU.

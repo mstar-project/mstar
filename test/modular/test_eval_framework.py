@@ -1020,6 +1020,362 @@ def test_speaker_similarity_is_scored_only_for_cloned_requests(tmp_path, monkeyp
     assert ("sim" in row) is clone
 
 
+@pytest.mark.parametrize("include_success", [False, True])
+def test_tts_wer_counts_failed_requests_as_empty_hypotheses(monkeypatch, include_success):
+    import argparse
+
+    import numpy as np
+
+    from benchmark.eval import judges
+    from benchmark.eval.datasets import Item
+    from benchmark.eval.suites.tts import TTSSuite
+
+    calls = []
+
+    class FakeASR:
+        def transcribe(self, clips, langs):
+            calls.append((len(clips), langs))
+            return ["one two"]
+
+    monkeypatch.setattr(judges, "asr_judge", lambda *a: FakeASR())
+    parser = argparse.ArgumentParser()
+    TTSSuite.add_args(parser)
+    args = parser.parse_args(["--normalizer", "basic", "--sim-judge", "none"])
+    items = [Item(id="a", text="one two"), Item(id="b", text="three four")]
+    rows = []
+    if include_success:
+        rows.append({"id": "a", "ok": True, "error": None, "ttfa_s": 0.1, "e2e_s": 0.5,
+                     "audio_s": 1.0, "rtf": 0.5, "chunks": 1, "stalls": 0, "stall_s": 0.0,
+                     "sample_rate": 16000, "_audio": np.zeros(16000, dtype=np.float32)})
+    rows.append({"id": "b", "ok": False, "error": "HTTP 500"})
+
+    metrics = TTSSuite(args).score(items, rows, 1.0, None)
+
+    assert metrics["wer"] == (0.5 if include_success else 1.0)
+    assert metrics["wer_utt_mean"] == (0.5 if include_success else 1.0)
+    assert rows[-1]["wer"] == 1.0
+    assert calls == ([(1, ["en"])] if include_success else [])
+
+
+@pytest.fixture
+def fresh_local_mos(monkeypatch):
+    from benchmark.eval import judges
+
+    monkeypatch.setattr(judges, "_MOS_REPO_CODE", {})
+    judges._cached_mos_judge.cache_clear()
+    yield
+    judges._cached_mos_judge.cache_clear()
+
+
+def test_utmos_loads_explicit_local_code_and_weights_without_a_hub_fetch(tmp_path, monkeypatch, fresh_local_mos):
+    import torch
+
+    from benchmark.eval.judges import MosJudge
+
+    repo = tmp_path / "SpeechMOS"
+    repo.mkdir()
+    (repo / "hubconf.py").write_text(
+        "import torch\n"
+        "def utmos22_strong(pretrained=True):\n"
+        "    assert not pretrained\n"
+        "    return torch.nn.Linear(1, 1)\n"
+    )
+    checkpoint = tmp_path / "utmos.pt"
+    original = torch.nn.Linear(1, 1)
+    torch.save(original.state_dict(), checkpoint)
+    monkeypatch.setattr(torch.hub, "download_url_to_file", lambda *a, **k: pytest.fail("network fetch"))
+    judge = MosJudge(device="cpu", repo_path=repo, checkpoint_path=checkpoint)
+
+    assert torch.equal(judge.model.weight, original.weight)
+    assert torch.equal(judge.model.bias, original.bias)
+    assert judge.id.startswith("utmos22_strong:local:")
+
+
+def test_utmos_cache_reloads_when_local_weights_change(tmp_path, fresh_local_mos):
+    import argparse
+
+    import torch
+
+    from benchmark.eval import judges
+    from benchmark.eval.suites.tts import TTSSuite
+
+    repo = tmp_path / "SpeechMOS"
+    repo.mkdir()
+    (repo / "hubconf.py").write_text(
+        "import torch\n"
+        "def utmos22_strong(pretrained=True):\n"
+        "    assert not pretrained\n"
+        "    return torch.nn.Linear(1, 1)\n"
+    )
+    checkpoint = tmp_path / "utmos.pt"
+    model = torch.nn.Linear(1, 1)
+    parser = argparse.ArgumentParser()
+    TTSSuite.add_args(parser)
+    args = parser.parse_args(["--mos", "--mos-repo", str(repo), "--mos-checkpoint", str(checkpoint)])
+    args.model_name = "test"
+
+    with torch.no_grad():
+        model.weight.fill_(1)
+    torch.save(model.state_dict(), checkpoint)
+    suite = TTSSuite(args)
+    first_id = suite.config()["mos_judge"]
+    first = judges.mos_judge("cpu", repo, checkpoint)
+    assert first.model.weight.item() == 1
+
+    with torch.no_grad():
+        model.weight.fill_(2)
+    torch.save(model.state_dict(), checkpoint)
+    second_id = TTSSuite(args).config()["mos_judge"]
+    second = judges.mos_judge("cpu", repo, checkpoint)
+    assert second_id != first_id
+    assert second.id == second_id
+    assert second is not first
+    assert second.model.weight.item() == 2
+
+
+def test_utmos_rejects_a_checkpoint_replaced_during_load(tmp_path, monkeypatch, fresh_local_mos):
+    import torch
+
+    from benchmark.eval import judges
+
+    repo = tmp_path / "SpeechMOS"
+    repo.mkdir()
+    (repo / "hubconf.py").write_text(
+        "import torch\n"
+        "def utmos22_strong(pretrained=True):\n"
+        "    assert not pretrained\n"
+        "    return torch.nn.Linear(1, 1)\n"
+    )
+    checkpoint = tmp_path / "utmos.pt"
+    original = torch.nn.Linear(1, 1)
+    replacement = torch.nn.Linear(1, 1)
+    with torch.no_grad():
+        original.weight.fill_(1)
+        replacement.weight.fill_(2)
+    torch.save(original.state_dict(), checkpoint)
+    load = torch.load
+
+    def replace_then_load(path, **kwargs):
+        torch.save(replacement.state_dict(), checkpoint)
+        return load(path, **kwargs)
+
+    monkeypatch.setattr(torch, "load", replace_then_load)
+    with pytest.raises(RuntimeError, match="local UTMOS files changed while loading"):
+        judges.mos_judge("cpu", repo, checkpoint)
+
+
+def test_utmos_refuses_changed_imported_code_at_the_same_repo_path(tmp_path, fresh_local_mos):
+    import torch
+
+    from benchmark.eval import judges
+
+    repo = tmp_path / "SpeechMOS"
+    repo.mkdir()
+    (repo / "hubconf.py").write_text(
+        "from local_utmos_model import make_model\n"
+        "def utmos22_strong(pretrained=True):\n"
+        "    assert not pretrained\n"
+        "    return make_model()\n"
+    )
+    model_code = repo / "local_utmos_model.py"
+    model_code.write_text("import torch\ndef make_model():\n    return torch.nn.Linear(1, 1)\n")
+    checkpoint = tmp_path / "utmos.pt"
+    torch.save(torch.nn.Linear(1, 1).state_dict(), checkpoint)
+    judges.mos_judge("cpu", repo, checkpoint)
+
+    model_code.write_text(model_code.read_text() + "# changed code\n")
+    with pytest.raises(RuntimeError, match="local UTMOS code changed.*restart"):
+        judges.mos_judge("cpu", repo, checkpoint)
+
+
+def test_utmos_refuses_another_local_repo_after_import(tmp_path, fresh_local_mos):
+    import torch
+
+    from benchmark.eval import judges
+
+    repos = [tmp_path / name for name in ("one", "two")]
+    for repo in repos:
+        repo.mkdir()
+        (repo / "hubconf.py").write_text(
+            "import torch\n"
+            "def utmos22_strong(pretrained=True):\n"
+            "    assert not pretrained\n"
+            "    return torch.nn.Linear(1, 1)\n"
+        )
+    checkpoint = tmp_path / "utmos.pt"
+    torch.save(torch.nn.Linear(1, 1).state_dict(), checkpoint)
+    judges.mos_judge("cpu", repos[0], checkpoint)
+
+    with pytest.raises(RuntimeError, match="different local UTMOS repo.*restart"):
+        judges.mos_judge("cpu", repos[1], checkpoint)
+
+
+def test_utmos_default_hub_path_still_reuses_the_judge(monkeypatch):
+    import torch
+
+    from benchmark.eval import judges
+
+    calls = []
+
+    class FakeModel:
+        def to(self, device):
+            return self
+
+        def eval(self):
+            return self
+
+    def load(*args, **kwargs):
+        calls.append((args, kwargs))
+        return FakeModel()
+
+    monkeypatch.setattr(torch.hub, "load", load)
+    judges._cached_mos_judge.cache_clear()
+    try:
+        first = judges.mos_judge("cpu")
+        assert judges.mos_judge("cpu") is first
+        assert calls == [(("tarepan/SpeechMOS:v1.2.0", "utmos22_strong"), {"trust_repo": True})]
+    finally:
+        judges._cached_mos_judge.cache_clear()
+
+
+def test_tts_offline_utmos_paths_reach_the_judge_and_are_checked(tmp_path, monkeypatch):
+    import argparse
+
+    import numpy as np
+
+    from benchmark.eval import judges
+    from benchmark.eval.datasets import Item
+    from benchmark.eval.suites.tts import TTSSuite
+
+    parser = argparse.ArgumentParser()
+    TTSSuite.add_args(parser)
+    repo = tmp_path / "SpeechMOS"
+    repo.mkdir()
+    checkpoint = tmp_path / "utmos.pt"
+    checkpoint.write_bytes(b"weights")
+    paths = ["--mos", "--mos-repo", str(repo), "--mos-checkpoint", str(checkpoint)]
+    with pytest.raises(FileNotFoundError, match="hubconf.py"):
+        TTSSuite(parser.parse_args(paths))
+    (repo / "hubconf.py").write_text("")
+    with pytest.raises(ValueError, match="must be set together"):
+        TTSSuite(parser.parse_args(["--mos", "--mos-repo", str(repo)]))
+    with pytest.raises(ValueError, match="require --mos"):
+        TTSSuite(parser.parse_args(paths[1:]))
+
+    calls = []
+
+    class FakeMOS:
+        @property
+        def id(self):
+            return judges.mos_local_id(repo, checkpoint)
+
+        def score(self, clip):
+            return 3.5
+
+    def mos_judge(*args):
+        calls.append(args)
+        return FakeMOS()
+
+    monkeypatch.setattr(judges, "mos_judge", mos_judge)
+    args = parser.parse_args(["--asr-judge", "none", *paths])
+    args.model_name = "test"
+    suite = TTSSuite(args)
+    assert suite.config()["mos_judge"].startswith("utmos22_strong:local:")
+    row = {"id": "a", "ok": True, "error": None, "ttfa_s": 0.1, "e2e_s": 0.5, "audio_s": 1.0,
+           "rtf": 0.5, "chunks": 1, "stalls": 0, "stall_s": 0.0, "sample_rate": 16000,
+           "_audio": np.zeros(16000, dtype=np.float32)}
+    metrics = suite.score([Item(id="a", text="one two")], [row], 1.0, None)
+    assert metrics["utmos_mean"] == 3.5
+    assert calls == [(None, repo, checkpoint)]
+
+
+def test_tts_run_pins_local_utmos_id_across_repeats(tmp_path, monkeypatch):
+    import argparse
+
+    import numpy as np
+
+    from benchmark.eval import judges
+    from benchmark.eval.datasets import Item
+    from benchmark.eval.suites.tts import TTSSuite
+
+    repo = tmp_path / "SpeechMOS"
+    repo.mkdir()
+    (repo / "hubconf.py").write_text("")
+    checkpoint = tmp_path / "utmos.pt"
+    checkpoint.write_bytes(b"first weights")
+    parser = argparse.ArgumentParser()
+    TTSSuite.add_args(parser)
+    args = parser.parse_args(["--asr-judge", "none", "--mos", "--mos-repo", str(repo),
+                              "--mos-checkpoint", str(checkpoint)])
+    args.model_name = "test"
+    suite = TTSSuite(args)
+    pinned_id = suite.config()["mos_judge"]
+    calls = []
+
+    class FakeMOS:
+        @property
+        def id(self):
+            return judges.mos_local_id(repo, checkpoint)
+
+        def score(self, clip):
+            calls.append(clip)
+            return 3.5
+
+    monkeypatch.setattr(judges, "mos_judge", lambda *a: FakeMOS())
+    row = {"id": "a", "ok": True, "error": None, "ttfa_s": 0.1, "e2e_s": 0.5, "audio_s": 1.0,
+           "rtf": 0.5, "chunks": 1, "stalls": 0, "stall_s": 0.0, "sample_rate": 16000,
+           "_audio": np.zeros(16000, dtype=np.float32)}
+    suite.score([Item(id="a", text="one two")], [row.copy()], 1.0, None)
+    checkpoint.write_bytes(b"second weights")
+
+    assert suite.config()["mos_judge"] == pinned_id
+    with pytest.raises(RuntimeError, match="local UTMOS files changed during this run"):
+        suite.score([Item(id="a", text="one two")], [row.copy()], 1.0, None)
+    assert len(calls) == 1
+
+
+def test_tts_run_rejects_checkpoint_changed_during_asr(tmp_path, monkeypatch):
+    import argparse
+
+    import numpy as np
+
+    from benchmark.eval import judges
+    from benchmark.eval.datasets import Item
+    from benchmark.eval.suites.tts import TTSSuite
+
+    repo = tmp_path / "SpeechMOS"
+    repo.mkdir()
+    (repo / "hubconf.py").write_text("")
+    checkpoint = tmp_path / "utmos.pt"
+    checkpoint.write_bytes(b"first weights")
+    parser = argparse.ArgumentParser()
+    TTSSuite.add_args(parser)
+    args = parser.parse_args(["--normalizer", "basic", "--mos", "--mos-repo", str(repo),
+                              "--mos-checkpoint", str(checkpoint)])
+    suite = TTSSuite(args)
+
+    class FakeASR:
+        def transcribe(self, clips, langs):
+            checkpoint.write_bytes(b"second weights")
+            return ["one two"]
+
+    class FakeMOS:
+        @property
+        def id(self):
+            return judges.mos_local_id(repo, checkpoint)
+
+        def score(self, clip):
+            pytest.fail("MOS scored under changed weights")
+
+    monkeypatch.setattr(judges, "asr_judge", lambda *a: FakeASR())
+    monkeypatch.setattr(judges, "mos_judge", lambda *a: FakeMOS())
+    row = {"id": "a", "ok": True, "error": None, "ttfa_s": 0.1, "e2e_s": 0.5, "audio_s": 1.0,
+           "rtf": 0.5, "chunks": 1, "stalls": 0, "stall_s": 0.0, "sample_rate": 16000,
+           "_audio": np.zeros(16000, dtype=np.float32)}
+    with pytest.raises(RuntimeError, match="local UTMOS files changed during this run"):
+        suite.score([Item(id="a", text="one two")], [row], 1.0, None)
+
+
 def test_a_server_with_its_own_cwd_resolves_a_relative_python_and_its_tree_there(tmp_path, monkeypatch):
     """The e2e compare starts each arm's server in that arm's checkout; a relative
     ``python`` runs from there, so PATH and the recorded tree come from there too."""

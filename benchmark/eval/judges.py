@@ -21,14 +21,19 @@ ASR judge is never compared with a WER from another by accident.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Sequence
-from functools import cache
+from functools import cache, lru_cache
+from pathlib import Path
+from threading import Lock
 
 import numpy as np
 
 from benchmark.eval.audio import resample
 
 RATE = 16000
+_MOS_REPO_CODE: dict[Path, str] = {}
+_MOS_REPO_CODE_LOCK = Lock()
 
 
 def _device(device: str | None) -> str:
@@ -106,12 +111,41 @@ class SpeakerSimJudge:
 
 
 class MosJudge:
-    def __init__(self, device: str | None = None, hub_ref: str = "tarepan/SpeechMOS:v1.2.0"):
+    def __init__(
+        self,
+        device: str | None = None,
+        hub_ref: str = "tarepan/SpeechMOS:v1.2.0",
+        repo_path: str | Path | None = None,
+        checkpoint_path: str | Path | None = None,
+    ):
         import torch
 
-        self.id = f"utmos22_strong:{hub_ref}"
+        if (repo_path is None) != (checkpoint_path is None):
+            raise ValueError("offline UTMOS needs both the SpeechMOS repo and checkpoint paths")
         self.device = _device(device)
-        self.model = torch.hub.load(hub_ref, "utmos22_strong", trust_repo=True).to(self.device).eval()
+        if repo_path is None:
+            self.id = f"utmos22_strong:{hub_ref}"
+            model = torch.hub.load(hub_ref, "utmos22_strong", trust_repo=True)
+        else:
+            repo, checkpoint = Path(repo_path).resolve(), Path(checkpoint_path)
+            if not (repo / "hubconf.py").is_file():
+                raise FileNotFoundError(f"offline UTMOS needs hubconf.py in {repo}")
+            if not checkpoint.is_file():
+                raise FileNotFoundError(f"offline UTMOS checkpoint not found: {checkpoint}")
+            code_id = _mos_code_id(repo)
+            with _MOS_REPO_CODE_LOCK:
+                if _MOS_REPO_CODE and repo not in _MOS_REPO_CODE:
+                    raise RuntimeError("different local UTMOS repo path; restart the judge process")
+                loaded = _MOS_REPO_CODE.get(repo)
+                if loaded is not None and loaded != code_id:
+                    raise RuntimeError("local UTMOS code changed at this repo path; restart the judge process")
+                _MOS_REPO_CODE[repo] = code_id
+            self.id = mos_local_id(repo, checkpoint)
+            model = torch.hub.load(str(repo), "utmos22_strong", source="local", pretrained=False)
+            model.load_state_dict(torch.load(checkpoint, map_location="cpu", weights_only=True))
+            if mos_local_id(repo, checkpoint) != self.id:
+                raise RuntimeError("local UTMOS files changed while loading")
+        self.model = model.to(self.device).eval()
         self.torch = torch
 
     def score(self, clip: tuple[np.ndarray, int]) -> float | None:
@@ -154,9 +188,43 @@ def sim_judge(model_id: str, device: str | None = None) -> SpeakerSimJudge:
     return SpeakerSimJudge(model_id, device)
 
 
-@cache
-def mos_judge(device: str | None = None) -> MosJudge:
-    return MosJudge(device)
+def mos_judge(
+    device: str | None = None, repo_path: str | Path | None = None, checkpoint_path: str | Path | None = None
+) -> MosJudge:
+    local_id = None
+    if repo_path is not None and checkpoint_path is not None:
+        local_id = mos_local_id(repo_path, checkpoint_path)
+    return _cached_mos_judge(device, repo_path, checkpoint_path, local_id)
+
+
+@lru_cache(maxsize=4)
+def _cached_mos_judge(
+    device: str | None, repo_path: str | Path | None, checkpoint_path: str | Path | None, local_id: str | None
+) -> MosJudge:
+    judge = MosJudge(device, repo_path=repo_path, checkpoint_path=checkpoint_path)
+    if local_id is not None and judge.id != local_id:
+        raise RuntimeError("local UTMOS files changed while loading")
+    return judge
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        while chunk := f.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()[:16]
+
+
+def mos_local_id(repo_path: str | Path, checkpoint_path: str | Path) -> str:
+    return f"utmos22_strong:local:{_mos_code_id(Path(repo_path))}:{_file_digest(Path(checkpoint_path))}"
+
+
+def _mos_code_id(repo: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(repo.rglob("*.py")):
+        digest.update(path.relative_to(repo).as_posix().encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:16]
 
 
 @cache
