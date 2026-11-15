@@ -74,15 +74,17 @@ def load_prefix_weights(
 ) -> tuple[set[str], set[str]]:
     """Stream the released VLA's two prefix towers into shared M* modules.
 
-    Filtering in the safetensors iterator leaves the action expert and the
-    training-only alignment heads unread. The vision tower's names match the
-    checkpoint directly; the dense LM's loader handles separate Q/K/V and
-    gate/up tensors and its tied output head.
+    A checkpoint index is required so every prefix key is checked before any
+    shard is read. Filtering in the safetensors iterator leaves the action
+    expert and the training-only alignment heads unread. The vision tower's
+    names match the checkpoint directly. The dense LM's loader handles
+    separate Q/K/V and gate/up tensors and its tied output head.
     """
     checkpoint_dir = Path(checkpoint_dir)
     index = checkpoint_dir / "model.safetensors.index.json"
-    if index.exists():
-        validate_prefix_index(vision, text, index)
+    if not index.exists():
+        raise FileNotFoundError(f"LingBot-VLA prefix requires {index}")
+    validate_prefix_index(vision, text, index)
     visual = iter_safetensors_shards(checkpoint_dir, device=device, prefix=_VISION_PREFIX)
     loaded_vision = load_weights_into(
         vision,

@@ -126,3 +126,10 @@ def test_prefix_refuses_unmapped_language_weight_before_reading(tmp_path):
     index.write_text(json.dumps(metadata))
     with pytest.raises(ValueError, match="language checkpoint keys differ: 0 missing.*1 extra"):
         load_prefix_weights(QwenVisionModel(vision_config), Qwen3DenseLM(text_config), tmp_path)
+
+
+def test_prefix_requires_index_before_reading_weights(tmp_path):
+    vision_config, text_config, _ = _checkpoint(tmp_path)
+    (tmp_path / "model.safetensors.index.json").unlink()
+    with pytest.raises(FileNotFoundError, match="LingBot-VLA prefix requires"):
+        load_prefix_weights(QwenVisionModel(vision_config), Qwen3DenseLM(text_config), tmp_path)
