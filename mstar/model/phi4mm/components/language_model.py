@@ -1,9 +1,8 @@
 """Phi-4-mini, Phi-4-multimodal's LLM, from the shared components.
 
 A Llama-style pre-norm decoder: GQA, SwiGLU, RMSNorm, a tied LM head, and RoPE
-over the first 3/4 of each head with LongRoPE scaling. The rotation is the
-position resource's (``PositionConfig(rotary_dim=..., longrope=...)``), so the
-layers are plain ``ParallelAttention``.
+over the first 3/4 of each head with LongRoPE scaling. The rotation is the KV
+array's declared ``Rope``, so the layers are plain ``ParallelAttention``.
 
 The checkpoint stores ``qkv_proj`` and ``gate_up_proj`` fused, under PEFT's
 ``base_layer`` names, beside the modality LoRAs (``lora_A.vision`` ...). Only the
@@ -19,7 +18,7 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components.decoder_layer import DecoderLayer, run_layers
+from mstar.model.components.decoder_layer import DecoderLayer, no_cursor, run_layers
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
     ParallelAttention,
@@ -28,7 +27,7 @@ from mstar.model.components.distributed import (
 )
 from mstar.model.components.norm import RMSNorm
 from mstar.model.loader.base import CheckpointRules
-from mstar.model.phi4mm.config import ATTN, KV_CACHE, ROPE, Phi4MMConfig
+from mstar.model.phi4mm.config import KV_CACHE, Phi4MMConfig
 
 # the LLM's tensors in the checkpoint: everything under `model.` but the media towers,
 # with PEFT's `.base_layer` dropped and its LoRA tensors left to the pool
@@ -63,9 +62,8 @@ class Phi4MiniLM(nn.Module):
                     o_bias=False,
                     rope_theta=config.rope_theta,
                     input_hidden_size=config.hidden_size,
-                    attn_key=ATTN,
                     kv_key=KV_CACHE,
-                    pos_key=ROPE,
+                    layer=i,
                 ),
                 mlp=ParallelGatedMLP(
                     comm_group=comm_group,
@@ -76,7 +74,7 @@ class Phi4MiniLM(nn.Module):
                 input_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
                 post_attention_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
             )
-            for _ in range(config.num_hidden_layers)
+            for i in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = ColumnParallelLinear(
@@ -115,9 +113,9 @@ class Phi4MiniLM(nn.Module):
         return self.embed_tokens(input_ids)
 
     def forward(self, input_embeds: torch.Tensor, *, label: str) -> torch.Tensor:
-        """``(tokens, hidden)`` -> ``(tokens, hidden)`` after the final norm."""
-        self.layers[0].self_attn.attend.bind_step(label)
-        return run_layers(self.layers, input_embeds, self.norm)
+        """``(tokens, hidden)`` -> ``(tokens, hidden)`` after the final norm. Each row's
+        label comes from the step's segments, so ``label`` goes unread."""
+        return run_layers(self.layers, input_embeds, self.norm, no_cursor)
 
     def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)
