@@ -3227,8 +3227,9 @@ row whose last step did not keep its value on the device (its first decode step,
 the prefill) still brings it routed, and that read puts it over the slot’s.
 <code class="docutils literal notranslate"><span class="pre">SampledTokenDecoder</span></code> declares it for Qwen3.5, Muse Glimmer, Higgs Audio, Qwen3-ASR and the Cosmos3 reasoner,
 and a node on it that reads the routed token sets <code class="docutils literal notranslate"><span class="pre">device_loopback</span> <span class="pre">=</span> <span class="pre">None</span></code>; Whisper and
-Qwen3-Omni’s Thinker declare their own. Qwen3.5, Qwen3-ASR and Whisper read the tokens with
-<code class="docutils literal notranslate"><span class="pre">last_sampled</span></code>, and put a row’s routed token over its slot’s with <code class="docutils literal notranslate"><span class="pre">splice_loopback_ids</span></code>.
+Qwen3-Omni’s Thinker declare their own. A node on <code class="docutils literal notranslate"><span class="pre">DeclaredTokenDecoder</span></code> and Whisper’s decoder
+read the tokens with <code class="docutils literal notranslate"><span class="pre">last_sampled</span></code>, and put a row’s routed token over its slot’s with
+<code class="docutils literal notranslate"><span class="pre">splice_loopback_ids</span></code>.
 Its <code class="docutils literal notranslate"><span class="pre">walk</span></code> may be a <code class="docutils literal notranslate"><span class="pre">frozenset</span></code> of walks when several decode walks read the token back; a
 combined step’s rows each follow their own walk, and naming a combined walk is refused at
 startup.</p>
@@ -4509,8 +4510,8 @@ SNAC decoder instead declares how it must be run, using two class attributes on 
 <p><code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> formats the string <code class="docutils literal notranslate"><span class="pre">&quot;{voice}:</span> <span class="pre">{text}&quot;</span></code>, tokenizes it, wraps the ids in
 the model’s start and end tokens, and returns <code class="docutils literal notranslate"><span class="pre">{&quot;text_inputs&quot;:</span> <span class="pre">[ids]}</span></code>, with its layout under
 <code class="docutils literal notranslate"><span class="pre">state_layout</span></code>.
-<code class="docutils literal notranslate"><span class="pre">get_submodule</span></code> builds either the Llama LLM submodule, a <code class="docutils literal notranslate"><span class="pre">SampledTokenDecoder</span></code> that
-declares little beyond its walk names, the state its steps list and capture buckets, or the SNAC
+<code class="docutils literal notranslate"><span class="pre">get_submodule</span></code> builds either the Llama LLM submodule, a <code class="docutils literal notranslate"><span class="pre">DeclaredTokenDecoder</span></code> that
+declares little beyond its walk names and capture buckets, or the SNAC
 decoder submodule, and caches the result. The SNAC submodule emits int16
 PCM, which the default <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> passes through as raw bytes.</p>
 <p>Orpheus also demonstrates the async partition API, described in the next section. The LLM
@@ -4888,7 +4889,9 @@ submodule cache and where the files come from. A model sets <code class="docutil
 <code class="docutils literal notranslate"><span class="pre">METADATA_FILES</span></code> and writes <code class="docutils literal notranslate"><span class="pre">__init__</span></code> (setting
 <code class="docutils literal notranslate"><span class="pre">config</span></code>, <code class="docutils literal notranslate"><span class="pre">tokenizer</span></code> and <code class="docutils literal notranslate"><span class="pre">media</span></code>), its resources (the sampler from
 <code class="docutils literal notranslate"><span class="pre">_sampler_spec</span></code>; <code class="docutils literal notranslate"><span class="pre">MIXED_SPLIT</span></code> is the attention resources’ split of a mixed step),
-<code class="docutils literal notranslate"><span class="pre">_prompt_ids</span></code> and <code class="docutils literal notranslate"><span class="pre">_create_submodule</span></code>. The scaffold’s
+<code class="docutils literal notranslate"><span class="pre">_prompt_ids</span></code> and <code class="docutils literal notranslate"><span class="pre">_create_submodule</span></code>. A model on the state contract subclasses
+<code class="docutils literal notranslate"><span class="pre">DeclaredDecoderModel</span></code>, which returns the layout as <code class="docutils literal notranslate"><span class="pre">state_layout</span></code> and the request’s
+settings as <code class="docutils literal notranslate"><span class="pre">SampleSettings</span></code>. The scaffold’s
 <code class="docutils literal notranslate"><span class="pre">rebuild_policies</span></code> lets the KV cache drop a request and reprefill its ids on its prefill
 walk, a media prompt’s with host copies of its encoders’ outputs. A model whose LLM node
 holds a resource that can’t drop returns <code class="docutils literal notranslate"><span class="pre">{}</span></code>, or the engine refuses to start; Muse
@@ -4950,8 +4953,10 @@ writes:</p>
 <code class="docutils literal notranslate"><span class="pre">Qwen3_5ForCausalLM</span></code> and <code class="docutils literal notranslate"><span class="pre">Qwen3DenseLM</span></code> do. The sampler is declared under
 <code class="docutils literal notranslate"><span class="pre">mstar.model.keys</span></code>’ <code class="docutils literal notranslate"><span class="pre">SAMPLER</span></code>, and the positions under the node’s <code class="docutils literal notranslate"><span class="pre">POS_KEY</span></code>
 (<code class="docutils literal notranslate"><span class="pre">ROPE</span></code> unless the model’s layers name another <code class="docutils literal notranslate"><span class="pre">pos_key</span></code>). A model on the state contract
-overrides <code class="docutils literal notranslate"><span class="pre">node_step</span></code>, <code class="docutils literal notranslate"><span class="pre">next_position</span></code>, <code class="docutils literal notranslate"><span class="pre">loopback_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">last_token_hidden</span></code> and
-<code class="docutils literal notranslate"><span class="pre">sample_tokens</span></code> with its handle calls, as Qwen3.5 does. <code class="docutils literal notranslate"><span class="pre">MSTAR_DECODE_BUCKETS</span></code> sets the
+subclasses <code class="docutils literal notranslate"><span class="pre">DeclaredTokenDecoder</span></code> instead and sets none of <code class="docutils literal notranslate"><span class="pre">ATTN_KEY</span></code>, <code class="docutils literal notranslate"><span class="pre">POS_KEY</span></code> or
+<code class="docutils literal notranslate"><span class="pre">layer_steps</span></code>, since its positions are the array’s: its <code class="docutils literal notranslate"><span class="pre">node_step</span></code>, <code class="docutils literal notranslate"><span class="pre">next_position</span></code>,
+<code class="docutils literal notranslate"><span class="pre">loopback_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">last_token_hidden</span></code> and <code class="docutils literal notranslate"><span class="pre">sample_tokens</span></code> make the handle calls, and a model
+overrides <code class="docutils literal notranslate"><span class="pre">node_step</span></code> only when it steps a second array, as Qwen3.5 does. <code class="docutils literal notranslate"><span class="pre">MSTAR_DECODE_BUCKETS</span></code> sets the
 default decode ladder, <code class="docutils literal notranslate"><span class="pre">MIXED_MAX_PREFILL_ROWS</span></code> caps a mixed step’s prompt rows, <code class="docutils literal notranslate"><span class="pre">capture_compile_mode(walk)</span></code> names a capture’s <code class="docutils literal notranslate"><span class="pre">compile_mode</span></code> (<code class="docutils literal notranslate"><span class="pre">None</span></code>, the default,
 takes the deployment’s compile level), and <code class="docutils literal notranslate"><span class="pre">CAPTURE_PREFILL</span> <span class="pre">=</span> <span class="pre">False</span></code> captures decode
 only. A lone encoder’s <code class="docutils literal notranslate"><span class="pre">MediaEncoder.walk</span></code> names its media walk when the model’s graph

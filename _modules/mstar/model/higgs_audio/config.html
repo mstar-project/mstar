@@ -1036,8 +1036,8 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">fields</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 
-<span class="c1"># the LLM's attention resource; its KV, position and sampler keys are</span>
-<span class="c1"># `mstar.model.keys`', as the shared decoder reads them</span>
+<span class="c1"># the read of the LLM's KV cache; the cache and the sampler are under</span>
+<span class="c1"># `mstar.model.keys`' names, as the shared decoder binds them</span>
 <span class="n">ATTN</span> <span class="o">=</span> <span class="s2">"attn"</span>
 
 
