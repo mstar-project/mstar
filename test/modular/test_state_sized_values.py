@@ -105,10 +105,12 @@ def test_a_value_with_sizes_takes_its_own_storage_and_builds_no_pool():
      "dtype is None, and a sized field's bytes are counted before"),
     (lambda: _caches(entry=Entry({SLOT: TensorType((Size("lat_h"), Size("lat_w")), dtype=torch.float32, shard=0)})),
      "shard is 0, and the store holds each request's tensors whole, on one rank"),
+    (lambda: _caches(entry=Entry({SLOT: TensorType((2, Size("lat_h"), Size("lat_w")), dtype=torch.float32, shard=0)})),
+     "shard is 0, and the store holds each request's tensors whole, on one rank"),
     (lambda: _caches(entry=Entry(ENTRY.tensors, host={"count": int})), "a sized Value holds tensors only"),
     (lambda: Size("lat_h", scale=0), "Size.scale must be a positive int, got 0"),
-], ids=["size_unbounded", "no_largest", "bound_unnamed", "bound_zero", "not_a_value", "dtype", "shard", "host",
-        "scale"])
+], ids=["size_unbounded", "no_largest", "bound_unnamed", "bound_zero", "not_a_value", "dtype", "shard_on_size",
+        "shard_on_fixed", "host", "scale"])
 def test_a_sized_value_refuses_what_it_cannot_count(make, message):
     with pytest.raises(ValueError, match=message):
         make()
