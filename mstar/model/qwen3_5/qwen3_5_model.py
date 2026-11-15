@@ -24,6 +24,7 @@ from mstar.engine.state import (
     Value,
 )
 from mstar.model.base import ProcessPromptOutput, TensorAndMetadata
+from mstar.model.components.lora.modules import LoraRoot
 from mstar.model.components.mrope import image_position_advance
 from mstar.model.keys import MIXED, PREFILL_TEXT
 from mstar.model.media_limits import read_image
@@ -176,10 +177,10 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
             settings[VISION_ATTN] = {"max_segments_per_step": self._vision_segment_ceiling()}
         return settings
 
-    def get_node_resources(self):
-        from mstar.model.qwen3_5.lora import qwen3_5_lora_spec
+    def lora_roots(self) -> tuple[LoraRoot, ...]:
+        from mstar.model.qwen3_5.lora import qwen3_5_lora_roots
 
-        return [qwen3_5_lora_spec(self.config, self.vision_config)]
+        return qwen3_5_lora_roots(self.config, self.vision_config)
 
     def _vision_segment_ceiling(self) -> int:
         """Segments a captured block loop's plan holds. A segment per image, not per request: the resize floors each
