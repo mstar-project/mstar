@@ -24,8 +24,9 @@ from mstar.engine.resources.lora.checkpoint import read_lora_file  # noqa: E402
 from mstar.engine.resources.lora.identity import adapter_digest  # noqa: E402
 from mstar.engine.resources.lora.pool import LoraAdapterPool  # noqa: E402
 from mstar.engine.resources.step import BucketKey, ResourceStep, Segment, SlotLease, StepContext  # noqa: E402
+from mstar.model.components.lora.modules import declared_lora_spec  # noqa: E402
 from mstar.model.qwen3_5.config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config  # noqa: E402
-from mstar.model.qwen3_5.lora import qwen3_5_lora_spec  # noqa: E402
+from mstar.model.qwen3_5.lora import qwen3_5_lora_roots  # noqa: E402
 
 # Qwen3.5-0.8B's geometry, two layers (a delta-net one and a full-attention one)
 HIDDEN, INTER, HEADS, KV_HEADS, HEAD_DIM = 1024, 3584, 8, 2, 256
@@ -91,14 +92,14 @@ def head_adapters(tmp_path_factory):
 
 def make_pool(paths, *, head=False, rank=0, world=1):
     """Two slots, max rank 16; ``head`` keeps only the LM head and embedding, at the real vocabulary."""
-    spec = qwen3_5_lora_spec(Qwen3_5Config(
+    spec = declared_lora_spec(qwen3_5_lora_roots(Qwen3_5Config(
         num_hidden_layers=len(LAYERS), hidden_size=HIDDEN, intermediate_size=INTER,
         layer_types=list(LAYERS), num_attention_heads=HEADS, num_key_value_heads=KV_HEADS,
         head_dim=HEAD_DIM, linear_num_key_heads=LIN_HEADS, linear_num_value_heads=LIN_HEADS,
         linear_key_head_dim=LIN_DIM, linear_value_head_dim=LIN_DIM, linear_conv_kernel_dim=4,
         vocab_size=VOCAB if head else 1000, rms_norm_eps=1e-6, max_position_embeddings=4096,
         attn_output_gate=True,
-    ))
+    )))
     targets = ["lm_head", "embed_tokens"] if head else None
     spec.apply_yaml_overrides(max_slots=2, max_rank=16, adapters=dict(paths), targets=targets)
     # pinned as the API server pins a serving config's adapters
