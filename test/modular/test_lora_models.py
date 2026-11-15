@@ -35,12 +35,12 @@ from mstar.engine.resources.step import PIECEWISE_WALK, BucketKey, SlotLease, St
 from mstar.engine.state.adapters import node_handles, state_steps  # noqa: E402
 from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP  # noqa: E402
 from mstar.model.components.lora.capable import make_lora_capable  # noqa: E402
-from mstar.model.components.lora.modules import _check  # noqa: E402
+from mstar.model.components.lora.modules import _check, declared_lora_spec  # noqa: E402
 from mstar.model.multimodal import MEDIA_LAYOUT  # noqa: E402
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM  # noqa: E402
 from mstar.model.qwen3_5.components.vision import Qwen3_5VisionModel  # noqa: E402
 from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5Config, Qwen3_5VisionConfig  # noqa: E402
-from mstar.model.qwen3_5.lora import qwen3_5_lora_spec  # noqa: E402
+from mstar.model.qwen3_5.lora import qwen3_5_lora_roots  # noqa: E402
 from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel  # noqa: E402
 from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule  # noqa: E402
 from mstar.model.submodule_base import engine_step, with_segment_steps  # noqa: E402
@@ -126,14 +126,14 @@ def _released(name: str, size: str | None = None):
     whether that root is TP)``."""
     if name != "qwen3_5":
         model, root = H.STACKS[name]().released()
-        return lora_spec(model.get_node_resources()), model.config, [(lambda g: root(model.config, g), True)]
+        return declared_lora_spec(model.lora_roots()), model.config, [(lambda g: root(model.config, g), True)]
     entry = QWEN3_5_SIZES[size]
     text = Qwen3_5Config(**entry["text_config"], tie_word_embeddings=entry["tie_word_embeddings"])
     vision = Qwen3_5VisionConfig(**entry["vision_config"])
     # the model's own declaration; its vision attention reads only these two processor fields
     processor = SimpleNamespace(size={"shortest_edge": 65536}, patch_size=vision.patch_size)
     model = H.model_object(Qwen3_5DenseModel, text, vision_config=vision, _image_processor=processor)
-    return lora_spec(model.get_node_resources()), text, [
+    return declared_lora_spec(model.lora_roots()), text, [
         (lambda g: Qwen3_5ForCausalLM(text, g), True), (lambda g: Qwen3_5VisionModel(vision), False),
     ]
 
@@ -429,7 +429,7 @@ def _encode(sub, rid="r"):
 
 def _vision_pool(paths, max_slots=2):
     """The vision node's pool, from the model's one spec as the engine builds it."""
-    spec = qwen3_5_lora_spec(H.tiny_config(), vision_config()).for_node("vision_encoder")
+    spec = declared_lora_spec(qwen3_5_lora_roots(H.tiny_config(), vision_config())).for_node("vision_encoder")
     spec.apply_yaml_overrides(max_slots=max_slots, max_rank=4, adapters=dict(paths))
     spec.dtype, spec.backend = H.DTYPE, "torch"
     return H.pool(H.pin_digests(spec))
