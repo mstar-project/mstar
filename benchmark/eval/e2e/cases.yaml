@@ -629,11 +629,10 @@ models:
         quality: [mos]
         perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
 
-  # ---------------- newer models (optional until their PRs are on main) ----------------
-  # Each adds an engine path none of the models above covers (#577). Base must serve the model too, so these stay
-  # optional (out of `all`, select with `tag:new-model` or by name) until the model's PR is on main; until then
-  # compare them with a base that has the model, e.g. `--base 515 --head <a PR stacked on it>`. MiniCPM-o still
-  # has no chat adapter for the client kinds used here.
+  # ---------------- newer models (select explicitly) ----------------
+  # These cases need model-specific weights, so they stay out of `all`. Select with `tag:new-model` or a model
+  # name; both revisions being compared must serve that model. MiniCPM-o still lacks a chat adapter for the
+  # client kinds used here.
   fish_s2_pro:            # slow/fast AR and streamed 44.1 kHz DAC; plain and reference-audio requests
     serve: fish_s2_pro
     optional: true
