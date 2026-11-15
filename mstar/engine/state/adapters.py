@@ -3456,7 +3456,7 @@ class WithinStepStorage(Storage):
                 query_array(array, read, by_name),
             )
             # refuses either side's second label at resolve, which validation and `build_specs` run before any handle
-            queries.plan_label(array)
+            plan_label = queries.plan_label(array)
             config = RaggedAttentionConfig(
                 num_qo_heads=read.op.q_heads, num_kv_heads=heads, head_dim=head_dim, dtype=dtype,
             )
@@ -3471,8 +3471,9 @@ class WithinStepStorage(Storage):
             } if expert else {})
             spec = queries.spec_class(resource_key=key, nodes=array.nodes, config=config, **extra)
             mask_size = read.mask.chunk_len if isinstance(read.mask, ChunkCausal) else None
+            # An expert plan holds one label or Q/KV pair. Unlike the chunk resource, it cannot share across labels.
             spec = shared.setdefault((queries.spec_class, array.nodes, astuple(config), mask_size,
-                                      read.mask if expert else None), spec)
+                                      read.mask if expert else None, plan_label if expert else None), spec)
             resolved.resource_of[key] = spec.resource_key
             if bound.binding.plans and isinstance(spec, RaggedAttentionSpec):
                 # the labels the node's sequence shard may split (`RaggedAttentionSpec.derive`)

@@ -221,6 +221,14 @@ def test_an_unread_key_warns_once_per_set_of_keys(caplog):
     assert {r.levelname for r in caplog.records if "does not read" in r.getMessage()} == {"WARNING"}
 
 
+def test_a_client_chunk_layout_key_is_reported_as_ignored(caplog):
+    # The data worker discards client-supplied layouts and accepts only the
+    # model's state_layout, so the API must not imply that this key is used.
+    with caplog.at_level("WARNING", logger=entrypoint.logger.name):
+        _RecordingServer()._report_ignored_params({"__state_chunk_causal_layout__": {"client": 1}})
+    assert _reported(caplog) == [["__state_chunk_causal_layout__"]]
+
+
 def test_the_reported_sets_hold_digests_and_stay_bounded(caplog):
     server = _RecordingServer()
     with caplog.at_level("WARNING", logger=entrypoint.logger.name):
