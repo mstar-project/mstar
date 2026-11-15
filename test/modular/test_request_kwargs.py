@@ -9,6 +9,7 @@ from dataclasses import fields, replace
 import pytest
 
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
+from mstar.engine.resources.sampler.grammar import GrammarRequest
 from mstar.engine.state import Sampler, SampleSettings
 from mstar.engine.state.adapters import build_specs
 from mstar.model.components.request_kwargs import (
@@ -59,7 +60,7 @@ def test_sample_settings_carry_every_field_a_sampling_config_sets():
     knobs = {
         "temperature": 0.3, "top_k": 7, "top_p": 0.8, "min_p": 0.05, "repetition_penalty": 1.2, "repetition_window": 16,
         "penalize_prompt": False, "min_tokens": 3, "ignore_eos": True, "top_p_first": True, "top_p_min_keep": 2,
-        "return_logprobs": True, "logprobs_mode": "processed",
+        "return_logprobs": True, "logprobs_mode": "processed", "grammar": GrammarRequest("regex", "a+"),
     }
     assert knobs.keys() == {field.name for field in fields(SampleSettings)}, "a field with no knob here goes unchecked"
     settings = sample_settings(SamplingReqConfig(**knobs))
