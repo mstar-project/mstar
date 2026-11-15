@@ -145,6 +145,7 @@ if TYPE_CHECKING:
 if TYPE_CHECKING:
     from mstar.engine.state import Array, Sampler, SampleSettings, SeqShard
     from mstar.engine.state.adapters import StateSetup
+    from mstar.model.components.lora.modules import LoraRoot
     from mstar.worker.scheduling_policy import WalkPriority
 
 DECODE = "decode"
@@ -551,18 +552,21 @@ def streamed_inputs(model: "Model", graph_walk: str, graph: GraphSection) -> set
 
 def enabled_resources(model: "Model", model_config: dict, setup: "StateSetup") -> list[NodeResourceSpec]:
     """The resource specs a deployment's YAML turns on, before its ``resources:``
-    overrides: the model's declaration, less the opt-in specs (``NodeResourceSpec.opt_in``)
-    its ``resources:`` block does not name. Raises the first problem with the declaration,
-    for callers that skip ``validate_deployment``, which reports them all."""
+    overrides: the model's declaration and the LoRA spec of its `lora_roots`, less the
+    opt-in specs (``NodeResourceSpec.opt_in``) its ``resources:`` block does not name.
+    Raises the first problem with the declaration, for callers that skip
+    ``validate_deployment``, which reports them all."""
     from mstar.engine.state.adapters import node_resources
     from mstar.engine.state.analysis import state_declaration_problems
+    from mstar.model.components.lora.modules import declared_lora_spec
 
     problems = state_declaration_problems(model)
     if problems:
         raise ValueError(problems[0])
     named = (model_config.get("resources") or {}).keys()
+    lora = declared_lora_spec(model.lora_roots())
     return [
-        spec for spec in node_resources(model, setup=setup)
+        spec for spec in [*node_resources(model, setup=setup), *([lora] if lora is not None else [])]
         if not spec.opt_in or spec.resource_key in named
     ]
 
@@ -800,10 +804,15 @@ class Model(ABC):
         The whole declaration, apart from what `declare_state` declares: a KV
         cache's shape, the attention backend over it, positions, samplers. The
         engine builds one resource per spec and hands each node the subset naming it.
-        An opt-in spec (per-request LoRA adapters) is declared here too, and built
-        only for a deployment whose ``resources:`` block names it.
+        Per-request LoRA adapters are declared in `lora_roots`.
         """
         return []
+
+    def lora_roots(self) -> "tuple[LoraRoot, ...]":
+        """The weights roots per-request LoRA adapters may reach, one per node, from which the bridge builds the
+        opt-in LoRA spec. LoRA stands outside `declare_state`: adapters are weights that no request writes, and a
+        request picks one by its kwargs."""
+        return ()
 
     def declare_state(self) -> "list[Array | Sampler | SeqShard]":
         """The state the model keeps between steps, from which the engine builds the specs for it.

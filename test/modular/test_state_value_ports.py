@@ -23,7 +23,6 @@ from mstar.engine.node_dtype import resolve_model_dtype
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
-from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
@@ -344,8 +343,8 @@ def test_specs_equal_the_hand_written_ones_on_every_published_config(path, tmp_p
     _assert_equal_per_key(serving_resources(model, deployment), expected, kv_dtype)
 
 
-def test_qwen3_tts_writes_only_lora_by_hand():
-    assert {spec.resource_key for spec in _tts().get_node_resources()} == {LORA_RESOURCE_KEY}
+def test_qwen3_tts_writes_no_spec_by_hand():
+    assert _tts().get_node_resources() == []
 
 
 def test_canary_qwen_differs_only_in_a_page_size_that_means_the_same_pages():
