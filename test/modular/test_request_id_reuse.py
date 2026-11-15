@@ -38,8 +38,7 @@ from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThrea
 from mstar.api_server.entrypoint import request_id_in_use
 from mstar.api_server.request_types import APIServerMessage, RequestFailed, ResultChunk
 from mstar.communication.event import EventWakeup
-from mstar.model.base import Model
-from mstar.streaming.topology import PartitionTopology
+from mstar.testing_utils.model import StubModel
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     NewRequestConductor,
@@ -52,16 +51,9 @@ from mstar.utils.ipc_format import (
 TEXT = dict(input_modalities=["text"], output_modalities=["text"])
 
 
-class _Model:
-    def get_partition_topology(self):
-        return PartitionTopology(partitions=["default"])
-
+class _Model(StubModel):
     def process_prompt(self, *args, **kwargs):
         return None
-
-    # the inline path's per-value default, over the stub's postprocess
-    postprocess_inline = Model.postprocess_inline
-    text_output = Model.text_output
 
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()
@@ -86,7 +78,9 @@ class _Socket:
         return msgs
 
     def send(self, entity, msg):
-        self.sent.append((entity, msg))
+        with self.cond:
+            self.sent.append((entity, msg))
+            self.cond.notify_all()
 
     # the data worker's outbox encodes with this: identity, so sends arrive as objects
     codec = SimpleNamespace(encode=lambda msg: msg)
@@ -101,10 +95,18 @@ class _Socket:
     def sent_of(self, message_type):
         return [m.body for e, m in self.sent if e == "conductor" and m.message_type == message_type]
 
+    def wait_for_sent(self, message_type):
+        with self.cond:
+            assert self.cond.wait_for(lambda: self.sent_of(message_type), timeout=10), (
+                f"data worker did not send {message_type}"
+            )
+            return self.sent_of(message_type)
+
 
 class _TensorManager:
     def __init__(self):
         self.forced = []
+        self.cleanup_done = threading.Event()
 
     def store_and_return_tensor_info(self, request_id, tensors):
         return {}
@@ -125,6 +127,7 @@ class _TensorManager:
 
     def force_cleanup_request(self, request_id):
         self.forced.append(request_id)
+        self.cleanup_done.set()
 
     def ack_unread_tensors(self, graph_edges):
         pass
@@ -201,6 +204,48 @@ def rig():
     r = _Rig()
     yield r
     r.close()
+
+
+def test_cancelled_collection_sends_abort_through_the_data_worker(rig):
+    """Cancellation crosses the real facade and worker queue into the outbox;
+    input tensors stay owned until the conductor authorizes hard cleanup."""
+    rig.server.submit_request(text="cancel while waiting", request_id="X", streaming=False, **TEXT)
+    (submitted,) = rig.socket.wait_for_sent(ConductorMessageType.NEW_REQUEST)
+    key = submitted.request_id
+    assert key != "X"
+
+    async def cancel():
+        entered = asyncio.Event()
+
+        async def collect():
+            entered.set()
+            # The caller resumes only after this direct await yields inside
+            # the collector, so cancellation cannot precede its first run.
+            return await rig.server.collect_results("X")
+
+        task = asyncio.create_task(collect())
+        await entered.wait()
+        assert not task.done()
+        assert rig.server.pending_requests[key].wake is not None
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel())
+    aborts = rig.socket.wait_for_sent(ConductorMessageType.ABORT_REQUEST)
+    reads_done = rig.socket.wait_for_sent(ConductorMessageType.READS_DONE)
+
+    assert not rig.server.pending_requests
+    assert not rig.server._live
+    assert not rig.server._client_ids
+    assert [body.request_id for body in aborts] == [key]
+    assert [(body.request_id, body.entity_id) for body in reads_done] == [(key, PREPROCESS)]
+    assert rig.tm.forced == [], "abort must not unlink inputs before REMOVE_REQUEST"
+
+    # Deliver the conductor's cleanup authorization through the real worker loop.
+    rig.socket.deliver(WorkerMessageType.REMOVE_REQUEST, RemoveRequest(key))
+    assert rig.tm.cleanup_done.wait(timeout=10), "data worker did not apply REMOVE_REQUEST"
+    assert rig.tm.forced == [key]
 
 
 def test_the_older_request_s_drain_does_not_free_the_reuse_on_the_conductor(rig):
@@ -767,6 +812,13 @@ def _bridge(s):
     sent = []
     bridge._send = sent.append
     return bridge, sent
+
+
+@pytest.mark.parametrize("streaming", [True, False])
+def test_the_conductor_learns_whether_the_client_streams(rig, streaming):
+    rig.server.submit_request(text="a", request_id="X", streaming=streaming, **TEXT)
+    rig.settle()
+    assert rig.socket.sent_of(ConductorMessageType.NEW_REQUEST)[-1].streaming is streaming, "the flag was lost"
 
 
 def test_rust_bridge_relays_a_refused_submit_under_its_own_sub():

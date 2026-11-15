@@ -2,6 +2,7 @@ import collections
 import fcntl
 import logging
 import os
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from enum import Enum
@@ -22,6 +23,12 @@ EXPECTED_MSTAR_RUST_VERSION = "0.1.1"
 #: ARE the same deployment as far as anything keyed off it is concerned --
 #: notably the tensor-file namespace in ``mstar.communication.tensors``.
 DEPLOYMENT_ANCHOR_ENTITY = "conductor"
+
+#: The entities that lock the deployment's IPC prefix when they bind: the
+#: anchor, and the first one the API-server process binds, so a second
+#: ``mstar serve`` on the prefix is refused before it takes over the first
+#: deployment's API-server sockets (its conductor starts later).
+DEPLOYMENT_LOCK_ENTITIES = (DEPLOYMENT_ANCHOR_ENTITY, "api_server_preprocess_worker")
 
 
 class CommProtocol(Enum):
@@ -76,8 +83,9 @@ class BaseCommunicator(ABC):
         """Claim this deployment, so a second one on the same IPC prefix fails
         here instead of corrupting the first.
 
-        Only the anchor entity locks, and only over IPC. TCP needs no lock: two
-        deployments sharing a base port collide on ``bind`` already. IPC does
+        Only ``DEPLOYMENT_LOCK_ENTITIES`` lock, each on its own file, and only
+        over IPC. TCP needs no lock: two deployments sharing a base port
+        collide on ``bind`` already. IPC does
         not -- libzmq UNLINKS an existing socket file and binds a fresh one, so
         the second conductor comes up, silently steals every connection aimed
         at the first, and derives the same tensor-file namespace (uuids are
@@ -89,7 +97,7 @@ class BaseCommunicator(ABC):
         exits, so a crashed deployment leaves nothing to clean up; the fd is
         kept on the instance purely so it outlives this call.
         """
-        if self.protocol != CommProtocol.IPC or my_id != DEPLOYMENT_ANCHOR_ENTITY:
+        if self.protocol != CommProtocol.IPC or my_id not in DEPLOYMENT_LOCK_ENTITIES:
             return
         path = self._endpoint(my_id).removeprefix("ipc://") + ".lock"
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
@@ -129,13 +137,15 @@ class BaseCommunicator(ABC):
     #     pass
 
 
-def make_communicator(*args, nonblocking_send: bool = False, **kwargs) -> BaseCommunicator:
+def make_communicator(
+    *args, nonblocking_send: bool = False, **kwargs,
+) -> "BaseCommunicator | OutboxCommunicator":
     """Construct the process's communicator: ``RustZMQCommunicator``, on the
     vendored ``rust/`` extension (see ``communication/rust_communicator.py``).
 
     Raises when the extension is missing or is not the version this tree
-    expects. ``nonblocking_send`` is for a communicator ``OutboxCommunicator``
-    wraps, which needs ``try_send_bytes``: an extension built before
+    expects. ``nonblocking_send`` wraps it in an ``OutboxCommunicator``, which
+    needs ``try_send_bytes``: an extension built before
     ``ZmqCommunicator.try_send`` is refused for it.
     """
     try:
@@ -165,10 +175,11 @@ def make_communicator(*args, nonblocking_send: bool = False, **kwargs) -> BaseCo
     if nonblocking_send and not hasattr(mstar_rust.ZmqCommunicator, "try_send"):
         raise RuntimeError(
             f"mstar_rust {version} predates ZmqCommunicator.try_send, which the "
-            "API server's preprocess thread sends with: rebuild it with "
+            "conductor and the API server's preprocess thread send with: rebuild it with "
             "`maturin develop --release -m rust/Cargo.toml`"
         )
-    return RustZMQCommunicator(*args, **kwargs)
+    communicator = RustZMQCommunicator(*args, **kwargs)
+    return OutboxCommunicator(communicator) if nonblocking_send else communicator
 
 
 class OutboxCommunicator:
@@ -176,16 +187,22 @@ class OutboxCommunicator:
     (at its high-water mark) is queued, in order behind any earlier one to the
     same peer, and retried by ``flush``.
 
-    For a loop that peers block on while it sends to them (the API server's
-    preprocess thread, against the conductor and the workers): if it blocked on
+    For a loop that peers block on while it sends to them (the conductor
+    against the workers, and the API server's preprocess thread against the
+    conductor and the workers): if it blocked on
     a full peer it would stop reading the input that peer waits to deliver, and
     the two would wait on each other for good. Everything else is the wrapped
     communicator's.
     """
 
+    #: How often a peer that stays behind is reported.
+    BEHIND_WARN_S = 10.0
+
     def __init__(self, inner: BaseCommunicator):
         self._inner = inner
         self._outbox: dict[str, collections.deque[bytes]] = {}
+        # peer -> (when its backlog started, when it was last reported)
+        self._behind: dict[str, tuple[float, float]] = {}
 
     def send(self, entity_id: str, msg) -> None:
         self.send_each((entity_id,), msg)
@@ -206,7 +223,10 @@ class OutboxCommunicator:
 
         A queued message whose send fails outright (not just a full peer) is
         dropped and logged: there is no caller left to raise to, and keeping
-        it would stop every message behind it."""
+        it would stop every message behind it. Nothing bounds the queue, since
+        blocking or dropping would hang the requests behind it, so a peer that
+        stays behind is logged with its depth every ``BEHIND_WARN_S``."""
+        now = time.monotonic()
         for entity_id, backlog in self._outbox.items():
             while backlog:
                 try:
@@ -215,6 +235,16 @@ class OutboxCommunicator:
                 except Exception:  # noqa: BLE001 — that message's failure alone
                     logger.exception("Dropping a queued message to %s that failed to send", entity_id)
                 backlog.popleft()
+            if not backlog:
+                self._behind.pop(entity_id, None)
+                continue
+            since, reported = self._behind.setdefault(entity_id, (now, now))
+            if now - reported >= self.BEHIND_WARN_S:
+                self._behind[entity_id] = (since, now)
+                logger.warning(
+                    "%s has taken less than it was sent for %.0f s: %d messages queued for it",
+                    entity_id, now - since, len(backlog),
+                )
         return any(self._outbox.values())
 
     def __getattr__(self, name):

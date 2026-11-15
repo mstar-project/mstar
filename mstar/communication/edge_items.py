@@ -41,7 +41,7 @@ class EdgeItemsBuilder:
         """Add the edge's row; False, adding nothing, when its descriptors
         don't share the frame's fields (or one walk)."""
         infos = edge.tensor_info
-        if not infos:
+        if not infos or (self._msg is not None and self._msg.values):
             return False
         first = infos[0]
         shared = (
@@ -84,6 +84,32 @@ class EdgeItemsBuilder:
             m.dtype_idx.append(d)
             m.shm_segment_idx.append(-1 if i.shm_segment is None else self._name(i.shm_segment))
             m.shm_offsets.append(i.shm_offset)
+        return True
+
+    def add_values(
+        self, request_id: str, signal: str, next_node: str, walk: str | None, values: list[int],
+        source: tuple[str, str, str | None, int, int],
+    ) -> bool:
+        """Add a row of inline items, ``source`` the producer's (session, entity,
+        node, tp_size, tp_rank); False, adding nothing, when the frame holds
+        descriptor rows or another producer's (a frame is one kind or the other)."""
+        m = self._msg
+        if m is None:
+            m = self._msg = EdgeItems(
+                partition_name=self._partition, source_session_id=source[0],
+                source_entity=source[1], tp_size=source[3], tp_rank=source[4],
+                source_node_name=source[2],
+            )
+        elif m.uuids or (
+            m.source_session_id, m.source_entity, m.source_node_name, m.tp_size, m.tp_rank,
+        ) != tuple(source):
+            return False
+        m.request_ids.append(request_id)
+        m.signal_idx.append(self._name(signal))
+        m.next_node_idx.append(self._name(next_node))
+        m.walk_idx.append(-1 if walk is None else self._name(walk))
+        m.num_items.append(len(values))
+        m.values.extend(values)
         return True
 
     def build(self) -> EdgeItems:
@@ -150,6 +176,21 @@ def row_infos(frame: EdgeItems, row: StreamRow, dtypes: list | None = None) -> l
         ))
         dim_at += nd
     return out
+
+
+def row_values_frame(frame: EdgeItems, row: StreamRow) -> EdgeItems:
+    """A row of inline items as a frame of its own (to park it for a request
+    that has not arrived)."""
+    walk = frame.walk_idx[row.index]
+    return EdgeItems(
+        partition_name=frame.partition_name, source_session_id=frame.source_session_id,
+        source_entity=frame.source_entity, tp_size=frame.tp_size, tp_rank=frame.tp_rank,
+        source_node_name=frame.source_node_name,
+        names=[row.signal, row.next_node] + ([] if walk < 0 else [frame.names[walk]]),
+        request_ids=[row.request_id], signal_idx=[0], next_node_idx=[1],
+        walk_idx=[-1 if walk < 0 else 2], num_items=[row.count],
+        values=frame.values[row.start:row.start + row.count],
+    )
 
 
 def row_input_signals(frame: EdgeItems, row: StreamRow) -> InputSignals:

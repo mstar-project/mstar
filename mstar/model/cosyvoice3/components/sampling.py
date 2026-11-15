@@ -32,6 +32,8 @@ distributions; they cannot follow its random stream, which is the global
 from __future__ import annotations
 
 import torch
+import triton
+import triton.language as tl
 
 # Largest top_k the fixed-shape nucleus covers (the reference uses 25).
 MAX_TOP_K = 128
@@ -73,7 +75,105 @@ def _gumbel(seed: torch.Tensor, step: torch.Tensor, salt: int, n: int) -> torch.
     return (-torch.log(-torch.log(u))).to(torch.float32)
 
 
-def ras_sample(
+@triton.jit
+def _mix32_tl(x):
+    x = x ^ (x >> 16)
+    x = x * 0x85EBCA6B
+    x = x ^ (x >> 13)
+    x = x * 0xC2B2AE35
+    return x ^ (x >> 16)
+
+
+@triton.jit
+def _row_mix_tl(seed, step, salt):
+    """What ``hashed_uniform`` adds each id's hash to, for one row."""
+    lo = (seed & 0xFFFFFFFF).to(tl.uint32)
+    hi = ((seed >> 32) & 0xFFFFFFFF).to(tl.uint32)
+    s = _mix32_tl(lo ^ (hi * 0x27D4EB2F))
+    t = _mix32_tl((step & 0xFFFFFFFF).to(tl.uint32) ^ salt)
+    return _mix32_tl((s * 0x9E3779B1) ^ t)
+
+
+@triton.jit
+def _gumbel_tl(row_mix, ids):
+    """``_gumbel`` of one row's ids: uint32 multiplies are its ``_mulmod32``."""
+    x = _mix32_tl(row_mix + ids * 0x632BE5AB)
+    u = (x.to(tl.float64) + 0.5) / 4294967296.0
+    return (-tl.log(-tl.log(u))).to(tl.float32)
+
+
+@triton.jit
+def _first_draw_kernel(TOP_LP, KEEP, SEED, STEP, PICK, k, BLOCK: tl.constexpr):
+    """A row's Gumbel-max over its kept nucleus: ``PICK`` is the winning rank."""
+    row = tl.program_id(0)
+    row_mix = _row_mix_tl(tl.load(SEED + row), tl.load(STEP + row), 0)
+    best = -float("inf")
+    best_at = 0
+    for start in range(0, k, BLOCK):
+        ranks = start + tl.arange(0, BLOCK)
+        mask = ranks < k
+        keep = tl.load(KEEP + row * k + ranks, mask=mask, other=0)
+        lp = tl.load(TOP_LP + row * k + ranks, mask=mask, other=0.0)
+        score = tl.where(keep != 0, lp + _gumbel_tl(row_mix, ranks.to(tl.uint32)), -float("inf"))
+        at = tl.argmax(score, 0)
+        value = tl.max(score, 0)
+        if value > best:
+            best = value
+            best_at = start + at
+    tl.store(PICK + row, best_at.to(PICK.dtype.element_ty))
+
+
+@triton.jit
+def _redraw_kernel(LOG_PROBS, SEED, STEP, TOKEN, REDRAW, OUT, vocab, BLOCK: tl.constexpr):
+    """Rows that repeated a token draw again from the whole distribution, without it.
+    Most rows don't, and leave at once."""
+    row = tl.program_id(0)
+    token = tl.load(TOKEN + row)
+    if tl.load(REDRAW + row) == 0:
+        tl.store(OUT + row, token)
+    else:
+        row_mix = _row_mix_tl(tl.load(SEED + row), tl.load(STEP + row), 0x5BD1E995)
+        best = -float("inf")
+        best_at = token
+        for start in range(0, vocab, BLOCK):
+            ids = start + tl.arange(0, BLOCK)
+            mask = ids < vocab
+            lp = tl.load(LOG_PROBS + row * vocab + ids, mask=mask, other=-float("inf"))
+            lp = tl.where(ids == token, -float("inf"), lp)
+            score = lp + _gumbel_tl(row_mix, ids.to(tl.uint32))
+            score = tl.where(mask, score, -float("inf"))
+            at = tl.argmax(score, 0)
+            value = tl.max(score, 0)
+            if value > best:
+                best = value
+                best_at = (start + at).to(tl.int64)
+        tl.store(OUT + row, best_at)
+
+
+def _fused_draws(log_probs, top_lp, top_ids, keep, seed, step, greedy, history, window, repeat_threshold):
+    """The noise and redraw of ``ras_sample`` in two launches, tokens unchanged."""
+    b, k = top_lp.shape
+    vocab = log_probs.shape[-1]
+    pick = torch.empty(b, dtype=torch.int64, device=log_probs.device)
+    keep = keep.to(torch.uint8)
+    _first_draw_kernel[(b,)](top_lp, keep, seed, step, pick, k, BLOCK=64, num_warps=1, num_stages=1)
+    token = top_ids.gather(1, pick[:, None]).squeeze(1)
+    token = torch.where(greedy, top_ids[:, 0], token)
+    width = history.shape[-1]
+    recent = torch.arange(width, device=history.device)[None, :] >= width - window[:, None]
+    repeats = ((history == token[:, None]) & recent).sum(dim=-1).to(repeat_threshold.dtype)
+    redraw = ((repeat_threshold > 0) & (repeats >= repeat_threshold)).to(torch.uint8)
+    out = torch.empty(b, dtype=torch.int64, device=log_probs.device)
+    _redraw_kernel[(b,)](log_probs, seed, step, token, redraw, out, vocab, BLOCK=256, num_warps=1, num_stages=1)
+    return out
+
+
+def ras_sample(logits: torch.Tensor, **kwargs) -> torch.Tensor:
+    """``ras_sample_plain``, on CUDA with the draws in one launch each (same tokens)."""
+    return ras_sample_plain(logits, fused=logits.is_cuda, **kwargs)
+
+
+def ras_sample_plain(
     logits: torch.Tensor,
     *,
     seed: torch.Tensor,
@@ -85,6 +185,7 @@ def ras_sample(
     window: torch.Tensor,
     repeat_threshold: torch.Tensor,
     blocked: torch.Tensor,
+    fused: bool = False,
 ) -> torch.Tensor:
     """One token per row.
 
@@ -110,6 +211,10 @@ def ras_sample(
     rank = torch.arange(k, device=logits.device)[None, :]
     keep = (mass_before < top_p[:, None]) & (rank < top_k[:, None])
     keep[:, 0] = True
+    if fused:
+        return _fused_draws(
+            log_probs, top_lp, top_ids, keep, seed, step, greedy, history, window, repeat_threshold,
+        )
     noise = _gumbel(seed, step, 0, k)
     pick = torch.where(keep, top_lp + noise, torch.full_like(top_lp, float("-inf"))).argmax(dim=-1)
     token = top_ids.gather(1, pick[:, None]).squeeze(1)

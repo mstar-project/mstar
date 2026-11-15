@@ -17,7 +17,7 @@ from mstar.model.command_a_plus.components.language_model import (
     CommandAPlusRouter,
 )
 from mstar.model.command_a_plus.config import CommandAPlusConfig
-from mstar.model.command_a_plus.tests.test_backbone import bind_test_resources, dense_reference
+from mstar.model.command_a_plus.tests.test_backbone import begin_test_step, bind_test_resources, dense_reference
 from mstar.model.components.norm import BiasFreeLayerNorm
 
 CUDA = torch.cuda.is_available()
@@ -166,7 +166,8 @@ class FusedBackboneTests(unittest.TestCase):
         with torch.inference_mode():
             for start, stop in [(0, 5), (5, 6), (6, 7), (7, 8), (8, 9)]:
                 pos.positions["main"] = torch.arange(start, stop)
-                outputs.append(model(model.embed_tokens(token_ids[start:stop]), label="main"))
+                begin_test_step(model, stop - start)
+                outputs.append(model(model.embed_tokens(token_ids[start:stop])))
         return torch.cat(outputs)
 
     def test_fused_matches_unfused_and_dense_reference(self):

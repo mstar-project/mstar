@@ -215,15 +215,10 @@ def test_shared_pool_region_outputs_survive_other_graph_replays(graph_device):
 
 @pytest.mark.parametrize("batched", [False, True])
 def test_worker_output_copy_on_accelerator(graph_device, batched):
-    from collections import defaultdict
-
     from mstar.model.submodule_base import BatchedModelOutput
-    from mstar.worker.worker import Worker
+    from mstar.worker.host_copies import HostCopies
 
-    worker = object.__new__(Worker)
-    worker.device = graph_device
-    worker._d2h_stream = None
-    worker._pinned_d2h_buffers = defaultdict(list)
+    worker = HostCopies(device=graph_device, device_capability=DeviceCapability.of(graph_device))
     value = torch.arange(16, device=graph_device)
     outputs = BatchedModelOutput(per_rid_outputs={7: {"token": [value]}})
     if batched:
@@ -231,7 +226,7 @@ def test_worker_output_copy_on_accelerator(graph_device, batched):
         outputs.row_request_ids = (7, 3)
     event = getattr(torch, graph_device.type).Event()
     event.record()
-    copied, host_rows = worker._prematerialize_for_check_stop(
+    copied, host_rows = worker.prematerialize_for_check_stop(
         outputs, event, request_ids=[3],
     )
     assert copied[7]["token"][0].device.type == "cpu"

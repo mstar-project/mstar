@@ -262,6 +262,7 @@ def test_ac_block_forward_runs():
         qkv_bias=True,
         layer_norm_eps=1e-6,
         grid_size=h,
+        layer=0,
     ).eval()
     x = torch.randn(1, n, dim)
     mask = build_action_block_causal_attention_mask(t, h, w, add_tokens=action_tokens)

@@ -6,9 +6,9 @@ without pulling FlashInfer in behind it.
 
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from mstar.engine.resources.kv.config import KVConfig, KVLayout, PagedKVConfig
 from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
@@ -16,6 +16,7 @@ from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
+    from mstar.engine.resources.sequence_shard import SeqShardSpec
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +39,8 @@ class AttentionConfig:
     backend: AttnBackend = AttnBackend.AUTO
     flashinfer_backend: str = "auto"
     # softmax scale; None means the kernel default (head_dim ** -0.5). MLA must
-    # pass the *original* qk head dim's scale, not the latent width's. Only the MLA
-    # backend reads it; the others refuse it at build
+    # pass the *original* qk head dim's scale, not the latent width's. FlashInfer
+    # and MLA read it; the others refuse it at build
     sm_scale: float | None = None
     # FlashInfer only: combined walks whose captured steps run their leading
     # one-token rows on a decode half and their prompt rows on a prefill
@@ -77,14 +78,66 @@ class AttentionConfig:
                 raise ValueError(f"layers must be distinct layers, at least one; got {self.layers}")
 
 
+# how a split step's tokens reach an attention (`sequence_shard`); "kv_gather" is what one over
+# layers every SP rank stores whole takes wherever its node splits, never a deployment's choice
+SpExchange = Literal["none", "ulysses", "all_gather", "ring", "kv_gather"]
+# the values a sequence shard's ``exchange`` takes besides ``auto``
+SP_EXCHANGES: tuple[SpExchange, ...] = ("none", "ulysses", "all_gather", "ring")
+
+
 @dataclass
 class AttentionSpec(NodeResourceSpec):
     config: AttentionConfig
+    # the sequence shard over its nodes, if any (`derive`)
+    shard_key: str | None = field(default=None, init=False, repr=False)
 
     def depends_on(self) -> set[str]:
         # the wrappers are planned against the cache's geometry, and it has to
         # be the same KVConfig the KV resource holds
-        return {self.config.kv_cache}
+        keys = {self.config.kv_cache}
+        if self.shard_key is not None:
+            keys.add(self.shard_key)
+        return keys
+
+    def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
+        from mstar.engine.resources.sequence_shard import take_shard_edge
+
+        return take_shard_edge(self, specs)
+
+    def resolve_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> SpExchange:
+        """Its node's sequence shard's ``exchange`` over its pool's storage; over KV every rank
+        stores whole (``stores_whole``), ``kv_gather`` wherever the node splits."""
+        from mstar.engine.resources.sequence_shard import shard_exchange
+
+        exchange = shard_exchange(self, specs)
+        if exchange != "none" and self.stores_whole(specs[self.config.kv_cache]):
+            return "kv_gather"
+        return exchange
+
+    def splits_eagerly(self, specs: Mapping[str, NodeResourceSpec]) -> bool:
+        # the ring's partner plans and kv_gather's own-query plans differ by rank
+        return self.resolve_exchange(specs) in ("ring", "kv_gather")
+
+    def stores_whole(self, kv: NodeResourceSpec) -> bool:
+        """Whether every rank holds this attention's KV whole: its window layers of a pool placed
+        by position, which keeps them whole on every partner so a decode step reads them with no
+        collective (`PagedKVConfig.placed_groups`). From raw fields."""
+        window = getattr(self.config, "sliding_window", None)
+        return kv.storage == "by_position" and window is not None and window < kv.config.max_seq_len
+
+    def split_step_refusals(
+        self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, NodeResourceSpec],
+    ) -> list[str]:
+        # kv_gather plans each rank's contiguous pieces of a row (`SeqRange.row_pieces`), which a
+        # ring's striped step doesn't give it; an axis-1 split the pool stored by position refuses
+        if shard.stripe_pool is None or self.resolve_exchange(specs) != "kv_gather":
+            return []
+        return [
+            f"attention {self.resource_key!r} gathers a split step's keys into KV {self.config.kv_cache!r}, which "
+            f"every rank stores whole (kv_gather), planning each rank's contiguous pieces of a row, and node "
+            f"{node!r}'s sequence shard stripes its steps by KV {shard.stripe_pool!r}'s stored positions (its "
+            "exchange ring): split it by all_gather"
+        ]
 
     def combined_splits(self) -> tuple[CombinedSplit, ...]:
         return self.config.splits
@@ -255,6 +308,12 @@ class AttentionStep(ResourceStep):
     # `segments` then carry the query counts, the cache's segments the appended counts.
     # Only the MLA backend reads it; the others refuse it (`refuse_context_only`).
     context_only: bool = False
+    # The step's layout follows from its capture bucket alone, so every replay of a
+    # bucket plans the layout the bucket was captured with (a DiT's denoise step,
+    # where every row, padding rows included, spans its bucket's tokens). Lets a
+    # ragged resource capture a kernel that bakes the layout into the graph; the
+    # other attention resources ignore it.
+    fixed_layout: bool = False
 
 
 def refuse_context_only(step: AttentionStep, manager: str) -> None:
@@ -265,3 +324,31 @@ def refuse_context_only(step: AttentionStep, manager: str) -> None:
             f"{manager} does not read AttentionStep.context_only; only the "
             f"{AttnBackend.FLASHINFER_MLA.value!r} backend does"
         )
+
+
+@dataclass
+class BlockCausalAttentionSpec(AttentionSpec):
+    """Self-attention over a paged KV cache in which a row's new tokens attend its
+    cache block-causally: a token in block ``b`` (``block_size`` tokens a block, from
+    the row's first cached token) attends every key of blocks ``0..b``, so what the
+    cache holds never changes and a step runs only new tokens. A step's new tokens
+    start on a block. Declared with ``AttentionStep(causal=False)``.
+
+    Its own kind, not a flag on ``AttentionSpec``: one step plans several blocks per
+    row, on FlashInfer's prefill kernel only. ``RaggedBlockCausalAttentionSpec`` is the
+    same mask over one forward's tokens, with no cache.
+    """
+
+    block_size: int = 0
+
+    def __post_init__(self):
+        if self.block_size < 1:
+            raise ValueError(f"block_size must be positive, got {self.block_size}")
+        if self.config.backend not in (AttnBackend.AUTO, AttnBackend.FLASHINFER):
+            raise ValueError(f"block-causal attention runs on flashinfer, not {self.config.backend!r}")
+
+    @property
+    def resource_class(self) -> "type[Resource]":
+        from mstar.engine.resources.attn.block_causal import BlockCausalAttentionManager
+
+        return BlockCausalAttentionManager

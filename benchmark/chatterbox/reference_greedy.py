@@ -5,7 +5,7 @@ Runs ``ChatterboxTTS`` / ``ChatterboxTurboTTS`` exactly as shipped, except that
 ``torch.multinomial`` is replaced by an argmax so the speech tokens are
 deterministic, and seeds the S3Gen noise with ``--seed`` right before the
 decoder (what M* does with the request seed). The tokens and the waveform are
-saved so an M* server run with ``do_sample=false`` and the same seed can be
+saved so an M* server run with ``temperature: 0`` and the same seed can be
 compared (``serve_parity.py``)::
 
     python benchmark/chatterbox/reference_greedy.py --text "..." --seed 1234 --out /tmp/ref

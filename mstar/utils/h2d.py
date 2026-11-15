@@ -271,7 +271,7 @@ def _cuda_memcpy_async():
 
 
 def to_device_nonblocking(
-    data: torch.Tensor | Sequence,
+    data: torch.Tensor | np.ndarray | Sequence,
     device: torch.device | str,
     dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
@@ -293,10 +293,18 @@ def to_device_nonblocking(
     stream the copy was issued on; another stream has to wait on it, as for any
     async copy. Where the device takes no pinned memory (a CPU device), the result
     is a plain ``.to(device)``.
+
+    An ndarray is wrapped (``torch.from_numpy``, so on a CPU device the result may share its
+    memory), cast to ``dtype`` and staged like a tensor.
     """
     device = torch.device(device)
     pin = DeviceCapability.of(device).pin_memory
-    if not isinstance(data, torch.Tensor):
+    if isinstance(data, np.ndarray):
+        # torch.tensor(ndarray, pin_memory=True) raises, so an array takes the tensor path
+        data = torch.from_numpy(np.asarray(data, order="C"))
+        if dtype is not None:
+            data, dtype = data.to(dtype), None
+    elif not isinstance(data, torch.Tensor):
         host = torch.tensor(data, dtype=dtype, pin_memory=pin)
         return host.to(device, non_blocking=pin)
     if dtype is not None:

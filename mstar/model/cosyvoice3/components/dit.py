@@ -38,11 +38,14 @@ paths match ``flow.pt`` under ``decoder.estimator.``.
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+import mstar.model.components.diffusion.modulation  # noqa: F401 - registers mstar::ada_layer_norm and its residual form
+from mstar.model.cosyvoice3.components.dit_kernels import partial_rotary_
 from mstar.model.cosyvoice3.config import DiTConfig
 
 
@@ -148,6 +151,18 @@ class Attention(nn.Module):
         return self.to_out[0](out) * row_keep
 
 
+    def forward_packed(self, x: torch.Tensor, attend, real: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+        """``x`` ``[1, N, C]`` of packed rows. ``attend`` writes the K/V to the cache
+        and reads the rows' prefixes; ``real`` ``[N]`` is False on a bucket's padded
+        tail, which the kernel leaves unwritten."""
+        n = x.shape[1]
+        q = apply_partial_rotary(self.to_q(x), freqs).view(n, self.heads, -1)
+        k = apply_partial_rotary(self.to_k(x), freqs).view(n, self.heads, -1)
+        v = self.to_v(x).view(n, self.heads, -1)
+        out = torch.where(real[:, None, None], attend(q, k, v).to(q.dtype), 0.0)
+        return self.to_out[0](out.reshape(1, n, -1))
+
+
 class AdaLayerNormZero(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -198,6 +213,76 @@ class DiTBlock(nn.Module):
         x = x + gate_msa.unsqueeze(1) * self.attn(norm, attn_mask, row_keep, freqs)
         ff_in = self.ff_norm(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
         return x + gate_mlp.unsqueeze(1) * self.ff(ff_in)
+
+
+    def forward_packed(self, x, t, attend, real, freqs):
+        norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, t)
+        x = x + gate_msa.unsqueeze(1) * self.attn.forward_packed(norm, attend, real, freqs)
+        ff_in = self.ff_norm(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        return x + gate_mlp.unsqueeze(1) * self.ff(ff_in)
+
+
+class BlockModulation(NamedTuple):
+    """A block's AdaLN outputs at one Euler step, ``[D]`` each. The time step is the same
+    for every row of a solve, so they are looked up, not computed per evaluation."""
+
+    shift_msa: torch.Tensor
+    scale_msa: torch.Tensor
+    gate_msa: torch.Tensor
+    shift_mlp: torch.Tensor
+    scale_mlp: torch.Tensor
+    gate_mlp: torch.Tensor
+
+
+class PackedRows(NamedTuple):
+    """Where a step's new frames sit, for a DiT pass over them alone.
+
+    Tokens are packed row by row in a branch's buffer; the blocks see every row's
+    conditional frames then, in the same order, its unconditional ones (``plan_order``).
+    A row's two causal convolutions run over a sequence that lays its kept tail right
+    before its new frames, so each new frame reads what a whole-utterance convolution
+    would. Position 0 of that sequence is
+    scratch: what a padded buffer leaves at zero (padding rows and tokens) lands there.
+    """
+
+    positions: torch.Tensor  # [T] long, each token's frame in its row
+    seq_at: torch.Tensor  # [T] long, each token's place in the convolution sequence
+    tail_at: torch.Tensor  # [B, K-1] long, where each row's kept tail goes
+    last_at: torch.Tensor  # [B, K-1] long, the row's tail after its new frames
+    real: torch.Tensor  # [T] bool, False on the padded tail
+
+
+def plan_order(real: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Permutations between the two CFG branches stacked as buffers, ``[cond T | uncond T]``,
+    and the KV and attention plan's order, ``[cond R | uncond R | padding]``, where ``R``
+    is the real tokens (``real``'s ``True`` prefix). Returns ``(to_plan, to_stacked)``:
+    ``stacked[to_plan]`` is in plan order, ``planned[to_stacked]`` back in buffer order.
+    Built on the device, so a captured graph follows each replay's ``R``."""
+    t = real.shape[0]
+    r = real.sum()
+    s = torch.arange(2 * t, device=real.device)
+    branch, i = s // t, s % t
+    to_stacked = torch.where(i < r, branch * r + i, 2 * r + branch * (t - r) + (i - r))
+    to_plan = torch.empty_like(s).scatter_(0, to_stacked, s)
+    return to_plan, to_stacked
+
+
+def _table(modulation: torch.Tensor) -> torch.Tensor:
+    """A ``[1, D]`` modulation as the float32 ``[1, 1, D]`` table ``mstar::ada_layer_norm`` reads."""
+    return modulation.float().reshape(1, 1, -1).contiguous()
+
+
+def _modulated_norm(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, eps: float) -> torch.Tensor:
+    """``LN(x) * (1 + scale) + shift`` over ``x`` ``[N, D]``, in one pass."""
+    return torch.ops.mstar.ada_layer_norm(x[None], shift, scale, None, None, eps)[0]
+
+
+def _residual_modulated_norm(x, y, gate, shift, scale, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(x + gate * y, LN(x + gate * y) * (1 + scale) + shift)`` over ``[N, D]``, in one pass."""
+    out, norm = torch.ops.mstar.residual_ada_layer_norm(
+        x[None], y.contiguous()[None], gate, shift, scale, None, None, eps,
+    )
+    return out[0], norm[0]
 
 
 class DiT(nn.Module):
@@ -259,3 +344,111 @@ class DiT(nn.Module):
         for block in self.transformer_blocks:
             h = block(h, temb, keep, row_keep, freqs)
         return self.proj_out(self.norm_out(h, temb)).transpose(1, 2).to(out_dtype)
+
+    def _conv_position(
+        self, h: torch.Tensor, tails: torch.Tensor, rows: PackedRows
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Position embedding of new frames ``h`` ``[2, T, D]`` (one row of ``h`` per CFG
+        branch) off the rows' tails ``[2, 2, B, K-1, D]`` (branch, convolution, row).
+        Returns the embedding and the next tails."""
+        kernel = self.config.conv_pos_kernel
+        convs = (self.input_embed.conv_pos_embed.conv1, self.input_embed.conv_pos_embed.conv2)
+        length = rows.seq_at.shape[0] + rows.tail_at.numel() + 1
+        next_tails = []
+        x = h
+        for c, conv in enumerate(convs):
+            seq = h.new_zeros(2, length, h.shape[-1])
+            seq[:, rows.tail_at.reshape(-1)] = tails[:, c].reshape(2, -1, h.shape[-1])
+            seq[:, rows.seq_at] = x
+            next_tails.append(seq[:, rows.last_at.reshape(-1)].reshape(tails[:, c].shape))
+            out = conv(F.pad(seq.transpose(1, 2), (kernel - 1, 0))).transpose(1, 2)
+            x = out[:, rows.seq_at]
+        return x, torch.stack(next_tails, dim=1)
+
+    @torch.no_grad()
+    def prepare_fused(self, t_span: torch.Tensor) -> None:
+        """Tables the fused path reads at this time grid; before capture, so a capture
+        doesn't put them in its pool. Per Euler step: every block's modulation, the final
+        norm's; per block: q/k/v as one projection."""
+        table, final = [], []
+        for t in t_span[:-1]:
+            emb = self.time_embed(t.reshape(1))
+            # float32 [1, 1, D], as mstar::ada_layer_norm takes a modulation
+            table.append(
+                [BlockModulation(*(_table(m) for m in b.attn_norm.linear(F.silu(emb)).chunk(6, dim=1)))
+                 for b in self.transformer_blocks]
+            )
+            scale, shift = self.norm_out.linear(F.silu(emb)).chunk(2, dim=1)
+            final.append((_table(shift), _table(scale)))
+        self._modulation, self._final_modulation = table, final
+        self._qkv_weight = [
+            torch.cat([b.attn.to_q.weight, b.attn.to_k.weight, b.attn.to_v.weight]) for b in self.transformer_blocks
+        ]
+        self._qkv_bias = [
+            torch.cat([b.attn.to_q.bias, b.attn.to_k.bias, b.attn.to_v.bias]) for b in self.transformer_blocks
+        ]
+        self._fused_steps = int(t_span.numel()) - 1
+
+    def _fused_blocks(self, h, step, attend, real, cos, sin, layer_base):
+        """The block stack on ``h`` ``[N, D]``: each residual add and modulated norm in one
+        pass (``mstar::ada_layer_norm``, the DiT scaffold's), the partial rotary in place."""
+        n, dim = h.shape
+        eps = 1e-6
+        rotated = cos.shape[-1]
+        assert rotated <= dim
+        heads = self.config.heads
+        inner = heads * self.config.dim_head
+        norm = None
+        for b, block in enumerate(self.transformer_blocks):
+            m = self._modulation[step][b]
+            if norm is None:
+                norm = _modulated_norm(h, m.shift_msa, m.scale_msa, eps)
+            attend.set_layer_idx(layer_base + b)
+            qkv = F.linear(norm, self._qkv_weight[b], self._qkv_bias[b])
+            q, k, v = qkv[:, :inner], qkv[:, inner : 2 * inner], qkv[:, 2 * inner :]
+            partial_rotary_(q, k, cos, sin)
+            out = attend(
+                q.view(n, heads, -1).contiguous(), k.view(n, heads, -1), v.view(n, heads, -1),
+            )
+            out = torch.where(real[:, None, None], out, 0.0).reshape(n, inner)
+            h, ff_in = _residual_modulated_norm(h, block.attn.to_out[0](out), m.gate_msa, m.shift_mlp, m.scale_mlp, eps)
+            ff = block.ff(ff_in)
+            if b + 1 < len(self.transformer_blocks):
+                next_m = self._modulation[step][b + 1]
+                h, norm = _residual_modulated_norm(h, ff, m.gate_mlp, next_m.shift_msa, next_m.scale_msa, eps)
+            else:
+                shift, scale = self._final_modulation[step]
+                h, norm = _residual_modulated_norm(h, ff, m.gate_mlp, shift, scale, eps)
+        return self.proj_out(norm)
+
+    def forward_new_frames(self, x, cond, mu, spks, t, tails, rows: PackedRows, attend, layer_base: int):
+        """One classifier-free-guided evaluation of new frames, over the cached K/V of
+        the frames before them: the conditional half of ``x``/``cond``/``mu``/``spks``
+        ``[T, 80]``, the unconditional half with zero ``cond``/``mu``/``spks``. Returns
+        (velocities ``[2, T, 80]``, next tails)."""
+        dtype = self.proj_out.weight.dtype
+        x, cond, mu, spks = (v.to(dtype) for v in (x, cond, mu, spks))
+        zeros = torch.zeros_like(mu)
+        h = self.input_embed.proj(
+            torch.stack([torch.cat([x, cond, mu, spks], dim=-1), torch.cat([x, zeros, zeros, zeros], dim=-1)])
+        )
+        conv, tails = self._conv_position(h, tails, rows)
+        # the blocks run in the plan's token order, which packs the branches' real tokens
+        # together however far the buffers are padded
+        to_plan, to_stacked = plan_order(rows.real)
+        h = (conv + h).reshape(-1, h.shape[-1]).index_select(0, to_plan)[None]
+        positions = rows.positions.repeat(2).index_select(0, to_plan).float()
+        freqs = torch.outer(positions, self.inv_freq)
+        freqs = torch.stack((freqs, freqs), dim=-1).flatten(-2)[None]
+        real = rows.real.repeat(2).index_select(0, to_plan)
+        if h.is_cuda and getattr(self, "_fused_steps", 0):
+            step = layer_base // self.config.depth
+            v = self._fused_blocks(h[0], step, attend, real, freqs[0].cos(), freqs[0].sin(), layer_base)
+        else:
+            temb = self.time_embed(t.reshape(1))
+            for b, block in enumerate(self.transformer_blocks):
+                attend.set_layer_idx(layer_base + b)
+                h = block.forward_packed(h, temb, attend, real, freqs)
+            v = self.proj_out(self.norm_out(h, temb))[0]
+        v = v.index_select(0, to_stacked)
+        return v.reshape(2, -1, v.shape[-1]), tails

@@ -37,7 +37,7 @@ from mstar.model.fish_s2_pro.config import (
 )
 from mstar.model.fish_s2_pro.fish_s2_pro_model import clip_digest
 from mstar.model.fish_s2_pro.submodules import CodecSubmodule, RefEncoderSubmodule
-from mstar.model.submodule_base import ARNodeInputs, InputMetadata, ModelInputsFromEngine
+from mstar.model.submodule_base import ARNodeInputs, InputMetadata, ModelInputsFromEngine, engine_step
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo
 
@@ -144,20 +144,23 @@ class CodecDriver:
 
     def __init__(self, submodule: CodecSubmodule, max_slots: int = 8):
         from mstar.engine.resources.base import EngineResourceInfo
-        from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
         from mstar.engine.resources.recurrent.pool import RecurrentStatePool
         from mstar.engine.resources.runner import StepRunner
-        from mstar.model.fish_s2_pro.components.incremental_dac import codec_state_blocks
+        from mstar.engine.state import Entry, TensorType, Value
+        from mstar.engine.state.adapters import StateSetup, _resolve, build_handle, build_specs
+        from mstar.model.fish_s2_pro.components.incremental_dac import codec_state_entry
 
         self.node = submodule
-        blocks = {
-            name: type(block)(shape=block.shape, dtype=torch.float64 if block.dtype == torch.float32 else block.dtype)
-            for name, block in codec_state_blocks(submodule.codec).items()
-        }
-        spec = RecurrentStateSpec(CODEC_STATE, {"Codec"}, RecurrentStateConfig(
-            num_layers=1, blocks=blocks, max_slots=max_slots))
+        # the codec runs in fp64 here, for an exact comparison
+        array = Value(CODEC_STATE, nodes={"Codec"}, layers={0}, entry=Entry({
+            name: TensorType(field.shape, dtype=torch.float64 if field.dtype == torch.float32 else field.dtype)
+            for name, field in codec_state_entry(submodule.codec).tensors.items()
+        }))
+        (spec,) = build_specs([array], kernel_settings={CODEC_STATE: {"max_slots": max_slots}})
         self.pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
         self.runner = StepRunner({CODEC_STATE: self.pool})
+        self.handle = build_handle(array, {CODEC_STATE: self.pool}, _resolve([array], StateSetup()))
+        self.node.bind_node_state({CODEC_STATE: self.handle})
         self.added: set[str] = set()
 
     def step(self, items: dict, captured: bool = False) -> dict:
@@ -179,15 +182,17 @@ class CodecDriver:
             if rid not in self.added:
                 self.pool.ingest_request(rid)
                 self.added.add(rid)
-        step = self.node.declare_step("codec_chunk", rows, inputs)
+        step = engine_step(self.node, "codec_chunk", rows, inputs)
         step.set_ctx(ctx)
         assert self.runner.admit(step).ok
         self.runner.plan(step)
-        engine_inputs = ModelInputsFromEngine(request_ids=rows, per_request_info={},
-                                              resources={CODEC_STATE: self.pool}, step=step)
+        engine_inputs = ModelInputsFromEngine(request_ids=rows, per_request_info={}, resources={}, step=step)
         packed = self.node.preprocess("codec_chunk", engine_inputs, inputs)
+        step.begin_calls()
         with torch.no_grad():
             audio = self.node.forward_batched("codec_chunk", engine_inputs, **packed).row_outputs["audio_chunk"]
+        step.check_calls()
+        step.end_calls()
         self.runner.commit(step)
         out = {}
         for i, rid in enumerate(rids):
@@ -199,7 +204,8 @@ class CodecDriver:
 def run_streams(submodule: CodecSubmodule, frames: dict[str, torch.Tensor], captured: bool = False):
     """Stream each request's frames through its own buffer; every step batches the
     requests that have a chunk ready, as the scheduler batches the codec.
-    Returns, per request, ``(chunk_info, audio)`` per step and the step count."""
+    Returns, per request, ``(chunk_info, audio)`` per step (a declined chunk
+    emits no audio) and the count of steps that ran a forward."""
     cfg = submodule.codec
     driver = CodecDriver(submodule)
     buffers = {}
@@ -220,21 +226,36 @@ def run_streams(submodule: CodecSubmodule, frames: dict[str, torch.Tensor], capt
     while rids := [rid for rid, buffer in buffers.items() if buffer.has_chunk_ready()]:
         chunks = {rid: buffers[rid].pop_chunk() for rid in rids}
         meta = {rid: InputMetadata(stream_chunks={"codec_tokens": chunk.info}) for rid, chunk in chunks.items()}
-        items = {
+        # an empty chunk reaches the node as an edge with no tensors
+        prepared = {
             rid: submodule.prepare_inputs(
-                "codec_chunk", infos[rid], {"codec_tokens": [chunks[rid].data["data"]]}, input_metadata=meta[rid]
+                "codec_chunk", infos[rid],
+                {"codec_tokens": [] if chunks[rid].data["data"] is None else [chunks[rid].data["data"]]},
+                input_metadata=meta[rid],
             )
             for rid in rids
         }
+        # as the engine does: a declined chunk runs no forward
+        for rid in rids:
+            if prepared[rid] is None:
+                assert chunks[rid].is_final
+                steps[rid].append((chunks[rid].info, torch.empty(0, dtype=torch.int16)))
+        items = {rid: item for rid, item in prepared.items() if item is not None}
+        if not items:
+            continue
         assert submodule.can_batch(None, list(items.values()))
         # the capture key, known before prepare_inputs, is the bucket preprocess pads to
         assert submodule.cg_key_info("codec_chunk", meta, meta) == submodule._bucket(
-            max(max(item.kwargs["frames"], 1) for item in items.values()))
+            max(item.kwargs["frames"] for item in items.values()))
         outputs = driver.step(items, captured=captured)
         count += 1
-        for rid in rids:
+        for rid in items:
             steps[rid].append((chunks[rid].info, outputs[rid]["audio_chunk"][0]))
     return steps, count
+
+
+def _no_device():
+    raise AssertionError("the codec built a device tensor")
 
 
 def streamed(steps) -> torch.Tensor:
@@ -302,13 +323,11 @@ def test_streamed_chunks_stitch_into_the_whole_decode(config, decoder, num_frame
 def test_incremental_decode_stitches_into_the_whole_decode(config, decoder, chunks):
     """Chunk by chunk from carried state (each chunk zero-padded to the batch's
     width beside a longer row) is one decode of the whole stream."""
-    from mstar.model.fish_s2_pro.components.incremental_dac import IncrementalDACDecoder, codec_state_blocks
+    from mstar.model.fish_s2_pro.components.incremental_dac import IncrementalDACDecoder, codec_state_entry
 
     inc = IncrementalDACDecoder(decoder)
-    blocks = inc.state_blocks()
-    assert {n: (b.shape, b.dtype) for n, b in blocks.items()} == {
-        n: (b.shape, b.dtype) for n, b in codec_state_blocks(config.codec).items()
-    }
+    assert inc.state_entry() == codec_state_entry(config.codec)
+    blocks = inc.state_entry().tensors
     total = sum(chunks)
     codes = stream_codes(total, seed=7)
     other = stream_codes(total + 64, seed=8)
@@ -352,7 +371,8 @@ def test_compiled_incremental_decode_matches_eager_on_cuda(config):
     compiled = torch.compile(inc, dynamic=True)
 
     def stream(decode, chunks=(4, 8, 3)):
-        state = {n: torch.zeros(2, *b.shape, dtype=b.dtype, device="cuda") for n, b in inc.state_blocks().items()}
+        fields = inc.state_entry().tensors
+        state = {n: torch.zeros(2, *b.shape, dtype=b.dtype, device="cuda") for n, b in fields.items()}
         codes = stream_codes(sum(chunks) + 8, seed=3).t().cuda()
         out, start = [], 0
         with torch.no_grad():
@@ -384,19 +404,34 @@ def test_streams_batched_at_different_offsets_each_stitch_into_their_own_decode(
         assert_same_audio(streamed(steps[rid]), whole_decode(decoder, request_codes))
 
 
-def test_frameless_terminal_flush_emits_nothing(config, decoder):
+def test_frameless_terminal_flush_is_declined(config, decoder, monkeypatch):
     """A stream that ends after its consumer drained it gets a final chunk with
-    no frames: it decodes at the smallest bucket and emits nothing."""
+    no frames: the codec declines it before building any tensor, so it runs no
+    forward and emits nothing (declined, it still ends the stream)."""
     submodule = CodecSubmodule(decoder, config)
+    monkeypatch.setattr(submodule, "get_device", _no_device)
     item = submodule.prepare_inputs(
         "codec_chunk",
         SimpleNamespace(request_id="r", rid_handle="r"),
         {},
-        input_metadata=InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(10, 0, 0, is_final=True)}),
+        input_metadata=InputMetadata(
+            stream_chunks={"codec_tokens": StreamChunkInfo(10, 0, 0, is_final=True)}
+        ),
     )
-    assert item.kwargs["frames"] == 0
-    out = CodecDriver(submodule).step({"r": item})
-    assert out["r"]["audio_chunk"][0].numel() == 0
+    assert item is None
+
+
+def test_a_stream_of_only_im_end_ends_with_a_declined_chunk(config, decoder, monkeypatch):
+    """The AR's first frame was <|im_end|>: the stream gets no item, and the
+    codec declines its final chunk, which reaches it with no tensor: it decodes
+    nothing and emits no audio."""
+    submodule = CodecSubmodule(decoder, config)
+    monkeypatch.setattr(submodule, "get_device", _no_device)
+    steps, decodes = run_streams(submodule, {"r": stream_codes(0)})
+
+    ((info, audio),) = steps["r"]
+    assert info == StreamChunkInfo(0, 0, 0, True)
+    assert audio.numel() == 0 and decodes == 0
 
 
 def test_codec_buckets_are_the_chunk_widths(config, decoder):

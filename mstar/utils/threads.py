@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 import threading
 from collections.abc import Callable, Collection
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 
 from mstar.utils.cpus import PINNABLE
 
@@ -94,3 +94,20 @@ class ThreadPool(ThreadPoolExecutor):
         initargs: tuple = (),
     ):
         super().__init__(max_workers, thread_name_prefix, _on_process_mask(initializer), initargs)
+
+
+class InlineExecutor:
+    """Stands in for a one-thread pool (``knobs: step_threads: serial``): ``submit``
+    runs the call on the caller and returns its finished future, so the code
+    around it waits on the same futures and events and finds them set."""
+
+    def submit(self, fn: Callable[..., object], /, *args, **kwargs) -> Future:
+        future: Future = Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except BaseException as exc:  # as a pool's worker: the future carries it
+            future.set_exception(exc)
+        return future
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        pass

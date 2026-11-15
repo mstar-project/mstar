@@ -138,7 +138,7 @@ def test_an_eager_write_under_a_lease_keeps_its_own_addressing_and_skips_padding
     k = torch.arange(40 * 4, dtype=torch.float32, device="cuda").view(40, 1, 4)
     mgr.write_kv(k, -k, layer_idx=0, label="ctx")
     torch.cuda.synchronize()
-    written = mgr.kv_cache.read_tokens(0, state.token_to_page[:40], state.token_to_cache[:40])
+    written = mgr.kv_cache.tensor[0][state.token_to_page[:40], :, state.token_to_cache[:40]]
     assert torch.equal(written[:, 0], k) and torch.equal(written[:, 1], -k)
     assert torch.equal(mgr.kv_cache.tensor[:, SINK_PAGE], sink_before)
     mgr.commit(step, ctx)

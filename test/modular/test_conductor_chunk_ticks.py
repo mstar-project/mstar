@@ -1,18 +1,22 @@
 """The conductor seeds a chunk Loop's loop-back on the ranks hosting the chunked
 node. A walk's other inputs can all go to a different rank (Qwen3-Omni's
 ``prefill_audio`` sends every edge to the audio encoder), and a seed that only
-reached those ranks would leave the Thinker's Loop unseeded."""
+reached those ranks would leave the Thinker's Loop unseeded. The seed is the
+walk plan's own (rule 1: a loop-back input with nothing held goes empty), so it
+is routed like any other edge, by the node it names."""
 from types import SimpleNamespace
 
+from test_ingest_unpersist import _ToyModel, plan_step
+
 from mstar.conductor.conductor import Conductor
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
+from mstar.conductor.request_info import PartitionState, WalkStep
 from mstar.distributed.base import ShardingConfig
-from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
-from mstar.model.base import ForwardPassArgs
+from mstar.graph.base import GraphEdge, GraphNode, NodeAndGraphWalk, Sequential, TensorPointerInfo
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.submodule_base import chunk_tick_name
 
 WALK = "prefill_audio"
-TICK = chunk_tick_name("Thinker", WALK)
+TICK = chunk_tick_name("llm", WALK)
 
 
 def _info(uuid):
@@ -23,44 +27,29 @@ def _info(uuid):
     )
 
 
-def _conductor():
+def test_tick_reaches_the_chunked_nodes_rank_not_the_encoders():
+    model = _ToyModel({WALK: Sequential([
+        GraphNode(name="audio_encoder", input_names=["input_features"],
+                  outputs=[GraphEdge(next_node="llm", name="audio_embeds")]),
+        GraphNode(name="llm", input_names=["audio_embeds"],
+                  outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text")]),
+    ])}, {"default": [WalkStep(WALK)]}, chunked=(WALK,))
+    step = plan_step(model, [WalkStep(WALK)], 0, {"input_features": [_info("a0")]})
+
     cfg = ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}).clone_empty()
     cfg.setup({
         NodeAndGraphWalk("audio_encoder", WALK): ["worker_0"],
-        NodeAndGraphWalk("Thinker", WALK): ["worker_1"],
+        NodeAndGraphWalk("llm", WALK): ["worker_1"],
     })
     c = Conductor.__new__(Conductor)
-    c._chunk_ticks = {WALK: (("Thinker", WALK),)}
-    pstate = SimpleNamespace(fwd_pass_number=0, random_seed=0, resource_publish_info=None)
     c.requests = {"r": SimpleNamespace(
-        sharding_config=cfg, partition_states={"Thinker": pstate},
+        sharding_config=cfg, partition_states={"default": PartitionState("default")},
         max_output_tokens=8, resource_configs={},
     )}
     c._update_persist_ref_counts = lambda rid, edges: None
     sent = {}
     c.communicator = SimpleNamespace(send=lambda w, m: sent.setdefault(w, []).extend(m.body.inputs))
-    return c, sent
+    c._send_inputs("r", "default", step.inputs, WALK, step.step_metadata)
 
-
-def _audio_inputs():
-    edge = GraphEdge(next_node="audio_encoder", name="input_features")
-    edge.tensor_info = [_info("a0")]
-    return [edge]
-
-
-def test_tick_reaches_the_chunked_nodes_rank_not_the_encoders():
-    c, sent = _conductor()
-    fwd = ForwardPassArgs(
-        full_metadata=CurrentForwardConductorMetadata(graph_walk=WALK, is_prefill=True),
-        inputs=_audio_inputs(), unpersist_tensors=[],
-    )
-    c._send_partition_inputs("r", "Thinker", fwd)
     assert [e.name for e in sent["worker_0"]] == ["input_features"]
     assert [e.name for e in sent["worker_1"]] == [TICK]
-
-
-def test_a_client_stream_chunk_carries_no_tick():
-    c, sent = _conductor()
-    c._send_inputs("r", "Thinker", _audio_inputs(), WALK, {})
-    assert [e.name for e in sent["worker_0"]] == ["input_features"]
-    assert "worker_1" not in sent

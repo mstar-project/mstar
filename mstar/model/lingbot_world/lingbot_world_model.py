@@ -1,6 +1,6 @@
 """LingBotWorldModel: LingBot-World-V2 causal-fast, camera-controlled image-to-world.
 
-Architecture (2 nodes; the dit's attention is the one engine resource):
+Architecture (2 nodes; the dit's rolling K/V and its attention are engine resources):
     text_encoder - UMT5-XXL prompt encoder (wan22's submodule, reused)
     dit          - the 1.3B causal DiT. One rollout iteration is one chunk of
                    4 latent frames: the chunk's I2V condition (a warm-cache
@@ -31,11 +31,11 @@ import numpy as np
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
-from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedCrossAttentionSpec
+from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedCrossAttentionSpec, ResourceReqConfig
+from mstar.engine.resources.kv.rolling import RollingKVConfig, RollingKVReqConfig, RollingKVSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import Model, ProcessPromptOutput, TensorAndMetadata, WalkStep
 from mstar.model.lingbot_world.components.camera import latent_camera_poses, scale_intrinsics
 from mstar.model.lingbot_world.config import (
     LINGBOT_CONFIGS,
@@ -44,8 +44,15 @@ from mstar.model.lingbot_world.config import (
     UMT5_DIFFUSERS_REPO,
     WAN21_VAE_DIFFUSERS_REPO,
 )
-from mstar.model.lingbot_world.submodules import DIT_ATTN, ROLLOUT_LOOP_NAME, ROLLOUT_WALK, LingBotDitSubmodule
-from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size
+from mstar.model.lingbot_world.submodules import (
+    DIT_ATTN,
+    DIT_KV,
+    ROLLOUT_LOOP_NAME,
+    ROLLOUT_WALK,
+    LingBotDitSubmodule,
+    rolling_extent,
+)
+from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, decoding_upload, open_upright_image
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -58,11 +65,14 @@ _CONFIG_KWARGS = ("reference_numerics", "dit_compile_autotune")
 REFERENCE_MODEL_KWARGS = {"reference_numerics": True}
 
 ENCODE_TEXT_WALK = "encode_text"
-_SCHEDULE = (ENCODE_TEXT_WALK, ROLLOUT_WALK)
 _DIT_INPUTS = ("text_embeds_pos", "image_inputs", "camera_poses", "intrinsics", "clock")
+# the rollout's rolling K/V tokens a layer, which process_prompt settles from the output size
+DIT_KV_TOKENS = "dit_kv_tokens"
 
 
 class LingBotWorldModel(Model):
+    INTERNAL_KWARGS = (DIT_KV_TOKENS,)
+
     def __init__(
         self,
         model_path_hf: str | None = None,
@@ -96,46 +106,54 @@ class LingBotWorldModel(Model):
     # ------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        if self.config.reference_numerics:
-            return []
+        """The rolling K/V store, and the ragged attention over it unless
+        ``reference_numerics`` attends with the reference's FA2 instead."""
         cfg = self.config
-        return [RaggedCrossAttentionSpec(
-            resource_key=DIT_ATTN, nodes={"dit"},
-            config=RaggedAttentionConfig(
-                num_qo_heads=cfg.num_heads, num_kv_heads=cfg.num_heads, head_dim=cfg.head_dim,
-                dtype=torch.bfloat16,
+        specs: list[NodeResourceSpec] = [RollingKVSpec(
+            resource_key=DIT_KV, nodes={"dit"},
+            config=RollingKVConfig(
+                num_layers=cfg.num_layers, num_heads=cfg.num_heads, head_dim=cfg.head_dim,
+                pool_tokens=self.max_window_tokens(), dtype=torch.bfloat16,
             ),
         )]
+        if not cfg.reference_numerics:
+            specs.append(RaggedCrossAttentionSpec(
+                resource_key=DIT_ATTN, nodes={"dit"},
+                config=RaggedAttentionConfig(
+                    num_qo_heads=cfg.num_heads, num_kv_heads=cfg.num_heads, head_dim=cfg.head_dim,
+                    dtype=torch.bfloat16,
+                ),
+            ))
+        return specs
 
-    def kv_cache_bytes(self, lat_h: int, lat_w: int) -> int:
-        """The rolling self-attention plus text K/V one request allocates at
-        that latent size (``LingBotCausalDiT.new_cache`` and its cross K/V)."""
+    def max_window_tokens(self) -> int:
+        """Tokens of rolling K/V one rollout keeps per layer at the largest area
+        a request may ask for: ``local_attn_size`` latent frames of at most
+        ``max_area / 256`` tokens each, whatever the aspect (see ``geometry``).
+        The default pool: room for any one rollout, or several smaller ones."""
         cfg = self.config
-        frame_seqlen = lat_h * lat_w // (cfg.patch_size[1] * cfg.patch_size[2])
-        tokens = frame_seqlen * cfg.local_attn_size + cfg.text_len
-        return cfg.num_layers * 2 * tokens * cfg.dim * torch.bfloat16.itemsize
+        cell = cfg.vae_stride[1] * cfg.vae_stride[2] * cfg.patch_size[1] * cfg.patch_size[2]
+        frames = cfg.local_attn_size if cfg.local_attn_size > -1 else cfg.max_chunks * cfg.chunk_size
+        return frames * (cfg.max_area // cell)
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse to serve more than one rollout at a time.
 
-        The dit allocates each request's rolling K/V and VAE caches itself, at
-        its first chunk, outside the engine's resources, so the only bound on
-        how many are live is the conductor's admit queue, which exists only
-        when ``max_concurrent_requests`` is set. Several at once run the GPU
-        out of memory mid-rollout instead of queueing.
+        The pool bounds each rollout's rolling K/V, not how many rollouts run: at
+        small output sizes it admits many. Each one's text K/V and VAE caches are
+        allocated by the dit outside the engine's resources, so until they are
+        resources, the conductor's admit queue, which exists only when
+        ``max_concurrent_requests`` is set, has to hold them to one rollout.
         """
         limit = config.get("max_concurrent_requests")
-        if limit == 1 and not isinstance(limit, bool):
+        if type(limit) is int and limit == 1:
             return
         cfg = self.config
-        side = int(np.sqrt(cfg.max_area))
-        gib = [self.kv_cache_bytes(*self.geometry((h, w), h, w)) / 2**30
-               for h, w in ((cfg.default_height, cfg.default_width), (side, side))]
+        text_kv_mib = cfg.num_layers * 2 * cfg.text_len * cfg.dim * torch.bfloat16.itemsize / 2**20
         raise ValueError(
             f"LingBot-World requires `max_concurrent_requests: 1` in {config_path}; got {limit!r}. "
-            f"Each request holds its own rolling K/V ({gib[0]:.1f} GiB at "
-            f"{cfg.default_height}x{cfg.default_width}, up to {gib[1]:.1f} GiB at the "
-            f"{cfg.max_area}-pixel area limit) plus its VAE caches, allocated by the dit outside the "
+            f"The rolling K/V pool bounds each rollout's K/V, not how many run, and each rollout's "
+            f"text K/V ({text_kv_mib:.0f} MiB) and VAE caches are allocated by the dit outside the "
             "engine's resources, so the admit queue that this key enables is the only bound on them."
         )
 
@@ -207,10 +225,22 @@ class LingBotWorldModel(Model):
         lat_f = (num_frames - 1) // cfg.vae_stride[0] + 1
         return lat_f - lat_f % cfg.chunk_size
 
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({"camera_poses", "intrinsics", "num_frames", "height", "width"})
+
+    def _latent_frames(self, model_kwargs: dict) -> int:
+        num_poses = len(model_kwargs["camera_poses"])
+        # num_frames is an integer by now: process_prompt refused anything else
+        return self.num_latent_frames(model_kwargs.get("num_frames", num_poses), num_poses)
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # one rollout iteration per chunk of latent frames; process_prompt refused a request without poses
+        return {ROLLOUT_LOOP_NAME: self._latent_frames(model_kwargs) // self.config.chunk_size}
+
     def process_prompt(
         self, prompt: str | None, input_modalities: list[str], output_modalities: list[str],
         tensors: NameToTensorList | None = None, **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         """Validate, tokenize the prompt, resize the image and resample the
         camera trajectory, on the data worker.
 
@@ -241,8 +271,8 @@ class LingBotWorldModel(Model):
         if not (np.isfinite(poses).all() and torch.isfinite(intrinsics).all()):
             raise ValueError("LingBot-World camera_poses and intrinsics must be finite numbers.")
 
-        num_frames = int(kwargs.get("num_frames", len(poses)))
-        lat_f = self.num_latent_frames(num_frames, len(poses))
+        num_frames = kwargs.get("num_frames", len(poses))
+        lat_f = self._latent_frames(kwargs)
         if lat_f < cfg.chunk_size or lat_f > cfg.max_chunks * cfg.chunk_size:
             raise ValueError(f"LingBot-World rollout of {lat_f} latent frames is out of range.")
         num_poses = ((len(poses) - 1) // 4) * 4 + 1
@@ -255,12 +285,12 @@ class LingBotWorldModel(Model):
         self._ensure_tokenizer()
         text = self.prompt_clean(prompt)
         ids = self.tokenizer(text, truncation=True, max_length=cfg.text_len, add_special_tokens=True).input_ids
-        return {
+        return ProcessPromptOutput({
             "text_inputs": [torch.tensor(ids, dtype=torch.long)],
             "image_inputs": [image],
             "camera_poses": [latent_camera_poses(poses[:frame_num], lat_f)],
             "intrinsics": [scale_intrinsics(intrinsics, cfg.intrinsics_height, cfg.intrinsics_width, height, width)],
-        }
+        }, {DIT_KV_TOKENS: sum(rolling_extent(cfg, (height, width), lat_f))})
 
     def _preprocess_image(self, image: torch.Tensor, kwargs: dict) -> torch.Tensor:
         """``[3, h, w]`` float32 in [-1, 1] at the output size: the reference's
@@ -271,8 +301,8 @@ class LingBotWorldModel(Model):
         image = image.cpu()
         image = image.float().div(255) if image.dtype == torch.uint8 else image.float()
         image = image.sub(0.5).div(0.5)
-        height = int(kwargs.get("height", cfg.default_height))
-        width = int(kwargs.get("width", cfg.default_width))
+        height = kwargs.get("height", cfg.default_height)
+        width = kwargs.get("width", cfg.default_width)
         # the area sizes the resize here and the DiT's tokens and rolling K/V
         if height <= 0 or width <= 0 or height * width > cfg.max_area:
             raise ValueError(
@@ -287,11 +317,13 @@ class LingBotWorldModel(Model):
 
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         """uint8 ``[3, H, W]`` as the reference reads it, with Pillow's ``convert("RGB")``
-        (alpha dropped, not composited); the resize and normalization are process_prompt's."""
-        from PIL import Image
-
+        (alpha dropped, not composited), upright by its EXIF orientation; the resize and normalization are
+        process_prompt's."""
         check_image_size(filepath, formats=PILLOW_IMAGE_FORMATS)
-        with Image.open(filepath, formats=PILLOW_IMAGE_FORMATS) as image:
+        with (
+            decoding_upload(filepath, "the image"),
+            open_upright_image(filepath, formats=PILLOW_IMAGE_FORMATS) as image,
+        ):
             rgb = np.array(image.convert("RGB"))
         return TensorAndMetadata(torch.from_numpy(rgb).permute(2, 0, 1).contiguous())
 
@@ -307,69 +339,26 @@ class LingBotWorldModel(Model):
     # Forward pass orchestration
     # ------------------------------------------------------------------
 
-    def _step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
-        kw = metadata.kwargs
-        return {
-            "is_prefill": metadata.is_prefill,
-            "guidance_scale": 1.0,
-            "num_latent_frames": kw["num_latent_frames"],
-            "num_chunks": kw["num_latent_frames"] // self.config.chunk_size,
-        }
-
-    def _walk_inputs(self, walk: str, signals: dict[str, list[TensorPointerInfo]]) -> list[GraphEdge]:
-        if walk == ENCODE_TEXT_WALK:
-            edges = [GraphEdge(next_node="text_encoder", name="text_inputs")]
-        else:
-            edges = [GraphEdge(next_node="dit", name=name) for name in _DIT_INPUTS]
-        for edge in edges:
-            edge.tensor_info = signals.get(edge.name, [])
-        return edges
-
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self, partition_name: str, input_modalities: list[str], output_modalities: list[str],
-        input_signals: dict[str, list[TensorPointerInfo]], model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
+        input_signals: dict[str, list[TensorPointerInfo]], model_kwargs: dict,
+    ) -> list[WalkStep]:
         for name in ("text_inputs", "image_inputs", "camera_poses", "intrinsics"):
             if not input_signals.get(name):
                 raise ValueError(f"LingBot-World is missing its {name!r} input; process_prompt emits it.")
         lat_f = int(input_signals["camera_poses"][0].dims[0])
-        metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=_SCHEDULE[0],
-            is_prefill=True,
-            kwargs={"walk_step": 0, "num_latent_frames": lat_f},
-        )
-        inputs = self._walk_inputs(_SCHEDULE[0], input_signals)
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=sum([e.tensor_info for e in inputs], start=[]),
-            step_metadata=self._step_metadata(metadata),
-        )
+        request = {"guidance_scale": 1.0, "num_latent_frames": lat_f}
+        return [WalkStep(walk, step_metadata=request) for walk in (ENCODE_TEXT_WALK, ROLLOUT_WALK)]
 
-    def get_partition_forward_pass_args(
-        self, partition_name: str, partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        step = metadata.kwargs["walk_step"] + 1
-        if step >= len(_SCHEDULE):
-            return ForwardPassArgs(
-                full_metadata=metadata, inputs=[], unpersist_tensors=[],
-                step_metadata=self._step_metadata(metadata), request_done=True,
-            )
-        metadata.kwargs["walk_step"] = step
-        metadata.graph_walk = _SCHEDULE[step]
-        metadata.is_prefill = _SCHEDULE[step] != ROLLOUT_WALK
-        inputs = self._walk_inputs(_SCHEDULE[step], persist_signals)
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=sum([e.tensor_info for e in inputs], start=[]),
-            step_metadata=self._step_metadata(metadata),
-        )
+    def get_request_resource_configs(
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
+    ) -> dict[str, ResourceReqConfig]:
+        """The rollout's rolling K/V, declared up front so it waits in the engine's
+        queue for room in the pool, and a size the pool can never hold is a 400.
+        ``process_prompt`` sizes it (``DIT_KV_TOKENS``), once it knows the output size."""
+        del input_modalities, output_modalities
+        tokens = model_kwargs.get(DIT_KV_TOKENS)
+        return {} if tokens is None else {DIT_KV: RollingKVReqConfig(tokens=int(tokens))}
 
     # ------------------------------------------------------------------
     # Submodule loading
@@ -380,7 +369,7 @@ class LingBotWorldModel(Model):
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, sp_group=None,
+        autocast_dtype: torch.dtype | None = None,
     ) -> torch.nn.Module | None:
         if node_name not in self._submodule_cache:
             self._submodule_cache[node_name] = self._create_submodule(node_name, device)

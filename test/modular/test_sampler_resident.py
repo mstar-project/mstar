@@ -121,7 +121,7 @@ class _Node:
             )
             self.kv._cg_max_seq_len = 64
             resources["kv"] = self.kv
-        self.sampler = SamplerResource(vocab_size=V, enable_repetion_penalty=True, device=CPU)
+        self.sampler = SamplerResource(vocab_size=V, enable_repetition_penalty=True, device=CPU)
         self.sampler.enable_device_loopback_reader()
         resources["sampler"] = self.sampler
         # as warmup does: the planner binds, then the runners claim their buffers

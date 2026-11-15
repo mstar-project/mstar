@@ -13,6 +13,7 @@ sanity check (a real clip is large; a flat/empty one is tiny).
 import argparse
 import base64
 import json
+import statistics
 import subprocess
 import time
 import urllib.request
@@ -100,7 +101,7 @@ for size in args.tiers.split(","):
             dt, sz = gen(size)
             ts.append(dt)
         ts.sort()
-        med = ts[len(ts) // 2]
+        med = statistics.median(ts)
         print(f"  {size:9s}  median {med:.2f}s  min {ts[0]:.2f}  max {ts[-1]:.2f}  "
               f"mp4={sz // 1024}KB  (n={args.rounds})", flush=True)
     except Exception as e:  # noqa: BLE001

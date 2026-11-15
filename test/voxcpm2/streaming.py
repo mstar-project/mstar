@@ -25,7 +25,7 @@ def stream_through(
         buffer.prime_context(len(lead))
     items += list(patches)
     info = SimpleNamespace(rid_handle="r", request_id="r")
-    engine = SimpleNamespace(request_ids=["r"], piecewise_runners=runners or {})
+    engine = SimpleNamespace(request_ids=["r"], piecewise_runners=runners or {}, captured=False)
     chunks = []
 
     def drain():

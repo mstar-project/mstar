@@ -1,14 +1,14 @@
 """A combined walk's step runs every walk's rows in one forward, so on a
 worker its walks must share one TP group, or all have world size 1."""
-from types import SimpleNamespace
 
 import pytest
 
 from mstar.distributed.base import ShardingConfig, ShardingGroup
+from mstar.testing_utils.model import make_model
 from mstar.worker.engine_manager import refuse_combined_walks_across_tp_groups
 
 COMBINED = {("LLM", "prefill"): "mixed", ("LLM", "decode"): "mixed"}
-MODEL = SimpleNamespace(combined_walk_of=lambda: COMBINED)
+MODEL = make_model(combined_walk_of=lambda: COMBINED)
 # the (node, walk) pairs of a worker that runs both halves
 BOTH = frozenset({("LLM", "prefill"), ("LLM", "decode")})
 

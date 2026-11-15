@@ -152,10 +152,10 @@ def test_captured_sampler_resource_matches_eager_with_padding_and_dropped_rows(d
     rids = tuple(range(4))
     padded_rids = [*rids, -1, -2, -3, -4]
     eager = SamplerResource(
-        logits.shape[1], enable_repetion_penalty=True, device=device, enable_min_p=True,
+        logits.shape[1], enable_repetition_penalty=True, device=device, enable_min_p=True,
     )
     captured = SamplerResource(
-        logits.shape[1], enable_repetion_penalty=True, device=device, enable_min_p=True,
+        logits.shape[1], enable_repetition_penalty=True, device=device, enable_min_p=True,
     )
     captured.build_accelerator_graph_buffers(
         [SimpleNamespace(slot=0)], max_bs=8, max_seq_len=1,

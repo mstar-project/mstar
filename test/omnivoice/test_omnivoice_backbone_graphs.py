@@ -10,8 +10,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from mstar.engine.state import ArrayStep
+from mstar.engine.state.adapters import node_resources
 from mstar.model.omnivoice.submodules import (
     BACKBONE_ATTN,
+    BACKBONE_TOKENS,
     OmniVoiceBackboneSubmodule,
     document_pairs,
 )
@@ -28,7 +31,7 @@ def _spans(step):
 def test_attention_step_two_documents_per_request():
     step = OmniVoiceBackboneSubmodule._attention_step(["a", "b"], [5, 3, 4, 0])
     assert _spans(step) == [("a", 5), ("a", 3), ("b", 4), ("b", 0)]
-    assert not step.steps[BACKBONE_ATTN].causal
+    assert step.state == {BACKBONE_TOKENS: ArrayStep()}
 
 
 def test_attention_step_padded_replay_and_capture_layouts():
@@ -48,7 +51,7 @@ def test_node_resources_do_not_follow_backbone_graphs():
     off = OmniVoiceModel("k2-fsa/OmniVoice", skip_weight_loading=True, backbone_graphs=False)
     # the eager layer loop attends through the same resource: the flag gates capture only
     for model in (on, off):
-        (spec,) = model.get_node_resources()
+        (spec,) = node_resources(model)
         assert spec.resource_key == BACKBONE_ATTN and spec.config.max_segments_per_request == 2
 
 
@@ -122,19 +125,18 @@ def test_the_codec_decoder_compiles_at_start_up_not_on_a_request(monkeypatch):
     import torch
     from torch._dynamo.testing import CompileCounter
 
-    from mstar.engine.engine import Engine
     from mstar.model.omnivoice.components.codec import decode_canvas
     from mstar.model.omnivoice.config import OmniVoiceConfig
     from mstar.model.omnivoice.submodules import OmniVoiceCode2WavSubmodule
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     codec = _codec(decoder_hidden_size=1024)
 
-    engine = Engine.__new__(Engine)
-    engine._device = torch.device("cpu")
-    engine._device_capability = SimpleNamespace(is_available=True)
     code2wav = OmniVoiceCode2WavSubmodule(codec, OmniVoiceConfig())
-    engine._submodules = {"code2wav": SimpleNamespace(submodule=code2wav, fp32_precision=None, node_dtype=None,
-                                                      lora_pools=())}
+    engine = make_engine(
+        _device_capability=SimpleNamespace(is_available=True),
+        _submodules={"code2wav": make_mgmt(code2wav)},
+    )
     counter, compile_ = CompileCounter(), torch.compile
     monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: compile_(fn, backend=counter, **kwargs))
     torch._dynamo.reset()

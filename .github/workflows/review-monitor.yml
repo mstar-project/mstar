@@ -1,0 +1,77 @@
+name: Review bot monitor
+
+# A daily report on the PRs merged with the review bot's approval. Reviews nothing and runs no
+# model: every step reads GitHub and git and writes the status issue (bot.py, monitor). Its
+# first scheduled run creates that issue and the skip-ai-review label. The status issue has one
+# writer: the monitor job, serialized by its concurrency group.
+#
+# Hourly, the reap job releases the live test's DigitalOcean boxes that outlived REVIEW_GPU_HOURS
+# by an hour (gpu_review.py reap): a droplet has no deadline of its own, so this is what ends one
+# whose runner died before its cleanup step. It runs no model and no PR code, and holds only the
+# DigitalOcean token.
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+    - cron: "30 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  PYTHONDONTWRITEBYTECODE: 1
+  # When set, only the app's login counts as the bot (render_summary.BOTS).
+  REVIEW_APP_CLIENT_ID: ${{ vars.REVIEW_APP_CLIENT_ID }}
+
+jobs:
+  monitor:
+    name: Monitor
+    if: github.event.schedule != '30 * * * *'
+    concurrency: review-monitor
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # The status issue (its body and its comments) and the skip-ai-review label.
+      issues: write
+      pull-requests: read
+      # A failed check on a merge commit whose parent passed.
+      checks: read
+    steps:
+      # Main's history, for reverts and blame; blobs on demand, so it stays light.
+      - name: Check out main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # No ref: a scheduled run's event has no repository, and it checks out the default branch.
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Report on the status issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          APPROVALS: ${{ vars.REVIEW_APPROVALS }}
+        run: python3 .github/review/bot.py monitor
+
+  reap:
+    name: Release runaway GPU boxes
+    if: github.event.schedule != '0 6 * * *'
+    # Holds DIGITALOCEAN_TOKEN: the environment's branch rule keeps it from branch workflows.
+    environment: review-bot
+    concurrency: review-reap
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Release them
+        env:
+          DIGITALOCEAN_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
+          HOURS: ${{ vars.REVIEW_GPU_HOURS }}
+        run: python3 .github/review/gpu_review.py reap

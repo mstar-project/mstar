@@ -208,9 +208,14 @@ def test_euler_step_with_negated_fp32_velocity_matches_reference_scheduler():
 
 
 def test_refiners_and_main_layers_use_their_own_attention_span(pair):
-    """Each span's kernel sees exactly its own packed rows, and the result equals the SDPA path."""
+    """Each array's read sees exactly its own packed rows under its own label, and the result equals the SDPA path."""
+    from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
+    from mstar.engine.state import ArrayStep
+    from mstar.engine.state.adapters import node_handles, state_steps
     from mstar.model.components.diffusion.attention import sdpa_attention
-    from mstar.model.z_image.components.transformer import ATTENTION_SPANS, CAPTION_SPAN, IMAGE_SPAN, MAIN_SPAN
+    from mstar.model.z_image.components.transformer import CAPTION_SPAN, IMAGE_SPAN, MAIN_SPAN
+    from mstar.model.z_image.config import CAPTION_TOKENS, DIT_ATTN, IMAGE_TOKENS, JOINT_TOKENS, ZImageConfig
+    from mstar.model.z_image.z_image_model import ZImageModel
 
     _, native = pair
     gen = torch.Generator().manual_seed(4)
@@ -223,39 +228,54 @@ def test_refiners_and_main_layers_use_their_own_attention_span(pair):
     spans = {IMAGE_SPAN: n_img, CAPTION_SPAN: n_cap, MAIN_SPAN: n_img + n_cap}
     seen: dict[str, set[int]] = {}
 
-    def kernel(label):
-        def run(q, k, v):
+    class _Ragged:
+        """Records each label's rows and attends each segment by SDPA, as the kernel does per segment."""
+
+        def run(self, q, k, v, label=None):
             seen.setdefault(label, set()).add(q.shape[0])
             span = spans[label]
-            out = sdpa_attention(*(x.view(-1, span, *x.shape[1:]) for x in (q, k, v)))
-            return out.reshape(q.shape)
+            return sdpa_attention(*(x.view(-1, span, *x.shape[1:]) for x in (q, k, v))).reshape(q.shape)
 
-        return run
-
-    ragged = {label: kernel(label) for label in ATTENTION_SPANS}
     with torch.no_grad():
         expected = native(tokens, cap_tokens, cap_pad, img_pad, t, img_freqs, cap_freqs)
-        got = native(tokens, cap_tokens, cap_pad, img_pad, t, img_freqs, cap_freqs, ragged=ragged)
+    model = ZImageModel(model_path_hf="test/z_image", skip_weight_loading=True)
+    model.set_config(ZImageConfig(transformer=ZImageTransformerConfig.from_dict(TINY)))
+    handles = node_handles(model, "dit", {DIT_ATTN: _Ragged()})
+    for module in native.modules():
+        if hasattr(module, "bind_state"):
+            module.bind_state(handles)
+    try:
+        step = state_steps(SubmoduleStep(state={
+            IMAGE_TOKENS: ArrayStep(segments=tuple(Segment(i, IMAGE_SPAN, n_img) for i in (0, 1))),
+            CAPTION_TOKENS: ArrayStep(segments=tuple(Segment(i, CAPTION_SPAN, n_cap) for i in (0, 1))),
+            JOINT_TOKENS: ArrayStep(segments=tuple(Segment(i, MAIN_SPAN, n_img + n_cap) for i in (0, 1))),
+        }), handles)
+        step.set_ctx(StepContext(request_ids=[0, 1], graph_walk="image_gen", slot=0, capture=False))
+        step.begin_calls()
+        with torch.no_grad():
+            got = native(tokens, cap_tokens, cap_pad, img_pad, t, img_freqs, cap_freqs)
+        step.end_calls()
+    finally:
+        for module in native.modules():
+            if hasattr(module, "bind_state"):
+                module.bind_state({})
     assert seen == {IMAGE_SPAN: {2 * n_img}, CAPTION_SPAN: {2 * n_cap}, MAIN_SPAN: {2 * (n_img + n_cap)}}
     assert torch.equal(got, expected)
-    with pytest.raises(KeyError, match="one kernel per span"):
-        native(tokens, cap_tokens, cap_pad, img_pad, t, img_freqs, cap_freqs, ragged={MAIN_SPAN: ragged[MAIN_SPAN]})
 
 
 def test_denoise_node_declares_the_three_spans():
     from mstar.model.z_image.components.transformer import CAPTION_SPAN, IMAGE_SPAN, MAIN_SPAN
-    from mstar.model.z_image.config import ZImageConfig
+    from mstar.model.z_image.config import CAPTION_TOKENS, IMAGE_TOKENS, JOINT_TOKENS, ZImageConfig
     from mstar.model.z_image.submodules import ZImageDenoiseSubmodule, ZShape
 
     config = ZImageConfig(transformer=ZImageTransformerConfig.from_dict(TINY))
-    node = ZImageDenoiseSubmodule(
-        None, config, loop_name="denoise_loop", attn_resource_key="dit_attn", compile_transformer=False,
-    )
+    node = ZImageDenoiseSubmodule(None, config, loop_name="denoise_loop", compile_transformer=False)
     key = ZShape(grid=(3, 5), cap_len=padded_length(11))
-    assert node.attention_segments(key) == (
-        (IMAGE_SPAN, padded_length(15)), (CAPTION_SPAN, padded_length(11)), (MAIN_SPAN, key.total_tokens),
-    )
-    assert node._ragged_spans() is None  # no resource bound -> SDPA everywhere
+    assert node.attention_segments(key) == {
+        IMAGE_TOKENS: ((IMAGE_SPAN, padded_length(15)),),
+        CAPTION_TOKENS: ((CAPTION_SPAN, padded_length(11)),),
+        JOINT_TOKENS: ((MAIN_SPAN, key.total_tokens),),
+    }
 
 
 @pytest.mark.parametrize("steps", [8, 10, 50])
@@ -285,9 +305,7 @@ def test_denoise_node_steps_a_batch_row_by_row(pair):
     _, native = pair
     native = native.to(torch.float32)
     config = ZImageConfig(transformer=ZImageTransformerConfig.from_dict(TINY))
-    node = ZImageDenoiseSubmodule(
-        native, config, loop_name="denoise_loop", attn_resource_key=None, compile_transformer=False,
-    )
+    node = ZImageDenoiseSubmodule(native, config, loop_name="denoise_loop", compile_transformer=False)
     h, w, cap_len, steps = 3, 5, padded_length(7), 4
     height, width = h * config.spatial_alignment, w * config.spatial_alignment
     gen = torch.Generator().manual_seed(0)

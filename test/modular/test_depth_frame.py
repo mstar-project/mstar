@@ -1,4 +1,4 @@
-"""The Qwen3-TTS 1.7B depth loop as one kernel (``DepthFrame``) against the loop it replaces.
+"""The Qwen3-TTS depth loop (0.6B and 1.7B) as one kernel (``DepthFrame``) against the loop it replaces.
 
 The task lists put the two halves of a split O or DOWN tile on the two CTAs of one cluster, which
 add their partial sums through each other's shared memory; a half dealt to any other CTA adds the
@@ -11,6 +11,8 @@ from collections import defaultdict
 import pytest
 import torch
 
+from mstar.engine.state import Sampler
+from mstar.engine.state.calls import SamplerHandle
 from mstar.model.qwen3_tts.components.depth_frame import schedule
 from mstar.model.qwen3_tts.components.depth_frame.schedule import NPAGES, TB
 
@@ -84,8 +86,8 @@ class _StubSampler:
 class _StubFrame:
     """Records its launches instead of running the kernel."""
 
-    max_rows = 64
-    kv_cache = positions = partials = None
+    max_rows, min_rows = 64, 2
+    kv_cache = depth_positions = partials = None
 
     def __init__(self):
         self.runs = 0
@@ -109,7 +111,9 @@ def _talker(frame):
 
 
 def _run_depth(talker, sampler, rows=3):
-    return talker._run_depth(torch.zeros(rows, 2048), torch.zeros(rows, dtype=torch.long), sampler, ["r"] * rows)
+    talker.cp_sampler = SamplerHandle(Sampler("code_predictor", nodes={"Talker"}, vocab_size=2048, draws=15), sampler)
+    talker.cp_sampler._open = True
+    return talker._run_depth(torch.zeros(rows, 2048), torch.zeros(rows, dtype=torch.long))
 
 
 def test_a_step_the_frame_can_draw_runs_the_frame_and_moves_the_offsets_past_its_draws():
@@ -131,6 +135,12 @@ def test_a_step_with_more_rows_than_the_frame_holds_runs_the_loop():
     assert frame.runs == 0, "the frame ran past its row scratch"
 
 
+def test_a_one_row_step_runs_the_loop():
+    frame = _StubFrame()
+    assert _run_depth(_talker(frame), _StubSampler(draw=object()), rows=1) == "loop"
+    assert frame.runs == 0, "the frame ran a step the loop runs faster"
+
+
 def test_without_the_frame_the_loop_runs():
     assert _run_depth(_talker(None), _StubSampler(draw=object())) == "loop"
 
@@ -148,29 +158,42 @@ def _depth_loop(predictor, talker_table, hidden, codes):
     return all_codes, embed_sum, logits_seen[-1], predictor.depth.kv_cache[:, :codes.shape[0]]
 
 
-def _predictor():
+def _predictor(talker_width: int = 2048, device: str = "cuda"):
+    """A random CodePredictor under a Talker of ``talker_width``: the 1.7B's 2048, projected into the predictor, or
+    the 0.6B's 1024, unprojected."""
     from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
     from mstar.model.qwen3_tts.config import Qwen3TTSModelConfig, Qwen3TTSTalkerConfig
 
     torch.manual_seed(0)
-    config = Qwen3TTSModelConfig(talker=Qwen3TTSTalkerConfig(hidden_size=2048))
-    predictor = ResidualCodePredictor(config.code_predictor, 2048, 128, embed_sum_dtype=None)
-    predictor = predictor.to("cuda", torch.bfloat16).eval()
+    config = Qwen3TTSModelConfig(talker=Qwen3TTSTalkerConfig(hidden_size=talker_width))
+    predictor = ResidualCodePredictor(config.code_predictor, talker_width, 128, embed_sum_dtype=None)
+    predictor = predictor.to(device, torch.bfloat16).eval()
     for name, param in predictor.named_parameters():
         if name.endswith("norm.weight"):
             param.data.uniform_(0.5, 1.5)
         else:
             param.data.normal_(std=0.02)
-    talker_table = torch.randn(config.talker.vocab_size, 2048, device="cuda", dtype=torch.bfloat16)
+    talker_table = torch.randn(config.talker.vocab_size, talker_width, device=device, dtype=torch.bfloat16)
     predictor.consolidate_stacked_weights()
+    predictor.depth.make(torch.bfloat16, device)
     return predictor, talker_table
 
 
-@pytest.fixture(scope="module")
-def _frame():
+@pytest.mark.parametrize("talker_width", [2048, 1024], ids=["1.7B", "0.6B"])
+def test_both_checkpoints_code_predictors_fit_the_kernel(talker_width):
+    """The 0.6B's Talker is as wide as its predictor, so it has no input projection; the kernel takes it padded."""
+    from mstar.model.qwen3_tts.components import depth_frame
+
+    predictor, talker_table = _predictor(talker_width, device="cpu")
+    assert depth_frame.fits(predictor, talker_table)
+    assert not depth_frame.fits(predictor, talker_table[:, :512]), "a table of another width fits"
+
+
+@pytest.fixture(scope="module", params=[2048, 1024], ids=["1.7B", "0.6B"])
+def _frame(request):
     from mstar.model.qwen3_tts.components.depth_frame.frame import DepthFrame
 
-    predictor, talker_table = _predictor()
+    predictor, talker_table = _predictor(request.param)
     return predictor, talker_table, DepthFrame(predictor, talker_table)
 
 
@@ -179,7 +202,7 @@ def _frame():
 def test_the_frame_with_given_codes_matches_the_depth_loop(_frame, bs):
     """The same frame at every size: a row count specialized at its first launch would break the later sizes."""
     predictor, talker_table, frame = _frame
-    hidden = torch.randn(bs, 2048, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn(bs, talker_table.shape[1], device="cuda", dtype=torch.bfloat16)
     codes = torch.randint(0, 2048, (bs, 16), device="cuda")
     codes[:, 0] = torch.randint(0, talker_table.shape[0], (bs,), device="cuda")
     with torch.no_grad():
@@ -187,7 +210,7 @@ def test_the_frame_with_given_codes_matches_the_depth_loop(_frame, bs):
     runs = []
     for _ in range(2):
         all_codes, embed_sum = torch.empty_like(codes), torch.empty_like(sum_want)
-        frame.run(hidden, codes, frame.kv_cache, frame.positions, frame.partials, all_codes, embed_sum, None)
+        frame.run(hidden, codes, frame.kv_cache, frame.depth_positions, frame.partials, all_codes, embed_sum, None)
         runs.append((all_codes, embed_sum, frame.kv_cache[:, :bs].clone(), frame.LOGITS[:bs].clone()))
     all_codes, embed_sum, kv, logits = runs[0]
     assert torch.equal(all_codes, codes_want) and torch.equal(embed_sum, sum_want), "given codes summed differently"
@@ -199,7 +222,7 @@ def test_the_frame_with_given_codes_matches_the_depth_loop(_frame, bs):
 
 
 def _draw(bs: int, offset: int):
-    from mstar.engine.resources.sampler.utils import FusedDrawArgs
+    from mstar.engine.state import FusedDrawArgs
 
     return FusedDrawArgs(
         torch.full((bs,), 0.9, device="cuda"), torch.full((bs,), 50, device="cuda", dtype=torch.int32),
@@ -216,10 +239,10 @@ def test_a_sampled_frame_draws_its_last_group_from_its_own_logits_at_the_last_of
 
     predictor, talker_table, frame = _frame
     bs = 13
-    hidden = torch.randn(bs, 2048, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn(bs, talker_table.shape[1], device="cuda", dtype=torch.bfloat16)
     layer0 = torch.randint(0, talker_table.shape[0], (bs,), device="cuda")
     draw = _draw(bs, offset=5)
-    kv, positions, partials = frame.kv_cache, frame.positions, frame.partials
+    kv, positions, partials = frame.kv_cache, frame.depth_positions, frame.partials
     codes, embed_sum = torch.empty(bs, 16, device="cuda", dtype=torch.long), torch.empty_like(hidden)
     frame.run(hidden, layer0, kv, positions, partials, codes, embed_sum, draw)
     given_sum = torch.empty_like(embed_sum)
@@ -234,9 +257,9 @@ def test_a_captured_frame_replays_what_it_ran(_frame):
     """The engine captures the Talker step with the frame's cluster launch inside it."""
     predictor, talker_table, frame = _frame
     bs = 13
-    hidden = torch.randn(bs, 2048, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn(bs, talker_table.shape[1], device="cuda", dtype=torch.bfloat16)
     layer0 = torch.randint(0, talker_table.shape[0], (bs,), device="cuda")
-    positions, partials = frame.positions, frame.partials
+    positions, partials = frame.depth_positions, frame.partials
     draw = _draw(bs, offset=5)
 
     def outputs():
@@ -250,3 +273,37 @@ def test_a_captured_frame_replays_what_it_ran(_frame):
         frame.run(hidden, layer0, replayed[0], positions, partials, replayed[1], replayed[2], draw)
     graph.replay()
     assert all(torch.equal(a, b) for a, b in zip(ran, replayed, strict=True)), "the replay ran another frame"
+
+
+@requires_hopper
+def test_a_frame_draws_through_the_contract_as_the_sampler_would(_frame):
+    """`fused_draw_args` hands the kernel a real sampler's buffers and `drew` moves its offsets, so the kernel's last
+    group is `fused_sample`'s at the last offset, and the next step starts past all fifteen."""
+    from mstar.engine.resources.sampler.resource import SamplerResource
+    from mstar.engine.resources.sampler.utils import SamplerBuffers, SamplingConfig, fused_sample
+    from mstar.engine.state import drew, fused_draw_args
+
+    predictor, talker_table, frame = _frame
+    rows = [f"r{i}" for i in range(13)]
+    bufs = SamplerBuffers.allocate(64, torch.device("cuda"), cg_slots=1)
+    for i, rid in enumerate(rows):
+        config = SamplingConfig(temperature=0.9, top_k=50, top_p=1.0)
+        config.set_seed(i)
+        bufs.register_request(rid, config)
+    bufs.gather_static(rows, 13, 0)
+    bufs.gather_dynamic(rows, 13, 0)
+    resource = SamplerResource(vocab_size=2048, enable_repetition_penalty=False, device=torch.device("cuda"))
+    resource._cg_sampler = bufs.sampler_for(13, 0)
+    handle = SamplerHandle(Sampler("code_predictor", nodes={"Talker"}, vocab_size=2048, draws=15), resource)
+    handle._open = True
+
+    hidden = torch.randn(13, talker_table.shape[1], device="cuda", dtype=torch.bfloat16)
+    layer0 = torch.randint(0, talker_table.shape[0], (13,), device="cuda")
+    codes, embed_sum = torch.empty(13, 16, device="cuda", dtype=torch.long), torch.empty_like(hidden)
+    draw = fused_draw_args(handle)
+    offsets = draw.offset.clone()
+    frame.run(hidden, layer0, frame.kv_cache, frame.depth_positions, frame.partials, codes, embed_sum, draw)
+    drew(handle, 15)
+    last = fused_sample(frame.LOGITS[:13], draw.temperature, draw.top_k, draw.top_p, draw.seed, offsets + 14)
+    assert torch.equal(codes[:, 15], last), "the kernel drew other tokens than the sampler's own draw"
+    assert torch.equal(draw.offset, offsets + 15), "the next step would draw from this step's random numbers"

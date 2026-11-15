@@ -14,28 +14,31 @@ import torch
 import yaml
 from test_kv_prefix_request_keys import _StubTensorManager
 
+import mstar.communication.wire_types  # noqa: F401  (registers the wire tags)
 import mstar.conductor.conductor as conductor_mod
 from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.api_server.request_types import PreprocessInput
+from mstar.communication import wire
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.conductor import Conductor
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
-from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig, PrefixSpan, StreamLayout
+from mstar.conductor.request_info import WalkStep
+from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig, PrefixSpan, SpanKind, StreamLayout
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span
+from mstar.model.base import KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span
+from mstar.testing_utils.model import StubModel
 from mstar.utils.ipc_format import ConductorMessage, ConductorMessageType, NewRequestConductor, SetupDone
 
 PS = 16
 PROMPT = 100
 LAYOUT = {"kv": {
     "main": LabelLayout(
-        spans=(Span("ids", "prefill", PROMPT, PROMPT, "text_inputs"),), growth=(("decode_loop", 1),),
+        spans=(Span(SpanKind.IDS, "prefill", PROMPT, PROMPT, "text_inputs"),), growth=(("decode_loop", 1),),
     ),
     "uncond": LabelLayout(
-        spans=(Span("rows", "prefill", 10, 10, "cond"),), growth=(("talk_loop", 2),), scratch=7,
+        spans=(Span(SpanKind.ROWS, "prefill", 10, 10, "cond"),), growth=(("talk_loop", 2),), scratch=7,
     ),
 }}
 
@@ -47,7 +50,8 @@ class _Comm:
         self.batches = deque()
 
     def send(self, entity_id, msg):
-        self.sent.append(msg)
+        # through the wire codec, as the data worker's and the conductor's messages travel
+        self.sent.append(wire.decode(wire.encode(msg)))
 
     def get_all_new_messages(self):
         return self.batches.popleft() if self.batches else []
@@ -60,8 +64,7 @@ class _ScriptDoneError(Exception):
     pass
 
 
-class _Model(Model):
-
+class _Model(StubModel):
     def __init__(self, layout=LAYOUT, max_seq_len=4096):
         self._layout, self._max_seq_len = layout, max_seq_len
 
@@ -98,31 +101,16 @@ class _Model(Model):
     def get_loop_caps(self, **model_kwargs):
         return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
 
-    def get_request_resource_configs(self, partition_fwd_args, model_kwargs=None):
+    def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
         return {"kv": KVReqConfig(needed_labels=["main", "uncond"])}
 
-    def get_initial_forward_pass_args(self, partition_name, input_modalities, output_modalities,
-                                      input_signals, model_kwargs=None):
-        return ForwardPassArgs(
-            full_metadata=CurrentForwardConductorMetadata(graph_walk="prefill", is_prefill=True),
-            inputs=[], unpersist_tensors=[],
-        )
-
-    def get_partition_forward_pass_args(self, *args, **kwargs):
-        raise AssertionError("the request never leaves its first walk")
-
-    def max_input_files(self):
-        return {}
+    def walk_plan(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs):
+        # no worker reports in these tests, so the request never leaves prefill
+        return [WalkStep("prefill"), WalkStep("decode", bind={"text_inputs": "new_token"})]
 
     def process_prompt(self, *args, **kwargs):
         tensors = {"text_inputs": [torch.arange(PROMPT)]}
         return tensors if self._layout is None else ProcessPromptOutput(tensors, {"kv_layout": self._layout})
-
-    def postprocess(self, *args, **kwargs):
-        return b""
-
-    def get_submodule(self, *args, **kwargs):
-        return None
 
 
 def _preprocess(model: _Model, model_kwargs: dict, **config) -> dict:
@@ -141,7 +129,9 @@ def _preprocess(model: _Model, model_kwargs: dict, **config) -> dict:
     return worker.communicator.sent[-1].body.model_kwargs
 
 
-def _conduct(model: _Model, model_kwargs: dict, tmp_path, monkeypatch, **config) -> _Comm:
+def _conduct(
+    model: _Model, model_kwargs: dict, tmp_path, monkeypatch, rids=("r",), streaming=False, outputs=("text",), **config,
+) -> _Comm:
     path = tmp_path / "cfg.yaml"
     path.write_text(yaml.safe_dump({
         "max_seq_len": 4096, "node_groups": [{"node_names": ["llm", "talker"], "ranks": [0]}], **config,
@@ -153,9 +143,10 @@ def _conduct(model: _Model, model_kwargs: dict, tmp_path, monkeypatch, **config)
     comm.batches.extend([
         [ConductorMessage(ConductorMessageType.SETUP_DONE, SetupDone(w)) for w in conductor.worker_ids],
         [ConductorMessage(ConductorMessageType.NEW_REQUEST, NewRequestConductor(
-            request_id="r", initial_signals={}, initial_input_modalities=["text"],
-            initial_output_modalities=["text"], input_metadata={}, model_kwargs=model_kwargs,
-        ))],
+            request_id=rid, initial_signals={}, initial_input_modalities=["text"],
+            initial_output_modalities=list(outputs), input_metadata={}, model_kwargs=model_kwargs,
+            streaming=streaming,
+        )) for rid in rids],
     ])
 
     def poll():
@@ -168,8 +159,8 @@ def _conduct(model: _Model, model_kwargs: dict, tmp_path, monkeypatch, **config)
     return comm
 
 
-def _ingest(model: _Model, model_kwargs: dict, tmp_path, monkeypatch):
-    sent = _conduct(model, model_kwargs, tmp_path, monkeypatch).sent
+def _ingest(model: _Model, model_kwargs: dict, tmp_path, monkeypatch, **kwargs):
+    sent = _conduct(model, model_kwargs, tmp_path, monkeypatch, **kwargs).sent
     return next(msg.body for msg in sent if getattr(msg.message_type, "name", "") == "NEW_REQUEST")
 
 
@@ -216,10 +207,14 @@ def test_a_prompt_is_keyed_only_where_its_cache_opens(model, config, model_kwarg
     assert ("prefix_keys" in kwargs) == keyed
 
 
-def test_a_cap_past_its_loop_is_refused(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cap", [51, 0])
+def test_a_cap_past_its_loop_or_below_one_is_refused(tmp_path, monkeypatch, cap):
+    """Past its loop's max_iters the loop would end short; a loop ends on its
+    count only at a cap of 1 or more, so a cap of 0 would never end by count."""
     model = _Model()
+    monkeypatch.setattr(model, "get_loop_caps", lambda **kwargs: {"decode_loop": cap})
 
-    sent = _conduct(model, _preprocess(model, {"max_output_tokens": 51}), tmp_path, monkeypatch).sent
+    sent = _conduct(model, _preprocess(model, {"max_output_tokens": 10}), tmp_path, monkeypatch).sent
 
     failed = [msg.body for msg in sent if getattr(msg, "message_type", None) == "request_failed"]
     assert [body.status for body in failed] == [400], "a request the loop would end short was served"
@@ -270,6 +265,62 @@ def test_a_request_that_asks_no_length_decodes_to_the_context(tmp_path, monkeypa
     assert new_request.request_info.max_tokens == 29
 
 
+@pytest.mark.parametrize("streaming, outputs", [
+    (False, ["text", "audio"]), (True, ["text"]),
+], ids=["unstreamed audio", "streamed text"])
+def test_the_conductor_leaves_a_request_that_can_pause_preemptible(tmp_path, monkeypatch, streaming, outputs):
+    model = _Model({"kv": {"main": LAYOUT["kv"]["main"], "uncond": LabelLayout()}})
+    new_request = _ingest(model, _preprocess(model, {}), tmp_path, monkeypatch, streaming=streaming, outputs=outputs)
+    assert not new_request.request_info.resource_configs["kv"].unpausable, "a request that can pause was guaranteed"
+
+
+def test_the_conductor_leaves_a_rows_span_to_the_pools_that_hold_it(tmp_path, monkeypatch):
+    """An unstreamed Qwen3-Omni chat with audio out lays out rows only in the Talker's pool, since the Talker reads
+    the Thinker's hidden states. Guaranteed in every pool, it would reserve the Thinker's whole decode cap, though
+    a rebuild writes the Thinker's ids again."""
+    model = _Model()
+    new_request = _ingest(model, _preprocess(model, {}), tmp_path, monkeypatch, outputs=["text", "audio"])
+    assert not new_request.request_info.resource_configs["kv"].unpausable, (
+        "a rows span made the request guaranteed in every pool"
+    )
+
+
+def test_the_conductor_marks_a_request_that_streams_audio_unpausable(tmp_path, monkeypatch):
+    model = _Model({"kv": {"main": LAYOUT["kv"]["main"], "uncond": LabelLayout()}})
+    kwargs = _preprocess(model, {})
+    new_request = _ingest(model, kwargs, tmp_path, monkeypatch, streaming=True, outputs=["text", "audio"])
+    assert new_request.request_info.resource_configs["kv"].unpausable, "a voice stream would be preempted"
+
+
+class _Pausable(_Model):
+    """A model whose streamed audio is buffered before it plays, so a pause is never heard."""
+    UNPAUSABLE_OUTPUTS = frozenset()
+
+
+def test_a_model_that_declares_no_unpausable_output_leaves_its_streamed_audio_preemptible(tmp_path, monkeypatch):
+    model = _Pausable({"kv": {"main": LAYOUT["kv"]["main"], "uncond": LabelLayout()}})
+    new_request = _ingest(model, _preprocess(model, {}), tmp_path, monkeypatch, streaming=True, outputs=["audio"])
+    assert not new_request.request_info.resource_configs["kv"].unpausable, (
+        "streamed audio was guaranteed though the model says it can pause"
+    )
+
+
+@pytest.mark.parametrize("unpausable, outputs, guaranteed", [
+    ([], ["text", "audio"], False), (["text"], ["text"], True),
+], ids=["voice deployment that keeps a fast first chunk", "streamed text that can't pause"])
+def test_the_serving_config_overrides_the_outputs_the_model_says_cant_pause(
+    tmp_path, monkeypatch, unpausable, outputs, guaranteed,
+):
+    model = _Model({"kv": {"main": LAYOUT["kv"]["main"], "uncond": LabelLayout()}})
+    new_request = _ingest(
+        model, _preprocess(model, {}), tmp_path, monkeypatch, streaming=True, outputs=outputs,
+        unpausable_outputs=unpausable,
+    )
+    assert new_request.request_info.resource_configs["kv"].unpausable == guaranteed, (
+        "the deployment's unpausable_outputs were ignored"
+    )
+
+
 def test_only_the_new_request_carries_the_layout(tmp_path, monkeypatch):
     model = _Model()
 
@@ -281,9 +332,42 @@ def test_only_the_new_request_carries_the_layout(tmp_path, monkeypatch):
     assert kept.kv_layout is None and kept.loop_caps is None, "the conductor's later messages would carry the layout"
 
 
+@pytest.mark.parametrize("lead", [None, {"codes": 3}])
+def test_a_stream_lead_reaches_the_new_request_and_a_clients_is_dropped(tmp_path, monkeypatch, lead):
+    """process_prompt's stream lead primes the consumer's stream; a client's
+    value past the stream's context would raise in the worker's ingest."""
+
+    class _Leading(_Model):
+        def process_prompt(self, *args, **kwargs):
+            out = super().process_prompt(*args, **kwargs)
+            if lead:
+                out.metadata["stream_lead_items"] = lead
+            return out
+
+    model = _Leading()
+    kwargs = _preprocess(model, {"max_output_tokens": 30, "stream_lead_items": {"codes": 999}})
+    assert _ingest(model, kwargs, tmp_path, monkeypatch).request_info.stream_lead_items == (lead or {})
+
+
 def test_a_layout_the_client_sent_is_dropped(tmp_path, monkeypatch):
     model = _Model()
     kwargs = _preprocess(model, {"max_output_tokens": 30, "kv_layout": {"kv": {"main": [[[1, 1, "x"]], [], 0, None]}}})
     cfg = _ingest(model, kwargs, tmp_path, monkeypatch).request_info.resource_configs["kv"]
 
     assert cfg.kv_layout["main"].spans[0].length == PROMPT, "a client's layout would size another request's pages"
+
+
+def test_requests_carry_their_arrival_on_the_request_info(tmp_path, monkeypatch):
+    model = _Model()
+    groups = [{"node_names": ["llm"], "ranks": [0]}, {"node_names": ["talker"], "ranks": [1]}]
+    kwargs = _preprocess(model, {"max_output_tokens": 30})
+
+    sent = _conduct(model, kwargs, tmp_path, monkeypatch, rids=("r", "s"), node_groups=groups).sent
+
+    frames = [msg.body for msg in sent if getattr(msg.message_type, "name", "") == "NEW_REQUEST"]
+    arrivals = {rid: set() for rid in ("r", "s")}
+    for frame in frames:
+        arrivals[frame.request_id].add(frame.request_info.arrival)
+    assert len(frames) == 4, "each worker hears of each request"
+    ((first,), (second,)) = arrivals["r"], arrivals["s"]
+    assert first < second, "a frame carried another number, or the later request didn't get the later one"

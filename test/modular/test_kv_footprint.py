@@ -114,3 +114,16 @@ def test_a_window_denoised_before_its_commit_counts_once():
     layout = StreamLayout(spans=(*_spans(prompt), *windows))
 
     assert peak == layout.pages({}, PS), "the last window's denoise is counted on top of its commit"
+
+
+def test_a_window_holds_every_span_its_one_step_writes():
+    """The VLM scaffold writes a media prompt as text and pad runs, a span each, in one step. Sizing the window by its
+    largest span left a 1024-token window 128 pages of 16 for a step that writes 191."""
+    lengths, caps, policy = (200, 1000, 800, 1000, 50), {"decode_loop": 100}, RetentionPolicy(context_budget=1024)
+    spans = tuple(PrefixSpan(length, length, "w", opens_step=i == 0) for i, length in enumerate(lengths))
+    split = StreamLayout(spans=spans, growth=(("decode_loop", 1),))
+    whole = StreamLayout(spans=_spans(sum(lengths)), growth=(("decode_loop", 1),))
+
+    assert split.pages(caps, 16, policy) == whole.pages(caps, 16, policy) == 197, (
+        "the window group would hold fewer pages than the step that writes the prompt"
+    )

@@ -22,17 +22,17 @@ def _clean(monkeypatch):
 
 
 def test_env_then_config_then_default(monkeypatch):
-    knobs.configure({"kv_plan_cache": 1, "ingraph_decode_rope": True})
-    assert knobs.kv_plan_cache() == 1 and knobs.ingraph_decode_rope() is True
+    knobs.configure({"kv_chain_lazy_steps": 4, "ingraph_decode_rope": True})
+    assert knobs.kv_chain_lazy_steps() == 4 and knobs.ingraph_decode_rope() is True
     assert knobs.kv_pinned_indptrs() is False, "unset in both: the default"
     monkeypatch.setenv("MSTAR_INGRAPH_DECODE_ROPE", "0")
     assert knobs.ingraph_decode_rope() is False, "a set env var wins"
     # scripts export an empty variable to mean "not set"
-    monkeypatch.setenv("MSTAR_KV_PLAN_CACHE", "")
-    assert knobs.kv_plan_cache() == 1, "an empty env var defers to the config"
+    monkeypatch.setenv("MSTAR_KV_CHAIN_LAZY_STEPS", "")
+    assert knobs.kv_chain_lazy_steps() == 4, "an empty env var defers to the config"
 
 
-@pytest.mark.parametrize("bad", [{"kv_plan_cahce": 1}, {"kv_plan_cache": "1"}])
+@pytest.mark.parametrize("bad", [{"kv_chain_lazy_stpes": 4}, {"kv_chain_lazy_steps": "4"}])
 def test_a_malformed_block_fails_the_startup_check(bad):
     with pytest.raises(ValueError):
         knobs.check(bad)
@@ -85,3 +85,18 @@ def test_idle_hold_from_the_config_and_the_environment(monkeypatch):
 def test_a_bad_idle_hold_fails_the_startup_check(value):
     with pytest.raises(ValueError, match="idle_hold"):
         knobs.check({"idle_hold": value})
+
+
+def test_step_threads_from_the_config_and_the_environment(monkeypatch):
+    assert knobs.step_threads() == "threaded"
+    knobs.configure({"step_threads": "serial"})
+    assert knobs.step_threads() == "serial"
+    monkeypatch.setenv("MSTAR_STEP_THREADS", "threaded")
+    assert knobs.step_threads() == "threaded"
+
+
+@pytest.mark.parametrize("value", ["inline", True, 1])
+def test_a_bad_step_threads_fails_the_startup_check(value):
+    with pytest.raises(ValueError, match="step_threads"):
+        knobs.check({"step_threads": value})
+

@@ -14,6 +14,7 @@ import pytest
 
 from mstar.engine.engine import Engine
 from mstar.engine.resources.spec import CombinedSplit
+from mstar.testing_utils.model import make_model
 
 
 def test_the_prefill_rows_are_the_prefill_walks_caps():
@@ -37,7 +38,7 @@ def test_several_prefill_walks_add_up_to_at_most_the_bucket():
 
 
 def _model(walk_nodes: dict[str, list[str]]):
-    return SimpleNamespace(get_graph_walk_graphs=lambda: {
+    return make_model(get_graph_walk_graphs=lambda: {
         walk: SimpleNamespace(get_nodes=lambda nodes=nodes: nodes)
         for walk, nodes in walk_nodes.items()
     })

@@ -507,10 +507,14 @@ def aggregate_metrics(
     profiling_type: Optional[str] = None,
     model: Optional[Model] = None,
 ) -> AggregateMetrics:
-    n_success = sum(1 for r in requests if r.status == Status.SUCCESS)
+    # Every figure covers successful requests only, as vLLM's benchmark_serving
+    # does: a fast failure would pull TTFT, ITL, E2E and RTF down, and a request
+    # cut mid-stream would add its partial tokens to the throughput.
+    succeeded = [r for r in requests if r.status == Status.SUCCESS]
+    n_success = len(succeeded)
 
     ttft_by_modality: dict[str, list[float]] = {}
-    for r in requests:
+    for r in succeeded:
         for modality, t in r.ttft.items():
             ttft_by_modality.setdefault(modality, []).append(t)
 
@@ -534,7 +538,7 @@ def aggregate_metrics(
             )
     itl_text_per_token: list[float] = []
     itl_audio_per_chunk: list[float] = []
-    for r in requests:
+    for r in succeeded:
         text_itl = r.itl_per_token_text(tokenizer)
         if text_itl:
             itl_text_per_token.extend(text_itl)
@@ -547,25 +551,25 @@ def aggregate_metrics(
     if itl_audio_per_chunk:
         itl_by_modality["audio"] = _latency_stats(itl_audio_per_chunk)
 
-    e2e_vals = [r.e2e_latency for r in requests if r.e2e_latency is not None]
-    sv_vals = [r.streaming_viability for r in requests if r.streaming_viability is not None]
+    e2e_vals = [r.e2e_latency for r in succeeded if r.e2e_latency is not None]
+    sv_vals = [r.streaming_viability for r in succeeded if r.streaming_viability is not None]
 
     total_chunks: dict[str, int] = {}
     total_bytes: dict[str, int] = {}
-    for r in requests:
+    for r in succeeded:
         for modality, n in r.response_chunks.items():
             total_chunks[modality] = total_chunks.get(modality, 0) + n
         for modality, n in r.output_bytes.items():
             total_bytes[modality] = total_bytes.get(modality, 0) + n
 
-    total_text_tokens = sum(r.output_text_tokens for r in requests)
-    text_token_counts = [r.output_text_tokens for r in requests if r.output_text_tokens > 0]
-    total_input_tokens = sum(r.input_tokens for r in requests)
+    total_text_tokens = sum(r.output_text_tokens for r in succeeded)
+    text_token_counts = [r.output_text_tokens for r in succeeded if r.output_text_tokens > 0]
+    total_input_tokens = sum(r.input_tokens for r in succeeded)
 
     # Per-request audio duration paired with the same request's E2E so RTF
     # (E2E / audio_duration) is computed consistently across requests.
     audio_pairs: list[tuple[RequestMetrics, float]] = []
-    for r in requests:
+    for r in succeeded:
         audio_bytes = r.output_bytes.get("audio", 0)
         if audio_bytes <= 0:
             continue
@@ -935,7 +939,7 @@ def _record_vllm_omni_chunk(chunk: dict, metrics: "RequestMetrics") -> None:
     usage = chunk.get("usage")
     if usage:
         ct = usage.get("completion_tokens")
-        if ct is not None:
+        if ct:  # audio chunks carry completion_tokens=0; keep the text count
             metrics.output_text_tokens = ct
         pt = usage.get("prompt_tokens")
         if pt is not None:
@@ -1380,6 +1384,9 @@ class SGLangOmni(InferenceSystem):
                 "stream": True,
                 "stream_options": {"include_usage": True},
                 **model.get_model_kwargs(req_type),
+                # Per-request overrides (max_tokens / ignore_eos stamped by the
+                # runner), as for vllm-omni.
+                **req_input.model_kwargs,
                 **additional_model_kwargs,
             }
             # Top-level multimodal fields (Fix 10a). sglang-omni reads files
@@ -1422,7 +1429,7 @@ class SGLangOmni(InferenceSystem):
                     usage = chunk.get("usage")
                     if usage:
                         ct = usage.get("completion_tokens")
-                        if ct is not None:
+                        if ct:  # a completion_tokens=0 chunk must not reset the count
                             metrics.output_text_tokens = ct
                         pt = usage.get("prompt_tokens")
                         if pt is not None:
@@ -1634,7 +1641,7 @@ class OursOpenAI(VLLMOmni):
         read is recorded as a PCM16 audio chunk so timing/throughput match the
         native path.
         """
-        kwargs = {**model.get_model_kwargs(req_input.req_type), **additional_model_kwargs}
+        kwargs = {**model.get_model_kwargs(req_input.req_type), **req_input.model_kwargs, **additional_model_kwargs}
         payload: dict = {
             "model": model.get_served_model_name(),
             "input": req_input.prompt,

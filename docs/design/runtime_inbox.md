@@ -8,7 +8,7 @@ Status: proposed, parked. Nothing measured today is limited by it; this note rec
 
 ## The input path today
 
-A worker's main thread drains its control socket and handles each message in Python (`Worker._process_message_list`):
+A worker's main thread drains its control socket and handles each message in Python (`InputIngest.process_messages`):
 
 1. **Decode** the message (`wire.decode`).
 2. **Dispatch** on its type: `NEW_REQUEST`, `INPUT_SIGNALS`, `EDGE_ITEMS`, `TENSOR_RECEIVED`, `REMOVE_REQUEST`, `STOP_LOOPS` and the TP control messages.

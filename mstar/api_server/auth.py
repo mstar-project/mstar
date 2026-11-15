@@ -3,7 +3,10 @@
 Off unless ``--api-key`` or ``MSTAR_API_KEY`` sets a key. When set, every
 request except the probe and scrape paths in ``UNAUTHENTICATED_PATHS`` must carry
 ``Authorization: Bearer <key>`` (what the OpenAI SDKs send for ``api_key``);
-WebSocket routes are checked at the handshake. The check is one ASGI
+WebSocket routes are checked at the handshake. A deployment that serves the
+openpi socket (an ``openpi:`` block) also takes openpi_client's conventions
+there, and only there: ``Authorization: Api-Key <key>`` on the ``/`` handshake,
+and ``/healthz`` without a key. The check is one ASGI
 middleware over the whole app rather than a per-route dependency, so a route
 added later is covered without anyone remembering to opt it in.
 """
@@ -16,6 +19,7 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +29,12 @@ API_KEY_ENV = "MSTAR_API_KEY"
 #: and the Prometheus scrape endpoint (request counts, latencies and the model
 #: name; never prompts or outputs).
 UNAUTHENTICATED_PATHS = frozenset({"/health", "/metrics"})
+
+OPENPI_SOCKET_PATH = "/"
+OPENPI_HEALTH_PATH = "/healthz"
+_OPENPI_PATHS = frozenset({OPENPI_SOCKET_PATH, OPENPI_HEALTH_PATH})
+_SCHEMES = frozenset({b"bearer"})
+_OPENPI_SCHEMES = frozenset({b"bearer", b"api-key"})
 
 _UNAUTHORIZED_BODY = json.dumps({"error": {
     "message": "missing or invalid API key; send 'Authorization: Bearer <key>'",
@@ -76,8 +86,10 @@ class APIKeyGuard:
     the CLI can set the key once its flags are parsed.
     """
 
-    def __init__(self, key: str | None = None):
+    def __init__(self, key: str | None = None, serves_openpi: Callable[[], bool] = lambda: False):
         self.set(key)
+        # asked only for the openpi paths, so the app can answer once its config is read
+        self.serves_openpi = serves_openpi
 
     def set(self, key: str | None) -> None:
         self._digest = _digest(key.encode()) if key else None
@@ -86,19 +98,19 @@ class APIKeyGuard:
     def enabled(self) -> bool:
         return self._digest is not None
 
-    def accepts(self, headers: list[tuple[bytes, bytes]]) -> bool:
+    def accepts(self, headers: list[tuple[bytes, bytes]], schemes: frozenset[bytes] = _SCHEMES) -> bool:
         if self._digest is None:
             return True
-        token = _bearer_token(headers)
+        token = _request_token(headers, schemes)
         # Comparing digests keeps the time independent of the key's length too.
         return token is not None and hmac.compare_digest(_digest(token), self._digest)
 
 
-def _bearer_token(headers: list[tuple[bytes, bytes]]) -> bytes | None:
+def _request_token(headers: list[tuple[bytes, bytes]], schemes: frozenset[bytes]) -> bytes | None:
     for name, value in headers:
         if name == b"authorization":
             scheme, _, token = value.strip().partition(b" ")
-            return token.strip() if scheme.lower() == b"bearer" else None
+            return token.strip() if scheme.lower() in schemes else None
     return None
 
 
@@ -124,10 +136,16 @@ class APIKeyMiddleware:
         self.guard = guard
 
     async def __call__(self, scope, receive, send):
-        if (scope["type"] not in ("http", "websocket")
-                or not self.guard.enabled
-                or _route_path(scope) in UNAUTHENTICATED_PATHS
-                or self.guard.accepts(scope.get("headers", []))):
+        if scope["type"] not in ("http", "websocket") or not self.guard.enabled:
+            await self.app(scope, receive, send)
+            return
+        path = _route_path(scope)
+        openpi = path in _OPENPI_PATHS and self.guard.serves_openpi()
+        openpi_health = openpi and path == OPENPI_HEALTH_PATH and scope["type"] == "http"
+        openpi_socket = openpi and path == OPENPI_SOCKET_PATH and scope["type"] == "websocket"
+        if (path in UNAUTHENTICATED_PATHS
+                or openpi_health
+                or self.guard.accepts(scope.get("headers", []), _OPENPI_SCHEMES if openpi_socket else _SCHEMES)):
             await self.app(scope, receive, send)
             return
         if scope["type"] == "websocket":

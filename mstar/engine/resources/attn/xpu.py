@@ -42,6 +42,8 @@ class XPUPagedPlan:
 class XPUPagedAttentionManager(AttentionManager):
     """Paged KV attention backed by ``vllm-xpu-kernels`` FlashAttention."""
 
+    supports_drop = True
+
     def __init__(
         self,
         kv_cache: str,
@@ -57,9 +59,6 @@ class XPUPagedAttentionManager(AttentionManager):
         self._preplan_states: dict[str, XPUPagedPlan] = {}
         self._preplanned = False
         self._plan_stagers: dict[str, PinnedStager] = {}
-
-    def depends_on(self):
-        return {self._kv_cache_name}
 
     def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,

@@ -1,5 +1,8 @@
-"""benchmark/tts_speech_wer.py: clips over Whisper's 30 s window are transcribed whole."""
+"""benchmark/tts_speech_wer.py and chatterbox/wer_eval.py: long clips are transcribed whole, and a missing
+WAV counts against WER."""
 
+import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -107,3 +110,50 @@ def test_the_long_form_features_cover_the_whole_clip():
                       padding="longest", return_attention_mask=True)
     assert whole.input_features.shape[-1] == 45 * SR // HOP
     assert int(whole.attention_mask.sum()) == 45 * SR // HOP
+
+
+def test_a_sentence_without_audio_scores_as_an_empty_transcript(tmp_path, monkeypatch):
+    """A failed request leaves no WAV; skipping it would make WER look better (#1047).
+    The run sent the first three sentences, as its report beside the WAVs says."""
+    (tmp_path / "sentences.txt").write_text("red fox\nblue cat\ngreen dog\nbrown cow\n")
+    (tmp_path / "report.json").write_text(json.dumps({"num_sentences": 3}))
+    for sid in (1, 3):
+        (tmp_path / f"{sid:04d}.wav").touch()
+    monkeypatch.setattr(tts_speech_wer, "transcribe", lambda paths, *a: ["red fox", "green dog"])
+    out = tmp_path / "wer.json"
+    tts_speech_wer.main(["--audio-dir", str(tmp_path), "--sentences", str(tmp_path / "sentences.txt"),
+                         "--out", str(out)])
+    report = json.loads(out.read_text())
+    assert (report["total_errors"], report["total_words"]) == (2, 6)
+    assert report["missing"] == [2]
+
+
+@pytest.mark.parametrize(("record", "content", "wavs", "sentences", "references", "hypotheses"), [
+    # benchmark.runner: 4 requests over 3 sentences (they wrap); request 2 failed
+    ("results.json", {"completed": 3, "failed": 1}, ["req_0", "req_1", "req_3"], ["red fox", "blue cat", "green dog"],
+     ["red fox", "blue cat", "green dog", "red fox"], ["req_0", "req_1", "", "req_3"]),
+    # bench_chatterbox_vllm.py: 3 of the file's 4 sentences sent; request 1 failed
+    ("summary.json", {"num_sentences": 3}, ["000", "002"], ["red fox", "blue cat", "green dog", "brown cow"],
+     ["red fox", "blue cat", "green dog"], ["000", "", "002"]),
+], ids=["runner", "vllm"])
+def test_wer_eval_scores_every_request_its_producer_recorded(tmp_path, monkeypatch, record, content, wavs,
+                                                             sentences, references, hypotheses):
+    """chatterbox/wer_eval.py scores the requests the run's own record says it sent, not one per sentence."""
+    sf = pytest.importorskip("soundfile")
+    pytest.importorskip("torchaudio")
+    from benchmark.chatterbox import wer_eval
+
+    (tmp_path / "sentences.txt").write_text("\n".join(sentences) + "\n")
+    (tmp_path / record).write_text(json.dumps(content))
+    for stem in wavs:
+        sf.write(str(tmp_path / f"{stem}.wav"), np.zeros(1, dtype=np.float32), 16000)
+    scored = []
+    monkeypatch.setattr(wer_eval, "transcribe", lambda paths, *a: ([p.stem for p in paths], str.lower))
+    monkeypatch.setattr(wer_eval, "_compute_wer",
+                        lambda refs, hyps: scored.append((refs, hyps)) or {"wer": 0.0, "per_sample": []})
+    out = tmp_path / "wer.json"
+    monkeypatch.setattr(sys, "argv", ["wer_eval", "--wavs", str(tmp_path), "--sentences",
+                                      str(tmp_path / "sentences.txt"), "--out", str(out)])
+    wer_eval.main()
+    assert scored[-1] == (references, hypotheses)
+    assert json.loads(out.read_text())["missing"] == [hypotheses.index("")]

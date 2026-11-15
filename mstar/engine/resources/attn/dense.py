@@ -21,12 +21,46 @@ logger = logging.getLogger(__name__)
 
 # imported here, not per `run`: the wheel may be absent, so keep the failure
 try:
-    from fa3_fwd_interface import flash_attn_varlen_func
+    from fa3_fwd_interface import flash_attn_func, flash_attn_varlen_func
 except Exception as _fa3_exc:  # noqa: BLE001
-    flash_attn_varlen_func = None
+    flash_attn_func = flash_attn_varlen_func = None
     _VARLEN_IMPORT_ERROR: str | None = f"{type(_fa3_exc).__name__}: {_fa3_exc}"
 else:
     _VARLEN_IMPORT_ERROR = None
+
+
+# What a fixed-length forward into a given output passes the fa3-fwd extension op, by
+# name, beyond q / k / v: everything else keeps the op's own default, which is the
+# feature's off value (no window, softcap, rotary, paging or FP8 scales). num_splits=1
+# is what flash_attn_func and flash_attn_varlen_func pass; the op's default, 0, picks a
+# split by heuristic, which can change the output from varlen's.
+_FA3_FIXED_KWARGS = {"is_causal": False, "num_splits": 1}
+
+
+def _fa3_fixed_into():
+    """FA3's fixed-length forward writing into a given output, or None. The
+    interface's own entry point allocates its output and refuses one passed in
+    (a custom op may not return an input), so this calls the extension op behind
+    it by its arguments' names. The op isn't a public API, so a build whose op
+    doesn't name them gets None, and its callers keep to the varlen kernel."""
+    try:
+        op = torch.ops.fa3_fwd.fwd
+        names = {a.name for a in op.default._schema.arguments}
+    except Exception:  # noqa: BLE001
+        return None
+    missing = {"out", "softmax_scale", *_FA3_FIXED_KWARGS} - names
+    if missing:
+        logger.info("fa3-fwd's forward op lacks %s; long segments run on the varlen kernel", sorted(missing))
+        return None
+
+    def run(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor, softmax_scale: float) -> None:
+        # q [1, Sq, H, D], k / v [1, Sk, Hkv, D], out [1, Sq, H, Dv]
+        op(q, k, v, out=out, softmax_scale=softmax_scale, **_FA3_FIXED_KWARGS)
+
+    return run
+
+
+fa3_fixed_into = _fa3_fixed_into() if flash_attn_func is not None else None
 
 # ROCm has no FA3; AITER's varlen FMHA takes the same call, so dense runs on it
 # there instead of degrading to the paged backend
@@ -174,6 +208,11 @@ class DenseAttentionManager(AttentionManager):
     (``PositionManager`` would only work for labels supplying explicit pos_ids).
     """
 
+    # attends the K/V it is handed, which an exchange hands it whole
+    supports_split_steps = True
+    # the gathered prefix is keyed on the stream's generation, which the KV's drop moves on
+    supports_drop = True
+
     def __init__(
         self,
         kv_cache: str,
@@ -222,9 +261,6 @@ class DenseAttentionManager(AttentionManager):
         # the kernel, not just the class: FA3 and each FlashInfer backend
         # differ in the last bits
         return fingerprint(type(self).__name__, self._wrapper_class.__name__, self._flashinfer_backend)
-
-    def depends_on(self):
-        return {self._kv_cache_name}
 
     def can_capture(self) -> bool:
         return False
@@ -297,6 +333,7 @@ class DenseAttentionManager(AttentionManager):
         assert plan_outputs is not None, (
             f"Dense Attention Manager expected plan result from {self._kv_cache_name}"
         )
+        self._check_sequence_shard(ctx)
 
         self._current_plans = {
             plan_label: self._build_plan(kv_out, step.causal, EagerSlotKey(label=plan_label, slot=ctx.slot))
@@ -401,6 +438,9 @@ class DenseAttentionManager(AttentionManager):
         written to the pages."""
         if label is None:
             label = self._default_label
+        if self._shard is not None:
+            # dense attention takes no placed pool, so its KV is stored by head
+            self._shard.check_bypass(label, "attention run", by_head=True)
         if layer_idx is None:
             layer_idx = self._default_layer_idx
         assert k is not None and v is not None and layer_idx is not None, (

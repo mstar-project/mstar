@@ -15,17 +15,10 @@ from types import SimpleNamespace
 
 from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread, ResultQueue
 from mstar.communication.event import EventWakeup
-from mstar.model.base import Model
+from mstar.testing_utils.model import StubModel
 
 
-class _Model:
-    def get_partition_topology(self):
-        from mstar.streaming.topology import PartitionTopology
-        return PartitionTopology(partitions=["default"])
-    # the inline path's per-value default, over the stub's postprocess
-    postprocess_inline = Model.postprocess_inline
-    text_output = Model.text_output
-
+class _Model(StubModel):
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()
 

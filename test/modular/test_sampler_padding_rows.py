@@ -31,7 +31,7 @@ UNINITIALIZED = "uninitialized SeenTokenMask"
 
 def _resource() -> SamplerResource:
     res = SamplerResource(
-        vocab_size=VOCAB, enable_repetion_penalty=True, device=torch.device("cpu"),
+        vocab_size=VOCAB, enable_repetition_penalty=True, device=torch.device("cpu"),
     )
     for rid in REAL:
         res.ingest_request(rid, SamplingReqConfig(repetition_penalty=1.3))

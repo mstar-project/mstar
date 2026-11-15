@@ -4,9 +4,9 @@
 //   csrc/moe/moe_align_sum_kernels.cu
 // Trimmed to just the ``moe_align_block_size`` host function + its kernels
 // (moe_sum was dropped) and made self-contained: WARP_SIZE / CEILDIV are
-// inlined and the type dispatch is hardcoded to int32 (mstar always passes
-// int32 topk_ids), so the vLLM cuda_compat.h / dispatch_utils.h headers are
-// not needed.  Registered under the ``_mstar_moe_C`` op namespace so it never
+// inlined and the type dispatch is ATen's index types (int32 or int64
+// topk_ids), so the vLLM cuda_compat.h / dispatch_utils.h headers are not
+// needed.  Registered under the ``_mstar_moe_C`` op namespace so it never
 // collides with a real vLLM ``_moe_C`` in the same process.
 //
 // Local change: the small-batch kernel skips ids >= num_experts, as the
@@ -210,6 +210,76 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
   }
 }
 
+// Decode-sized batches with more than 64 experts: count, scan, expert ids and the
+// scatter in one block, where the two-kernel path below launches twice. One thread per
+// expert in the scan (num_experts < 1024 is checked by the caller), the slots strided
+// over the block.
+template <typename scalar_t>
+__global__ void moe_align_block_size_single_block_kernel(
+    const scalar_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids, int32_t* __restrict__ expert_ids,
+    int32_t* __restrict__ total_tokens_post_pad, int32_t num_experts,
+    int32_t block_size, size_t numel, int32_t max_num_tokens_padded) {
+  extern __shared__ int32_t smem[];
+  int32_t* counts = smem;                   // num_experts
+  int32_t* offsets = smem + num_experts;    // num_experts + 1
+
+  for (size_t it = threadIdx.x; it < max_num_tokens_padded; it += blockDim.x) {
+    sorted_token_ids[it] = numel;
+  }
+  for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
+    counts[e] = 0;
+  }
+  __syncthreads();
+
+  for (size_t i = threadIdx.x; i < numel; i += blockDim.x) {
+    int expert_id = topk_ids[i];
+    if (expert_id >= num_experts) {
+      continue;
+    }
+    atomicAdd(&counts[expert_id], 1);
+  }
+  __syncthreads();
+
+  using BlockScan = cub::BlockScan<int32_t, 1024>;
+  __shared__ typename BlockScan::TempStorage temp_storage;
+  int32_t padded = 0;
+  if (threadIdx.x < num_experts) {
+    padded = CEILDIV(counts[threadIdx.x], block_size) * block_size;
+  }
+  int32_t start;
+  BlockScan(temp_storage).ExclusiveSum(padded, start);
+  if (threadIdx.x <= num_experts) {
+    offsets[threadIdx.x] = start;
+  }
+  if (threadIdx.x == num_experts) {
+    *total_tokens_post_pad = start;
+  }
+  __syncthreads();
+
+  if (threadIdx.x < num_experts) {
+    for (int i = offsets[threadIdx.x]; i < offsets[threadIdx.x + 1]; i += block_size) {
+      expert_ids[i / block_size] = threadIdx.x;
+    }
+  }
+  const size_t fill_start_idx = offsets[num_experts] / block_size + threadIdx.x;
+  const size_t expert_ids_size = CEILDIV(max_num_tokens_padded, block_size);
+  for (size_t i = fill_start_idx; i < expert_ids_size; i += blockDim.x) {
+    expert_ids[i] = 0;
+  }
+  // every read of the offsets above lands before the scatter below moves them
+  __syncthreads();
+
+  for (size_t i = threadIdx.x; i < numel; i += blockDim.x) {
+    int expert_id = topk_ids[i];
+    if (expert_id >= num_experts) {
+      continue;
+    }
+    int32_t rank_post_pad = atomicAdd(&offsets[expert_id], 1);
+    sorted_token_ids[rank_post_pad] = i;
+  }
+}
+
 }  // namespace moe
 }  // namespace mstar
 
@@ -219,8 +289,9 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
                           int64_t block_size, torch::Tensor sorted_token_ids,
                           torch::Tensor experts_ids,
                           torch::Tensor num_tokens_post_pad) {
-  TORCH_CHECK(topk_ids.scalar_type() == torch::kInt32,
-              "moe_align_block_size: topk_ids must be int32");
+  TORCH_CHECK(topk_ids.scalar_type() == torch::kInt32 ||
+                  topk_ids.scalar_type() == torch::kInt64,
+              "moe_align_block_size: topk_ids must be int32 or int64");
   const at::cuda::OptionalCUDAGuard device_guard(device_of(topk_ids));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -234,51 +305,65 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
   TORCH_CHECK(padded_num_experts < 1024,
               "padded_num_experts must be less than 1024");
 
-  using scalar_t = int32_t;
-  // calc needed amount of shared mem for `cumsum` tensors
-  auto options_int =
-      torch::TensorOptions().dtype(torch::kInt).device(topk_ids.device());
-  torch::Tensor cumsum_buffer = torch::empty({num_experts + 1}, options_int);
-  bool small_batch_expert_mode =
-      (topk_ids.numel() < 1024) && (num_experts <= 64);
+  // a router's int64 ids are read as they are: no cast kernel ahead of this one
+  AT_DISPATCH_INDEX_TYPES(topk_ids.scalar_type(), "moe_align_block_size", [&] {
+    using scalar_t = index_t;
+    // calc needed amount of shared mem for `cumsum` tensors
+    auto options_int =
+        torch::TensorOptions().dtype(torch::kInt).device(topk_ids.device());
+    torch::Tensor cumsum_buffer = torch::empty({num_experts + 1}, options_int);
+    bool small_batch_expert_mode =
+        (topk_ids.numel() < 1024) && (num_experts <= 64);
+    // a decode step's slots fit one block: one launch instead of align + sort
+    bool single_block_mode = !small_batch_expert_mode && topk_ids.numel() < 4096;
 
-  if (small_batch_expert_mode) {
-    const int32_t threads = max((int32_t)num_experts, WARP_SIZE);
-    const int32_t shared_mem_size =
-        ((threads + 1) * num_experts + (num_experts + 1)) * sizeof(int32_t);
+    if (small_batch_expert_mode) {
+      const int32_t threads = max((int32_t)num_experts, WARP_SIZE);
+      const int32_t shared_mem_size =
+          ((threads + 1) * num_experts + (num_experts + 1)) * sizeof(int32_t);
 
-    auto small_batch_expert_kernel =
-        mstar::moe::moe_align_block_size_small_batch_expert_kernel<scalar_t>;
-    small_batch_expert_kernel<<<1, threads, shared_mem_size, stream>>>(
-        topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
-        experts_ids.data_ptr<int32_t>(),
-        num_tokens_post_pad.data_ptr<int32_t>(), num_experts, block_size,
-        topk_ids.numel(), sorted_token_ids.size(0));
-  } else {
-    auto align_kernel = mstar::moe::moe_align_block_size_kernel<scalar_t>;
+      auto small_batch_expert_kernel =
+          mstar::moe::moe_align_block_size_small_batch_expert_kernel<scalar_t>;
+      small_batch_expert_kernel<<<1, threads, shared_mem_size, stream>>>(
+          topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
+          experts_ids.data_ptr<int32_t>(),
+          num_tokens_post_pad.data_ptr<int32_t>(), num_experts, block_size,
+          topk_ids.numel(), sorted_token_ids.size(0));
+    } else if (single_block_mode) {
+      const size_t shared_mem_size = (2 * num_experts + 1) * sizeof(int32_t);
+      auto single_block_kernel =
+          mstar::moe::moe_align_block_size_single_block_kernel<scalar_t>;
+      single_block_kernel<<<1, 1024, shared_mem_size, stream>>>(
+          topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
+          experts_ids.data_ptr<int32_t>(),
+          num_tokens_post_pad.data_ptr<int32_t>(), num_experts, block_size,
+          topk_ids.numel(), sorted_token_ids.size(0));
+    } else {
+      auto align_kernel = mstar::moe::moe_align_block_size_kernel<scalar_t>;
 
-    size_t num_warps = CEILDIV(padded_num_experts, experts_per_warp);
-    size_t shared_mem_size = num_warps * experts_per_warp * sizeof(int32_t);
+      size_t num_warps = CEILDIV(padded_num_experts, experts_per_warp);
+      size_t shared_mem_size = num_warps * experts_per_warp * sizeof(int32_t);
 
-    align_kernel<<<1, threads, shared_mem_size, stream>>>(
-        topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
-        experts_ids.data_ptr<int32_t>(),
-        num_tokens_post_pad.data_ptr<int32_t>(), num_experts,
-        padded_num_experts, experts_per_warp, block_size, topk_ids.numel(),
-        cumsum_buffer.data_ptr<int32_t>(), sorted_token_ids.size(0));
+      align_kernel<<<1, threads, shared_mem_size, stream>>>(
+          topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
+          experts_ids.data_ptr<int32_t>(),
+          num_tokens_post_pad.data_ptr<int32_t>(), num_experts,
+          padded_num_experts, experts_per_warp, block_size, topk_ids.numel(),
+          cumsum_buffer.data_ptr<int32_t>(), sorted_token_ids.size(0));
 
-    const int block_threads = std::min(256, (int)threads);
-    const int num_blocks =
-        (topk_ids.numel() + block_threads - 1) / block_threads;
-    const int max_blocks = 65535;
-    const int actual_blocks = std::min(num_blocks, max_blocks);
+      const int block_threads = std::min(256, (int)threads);
+      const int num_blocks =
+          (topk_ids.numel() + block_threads - 1) / block_threads;
+      const int max_blocks = 65535;
+      const int actual_blocks = std::min(num_blocks, max_blocks);
 
-    auto sort_kernel =
-        mstar::moe::count_and_sort_expert_tokens_kernel<scalar_t>;
-    sort_kernel<<<actual_blocks, block_threads, 0, stream>>>(
-        topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
-        cumsum_buffer.data_ptr<int32_t>(), topk_ids.numel(), num_experts);
-  }
+      auto sort_kernel =
+          mstar::moe::count_and_sort_expert_tokens_kernel<scalar_t>;
+      sort_kernel<<<actual_blocks, block_threads, 0, stream>>>(
+          topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
+          cumsum_buffer.data_ptr<int32_t>(), topk_ids.numel(), num_experts);
+    }
+  });
 }
 
 TORCH_LIBRARY(_mstar_moe_C, m) {

@@ -9,7 +9,7 @@ from mstar.engine.resources import AttentionStep, KVStep, Segment, StepContext, 
 from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVLayout, PagedKVConfig
-from mstar.engine.resources.kv.plan import SequenceView, context_only_views
+from mstar.engine.resources.kv.plan import SequenceView, build_paged_indptrs
 
 CPU = torch.device("cpu")
 LAT, ROPE, H, PAGE = 8, 4, 2, 4
@@ -30,14 +30,15 @@ def _cfg():
     )
 
 
-def test_context_only_views_drop_the_appended_tail():
-    views = [SequenceView("a", "main", [3, 7, 1], length=8, to_compute=3),
-             SequenceView("b", "main", [4, 2], length=6, to_compute=3)]
-    out = context_only_views(views, [2, 2], PAGE)
-    assert out[0].length == 5 and out[0].to_compute == 2 and out[0].page_idxs == [3, 7]
-    assert out[1].length == 3 and out[1].to_compute == 2 and out[1].page_idxs == [4]
-    empty = context_only_views([SequenceView("c", "main", [9], length=3, to_compute=3)], [2], PAGE)[0]
-    assert empty.length == 0 and empty.page_idxs == []
+def test_context_only_indptrs_drop_the_appended_tail():
+    views = [SequenceView("a", "main", [3, 7, 1], length=10, to_compute=3),
+             SequenceView("b", "main", [4, 2], length=6, to_compute=3),
+             SequenceView("c", "main", [9], length=3, to_compute=3)]
+    out = build_paged_indptrs(views, PAGE).context_only(PAGE, torch.tensor([0, 2, 4, 6], dtype=torch.int32))
+    assert out.qo_indptr.tolist() == [0, 2, 4, 6]
+    # stored 7, 3 and 0 tokens: pages [3, 7], [4] and none
+    assert out.paged_kv_indptr.tolist() == [0, 2, 3, 3] and out.paged_kv_indices.tolist() == [3, 7, 4]
+    assert out.paged_kv_last_page_len.tolist()[:2] == [3, 3]
 
 
 def test_queries_attend_to_the_stored_context_only(monkeypatch):

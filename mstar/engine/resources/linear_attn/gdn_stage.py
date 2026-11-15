@@ -39,12 +39,12 @@ class GDNStagedInputs(NamedTuple):
 
 def gdn_stage_applies(device: torch.device, geometry: DeltaNetGeometry) -> bool:
     """Whether ``stage_gdn_prefill_inputs`` can stand in for the eager path on
-    this pool: one head dim for q, k and v, and a GPU it has been measured on.
-    Nothing in the kernel is specific to Blackwell; older ones keep the eager
-    path until someone measures them."""
+    this pool: one head dim for q, k and v, and a GPU it has been measured on
+    (Hopper and Blackwell). Nothing in the kernel is specific to them; older
+    ones keep the eager path until someone measures them."""
     return (
         device.type == "cuda"
-        and current_platform.has_cuda_capability(10, 0, device)
+        and current_platform.has_cuda_capability(9, 0, device)
         and geometry.head_k_dim == geometry.head_v_dim
         and geometry.head_k_dim <= _MAX_HEAD_DIM
     )

@@ -4,7 +4,7 @@ The Talker is a smaller MoE transformer (1024 hidden, 20 layers) that runs
 in streaming mode alongside the Thinker.  Key differences from the Thinker:
 
 1. Standard 1-D RoPE (no 3-D MRoPE).
-2. All layers are MoE with a shared expert (``SparseMoeBlockWithSharedExpert``).
+2. All layers are MoE with a shared expert (``ParallelSparseMoeBlock`` with ``shared_expert``).
 3. No ``lm_head`` -- uses ``codec_head`` for codec token prediction.
 4. Has ``codec_embedding`` for layer-0 codec tokens.
 5. Has ``text_projection`` and ``hidden_projection`` MLPs that project
@@ -20,8 +20,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components import ParallelSparseMoeBlockWithSharedExpert, RMSNorm, TopKRouter
-from mstar.model.components.decoder_layer import DecoderLayer, run_layers
+from mstar.model.components import ParallelSparseMoeBlock, RMSNorm, TopKRouter
+from mstar.model.components.decoder_layer import DecoderLayer, eager_frame, no_cursor, run_layers
 from mstar.model.components.distributed import ParallelGatedMLP
 from mstar.model.qwen3_omni.components.attention import Qwen3OmniAttention
 from mstar.model.qwen3_omni.config import TALKER_ATTN, TALKER_KV, TALKER_POS, Qwen3OmniModelConfig, TalkerTextConfig
@@ -79,9 +79,10 @@ class Qwen3OmniTalkerLayer(DecoderLayer):
                 comm_group=comm_group,
                 attn_key=TALKER_ATTN,
                 kv_key=TALKER_KV,
-                pos_key=TALKER_POS
+                pos_key=TALKER_POS,
+                layer=layer_idx,
             ),
-            mlp=ParallelSparseMoeBlockWithSharedExpert(
+            mlp=ParallelSparseMoeBlock(
                 hidden_size=hidden_size,
                 moe_intermediate_size=config.moe_intermediate_size,
                 num_experts=config.num_experts,
@@ -134,16 +135,9 @@ class Qwen3OmniTalkerLanguageModel(nn.Module):
         # same on every rank, making the lookup output naturally replicated.
         self.codec_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
 
-    def forward(
-        self,
-        input_embeds: torch.Tensor,
-        label: str = "main",
-    ) -> torch.Tensor:
-        # The label and layer index are cursors on the shared resources: bind
-        # the label once, advance the index per layer (`run_layers`). Passing
-        # them as arguments instead would make inductor specialize on the int.
-        self.layers[0].self_attn.attend.bind_step(label)
-        return run_layers(self.layers, input_embeds, self.norm)
+    @eager_frame
+    def forward(self, input_embeds: torch.Tensor) -> torch.Tensor:
+        return run_layers(self.layers, input_embeds, self.norm, no_cursor)
 
 
 # ---------------------------------------------------------------------------
@@ -202,11 +196,7 @@ class Qwen3OmniTalkerModel(nn.Module):
             thinker_hidden_size, intermediate_size, talker_text.hidden_size
         )
 
-    def forward(
-        self,
-        input_embeds: torch.Tensor,
-        label: str = "main",
-    ) -> torch.Tensor:
+    def forward(self, input_embeds: torch.Tensor) -> torch.Tensor:
         """Run the Talker backbone and return the final hidden states.
 
         The caller is responsible for applying ``self.codec_head`` to produce
@@ -215,11 +205,8 @@ class Qwen3OmniTalkerModel(nn.Module):
         Args:
             input_embeds: [total_tokens, hidden_size] -- pre-embedded input
                 (may combine codec embeddings and projected Thinker states).
-            label: the plan key every layer runs against.
 
         Returns:
             hidden_states: [total_tokens, hidden_size] after final RMS norm.
         """
-        return self.model(
-            input_embeds=input_embeds, label=label,
-        )
+        return self.model(input_embeds=input_embeds)

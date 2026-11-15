@@ -37,14 +37,13 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
 )
-from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.state import ArrayStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.components.predictor import VJEPA2Predictor
 from mstar.model.vjepa2.components.vit_encoder import VJEPA2Encoder
-from mstar.model.vjepa2.config import AC_ROLLOUT_NUM_FRAMES, ATTN, KV_CACHE, VJepa2Config
+from mstar.model.vjepa2.config import AC_ROLLOUT_NUM_FRAMES, KV_CACHE, VJepa2Config
 
 # the AC predictor's transformer block loop, as a piecewise capture region
 BLOCK_LOOP_REGION = "block_loop"
@@ -662,10 +661,9 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
 
         ``can_batch`` guarantees all rids are at the same ``iter_idx`` (else
         we fall to sequential), so the rollout-step math is a single
-        ``[B, N, D]`` forward.  Per-request early-exit (``check_stop``)
-        still fires independently when each rid's ``rollout_horizon`` is
-        reached — individual rids can drop out while others continue, and
-        the scheduler re-batches remaining rids on the next iter.
+        ``[B, N, D]`` forward.  Each rid's loop ends on its own cap (its
+        ``rollout_horizon``), so rids can drop out while others continue,
+        and the scheduler re-batches the remaining rids on the next iter.
         """
         request_ids = engine_inputs.request_ids
         per_request_info = engine_inputs.per_request_info
@@ -695,21 +693,6 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
             for i, rid in enumerate(request_ids)
         }
 
-    def check_stop(
-        self, request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: Mapping[str, list[torch.Tensor]],
-    ) -> set[str]:
-        iter_idx = request_info.dynamic_loop_iter_counts.get("rollout_loop", 0)
-        horizon = int(request_info.step_metadata.get("rollout_horizon", 0) or 0)
-        if horizon > 0 and iter_idx + 1 >= horizon:
-            logger.info(
-                "VJepa2RolloutPredictorSubmodule.forward: horizon H=%d reached at iter=%d; stopping rollout_loop.",
-                horizon,
-                iter_idx,
-            )
-            return {"rollout_loop"}
-        return set()
 
 
 class VJepa2ACPredictorSubmodule(ARNodeSubmodule):
@@ -718,8 +701,8 @@ class VJepa2ACPredictorSubmodule(ARNodeSubmodule):
     Additional required inputs vs the masked predictor: ``actions``,
     ``states``, and optionally ``extrinsics``.  Each is per-timestep, shape
     ``[T, action_embed_dim]`` (or ``[T, action_embed_dim - 1]`` for
-    extrinsics), delivered as a GraphEdge by the model's ``process_prompt``
-    / ``get_initial_forward_pass_args``.  Output is ``predicted_hidden``
+    extrinsics), emitted by the model's ``process_prompt`` and sent to this
+    node as an input edge of the walk.  Output is ``predicted_hidden``
     with the same shape as ``encoder_hidden``.
     """
 
@@ -882,9 +865,12 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
     forward based on ``iter_idx`` — the tensors themselves don't change.
 
     Shares the sibling rollout submodule's batching contract (``B >= 2``
-    + shape + same-iter homogeneity) and ``check_stop`` early-exit
-    semantics.
+    + shape + same-iter homogeneity) and per-request horizon.
     """
+
+    # Both forwards only call `_rollout_step`, so compiling them would compile only the glue around the region's replay
+    # and the eager predictor. The region's capture follows its own config, which doesn't compile.
+    disable_torch_compile = True
 
     def __init__(
         self,
@@ -909,7 +895,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         it around each replay, outside the graph.
         """
         cond_tokens = inp.kwargs.get("cond_tokens")
-        fn = self.predictor.make_block_loop_fn("main", inp.static_inputs, cond_tokens)
+        fn = self.predictor.make_block_loop_fn(cached=True, static_pos_bufs=inp.static_inputs, cond_tokens=cond_tokens)
         return {"x": fn(inp.static_inputs["x"])}
 
     def get_piecewise_accelerator_graph_configs(
@@ -920,8 +906,8 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
 
         ``capture_seq_len = cond_tokens + N*N`` is the per-frame token count
         (one rollout step processes one frame). The block loop reads the KV
-        cache, so the region declares its own ``KVStep`` / ``AttentionStep``
-        and takes its slot with ``lease_before_step=True``.
+        cache, so the region declares its own state and takes its slot with
+        ``lease_before_step=True``.
         """
         ac = self.config.ac_predictor
         if ac is None:
@@ -954,10 +940,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
                     Segment(request_id=rid, label="main", span=seq_len)
                     for rid, seq_len in zip(request_ids, seq_lens, strict=True)
                 ],
-                steps={
-                    KV_CACHE: KVStep(),
-                    ATTN: AttentionStep(causal=False)
-                }
+                state={KV_CACHE: ArrayStep()},
             )
 
         return {
@@ -1036,7 +1019,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
                 Segment(request_id=rid, label="main", span=inp.input_seq_len)
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
-            steps={KV_CACHE: KVStep(), ATTN: AttentionStep(causal=False)},
+            state={KV_CACHE: ArrayStep()},
         )
 
     # ------------------------------------------------------------------
@@ -1132,13 +1115,12 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         return out
 
     @staticmethod
-    def _leased_runner(engine_inputs: ModelInputsFromEngine) -> PiecewiseAcceleratorGraphRunner | None:
+    def _leased_runner(engine_inputs: ModelInputsFromEngine):
         """The block loop's runner when this step leased it, else None."""
         if BLOCK_LOOP_REGION not in engine_inputs.piecewise_leases:
             return None
         return engine_inputs.piecewise_runners[BLOCK_LOOP_REGION]
 
-    @torch.compiler.disable
     def _rollout_step(
         self,
         encoder_hidden: torch.Tensor,            # [B, H*W, D]
@@ -1147,7 +1129,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         t_0: int,
         extrinsics: torch.Tensor | None = None,  # [B, 1, action_embed_dim - 1] or None
         request_ids: list[str] | None = None,    # needed by PiecewiseCudaGraphRunner
-        runner: "PiecewiseAcceleratorGraphRunner | None" = None,
+        runner=None,
     ) -> torch.Tensor:
         """One AC rollout step using either the CUDA-graph or eager path.
 
@@ -1191,7 +1173,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
                 t_0=t_0,
                 # without this every block takes plain SDPA and writes no K/V,
                 # leaving a gap in `main` that the declared span counted
-                label="main",
+                cached=True,
             )
 
         # Per-step LayerNorm — matches the upstream notebook's step_predictor
@@ -1273,21 +1255,6 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             for i, rid in enumerate(request_ids)
         }
 
-    def check_stop(
-        self, request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: Mapping[str, list[torch.Tensor]],
-    ) -> set[str]:
-        horizon = int(request_info.step_metadata.get("rollout_horizon", 0) or 0)
-        iter_idx = request_info.dynamic_loop_iter_counts.get("rollout_loop", 0)
-        if horizon > 0 and iter_idx + 1 >= horizon:
-            logger.info(
-                "VJepa2ACRolloutPredictorSubmodule.forward: horizon H=%d reached at iter=%d; stopping rollout_loop.",
-                horizon,
-                iter_idx,
-            )
-            return {"rollout_loop"}
-        return set()
 
 
 # ---------------------------------------------------------------------------

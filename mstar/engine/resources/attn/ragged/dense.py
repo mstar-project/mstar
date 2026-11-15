@@ -6,9 +6,14 @@ FA3 takes no workspace, so these managers allocate none.
 import functools
 import logging
 
-from mstar.engine.resources.attn.ragged.base import _RaggedCrossManagerBase, _RaggedSelfManagerBase
+from mstar.engine.resources.attn.ragged.base import (
+    _RaggedCrossManagerBase,
+    _RaggedKeyPrefixManagerBase,
+    _RaggedSelfManagerBase,
+)
 from mstar.engine.resources.attn.ragged.config import RaggedAttnBackend
 from mstar.engine.resources.attn.ragged.dense_wrappers import (
+    DenseKeyPrefixPrefillWrapper,
     DenseRaggedCrossPrefillWrapper,
     DenseRaggedPrefillWrapper,
 )
@@ -39,3 +44,7 @@ class DenseRaggedManager(_RaggedSelfManagerBase):
 
 class DenseRaggedCrossManager(_RaggedCrossManagerBase):
     wrapper_class = DenseRaggedCrossPrefillWrapper
+
+
+class DenseRaggedKeyPrefixManager(_RaggedKeyPrefixManagerBase):
+    wrapper_class = DenseKeyPrefixPrefillWrapper

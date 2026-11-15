@@ -19,7 +19,6 @@ a long one, and the budget bounds a forward's memory.
 
 from __future__ import annotations
 
-import functools
 from collections.abc import Mapping
 from typing import Any
 
@@ -34,10 +33,15 @@ from mstar.engine.accelerator_graph_config import (
     PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
+from mstar.engine.state import ArrayStep, Segment, SlotLease, SubmoduleStep, kernel_setting
 from mstar.model.omnilingual_asr.components.wav2vec2 import Wav2Vec2CTC
-from mstar.model.omnilingual_asr.config import ENCODER_ATTN, SAMPLE_RATE, TOKEN_IDS, WAVEFORM
+from mstar.model.omnilingual_asr.config import (
+    ENCODER_ATTN,
+    ENCODER_TOKENS,
+    SAMPLE_RATE,
+    TOKEN_IDS,
+    WAVEFORM,
+)
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 # The packed encoder (layers, final norm, CTC head, argmax) as a piecewise
@@ -70,6 +74,11 @@ class OmniASRCTCSubmodule(NodeSubmodule):
         self._max_batch_size = max_batch_size
         self._max_batch_samples = int(max_batch_seconds * SAMPLE_RATE)
         self._max_batch_frames = model.frame_lengths([self._max_batch_samples])[0]
+        # stays None in fp32, since the engine binds no handles on a node that declares none
+        self.tokens = None
+
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.tokens = handles[ENCODER_TOKENS]
 
     def compile_regions(self) -> dict[str, list[tuple]]:
         """Eager, each conv layer's channel LayerNorm (in fp32, over a transposed
@@ -104,10 +113,10 @@ class OmniASRCTCSubmodule(NodeSubmodule):
         **kwargs: Any,
     ) -> SubmoduleStep | None:
         """One attention segment per request, its valid frames, when the
-        encoder attends packed (see `get_node_resources`). Leased, the captured
+        encoder attends packed (see `declare_state`). Leased, the captured
         encoder plans its own."""
         if (
-            ENCODER_ATTN not in self.node_resources
+            self.tokens is None
             or (piecewise_leases or {}).get(ENCODER_LOOP)
             or not self._packs([inp.input_seq_len for inp in inputs])
         ):
@@ -117,7 +126,7 @@ class OmniASRCTCSubmodule(NodeSubmodule):
                 Segment(request_id=rid, label="main", span=inp.input_seq_len)
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
-            steps={ENCODER_ATTN: AttentionStep(causal=False)},
+            state={ENCODER_TOKENS: ArrayStep()},
         )
 
     def get_piecewise_accelerator_graph_configs(
@@ -126,7 +135,7 @@ class OmniASRCTCSubmodule(NodeSubmodule):
         """The packed encoder, one replay a step: every request's frames are a
         segment of one row (`one_row_per_step`). Eager, the encoder is a few
         hundred small launches, which bounds a lone clip's latency."""
-        if ENCODER_ATTN not in self.node_resources:
+        if self.tokens is None:
             return {}
         model_dim = self.model.config.model_dim
 
@@ -137,7 +146,7 @@ class OmniASRCTCSubmodule(NodeSubmodule):
             ENCODER_LOOP: PiecewisePackedConfig(
                 capture_fn=self._capture_encoder,
                 make_static_inputs=make_static_inputs,
-                attn_key=ENCODER_ATTN,
+                array=ENCODER_TOKENS,
                 lease_before_step=True,
                 can_lease=self._fits_capture,
                 one_row_per_step=True,
@@ -148,8 +157,11 @@ class OmniASRCTCSubmodule(NodeSubmodule):
 
     def _capture_encoder(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
         """The captured region: reads the runner's buffer, never rebinds."""
-        attn = functools.partial(inp.resources[ENCODER_ATTN].run, label="main")
-        return {"ids": self.model.encode_packed(inp.static_inputs["hidden"], attn).argmax(dim=-1)}
+        return {"ids": self.model.encode_packed(inp.static_inputs["hidden"], self._attend).argmax(dim=-1)}
+
+    def _attend(self, layer: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        self.tokens.add(layer, k=k, v=v)
+        return self.tokens.read(layer, q)
 
     def max_batch_size(self, graph_walk: str) -> int:
         del graph_walk
@@ -199,7 +211,7 @@ class OmniASRCTCSubmodule(NodeSubmodule):
         one segment each under the replay's one row, fit the attention
         resource's ``max_segments_per_step`` (read from it, so a YAML override
         holds). A step over the ceiling encodes packed eagerly."""
-        return len(inputs) <= self.node_resources[ENCODER_ATTN].max_segments_per_step and self._packs(
+        return len(inputs) <= kernel_setting(self.tokens, ENCODER_ATTN, "max_segments_per_step") and self._packs(
             [inp.input_seq_len for inp in inputs]
         )
 
@@ -211,7 +223,7 @@ class OmniASRCTCSubmodule(NodeSubmodule):
         return sum(frames) <= self._max_batch_frames
 
     def _transcribe_packed(
-        self, waveforms: list[torch.Tensor], attn, engine_inputs: ModelInputsFromEngine,
+        self, waveforms: list[torch.Tensor], engine_inputs: ModelInputsFromEngine,
     ) -> list[torch.Tensor]:
         """Argmax ids per row: the conv frontend runs padded per sub-batch, then
         every row's valid frames go through the encoder packed, in request order
@@ -234,17 +246,16 @@ class OmniASRCTCSubmodule(NodeSubmodule):
                 seq_lens=frames,
             ).get("ids")
         else:
-            ids = self.model.encode_packed(packed, functools.partial(attn.run, label="main")).argmax(dim=-1)
+            ids = self.model.encode_packed(packed, self._attend).argmax(dim=-1)
         return list(ids.split(frames))
 
     def _transcribe(
-        self, waveforms: list[torch.Tensor], engine_inputs: ModelInputsFromEngine | None = None,
+        self, waveforms: list[torch.Tensor], engine_inputs: ModelInputsFromEngine,
     ) -> list[torch.Tensor]:
         """Argmax ids per row, over the row's valid frames."""
-        attn = getattr(engine_inputs, "resources", {}).get(ENCODER_ATTN)
         lengths = [w.shape[0] for w in waveforms]
-        if attn is not None and self._packs(self.model.frame_lengths(lengths)):
-            return self._transcribe_packed(waveforms, attn, engine_inputs)
+        if self.tokens is not None and self._packs(self.model.frame_lengths(lengths)):
+            return self._transcribe_packed(waveforms, engine_inputs)
         out: list[torch.Tensor | None] = [None] * len(waveforms)
         for group, batch, group_lens in self._padded_groups(waveforms):
             logits, frame_lens = self.model(batch, group_lens)

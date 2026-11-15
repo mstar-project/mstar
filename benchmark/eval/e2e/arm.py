@@ -36,7 +36,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from benchmark.eval.e2e import checks, stress
-from benchmark.eval.server import ManagedServer, ServerError, is_healthy
+from benchmark.eval.server import ManagedServer, ServerError, exit_on_signals, is_healthy, signals_deferred
 
 CASE_TIMEOUT_S = 3600
 QUALITY_TIMEOUT_S = 1800
@@ -225,15 +225,15 @@ def health_after(before: dict, server: ManagedServer, log_path: Path) -> list[st
     return found
 
 
-def dump_stacks(pgid: int, path: Path) -> None:
-    """Every Python thread's stack in the server's process group (``py-spy dump``), for a case that hung; without
+def dump_stacks(sid: int, path: Path) -> None:
+    """Every Python thread's stack in the server's session (``py-spy dump``), for a case that hung; without
     py-spy, the process list and why there are no stacks. Threads only: a hang at an ``await`` shows an idle event
     loop. Retries with ``sudo -n`` only when the job asks (``compare --stacks-sudo``): on a shared cluster a refused
     ``sudo`` is logged, and often mailed to the admins."""
-    r = subprocess.run(["ps", "-o", "pid=,args=", "-g", str(pgid)], capture_output=True, text=True, check=False)
+    r = subprocess.run(["ps", "-o", "pid=,args=", "-g", str(sid)], capture_output=True, text=True, check=False)
     procs = [ln.strip().split(None, 1) for ln in r.stdout.splitlines() if ln.strip()]
     spy = shutil.which("py-spy", path=base_env()["PATH"])
-    lines = [f"# process group {pgid}: {len(procs)} processes; py-spy: {spy or 'not installed (pip install py-spy)'}"]
+    lines = [f"# session {sid}: {len(procs)} processes; py-spy: {spy or 'not installed (pip install py-spy)'}"]
     if spy and not job.get("stacks_sudo"):
         lines[0] += " (no sudo retry; compare --stacks-sudo adds one where ptrace is restricted)"
     for pid, *args in procs:
@@ -311,13 +311,13 @@ def build_rust_server(arm: dict) -> str | None:
     with host_lock(f"rust-server-{tree}"):
         if not binary.exists():
             if not shutil.which("cargo"):
-                return "the Rust frontend needs cargo on the host"
+                return "mstar-server needs cargo on the host"
             target = binary.parent / "target-server"
             r = subprocess.run(["cargo", "build", "-q", "--release"], cwd=f"{arm['src']}/rust/server",
                                env={**os.environ, "PYO3_PYTHON": job["python"], "CARGO_TARGET_DIR": str(target)},
                                capture_output=True, text=True, check=False)
             if r.returncode != 0:
-                return f"Rust frontend build failed: {r.stderr.strip()[-300:]}"
+                return f"mstar-server build failed: {r.stderr.strip()[-300:]}"
             shutil.copy(target / "release" / "mstar-server", binary)
     arm["rust_server"] = str(binary)
     return None
@@ -377,7 +377,11 @@ def case_cmds(case: dict, url: str, label: str, d: Path) -> list[list[str]]:
 
 
 def serve_args(arm: dict) -> list[str]:
-    return [a.replace("{rust_server_bin}", arm.get("rust_server") or "") for a in job["model"].get("serve_args", [])]
+    """The model's ``serve_args`` and its Rust binary unless Python is selected."""
+    args = [a.replace("{rust_server_bin}", arm.get("rust_server") or "") for a in job["model"].get("serve_args", [])]
+    if "--python-frontend" not in args and "--rust-frontend-bin" not in args:
+        args += ["--rust-frontend-bin", arm["rust_server"]]
+    return args
 
 
 def timeout_server(arm: dict, d: Path, timeout_s: float, scratch: str) -> ManagedServer:
@@ -471,8 +475,7 @@ def run_arm(arm_name: str, session: int) -> dict:
         going = run_cases(server, [c for c in mine if not c.get("server_timeout_s")], arm_name, session, cases)
         for to in sorted({c["server_timeout_s"] for c in mine if c.get("server_timeout_s")}) if going else []:
             group = [c for c in mine if c.get("server_timeout_s") == to]
-            with signals_deferred():
-                current.stop()
+            current.stop()
             wait_gpu_idle()
             scratch.append(tempfile.mkdtemp(prefix="mstar-eval-to-"))
             current = timeout_server(arm, d, to, scratch[-1])
@@ -507,26 +510,6 @@ def run_arm(arm_name: str, session: int) -> dict:
             info["cases"] = cases
             _publish("startup.json", info, d)
     return info
-
-
-SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
-
-
-def _on_term(signum, frame) -> None:  # noqa: ARG001
-    raise SystemExit(128 + signum)   # unwinds to run_arm's finally, which stops the server
-
-
-@contextmanager
-def signals_deferred():
-    pending: list[int] = []
-    old = {s: signal.signal(s, lambda n, f: pending.append(n)) for s in SIGNALS}
-    try:
-        yield
-    finally:
-        for s, h in old.items():
-            signal.signal(s, h)
-        if pending:
-            raise SystemExit(128 + pending[0])
 
 
 def watch_lease(lease_s: float) -> None:
@@ -583,13 +566,13 @@ def run() -> None:
         bad = [f"{a}: {p}" for a, p in problems.items() if p]
         return done("error", reason="base and head have different rust/ trees and one did not build: " + "; ".join(bad),
                     **_broken(problems))
-    if any("{rust_server_bin}" in a for a in model.get("serve_args", [])):
-        if not shutil.which("cargo"):
-            return done("skipped", reason="the Rust frontend needs cargo on the host")
-        problems = {a: build_rust_server(arm) for a, arm in arms.items()}
-        if any(problems.values()):
-            bad = [f"{a}: {p}" for a, p in problems.items() if p]
-            return done("error", reason="; ".join(bad), **_broken(problems))
+    # mstar-server is mstar serve's HTTP frontend: every arm serves through its own build
+    if not shutil.which("cargo"):
+        return done("skipped", reason="mstar-server needs cargo on the host")
+    problems = {a: build_rust_server(arm) for a, arm in arms.items()}
+    if any(problems.values()):
+        bad = [f"{a}: {p}" for a, p in problems.items() if p]
+        return done("error", reason="; ".join(bad), **_broken(problems))
     missing = {a: requirements_problem(arm) for a, arm in arms.items()}
     if all(missing.values()):
         return done("skipped", reason=f"environment lacks: {missing['base']}")
@@ -615,20 +598,19 @@ def main(argv: list[str] | None = None) -> None:
     out.mkdir(parents=True, exist_ok=True)
     (out / "done.json").unlink(missing_ok=True)
     (out / "pid").write_text(str(os.getpid()))
-    for sig in SIGNALS:
-        signal.signal(sig, _on_term)
-    if job.get("lease_s"):
-        threading.Thread(target=watch_lease, args=(float(job["lease_s"]),), daemon=True).start()
-    t0 = time.time()
-    try:
-        run()
-    except SystemExit as e:
-        done("interrupted", reason=stop_reason or f"signal {int(e.code or 0) - 128}")
-        raise
-    except Exception as e:  # noqa: BLE001 - always leave a done.json behind
-        done("error", reason=f"{type(e).__name__}: {str(e)[:400]}")
-        raise
-    log(f"{model_name()} finished in {time.time() - t0:.0f} s")
+    with exit_on_signals():   # unwinds to run_arm's finally, which stops the server
+        if job.get("lease_s"):
+            threading.Thread(target=watch_lease, args=(float(job["lease_s"]),), daemon=True).start()
+        t0 = time.time()
+        try:
+            run()
+        except (SystemExit, KeyboardInterrupt) as e:
+            done("interrupted", reason=stop_reason or f"signal {getattr(e, 'signum', '?')}")
+            raise
+        except Exception as e:  # noqa: BLE001 - always leave a done.json behind
+            done("error", reason=f"{type(e).__name__}: {str(e)[:400]}")
+            raise
+        log(f"{model_name()} finished in {time.time() - t0:.0f} s")
 
 
 def model_name() -> str:

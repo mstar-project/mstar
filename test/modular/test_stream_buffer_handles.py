@@ -131,6 +131,57 @@ def test_a_sliding_window_keeps_its_overlap_alive_and_frees_everything_once_cons
 
 
 @pytest.mark.parametrize("kind", ["python", "rust"])
+def test_a_window_of_inline_items_is_one_stored_tensor_freed_once_consumed(kind):
+    """Items that came inline (their values, no stored tensor each) pop as one
+    stored CPU tensor per window, overlap included, that the edge alone holds:
+    nothing is left in the store once each window is consumed."""
+    streams, tm, buf = _consumer(window=3, stride=2, kind=kind)
+    buf.put_values([10, 11, 12, 13, 14])
+    seen = []
+    while (se := streams.pop_edge(buf, EDGE, RID)) is not None:
+        (uuid,) = se.uuids
+        (window,) = _consume(streams, tm, se)
+        assert window.device.type == "cpu" and window.dtype == torch.int64
+        seen.append(window.tolist())
+        assert not tm.tensor_store.check_uuid_presence(uuid)
+    assert seen == [[10, 11, 12], [12, 13, 14]]
+
+
+@pytest.mark.parametrize("kind", ["python", "rust"])
+def test_a_window_mixing_stored_and_inline_items_keeps_their_order(kind):
+    """A step that could not send its item inline stores it; the window it
+    shares with inline items is still one tensor, in stream order, and the
+    stored item is released once the buffer moves past it."""
+    streams, tm, buf = _consumer(window=3, stride=3, kind=kind)
+    buf.put_values([20])
+    (stored,) = _produce(tm, buf, [21])
+    buf.put_values([22])
+    se = streams.pop_edge(buf, EDGE, RID)
+    (window,) = _consume(streams, tm, se)
+    assert window.tolist() == [20, 21, 22]
+    assert not tm.tensor_store.check_uuid_presence(stored)
+
+
+def test_inline_items_wait_behind_an_item_still_being_read():
+    """Values that arrive while an earlier item's read is in flight join the
+    buffer after it, so the stream keeps its order whichever way each item
+    travelled."""
+    buf = StreamBuffer(RID, EDGE, "LLM", FixedChunkPolicy(chunk_size=2))
+    buf.pre_read_register(100)
+    buf.put_values([5])
+    assert not buf.has_chunk_ready()
+    buf.put(100, 100)
+    assert buf.has_chunk_ready()
+    assert buf.pop_chunk().data["data"] == [100, 5]
+
+
+def test_a_joined_stream_refuses_inline_items():
+    buf = StreamBuffer(RID, EDGE, "LLM", FixedChunkPolicy(chunk_size=1), join_dim=0)
+    with pytest.raises(ValueError, match="cannot take them inline"):
+        buf.put_values([1])
+
+
+@pytest.mark.parametrize("kind", ["python", "rust"])
 def test_a_chunked_producers_pieces_are_joined_into_one_stored_item(kind):
     """A buffer holding uuids joins a chunked producer's pieces through the
     manager: one new stored item, which the buffer holds instead of the

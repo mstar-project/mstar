@@ -40,8 +40,18 @@ class Pi05SiglipEncoder(nn.Module):
             config.vit_hidden_size, config.hidden_size, bias=True
         )
 
+    @property
+    def tower(self) -> nn.Module:
+        """The module holding ``embeddings``/``encoder``/``post_layernorm``: the
+        SiglipVisionModel itself in transformers 5.x, its ``vision_model`` in 4.x."""
+        return getattr(self.vision_model, "vision_model", self.vision_model)
+
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Encode a batch of images into LLM-space tokens.
+
+        As openpi's SigLIP: the patch and position embeddings run in their
+        own (float32) dtype and the encoder, final norm and connector in the
+        connector's dtype.
 
         Args:
             pixel_values: Tensor of shape ``(N, 3, H, W)`` where ``N`` is the
@@ -50,7 +60,7 @@ class Pi05SiglipEncoder(nn.Module):
         Returns:
             Tensor of shape ``(N, tokens_per_image, hidden_size)``.
         """
-        outputs = self.vision_model(pixel_values=pixel_values)
-        # last_hidden_state: [N, num_patches, vit_hidden_size]
-        features = outputs.last_hidden_state
-        return self.connector(features)
+        tower = self.tower
+        embeds = tower.embeddings(pixel_values.to(tower.embeddings.patch_embedding.weight.dtype))
+        hidden = tower.encoder(inputs_embeds=embeds.to(self.connector.weight.dtype)).last_hidden_state
+        return self.connector(tower.post_layernorm(hidden))

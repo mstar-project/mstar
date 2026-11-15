@@ -94,7 +94,7 @@ def test_an_eager_write_uploads_its_addressing_in_one_copy(kv):
         paged_kv_last_page_len=i32([4, 2]), kv_lens=None,
     )
     copies = kv._plan_stager.copies
-    state = kv._host_plan_state(indptrs, 5, 4)
+    state = kv._host_plan_state(indptrs, 5, 4, placement=None)
     assert kv._plan_stager.copies == copies + 1
     torch.cuda.synchronize()
     assert state.token_to_page.is_cuda and state.total_tokens == 5

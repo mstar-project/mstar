@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import stat
+from pathlib import Path
 
 import pytest
 import yaml
@@ -101,6 +102,9 @@ def test_conductor_refuses_the_socket_dir_before_launching_workers(bad_dir, tmp_
 
         def get_submodule(self, *a, **k):
             return None
+
+        def walk_plan(self, *a, **k):
+            raise NotImplementedError
 
         def get_initial_forward_pass_args(self, *a, **k):
             raise NotImplementedError
@@ -280,6 +284,51 @@ def test_upload_files_are_0600(umask, tmp_path):
     assert {p: _mode(p) for p in paths} == dict.fromkeys(paths, 0o600)
 
 
+def test_new_frame_and_remote_upload_paths_are_private(umask, tmp_path):
+    from mstar.api_server import ws_frames
+
+    class Response:
+        length = None
+
+        def __init__(self):
+            self.chunks = iter([b"media", b""])
+
+        def getheader(self, _):
+            return "image/png"
+
+        def read1(self, _):
+            return next(self.chunks)
+
+    class Connection:
+        def timed_out(self):
+            return False
+
+    upload_dir = tmp_path / "uploads"
+    frame = ws_frames.save_entry("a.png", b"frame", upload_dir)
+    _, fetched = media_io._stream_to_upload(
+        Response(), Connection(), "https://example.com/a.png", upload_dir, 32, "example.com",
+    )
+    assert _mode(upload_dir) == 0o700
+    assert _mode(frame) == _mode(fetched) == 0o600
+    assert frame.read_bytes() == b"frame" and Path(fetched).read_bytes() == b"media"
+
+
+def test_new_frame_and_remote_upload_paths_refuse_a_bad_dir(bad_dir):
+    from mstar.api_server import ws_frames
+
+    with pytest.raises(PermissionError, match="refusing"):
+        ws_frames.save_entry("a.png", b"frame", bad_dir)
+
+    class Response:
+        length = None
+
+        def getheader(self, _):
+            return "image/png"
+
+    with pytest.raises(media_io.RemoteFetchError, match="could not save the file"):
+        media_io._stream_to_upload(Response(), None, "https://example.com/a.png", Path(bad_dir), 32, "example.com")
+
+
 def _tensor(name, data_type, shape, values):
     return {"metadata": {"name": name, "data_type": data_type, "shape": shape},
             "data": {"data_type": data_type, "values": values}}
@@ -383,12 +432,12 @@ def test_a_dynamo_realtime_commit_tells_the_client_only_an_error_id(bad_dir):
 def test_a_streamed_transcription_sends_an_error_event_for_a_refused_upload_dir(bad_dir):
     """After the 200 the refusal has to go in band, with an id and no path:
     each window's WAV is written through the upload dir."""
-    from mstar.api_server.openai.serving_transcriptions import _cutting_error_event
+    from mstar.api_server.openai.serving_transcriptions import _stream_error_event
 
     try:
         ensure_private_dir(bad_dir)
     except PermissionError as exc:
-        event = _cutting_error_event(exc)
+        event = _stream_error_event(exc)
     assert "refusing" not in event and str(bad_dir).rstrip("/") not in event
     assert re.search(r"internal error \(error id [0-9a-f]{12}\)", event), event
     assert '"status": 500' in event or "'status': 500" in event or "500" in event

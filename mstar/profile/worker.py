@@ -51,7 +51,7 @@ class WorkerProfileInfo:
     and ``fwd_end`` (stamped by the worker after the GPU completion event). All
     the data lives on the batch's ``ExecTimings`` (passed in by the caller), so
     no per-batch state has to be carried across the pipeline here; speculative
-    and fallthrough batches alike flow through ``_postprocess_batch`` once and
+    and fallthrough batches alike flow through ``StepExecutor.postprocess`` once and
     are recorded there.
 
     Timings accumulate per request and per ``(node, graph_walk)`` so repeated

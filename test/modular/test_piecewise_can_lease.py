@@ -12,7 +12,7 @@ import pytest
 
 from mstar.engine.accelerator_graph_config import PiecewiseConfigType
 from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner, PiecewiseGraphKey
-from mstar.engine.engine import Engine
+from mstar.testing_utils.engine import make_engine, make_mgmt
 
 
 class _Runner:
@@ -37,9 +37,9 @@ class _Ctx:
 
 
 def _lease(runners, inputs):
-    engine = SimpleNamespace(_submodules={"node": SimpleNamespace(piecewise_runners=runners)})
+    engine = make_engine(_submodules={"node": make_mgmt(piecewise_runners=runners)})
     ctx = _Ctx()
-    Engine._maybe_lease_piecewise_regions(engine, "node", ctx, inputs)
+    engine._maybe_lease_piecewise_regions("node", ctx, inputs)
     return ctx.piecewise_leases
 
 
@@ -73,7 +73,7 @@ def _packed_runner(one_row):
         replay_seq_lens=lambda shape, seq_lens, real_bs: list(seq_lens),
     )
     runner._label, runner._current_slot, runner._capture_batch_sizes = "region", 0, sizes
-    runner._lora_keys = ()
+    runner._segment_keys, runner._lean = (), frozenset()
     runner._graphs = {
         PiecewiseGraphKey(bs=bs, seq_len=256, slot=0): SimpleNamespace(
             bucket=(bs, 256), shape=SimpleNamespace(bs=bs), dummy_rids=list(range(bs)),
@@ -87,6 +87,17 @@ def _packed_runner(one_row):
     runner._step_runner = SimpleNamespace(commit=lambda step: None)
     runner._dummy_rows = SimpleNamespace(reset=lambda rids: None)
     return runner
+
+
+def test_a_replay_applies_its_steps_host_writes_after_its_resources_commit():
+    runner = _packed_runner(True)
+    order = []
+    runner._step_runner = SimpleNamespace(commit=lambda step: order.append("resources"))
+    runner._declare = lambda *a, **k: SimpleNamespace(commit_calls=lambda: order.append("host fields"))
+    inputs = [SimpleNamespace(input_seq_len=100)]
+    _lease({"packed": runner}, inputs)
+    runner.run({}, request_ids=[7], seq_lens=[100])
+    assert order == ["resources", "host fields"]
 
 
 def test_a_one_row_per_step_region_leases_and_replays_the_whole_step_as_one_row():

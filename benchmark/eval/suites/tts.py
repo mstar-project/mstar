@@ -1,4 +1,4 @@
-"""TTS: streaming ``/v1/audio/speech`` latency, throughput, stalls, and quality.
+"""TTS: streaming latency, throughput, stalls, and quality.
 
 Per request: time to first audio (TTFA, first PCM byte after the WAV header),
 end-to-end latency, seconds of audio, RTF (latency / audio seconds), and the
@@ -9,11 +9,15 @@ clip (voice-clone sets such as Seed-TTS), and predicted MOS (UTMOS).
 
 Engines differ only in how audio is streamed: M* sends one open-ended WAV,
 vLLM-Omni and SGLang-Omni send raw PCM16 (``--sample-rate`` then applies).
+All three take ``/v1/audio/speech``. Nano-vLLM-VoxCPM's demo server takes its
+own ``/generate`` body and streams PCM16 at the rate in its
+``X-Audio-Sample-Rate`` header.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import time
 from pathlib import Path
 from typing import Any
@@ -26,12 +30,12 @@ from benchmark.eval.datasets import Item
 from benchmark.eval.suites.base import Suite, data_url, error_row, exception_row, parse_extra
 from benchmark.eval.text_metrics import NORMALIZERS, check_languages, error_rate, get_normalizer
 
-ENGINES = ("mstar", "vllm-omni", "sglang-omni")
+ENGINES = ("mstar", "vllm-omni", "sglang-omni", "nanovllm-voxcpm")
 
 
 class TTSSuite(Suite):
     name = "tts"
-    help = "text to speech over /v1/audio/speech (streaming)"
+    help = "text to speech, streamed (/v1/audio/speech, or /generate for nanovllm-voxcpm)"
     requires = ("text",)
 
     @staticmethod
@@ -44,7 +48,7 @@ class TTSSuite(Suite):
         g.add_argument("--seed", type=int, default=None,
                        help="per-item seed = SEED + item index (same in every repeat); default: server sampling")
         g.add_argument("--clone", action="store_true",
-                       help="send each item's ref_audio (data URL) and ref_text: zero-shot voice cloning")
+                       help="send each item's ref_audio and ref_text: zero-shot voice cloning")
         g.add_argument("--sample-rate", type=int, default=24000, help="PCM rate for engines that send raw PCM")
         g.add_argument("--extra", action="append", default=[], metavar="KEY=JSON", help="extra request field")
         g.add_argument("--asr-judge", default="openai/whisper-large-v3",
@@ -65,6 +69,10 @@ class TTSSuite(Suite):
         super().__init__(args)
         self.extra = parse_extra(args.extra)
         self.normalizer_name, self.normalize = get_normalizer(args.normalizer)
+        if args.engine == "nanovllm-voxcpm":
+            unsent = [f"--{k}" for k in ("voice", "language", "instructions") if getattr(args, k)]
+            if unsent:
+                raise ValueError(f"{', '.join(unsent)}: Nano-vLLM-VoxCPM's /generate has no such field")
 
     def check_items(self, items: list[Item]) -> None:
         super().check_items(items)
@@ -89,6 +97,8 @@ class TTSSuite(Suite):
 
     def _payload(self, item: Item, index: int) -> dict[str, Any]:
         a = self.args
+        if a.engine == "nanovllm-voxcpm":
+            return self._nano_payload(item, index)
         body: dict[str, Any] = {"model": a.model_name, "input": item.text, "stream": True}
         body["response_format"] = "wav" if a.engine == "mstar" else "pcm"
         if a.engine == "vllm-omni":
@@ -104,6 +114,26 @@ class TTSSuite(Suite):
                 body["ref_text"] = item.ref_text
         return body | self.extra
 
+    def _nano_payload(self, item: Item, index: int) -> dict[str, Any]:
+        """Nano-vLLM-VoxCPM's ``/generate``, in the mode M* runs for the same item. A
+        clip is a reference block (``ref_audio_wav_*``); with its transcript it is
+        also the prompt the speech continues (``prompt_wav_*``, ``prompt_text``),
+        as ``ref_audio`` with ``ref_text`` is to VoxCPM2 on M*. Nano refuses a
+        prompt clip without its transcript."""
+        a = self.args
+        body: dict[str, Any] = {"target_text": item.text, "response_format": "pcm"}
+        if a.seed is not None:
+            body["seed"] = a.seed + index
+        if a.clone and item.ref_audio:
+            path = Path(item.ref_audio)
+            clip = base64.b64encode(path.read_bytes()).decode()
+            fmt = path.suffix.lstrip(".") or "wav"
+            body["ref_audio_wav_base64"], body["ref_audio_wav_format"] = clip, fmt
+            if item.ref_text:
+                body["prompt_wav_base64"], body["prompt_wav_format"] = clip, fmt
+                body["prompt_text"] = item.ref_text
+        return body | self.extra
+
     async def request(
         self, session: aiohttp.ClientSession, url: str, index: int, item: Item, t0: float
     ) -> dict[str, Any]:
@@ -117,9 +147,16 @@ class TTSSuite(Suite):
         ttfa = None
         try:
             timeout = aiohttp.ClientTimeout(total=a.timeout, sock_read=a.timeout)
-            async with session.post(f"{url}/v1/audio/speech", json=body, timeout=timeout) as resp:
+            path = "/generate" if a.engine == "nanovllm-voxcpm" else "/v1/audio/speech"
+            async with session.post(f"{url}{path}", json=body, timeout=timeout) as resp:
                 if resp.status != 200:
                     return error_row(item, f"HTTP {resp.status}", await resp.text())
+                if a.engine == "nanovllm-voxcpm":
+                    # before 2.0.3 nano had no response_format and streamed MP3 under the same rate header
+                    encoding = resp.headers.get("X-Audio-Encoding")
+                    if encoding != "s16le":
+                        return error_row(item, "not a PCM16 stream", f"X-Audio-Encoding: {encoding!r}")
+                    rate = int(resp.headers["X-Audio-Sample-Rate"])
                 async for chunk in resp.content.iter_any():
                     now = time.perf_counter() - t0
                     if not header_done:

@@ -135,7 +135,7 @@ class Script:
         """Store a tensor so routing has something to refer to."""
         self.store.put_tensor(request_id=1, uuid=uuid, tensor=torch.zeros(4),
                               info=_info(uuid))
-        # The worker's safety hold: _postprocess_batch stores the outputs and
+        # The worker's safety hold: StepExecutor.postprocess stores the outputs and
         # immediately does increment_ref_batch_uniform(uuids, 1), so a tensor
         # is never collectable between being stored and being routed. Without
         # it every uuid sits at refcount 0 from birth and the free paths fire
@@ -326,8 +326,8 @@ def test_cleanup_then_route_after_an_emit(emit_lock):
     lk.route("prefill", rid, ["token"], [201])
     lk.pop("ar_decode", rid)
     lk.put(202)
-    # Production order: _postprocess_batch calls _cleanup_consumed_inputs
-    # (worker.py) BEFORE complete_and_route_batch, not after.
+    # Production order: StepExecutor.postprocess calls the runtime's
+    # cleanup_consumed_inputs BEFORE complete_and_route_batch, not after.
     lk.cleanup("ar_decode", rid)
     lk.route("ar_decode", rid, ["token"], [202])
     assert lk.ready() == [("ar_decode", WALK, [rid])]
@@ -336,7 +336,7 @@ def test_cleanup_then_route_after_an_emit(emit_lock):
 
 def test_route_then_cleanup_after_an_emit(emit_lock):
     """The SAME steps with route before cleanup -- an order the worker does not
-    produce (_postprocess_batch cleans up first). Clearing a node's inputs has
+    produce (StepExecutor.postprocess cleans up first). Clearing a node's inputs has
     to take it out of the ready set whichever order runs."""
     lk = emit_lock
     rid = lk.admit()
@@ -480,7 +480,7 @@ def test_speculative_flag_survives_completion(lock):
     runtime report a node ready whose rids were mid-flight, and
     ``get_ready_nodes`` handed them back to the scheduler as fresh work. Every
     speculation then ran a full get_ready_nodes -> _assemble_batch -> pop_rids
-    round trip that ended in ``push_back_node`` -- the branch worker.py
+    round trip that ended in ``push_back_node`` -- the branch speculation.py
     documents as "Shouldn't happen". Measured on bagel bs32 before the fix:
     30.89 of 31.01 "fresh" rids were the in-flight set.
 

@@ -11,15 +11,14 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from mstar.model import keys
 from mstar.model.components.audio_features import check_nemo_preprocessor
 from mstar.model.components.fastconformer import FastConformerConfig
 from mstar.model.components.qwen3_lm import Qwen3LMConfig
 
-KV_CACHE = "kv_cache"
+KV_CACHE = keys.KV_CACHE
 ATTN = "attn"
-ROPE = "rope"
-SAMPLER = "sampler"
-PREFILL_WALK = "prefill"
+SAMPLER = keys.SAMPLER
 DECODE_WALK = "decode"
 DECODE_LOOP = "decode_loop"
 
@@ -38,6 +37,8 @@ class CanaryQwenModelConfig:
     audio_locator_tag: str = "<|audioplaceholder|>"
     lora_scale: float = 2.0
     sampling_rate: int = 16_000
+    # the tokenizer's <|im_end|> and <|endoftext|>, set by the model
+    stop_token_ids: frozenset[int] = frozenset()
 
     @classmethod
     def from_pretrained(cls, local_dir: str | Path, llm_dir: str | Path) -> CanaryQwenModelConfig:

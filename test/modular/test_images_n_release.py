@@ -153,27 +153,40 @@ class _DisconnectedRequest:
 
 
 @pytest.mark.parametrize("how", ["cancelled", "polled"])
-def test_client_disconnect_releases_every_image(how):
+def test_client_disconnect_releases_every_image(how, monkeypatch):
     api, engine = _api([RUNNING, OK, RUNNING, RUNNING])
+    released = []
+    release = api.release_request
+
+    def release_once(request_id):
+        released.append(request_id)
+        release(request_id)
+
+    monkeypatch.setattr(api, "release_request", release_once)
 
     async def disconnect():
         if how == "polled":
             return await _create(api, n=4, raw_request=_DisconnectedRequest())
-        # the handler task is cancelled while it waits on the first image
-        task = asyncio.ensure_future(_create(api, n=4))
-        await asyncio.sleep(0.05)
-        assert not task.done()
-        task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await _cancel_while_waiting(api, n=4)
 
     asyncio.run(disconnect())
+    # Cancellation leaves siblings to the handler; polling visits every image.
+    assert len(released) == (3 if how == "cancelled" else 0)
     _assert_nothing_left(api, engine, aborted=engine.ids(RUNNING), reads_done=engine.ids(OK))
 
 
 async def _cancel_while_waiting(api, n):
+    waiting = asyncio.Event()
+    collect = api.collect_results
+
+    async def collect_when_waiting(*args, **kwargs):
+        waiting.set()
+        return await collect(*args, **kwargs)
+
+    api.collect_results = collect_when_waiting
     task = asyncio.ensure_future(_create(api, n=n))
-    await asyncio.sleep(0.05)
+    await waiting.wait()
     task.cancel()
     await task
 
@@ -216,6 +229,8 @@ def test_failed_release_still_releases_the_rest(plan, run, original, caplog):
         assert exc.value.detail == "injected image failure"
 
     unread = [rid for rid, o in zip(client_ids, plan, strict=False) if o != FAIL]
+    if original is asyncio.CancelledError:
+        unread = unread[1:]  # collect_results released the cancelled image
     assert attempted == unread
     failed, rest = attempted[0], attempted[1:]
     # the engine may key a submit by its own id; engine.submitted is in submit order

@@ -1,0 +1,13 @@
+model: "minimax_h3"
+
+# See minimax_h3.yaml.
+max_seq_len: 8192
+
+# MiniMax-H3 on 2 GPUs, no sequence parallelism: the DiT alone on rank 0, the conditioner
+# and both decoders on rank 1. Slow at 768p (one GPU runs every step); for parity runs and
+# short clips at reduced resolution.
+node_groups:
+  - node_names: [dit]
+    ranks: [0]
+  - node_names: [text_encoder, vae_encoder, vae_decoder, audio_decoder]
+    ranks: [1]

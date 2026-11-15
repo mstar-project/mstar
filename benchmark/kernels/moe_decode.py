@@ -82,8 +82,6 @@ class MoeDecodeSweep:
 
     def __init__(self, shape: Mapping[str, int], dtype: torch.dtype, device: torch.device,
                  quick: bool = False):
-        if dtype != torch.float8_e4m3fn:
-            raise ValueError(f"moe_decode's experts are float8_e4m3fn; got {dtype}")
         self.H, self.E, self.I, self.K = (shape[k] for k in ("H", "E", "I", "K"))
         self.device, self.quick = device, quick
         torch.manual_seed(0)

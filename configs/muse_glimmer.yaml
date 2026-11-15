@@ -1,0 +1,29 @@
+model: "muse_glimmer"
+max_seq_len: 32768
+
+resources:
+  kv_cache:
+    # 52 layers x 2 KV heads x 128 dims x 2 (k, v) x bf16 = 52 KiB a token, so 13 GiB
+    # (pages of 128 tokens of every layer, whatever page the window derives). A request
+    # holds every token of the 13 full layers but only the last ~2048 of the 39 sliding
+    # ones (all of a prompt's until its prefill commits), so this holds 71 requests of
+    # 8K tokens or 24 of 32K, where keeping every layer's K/V held 31 or 7
+    # (benchmark/kv_capacity.py).
+    max_num_pages: 2048
+    # a pool that keeps a window doesn't prefix cache yet
+    prefix_cache: false
+
+node_groups:
+  # Text and images. ~60 GB of bf16 weights: one 141 GB GPU (H200), or
+  # muse_glimmer_tp2.yaml on two 80 GB ones. Colocated: the encoder runs once
+  # per request, then idles.
+  - node_names: [LLM, vision_encoder]
+    ranks: [0]
+
+warmup_requests:
+  - text: What is in this image?
+    files: [hf://nvidia/Cosmos3-Edge/assets/example_action_fd_umi_first_frame.png]
+    model_kwargs: {max_output_tokens: 4}
+  - text: What is in this image?
+    files: [hf://nvidia/Cosmos3-Edge/assets/edge_action_id_av_0_output.png]
+    model_kwargs: {max_output_tokens: 4}

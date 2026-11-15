@@ -579,6 +579,15 @@ def causal_conv1d_fn(
         The block size to align the cached states to
     out: same shape as `x`
     """
+    if x.device.type == "cpu":
+        # mstar: a torch stand-in, so a recurrent resource's paths run in a test without a GPU
+        from mstar.utils.causal_conv1d import cpu
+
+        return cpu.causal_conv1d_fn(
+            x, weight, bias, conv_states, query_start_loc, cache_indices, has_initial_state, activation,
+            pad_slot_id, null_block_id, block_idx_first_scheduled_token=block_idx_first_scheduled_token,
+            initial_state_idx=initial_state_idx,
+        )
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
@@ -1186,6 +1195,14 @@ def causal_conv1d_update(
     out: optional output tensor with the same shape as `x`. When omitted,
         the input is overwritten.
     """
+    if x.device.type == "cpu":
+        # mstar: a torch stand-in, as `causal_conv1d_fn`'s
+        from mstar.utils.causal_conv1d import cpu
+
+        return cpu.causal_conv1d_update(
+            x, conv_state, weight, bias, activation, conv_state_indices, null_block_id, out,
+            query_start_loc=query_start_loc, num_accepted_tokens=num_accepted_tokens,
+        )
     if validate_data:
         assert null_block_id is not None
         assert x.stride(1) == 1

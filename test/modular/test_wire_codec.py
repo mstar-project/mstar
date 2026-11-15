@@ -20,6 +20,7 @@ import mstar.communication.wire_types  # noqa: F401  (registers the tags)
 from mstar.api_server.request_types import APIServerMessage, RequestComplete, ResultTensors
 from mstar.communication.wire import _TYPE_TO_TAG, WireError, decode, encode
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.resources.base import CachedLease
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.profile.format import GraphTiming, RxInfo, TxInfo
@@ -28,7 +29,9 @@ from mstar.utils.ipc_format import (
     ConductorMessageType,
     FailRequests,
     InputSignals,
+    MoveKind,
     NewRequest,
+    OffloadDelta,
     ScheduleTPNode,
     StopLoops,
     WorkerGraphsDone,
@@ -62,7 +65,7 @@ def _fwd_info() -> CurrentForwardPassInfo:
     return CurrentForwardPassInfo(
         request_id="r0", fwd_index=3, random_seed=7, max_tokens=128,
         graph_walk="decode", partition_name="p0",
-        step_metadata={"is_prefill": False, "chunk": 2},
+        step_metadata={"final_prefill": True, "chunk": 2},
     )
 
 
@@ -170,6 +173,30 @@ def test_polymorphic_body_dispatch():
         assert got.message_type is mtype
 
 
+def test_rank_0s_moves_round_trip_typed():
+    delta = OffloadDelta.new()
+    delta.add(MoveKind.EARMARK, "r", "kv", 1, ["v"])
+    delta.add(MoveKind.DROP, "v", count=8, node="llm")
+    body = ScheduleTPNode("llm", "decode", ["r", "w"], spec_seq=3, resident_delta=delta)
+
+    got = roundtrip(WorkerMessage(message_type=WorkerMessageType.SCHEDULE_TP, body=body)).body
+
+    assert got.resident_delta == delta, "a follower would replay other moves"
+    assert type(got.resident_delta.kinds[0]) is MoveKind, "the kinds came back untyped"
+
+
+def test_rank_0s_leases_and_page_trails_round_trip_typed():
+    body = ScheduleTPNode(
+        "llm", "decode", ["r"], prefix_hits={"r": {"kv": CachedLease([4, 5, 6], [4])}},
+        page_trails={"kv": (3, 17, 2, 0, 1)},
+    )
+
+    got = roundtrip(WorkerMessage(message_type=WorkerMessageType.SCHEDULE_TP, body=body)).body
+
+    assert got.prefix_hits == body.prefix_hits, "a follower would take another lease than rank 0's"
+    assert got.page_trails == body.page_trails, "a follower would check another trail than rank 0's"
+
+
 def test_unregistered_payloads_still_round_trip():
     """Supported unregistered values retain their types in a data envelope,
     including tuple-ness, which plain msgpack would flatten."""
@@ -203,7 +230,6 @@ def test_worker_graphs_done_full():
             new_token_counts={"tok": 5},
             resource_publish_info={},
             partition_name="p0", partition_done=True,
-            stream_tokens_consumed={"audio": 12},
             output_signal_names=["tok", "tok"],
             rx_info=[RxInfo(edge_name="e", source_entity="w1", dest_entity="w0",
                             count=2, num_bytes=99, time=0.5)],
@@ -216,7 +242,6 @@ def test_worker_graphs_done_full():
     assert body.is_first_tp_rank is False
     assert [i.uuid for i in body.persist_signals["kv"]] == ["u-a", "u-b"]
     assert body.persist_signals["kv"][0].dtype is torch.bfloat16
-    assert body.stream_tokens_consumed == {"audio": 12}
     assert body.rx_info[0].num_bytes == 99
     assert body.tx_info[0].time == pytest.approx(0.25)
     assert body.partition_done is True
@@ -341,6 +366,21 @@ def test_none_in_a_field_with_a_non_none_default_survives():
     assert out.top_k is None
     assert out.temperature is None
     assert out.top_p == 1
+
+
+def test_a_rolling_kv_request_config_crosses_the_wire_typed():
+    from mstar.communication.wire import _encoder
+    from mstar.engine.resources.kv.rolling import RollingKVReqConfig
+
+    assert _encoder(RollingKVReqConfig).__name__ == "_encode_dataclass"
+    fi = _fwd_info()
+    fi.resource_configs = {"dit_kv": RollingKVReqConfig(tokens=27144)}
+    msg = WorkerMessage(
+        message_type=WorkerMessageType.INPUT_SIGNALS,
+        body=InputSignals(request_id="r", partition_name="p",
+                          request_info=fi, inputs=[]),
+    )
+    assert roundtrip(msg).body.request_info.resource_configs == {"dit_kv": RollingKVReqConfig(tokens=27144)}
 
 
 def test_non_mstar_types_are_refused_rather_than_imported_from_the_wire():
