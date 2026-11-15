@@ -38,6 +38,7 @@ from mstar.engine.state import (
 )
 from mstar.model.base import KEEP_ADAPTER, KeepAdapter, ProcessPromptOutput, TensorAndMetadata
 from mstar.model.components.audio_features import load_speech_file, speech_file_rate
+from mstar.model.components.lora.modules import LoraRoot
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns
 from mstar.model.multimodal_decoder import MIXED_SPLIT, MediaIntake, MultimodalDecoderModel
 from mstar.model.phi4mm.audio import NARROWBAND_RATE, audio_encoder
@@ -158,20 +159,10 @@ class Phi4MMModel(MultimodalDecoderModel):
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
         return {ATTN: {"splits": (MIXED_SPLIT,)}, VISION_ATTN: vision_kernel_settings(self.vision_config)}
 
-    def get_node_resources(self):
-        return [self._lora_spec()]
+    def lora_roots(self) -> tuple[LoraRoot, ...]:
+        from mstar.model.phi4mm.lora import phi4mm_lora_root
 
-    def _lora_spec(self):
-        from mstar.model.phi4mm.lora import phi4mm_lora_spec
-
-        spec = phi4mm_lora_spec(self.config)
-        # the checkpoint's own adapters; a deployment that names its own `adapters:`
-        # names these too (`prompt_lora_adapters`, checked at startup)
-        spec.adapters = {
-            name: str(Path(self.local_dir) / f"{name}-lora" / "adapter_model.safetensors")
-            for name in (VISION_ADAPTER, SPEECH_ADAPTER)
-        }
-        return spec
+        return (phi4mm_lora_root(self.config, self.local_dir),)
 
     # -----------------------------------------------------------------------
     # Prompt

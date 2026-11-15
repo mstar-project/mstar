@@ -106,16 +106,12 @@ def test_phi4mm_specs_equal_the_hand_written_ones_after_a_deployments_overrides(
 
 
 def test_phi4mm_specs_equal_the_hand_written_ones_on_its_published_config():
-    """``configs/phi4mm.yaml`` overrides only the LoRA pool, which the model still writes by hand."""
+    """``configs/phi4mm.yaml`` overrides only the LoRA pool, which the bridge builds from the model's roots."""
     model = _phi4mm()
     specs = serving_resources(model, yaml.safe_load(PUBLISHED.read_text()))
     lora = {spec.resource_key for spec in specs if spec.resource_key.startswith(LORA_RESOURCE_KEY)}
     assert len(lora) == 1, "the published config serves both adapters from one LoRA pool"
     _assert_equal_per_key([spec for spec in specs if spec.resource_key not in lora], _reference(model))
-
-
-def test_phi4mm_writes_only_lora_by_hand():
-    assert {spec.resource_key for spec in _phi4mm().get_node_resources()} == {LORA_RESOURCE_KEY}
 
 
 def test_phi4mm_llm_layers_each_carry_their_own_kv_layer():

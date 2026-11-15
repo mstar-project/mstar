@@ -573,8 +573,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         — so every condition the old gate checked lives here:
 
         * a request's guidance regime (``_regime``: both branches, or the
-          conditional one alone) is part of every key, and only the regime the
-          deployment's default guidance runs is captured (``_capture_regime``);
+          conditional one alone) is part of every key; the denoise step is
+          captured only in the regime the deployment's default guidance runs
+          (``_capture_regime``), the prefill in both (``_prefill_capture_regimes``);
         * of the denoise walks only ``image_gen`` and the plain and chained
           video walks, and only at a latent shape a graph was captured for
           (``_capture_keys``);
@@ -2341,10 +2342,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def get_accelerator_graph_configs(self, device, tp_world_size: int = 1):
         """Declare one fixed-shape capture of the image denoise step per
         resolution, in the guidance regime the deployment's default guidance
-        runs (``_capture_regime``). Requests at other resolutions, or in the
-        other regime, fall back to the eager path. The per-resolution token layout is prompt-independent,
-        so bake it once here and key it by latent shape; the per-prompt rotary
-        tables, the latents and the timestep flow in as static-buffer inputs.
+        runs (``_capture_regime``), and the text prefill in every regime a
+        request can run (``_prefill_capture_regimes``). Denoise steps at other
+        resolutions, or in the other regime, fall back to the eager path. The
+        per-resolution token layout is prompt-independent, so bake it once here
+        and key it by latent shape; the per-prompt rotary tables, the latents
+        and the timestep flow in as static-buffer inputs.
 
         Set ``COSMOS3_DISABLE_CUDA_GRAPH=1`` to skip capture and run the denoise
         loop eagerly (escape hatch for a misbehaving driver, and an A/B switch).
@@ -2418,9 +2421,17 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 walk, replay_walks, regime,
             ))
 
-        configs.extend(self._prefill_capture_configs(device, regime))
+        configs.extend(self._prefill_capture_configs(device, self._prefill_capture_regimes()))
         self._captured_walks = frozenset(w for c in configs for w in c.replay_graph_walks)
         return configs
+
+    def _prefill_capture_regimes(self) -> tuple[GuidanceRegime, ...]:
+        """The prefill is captured in every regime a request can run, since
+        each regime keys its own graph (`cg_key_info`) and an uncaptured one
+        runs eager and host-bound. A guided checkpoint serves both, whatever
+        its default (action requests, forward and inverse dynamics and client
+        overrides change the scale); a distilled one refuses any scale but 1."""
+        return (COND_REGIME,) if self.config.distilled_sigmas else (CFG_REGIME, COND_REGIME)
 
     def _capture_regime(self) -> GuidanceRegime:
         """The guidance regime the captures are built for: the one a request
@@ -2499,9 +2510,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             total_tokens_multiplier=regime.tokens_multiplier,
         )
 
-    def _prefill_capture_configs(self, device, regime: GuidanceRegime) -> list:
+    def _prefill_capture_configs(self, device, regimes: tuple[GuidanceRegime, ...]) -> list:
         configs = []
-        # Understanding-tower text prefill in the captured regime: cond+uncond
+        # Understanding-tower text prefill, one config per regime: cond+uncond
         # packed into one combined sequence (batched CFG), or the conditional
         # prompt alone. The dummy zeros are placeholders — the real
         # input_ids / mrope ids are copied into the static buffers at replay.
@@ -2513,21 +2524,22 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             )
             mrope_dtype = torch.float32 if self.config.enable_fps_modulation else torch.long
 
-            configs.append(PackedAcceleratorGraphConfig(
+            configs.extend(PackedAcceleratorGraphConfig(
                 capture_graph_walk=PREFILL_WALK,
                 replay_graph_walks=list(PREFILL_WALKS),
                 capture_token_lengths=list(self.prefill_capture_token_buckets),
-                make_node_input=lambda n: self._prefill_capture_input(
+                make_node_input=lambda n, regime=regime: self._prefill_capture_input(
                     n, device, mrope_dtype, regime,
                 ),
-                # A prefill in the other regime declares a different set of
-                # labels, so it keys elsewhere (`cg_key_info`) and runs eager.
+                # Each regime declares its own set of labels, so it keys its
+                # own graph (`cg_key_info`).
                 additional_key_info=regime.name,
                 compile=self.config.compile_prefill,
                 compile_mode=engine_compile_mode(self.config.denoise_compile_mode),
-                capture_batch_sizes=prefill_bs,
+                # a regime that never batches never fills a wider bucket
+                capture_batch_sizes=prefill_bs if regime.batches else [1],
                 caps_eager_batch_size=False,
-            ))
+            ) for regime in regimes)
         return configs
 
     def _prefill_capture_input(
@@ -2686,8 +2698,9 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
         frames of a full-latent-shape tensor (zeros elsewhere).
     """
 
-    # One-shot per-request encode at request-specific shapes; nothing to gain
-    # from compiling the submodule wrapper.
+    # One-shot per-request encode at request-specific shapes; a deployment
+    # with a fixed observation size compiles that one encode itself
+    # (``compile_vae_encode_size``).
     disable_torch_compile = True
 
     def __init__(self, vae, config):
@@ -2699,6 +2712,17 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
         self.vae = vae
         self.config = config
         self._video_processor = None
+        # the pixel shape [1, 3, 1, H, W] whose encode is compiled, and the compiled call
+        self._compiled_shape: tuple[int, ...] | None = None
+        self._compiled_encode = None
+        self._compiled_encode_warmed = False
+        if config.compile_vae_encode_size is not None and vae is not None:
+            # Compiled, the encoder's norms and activations fuse around cuDNN's
+            # channels-last convs; eager, channels-last alone is slower.
+            width, height = config.compile_vae_encode_size
+            self._compiled_shape = (1, 3, 1, int(height), int(width))
+            _wan_vae().encoder_to_channels_last(vae)
+            self._compiled_encode = _wan_vae().compile_encode(vae)
 
     def _latent_t(self, num_frames: int) -> int:
         return 1 if num_frames == 1 else 1 + (num_frames - 1) // self.config.vae.scale_factor_temporal
@@ -2802,7 +2826,19 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
         device = vision.device
         mean, inv_std = latent_affine(vae, dtype, device)
         with torch.autocast(device_type=device.type, enabled=False):
-            raw_mu = vae.encode(vision.to(dtype)).latent_dist.mode()
+            pixels = vision.to(dtype)
+            if self._compiled_encode is not None and tuple(pixels.shape) == self._compiled_shape:
+                if not self._compiled_encode_warmed:
+                    # As in ``_decode_pixels``: a process's first run of a
+                    # compiled bf16 Wan VAE graph can return wrong values on
+                    # some torch/cuDNN stacks, even from a warm Inductor cache.
+                    # Run it once and discard, so no request depends on a
+                    # startup warmup having been the first caller.
+                    self._compiled_encode(pixels)
+                    self._compiled_encode_warmed = True
+                raw_mu = self._compiled_encode(pixels)
+            else:
+                raw_mu = vae.encode(pixels).latent_dist.mode()
         latents = ((raw_mu - mean) * inv_std).to(torch.bfloat16)
         if condition_indexes:
             full = torch.zeros(latent_shape, device=device, dtype=latents.dtype)
