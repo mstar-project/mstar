@@ -83,6 +83,7 @@ def _conductor(*ticks, requests):
         poll_for_messages=lambda timeout_ms: bool(batches),
         flush=lambda: False,
     )
+    c._declaration_digests = {}
     c._walk_inputs = {"decode": ()}
     c._repeating_walks = frozenset()
 

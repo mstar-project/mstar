@@ -8,6 +8,7 @@ from mstar.engine.resources.step import (
     SubmoduleStep,  # noqa: F401
 )
 from mstar.engine.state.calls import (
+    add_read,
     at_last_token,
     causal_conv,
     drew,  # noqa: F401
@@ -17,6 +18,7 @@ from mstar.engine.state.calls import (
     host,
     kernel_setting,  # noqa: F401
     last_sampled,
+    mamba2,
     position,
     positions,
     rope,
@@ -37,6 +39,7 @@ from mstar.engine.state.contract import (
     GatedDeltaNet,
     KVEntry,
     Layout,
+    Mamba2,
     PagedNHD,
     PagedNHDTarget,
     Positions,
@@ -71,6 +74,7 @@ __all__ = [
     "GatedDeltaNet",
     "KVEntry",
     "Layout",
+    "Mamba2",
     "PagedNHD",
     "PagedNHDTarget",
     "Positions",
@@ -87,12 +91,14 @@ __all__ = [
     "TensorType",
     "Value",
     "Window",
+    "add_read",
     "at_last_token",
     "causal_conv",
     "gated_delta_net",
     "gather",
     "host",
     "last_sampled",
+    "mamba2",
     "position",
     "positions",
     "rope",

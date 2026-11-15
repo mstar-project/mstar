@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.engine.state import add_read
 from mstar.model.vjepa2.components.rope_utils import (
     RopeTables,
     apply_rope_BNHD,
@@ -267,8 +268,7 @@ class ACRoPEAttention(nn.Module):
         k = k.reshape(b * n, self.num_heads, hd)
         v = v.reshape(b * n, self.num_heads, hd)
 
-        self.state.add(self.layer, k=k, v=v)
-        x = self.state.read(self.layer, q)
+        x = add_read(self.state, self.layer, q, k=k, v=v)
         x = x.reshape(b, n, c)
         return self.proj(x)
 

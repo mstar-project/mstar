@@ -27,6 +27,7 @@ from mstar.engine.resources.lora.pool import LoraAdapterPool
 from mstar.engine.resources.lora.store import classify_adapter
 from mstar.engine.resources.step import ResourceStep, Segment, StepContext, SubmoduleStep
 from mstar.engine.state import ArrayStep
+from mstar.model.components.lora.modules import declared_lora_spec
 from mstar.model.qwen3_5.config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config
 from mstar.model.submodule_base import ARNodeInputs, engine_step, with_segment_steps
 from mstar.testing_utils.comm import ThreadGroup, run_ranks  # noqa: F401  (re-exported)
@@ -432,14 +433,14 @@ def write_peft_adapter(directory, rank, projs, alpha=None, text_only=False, seed
 
 
 def _declared(model) -> LoraSpec:
-    """The model's LoRA spec, as it declares it beside its other resources."""
-    return next(s for s in model.get_node_resources() if isinstance(s, LoraSpec))
+    """The model's LoRA spec, as the bridge builds it from its roots."""
+    return declared_lora_spec(model.lora_roots())
 
 
 def lora_spec(paths, **kw) -> LoraSpec:
-    from mstar.model.qwen3_5.lora import qwen3_5_lora_spec
+    from mstar.model.qwen3_5.lora import qwen3_5_lora_roots
 
-    return serve(qwen3_5_lora_spec(tiny_config()), paths, **kw)
+    return serve(declared_lora_spec(qwen3_5_lora_roots(tiny_config())), paths, **kw)
 
 
 class _GatedNorm(nn.Module):
@@ -914,10 +915,17 @@ def _t3_config():
 def _chatterbox_t3():
     """Under classifier-free guidance T3 runs every request twice, cond rows then uncond
     rows, and each copy takes the request's adapter. A row is ``[cond, uncond]`` embeddings."""
+    from mstar.engine.state.adapters import node_handles
     from mstar.model.chatterbox.chatterbox_model import ChatterboxModel
     from mstar.model.chatterbox.components.t3 import T3Model
-    from mstar.model.chatterbox.config import ChatterboxConfig
+    from mstar.model.chatterbox.config import T3_ATTN, T3_KV, T3_NODE, T3_POS, T3_SAMPLER, ChatterboxConfig
     from mstar.model.chatterbox.submodules import T3Submodule
+
+    def stub_cores(sub, rows: _Rows):
+        """``sub`` with its handles on T3's declared state bound over stubs of the kernels, which read ``rows``."""
+        resources = {T3_KV: _Unread(), T3_ATTN: _AttendCore(rows), T3_POS: _NoRotation(), T3_SAMPLER: None}
+        sub.bind_node_state(node_handles(model_object(ChatterboxModel, sub.config), T3_NODE, resources))
+        return sub
 
     def weights(c):
         """The reference layout (``tfmr.*``, separate q/k/v and gate/up), from a model's
@@ -942,13 +950,14 @@ def _chatterbox_t3():
     def build(c, group, w):
         model = T3Model(c.t3, comm_group=group).to(DTYPE)
         model.load_weights(w.items())
-        return T3Submodule(model.requires_grad_(False).eval(), c, builtin_voice=None)
+        return stub_cores(T3Submodule(model.requires_grad_(False).eval(), c, builtin_voice=None), _Rows())
 
     def run(sub, rows):
-        k, lengths = len(rows), [r.shape[1] for r in rows] * 2
-        stub_attention(sub.model, lengths)
-        hidden = sub.model.hidden(torch.cat([r[0] for r in rows] + [r[1] for r in rows]), label="cfg")
-        per = _per_row(hidden, sub.model.logits(_last(hidden, lengths)), lengths)
+        k, lengths = len(rows), _Rows([r.shape[1] for r in rows] * 2)
+        stub_cores(sub, lengths)
+        with step_over(sub, lengths, (T3_KV,)):
+            hidden = sub.model.hidden(torch.cat([r[0] for r in rows] + [r[1] for r in rows]))
+        per = _per_row(hidden, sub.model.logits(_last(hidden, lengths.lengths)), lengths.lengths)
         return [tuple(torch.cat(p) for p in zip(per[i], per[i + k], strict=True)) for i in range(k)]
 
     return Stack(
@@ -970,7 +979,7 @@ def _qwen3_5():
     ``[q|k|v|z|a|pad|b]`` in-projection (``a`` padded per rank), the LM head (one row
     per request) and the token embedding. Its
     released sizes, with the vision tower's spec, are the models test's own."""
-    from mstar.model.qwen3_5.lora import qwen3_5_lora_spec
+    from mstar.model.qwen3_5.lora import qwen3_5_lora_roots
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
     def a1(c):
@@ -986,7 +995,7 @@ def _qwen3_5():
         return _per_row(hidden, lm.lm_head(_last(hidden, lengths.lengths)), lengths.lengths)
 
     return Stack(
-        config=tiny_config, lora_spec=qwen3_5_lora_spec,
+        config=tiny_config, lora_spec=lambda c: declared_lora_spec(qwen3_5_lora_roots(c)),
         build=lambda c, group, w: _stub_cores(LLMSubmodule(build_stack(w, group, c), c), _Rows()),
         weights=lambda c: hf_text_weights(), a1=a1,
         # leaves `in_proj_qkv` and `in_proj_a` out: slices of one fused target on and off it

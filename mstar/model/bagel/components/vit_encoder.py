@@ -17,7 +17,7 @@ from torch import nn
 from torch.nn.functional import scaled_dot_product_attention
 from transformers.activations import ACT2FN
 
-from mstar.model.bagel.config import BagelViTConfig
+from mstar.model.bagel.config import VIT_TOKENS, BagelViTConfig
 
 logger = logging.getLogger(__name__)
 
@@ -70,11 +70,6 @@ def _sdpa_varlen(
         q_b, k_b, v_b, attn_mask=attn_mask, scale=scale
     )
     return out.squeeze(0).transpose(0, 1).contiguous()
-
-# Resource key BAGEL declares its ViT's cacheless attention under. The layers
-# bind against it (``BagelViTAttention.bind_resources``) and the piecewise
-# region's ``declare_step`` names it.
-VIT_ATTN = "vit_attn"
 
 
 class RotaryEmbedding2D(torch.nn.Module):
@@ -183,7 +178,7 @@ class BagelVisionEmbeddings(nn.Module):
 
 
 class BagelViTAttention(nn.Module):
-    def __init__(self, config: BagelViTConfig):
+    def __init__(self, config: BagelViTConfig, layer: int):
         super().__init__()
         self.config = config
         self.embed_dim = config.hidden_size
@@ -201,15 +196,11 @@ class BagelViTAttention(nn.Module):
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
 
-        # The engine's cacheless attention resource, bound at load; used only
-        # for a step the encoder pointed at it. See `attend` / `BagelViTEncoder.bind_step`.
-        self.ragged_attn = None
-        self.use_ragged = False
+        self.layer = layer
+        self.state = None
 
-    def bind_resources(self, resources: dict) -> None:
-        """See ``NodeSubmodule.bind_node_resources``. ``.get``: a deployment
-        that declares no ViT attention resource keeps the eager path."""
-        self.ragged_attn = resources.get(VIT_ATTN)
+    def bind_state(self, handles: dict) -> None:
+        self.state = handles[VIT_TOKENS]
 
     @torch.compiler.disable
     def attend(
@@ -225,19 +216,10 @@ class BagelViTAttention(nn.Module):
         """Varlen attention; ``cu_seqlens`` isolates per-image attention when
         several images are packed into one forward.
 
-        Two backends, picked by the step's ``use_ragged`` cursor:
-
-        - set (captured path) — the engine's ragged attention resource,
-          planned OUTSIDE the graph by the piecewise runner. The only
-          capture-legal option: flash-attn's varlen entry point is not
-          reliably capturable, and the SDPA fallback builds its mask from data.
-          The layout lives in the plan, so ``cu_seqlens`` goes unread here.
-        - clear (eager path) — flash-attn varlen, preferred when not
-          capturing: FlashInfer has no kernel for SigLIP2's head_dim=72 and
-          has to zero-pad q/k/v to 128, which flash-attn does not.
+        Flash-attn varlen, preferred when not capturing: FlashInfer has no kernel
+        for SigLIP2's head_dim=72 and has to zero-pad q/k/v to 128, which
+        flash-attn does not.
         """
-        if self.use_ragged:
-            return self.ragged_attn.run(q, k, v)
         if _FLASH_ATTN_AVAILABLE:
             return flash_attn_varlen_func(
                 q, k, v,
@@ -259,6 +241,7 @@ class BagelViTAttention(nn.Module):
         sin_h: torch.Tensor = None,
         cos_w: torch.Tensor = None,
         sin_w: torch.Tensor = None,
+        use_ragged: bool = False,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -283,14 +266,21 @@ class BagelViTAttention(nn.Module):
             q = torch.cat([qh, qw], dim=-1)
             k = torch.cat([kh, kw], dim=-1)
 
-        attn_output = self.attend(
-            q,
-            k,
-            v,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            causal=False,
-        )
+        if use_ragged:
+            # The only path a capture can hold: flash-attn's varlen entry point is not reliably capturable, and the
+            # SDPA fallback builds its mask from data. The layout is in the plan the piecewise runner makes outside the
+            # graph, so ``cu_seqlens`` goes unread.
+            self.state.add(self.layer, k=k, v=v)
+            attn_output = self.state.read(self.layer, q)
+        else:
+            attn_output = self.attend(
+                q,
+                k,
+                v,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                causal=False,
+            )
 
         attn_output = attn_output.reshape(total_q_len, -1)
 
@@ -314,10 +304,10 @@ class BagelViTMLP(nn.Module):
 
 
 class BagelViTEncoderLayer(nn.Module):
-    def __init__(self, config: BagelViTConfig):
+    def __init__(self, config: BagelViTConfig, layer: int):
         super().__init__()
         self.embed_dim = config.hidden_size
-        self.self_attn = BagelViTAttention(config)
+        self.self_attn = BagelViTAttention(config, layer)
         self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.mlp = BagelViTMLP(config)
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
@@ -330,7 +320,8 @@ class BagelViTEncoderLayer(nn.Module):
         cos_h: torch.Tensor = None,
         sin_h: torch.Tensor = None,
         cos_w: torch.Tensor = None,
-        sin_w: torch.Tensor = None
+        sin_w: torch.Tensor = None,
+        use_ragged: bool = False,
     ) -> torch.Tensor:
         residual = hidden_states
 
@@ -342,7 +333,8 @@ class BagelViTEncoderLayer(nn.Module):
             cos_h=cos_h,
             sin_h=sin_h,
             cos_w=cos_w,
-            sin_w=sin_w
+            sin_w=sin_w,
+            use_ragged=use_ragged,
         )
         hidden_states = residual + hidden_states
 
@@ -359,29 +351,8 @@ class BagelViTEncoder(nn.Module):
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList(
-            [BagelViTEncoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [BagelViTEncoderLayer(config, layer) for layer in range(config.num_hidden_layers)]
         )
-
-    @property
-    def ragged_available(self) -> bool:
-        """Whether a ragged attention resource was bound — i.e. whether the
-        captured path is possible at all on this deployment."""
-        return self.layers[0].self_attn.ragged_attn is not None
-
-    def bind_step(self, use_ragged: bool) -> None:
-        """Point the whole stack at this step's attention backend.
-
-        Only a captured region binds the resource: outside one nothing planned
-        a layout, and attending an unplanned resource is an error rather than
-        something to fall back from.
-        """
-        if use_ragged and not self.ragged_available:
-            raise RuntimeError(
-                "BagelViTEncoder: no ragged attention resource bound; declare "
-                f"a RaggedAttentionSpec under {VIT_ATTN!r} for this node"
-            )
-        for layer in self.layers:
-            layer.self_attn.use_ragged = use_ragged
 
     def forward(
         self,
@@ -392,12 +363,13 @@ class BagelViTEncoder(nn.Module):
         sin_h: torch.Tensor = None,
         cos_w: torch.Tensor = None,
         sin_w: torch.Tensor = None,
+        use_ragged: bool = False,
     ) -> torch.Tensor:
 
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
             hidden_states = encoder_layer(hidden_states, cu_seqlens, max_seqlen,
-                                          cos_h=cos_h, sin_h=sin_h, cos_w=cos_w, sin_w=sin_w)
+                                          cos_h=cos_h, sin_h=sin_h, cos_w=cos_w, sin_w=sin_w, use_ragged=use_ragged)
 
         return hidden_states
 
@@ -455,12 +427,11 @@ class BagelVisionTransformer(nn.Module):
 
         Constant for a fixed token layout, so this is the region a piecewise
         CUDA graph records. ``use_ragged`` selects the attention backend for
-        the whole stack — see ``BagelViTAttention.attend``.
+        the whole stack — see ``BagelViTAttention.forward``.
         """
-        self.encoder.bind_step(use_ragged)
         last_hidden_state = self.encoder(
             inputs_embeds=hidden_states, cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen, **rope_inputs
+            max_seqlen=max_seqlen, use_ragged=use_ragged, **rope_inputs
         )
         return self.post_layernorm(last_hidden_state)
 

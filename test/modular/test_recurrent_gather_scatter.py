@@ -189,8 +189,8 @@ def test_padding_rows_read_and_write_only_the_sink():
     plan(pool, step, ctx)
     got = pool.gather("h", layer_idx=1)
     assert bool((got == 0).all()), "a fresh slot and the padding rows read zeros, not the sink's leftovers"
-    start = torch.full(SHAPE, 2.0)
-    assert bool((pool.gather("h", layer_idx=1, start=start) == 2.0).all()), "or the start state given"
+    pool.set_start({("h", 1): torch.full(SHAPE, 2.0)})
+    assert bool((pool.gather("h", layer_idx=1) == 2.0).all()), "or the start state set"
 
     value = torch.cat([torch.full((1, *SHAPE), 5.0), torch.full((3, *SHAPE), -1.0)])
     with pytest.raises(ValueError, match="1 rows for a step that declared 4"):
@@ -214,20 +214,21 @@ def test_a_step_whose_rows_all_have_state_reads_them_with_no_select(monkeypatch)
     pool.scatter_("h", rows_of(2, 1.0), layer_idx=1)
     pool.commit(step, ctx)
     start = torch.full(SHAPE, 9.0)
+    pool.set_start({("h", 1): start})
 
     step, ctx = eager(["b", "a"])
     rows = plan(pool, step, ctx)
     with monkeypatch.context() as patched:
         patched.setattr(torch, "where", Mock(side_effect=AssertionError("the read ran the select")))
-        skipped = pool.gather("h", layer_idx=1, start=start)
+        skipped = pool.gather("h", layer_idx=1)
     pool._current["main"] = replace(rows, every_row_has_state=False)
-    assert torch.equal(skipped, pool.gather("h", layer_idx=1, start=start)), "the skip reads other rows than the select"
+    assert torch.equal(skipped, pool.gather("h", layer_idx=1)), "the skip reads other rows than the select"
     torch.testing.assert_close(skipped, rows_of(2, 1.0)[[1, 0]])
     pool.commit(step, ctx)
 
     step, ctx = eager(["c", "a"])
     plan(pool, step, ctx)
-    read = pool.gather("h", layer_idx=1, start=start)
+    read = pool.gather("h", layer_idx=1)
     assert torch.equal(read[0], start), "a fresh row reads its start"
     torch.testing.assert_close(read[1], rows_of(2, 1.0)[0])
 
@@ -253,7 +254,8 @@ def test_a_freed_slot_reads_as_zeros():
     pool.commit(step, ctx)
     step, ctx = eager(["d"])
     plan(pool, step, ctx)
-    torch.testing.assert_close(pool.gather("h", layer_idx=1, start=torch.full(SHAPE, 2.0)), rows_of(1, 4.0))
+    pool.set_start({("h", 1): torch.full(SHAPE, 2.0)})
+    torch.testing.assert_close(pool.gather("h", layer_idx=1), rows_of(1, 4.0))
 
 
 def test_a_pool_without_a_sink_refuses_gather_and_scatter():

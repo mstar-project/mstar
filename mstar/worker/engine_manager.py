@@ -14,6 +14,7 @@ from mstar.engine.engine import Engine
 from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
 from mstar.engine.resources import ResourceReqConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.state.analysis import declaration_digests, digest_mismatch
 from mstar.graph.base import GraphNode
 from mstar.graph.runtime.base import GraphRuntime, inline_column
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -420,6 +421,7 @@ class EngineManager:
         enable_nvtx: bool = False,
         enable_prof: bool=False,
         device_capability: DeviceCapability | None = None,
+        conductor_digests: Mapping[str, str] | None = None,
     ) -> "EngineManager":
         """Build the engine and load this worker's nodes into it.
 
@@ -427,7 +429,16 @@ class EngineManager:
         resources via ``declare_state`` and ``get_node_resources``; the KV cache's
         shape rides on those, so there is no separate cache config. The conductor's
         ``validate_deployment`` has already checked the specs and overrides.
+        ``conductor_digests`` are the conductor's `declaration_digests`, which this
+        worker's must equal.
         """
+        if conductor_digests is not None:
+            mismatch = digest_mismatch(
+                declaration_digests(model.declare_state(), model.kernel_settings()), conductor_digests,
+                here=f"worker {transfer_engine_info.my_entity_id}", there="conductor",
+            )
+            if mismatch is not None:
+                raise RuntimeError(mismatch)
         # the per-node settings read only the config: refuse a bad one before any weights load
         budgets = model_config.get("max_batch_tokens") or {}
         override_mixed = model_config.get("can_override_mixed_max_tokens") or {}

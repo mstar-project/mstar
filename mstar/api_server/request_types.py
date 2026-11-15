@@ -118,12 +118,19 @@ class LoraAdapterResult:
     status: int = 200
 
 
-# what an ``APIServerMessage`` carries; None for ``setup_done``. The decoder
-# tries branches in order and takes the first whose required fields are all
-# present, so a body must lack a required field of every branch before it.
+@dataclass
+class WorkersReady:
+    """The conductor's ``setup_done``: every worker is ready, and these are its declarations' digests by name
+    (`declaration_digests`), which the API server checks its own against."""
+    declaration_digests: dict[str, str]
+
+
+# what an ``APIServerMessage`` carries. The decoder tries branches in order and
+# takes the first whose required fields are all present, so a body must lack a
+# required field of every branch before it.
 APIServerMessageBody = (
     ResultTensors | ResultTokens | RequestComplete | RequestFailed | ConductorStatus
-    | LoraAdapterResult | None
+    | LoraAdapterResult | WorkersReady | None
 )
 
 

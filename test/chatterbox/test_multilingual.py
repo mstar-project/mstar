@@ -21,7 +21,7 @@ from chatterbox.models.t3.modules.cond_enc import T3Cond  # noqa: E402
 from chatterbox.models.t3.modules.t3_config import T3Config as RefT3Config  # noqa: E402
 from chatterbox.models.tokenizers import MTLTokenizer  # noqa: E402
 from chatterbox.mtl_tts import punc_norm as ref_punc_norm  # noqa: E402
-from fake_resources import FakeT3Resources  # noqa: E402
+from fake_resources import FakeT3State  # noqa: E402
 from safetensors.torch import load_file  # noqa: E402
 from test_t3_pipeline import FakeGreedySampler, _reference_greedy  # noqa: E402
 
@@ -120,16 +120,17 @@ def test_t3_greedy_tokens_match_reference(snapshot, tokenizers):
     reference ``T3.inference`` loop with argmax sampling (as in
     ``test_t3_pipeline`` for the English and Turbo checkpoints)."""
     from mstar.model.chatterbox.components.t3 import T3Model
-    from mstar.model.chatterbox.config import T3_ATTN, T3_KV, T3_POS, T3_SAMPLER
+    from mstar.model.chatterbox.config import T3_SAMPLER
     from mstar.model.chatterbox.loader import iter_weights
     from mstar.model.chatterbox.submodules import (
+        DECODE_LOOP,
         PREV_TOKEN,
         SPEECH_TOKENS,
         TEXT_INPUTS,
         BuiltinT3Voice,
         T3Submodule,
     )
-    from mstar.model.submodule_base import ModelInputsFromEngine
+    from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine, engine_step
 
     ours, _ = tokenizers
     config = ChatterboxConfig.multilingual()
@@ -153,9 +154,8 @@ def test_t3_greedy_tokens_match_reference(snapshot, tokenizers):
         speaker_emb=conds["speaker_emb"].reshape(-1), prompt_tokens=conds["cond_prompt_speech_tokens"].reshape(-1),
     )
     sub = T3Submodule(model, config, builtin_voice=builtin)
-    res = FakeT3Resources()
-    res.bind(model, T3_ATTN, T3_KV, T3_POS)
-    resources = {T3_ATTN: res.kv_attn, T3_KV: res.kv_attn, T3_POS: res.pos, T3_SAMPLER: FakeGreedySampler()}
+    res = FakeT3State(config, FakeGreedySampler())
+    sub.bind_node_state(res.handles)
     info = SimpleNamespace(
         request_id="r", rid_handle="r",
         step_metadata={"cfg_weight": cfg_weight, "exaggeration": exaggeration, "min_p": 0.05,
@@ -163,14 +163,14 @@ def test_t3_greedy_tokens_match_reference(snapshot, tokenizers):
         resource_configs={T3_SAMPLER: SimpleNamespace(temperature=0.0, ignore_eos=False)},
         max_tokens=4096, random_seed=0,
     )
-    engine = ModelInputsFromEngine(request_ids=["r"], per_request_info={"r": info}, resources=resources)
+    engine = ModelInputsFromEngine(request_ids=["r"], per_request_info={"r": info})
 
-    def run(walk, inputs):
-        prepared = sub.prepare_inputs(walk, info, inputs)
-        step = sub.declare_step(walk, ["r"], [prepared])
-        res.plan([seg.span for seg in step.segments])
-        packed = sub.preprocess(walk, engine, [prepared])
-        out = sub.forward(walk, engine, **packed)
+    def run(walk, inputs, iteration=0):
+        loop = InputMetadata(dynamic_loop_iter_counts={DECODE_LOOP: iteration})
+        prepared = sub.prepare_inputs(walk, info, inputs, input_metadata=loop)
+        step = engine_step(sub, graph_walk=walk, request_ids=["r"], inputs=[prepared])
+        with res.opened(step, walk):
+            out = sub.forward(walk, engine, **sub.preprocess(walk, engine, [prepared]))
         sub.postprocess("r", info, out)
         return out[SPEECH_TOKENS][0]
 
@@ -178,8 +178,8 @@ def test_t3_greedy_tokens_match_reference(snapshot, tokenizers):
         expected = _reference_greedy(ref, cond, text_tokens, cfg_weight, n_steps)
         got = [int(run("prefill", {TEXT_INPUTS: [text_tokens]}))]
         prev = torch.tensor([got[-1]])
-        for _ in range(n_steps - 1):
-            prev = run("decode", {PREV_TOKEN: [prev]})
+        for iteration in range(n_steps - 1):
+            prev = run("decode", {PREV_TOKEN: [prev]}, iteration)
             got.append(int(prev))
     print(f"[multilingual de] ref={expected}\n mstar={got}")
     assert got == expected

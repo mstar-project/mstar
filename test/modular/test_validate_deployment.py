@@ -314,6 +314,19 @@ def test_the_sp_checks_run_when_the_lora_specs_fail_to_build(tmp_path):
     assert any("node 'llm' runs on 2 SP ranks but neither splits tokens" in p for p in problems), problems
 
 
+def test_a_lora_root_on_a_node_the_model_lacks_is_refused(tmp_path):
+    """Its pool would bind no node, so an adapter's modules there would load and never apply."""
+    from torch import nn
+
+    from mstar.model.components.lora.modules import LoraRoot
+
+    class _WithLora(_Model):
+        def lora_roots(self):
+            return (LoraRoot(node="vision", build=lambda _: nn.Sequential(nn.Linear(4, 4)), root_path=""),)
+
+    _refused(_WithLora(), _cfg(tmp_path), r"lora_roots\(\) declares roots on \['vision'\], which are not nodes")
+
+
 def _paged_llm(*extra, node="llm", kv_heads=2, **kw) -> _Model:
     """A model whose ``node`` holds a paged KV pool, and ``extra`` specs."""
     kv = KVSpec(resource_key="kv", nodes={node}, config=PagedKVConfig(

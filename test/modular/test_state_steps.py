@@ -253,7 +253,7 @@ def test_each_step_gets_fresh_step_objects():
     handles = _handles(_kv())
     first = state_steps(SubmoduleStep(segments=[Segment(1, "main", 1)], state={"kv": ArrayStep()}), handles)
     second = state_steps(SubmoduleStep(segments=[Segment(2, "main", 2)], state={"kv": ArrayStep()}), handles)
-    assert first.steps["kv"].segments == [Segment(1, "main", 1)], "SubmoduleStep writes segments onto its step objects"
+    assert first.steps["kv"].segments == [Segment(1, "main", 1)], "a step's KVStep carries that step's segments"
     assert second.steps["kv"].segments == [Segment(2, "main", 2)]
 
 
@@ -646,6 +646,25 @@ def test_a_converted_layout_serializes_like_a_hand_written_one():
     assert converted.row() == LabelLayout(spans=(_SPAN,), growth=(("decode_loop", 1),)).row()
 
 
+def test_a_layout_s_max_growth_reaches_the_paged_pool():
+    """A talker stream at 160 s: 37 warm-up rows, then a row a frame for 2001 frames and the final pad, 2039 rows. The
+    talker loop's cap of 2017 iterations alone reserves 2054, a 17th page of 128 the stream never fills."""
+    talker = _kv(max_len=8012)
+    layout = Layout(spans=(Span("rows", "talker_decode", 37, 37, "audio_prompt_latents"),),
+                    growth=(("talker_decode_loop", 1),))
+    caps = {"talker_decode_loop": 2017}
+    pool = PagedKVConfig(num_layers=2, num_qo_heads=4, num_kv_heads=4, head_dim=8, max_seq_len=8012)
+
+    def pages(layout: Layout) -> int:
+        row = kv_layouts([talker], {"kv": {"main": layout}}, {})["kv"]["main"].row()
+        config = KVReqConfig(needed_labels=["main"])
+        config.apply_conductor_config(kv_layout={"main": row}, loop_caps=caps)
+        return config.pages(None, caps, pool)
+
+    assert pages(replace(layout, max_growth=2002)) == 16, "the stream's 2039 rows fill 16 pages"
+    assert pages(layout) == 17, "without the cap the growth reserves the loop's cap"
+
+
 @pytest.mark.parametrize("state_layout, keyed, cause", [
     ({"other": {"main": Layout()}}, {}, r"state_layout\['other'\]: it names no declared array"),
     ({"kv": {"cfg": Layout()}}, {}, r"state_layout\['kv'\]: labels \['cfg'\] aren't in Array 'kv'.labels"),
@@ -780,8 +799,8 @@ class _EngineNode(NodeSubmodule):
         self.declared_handles = handles
 
 
-def _load_engine(monkeypatch, node, model):
-    monkeypatch.setattr(engine_module, "node_handles", lambda model, name, resources, **kwargs: {"kv": name})
+def _load_engine(monkeypatch, nodes, model, handles=lambda model, name, resources, **kwargs: {"kv": name}):
+    monkeypatch.setattr(engine_module, "node_handles", handles)
     joint = SimpleNamespace(
         world_size=1, tp_group=SimpleNamespace(barrier=lambda: None, world_size=1),
         sp_group=SimpleNamespace(world_size=1),
@@ -792,20 +811,31 @@ def _load_engine(monkeypatch, node, model):
     )
     engine = Engine(None, autocast_dtype=None)
     engine.load_model(
-        submodules={"LLM": node}, specs=[], parallel_groups=groups, device=torch.device("cpu"),
+        submodules=nodes, specs=[], parallel_groups=groups, device=torch.device("cpu"),
         transfer_engine_info=None, model=model,
     )
 
 
 def test_the_engine_binds_a_nodes_handles_when_it_loads_a_model(monkeypatch):
     node = _EngineNode()
-    _load_engine(monkeypatch, node, make_model(checkpoint_path=lambda: None))
+    _load_engine(monkeypatch, {"LLM": node}, make_model(checkpoint_path=lambda: None))
     assert node.declared_handles == {"kv": "LLM"}
+
+
+def test_nodes_in_one_process_share_their_handles(monkeypatch):
+    nodes = {name: _EngineNode() for name in ("LLM_cfg_text", "LLM_cfg_img")}
+    _load_engine(monkeypatch, nodes, make_model(checkpoint_path=lambda: None),
+                 handles=lambda model, name, resources, built, **kwargs: {"kv": built.setdefault("kv", object())})
+    text, image = (node.declared_handles for node in nodes.values())
+    assert text["kv"] is image["kv"], (
+        "BAGEL's LLM nodes share one language model, so a handle per node would leave the shared layers on the handle "
+        "of the node bound last, which the other node's steps never open"
+    )
 
 
 def test_the_engine_binds_nothing_when_it_loads_no_model(monkeypatch):
     node = _EngineNode()
-    _load_engine(monkeypatch, node, model=None)
+    _load_engine(monkeypatch, {"LLM": node}, model=None)
     assert node.declared_handles is None
 
 

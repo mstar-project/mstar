@@ -23,7 +23,6 @@ from mstar.engine.node_dtype import resolve_model_dtype
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
-from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
@@ -36,7 +35,7 @@ from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.engine.state import Span
 from mstar.engine.state.adapters import StateSetup, kv_layouts, node_resources, sampling_configs, state_steps
-from mstar.engine.state.analysis import declaration_digest, state_declaration_problems
+from mstar.engine.state.analysis import declaration_digests, state_declaration_problems
 from mstar.model.base import LabelLayout, enabled_resources, parse_autocast_dtype, serving_resources
 from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel
 from mstar.model.canary_qwen.submodules import CanaryQwenLLMSubmodule
@@ -344,8 +343,8 @@ def test_specs_equal_the_hand_written_ones_on_every_published_config(path, tmp_p
     _assert_equal_per_key(serving_resources(model, deployment), expected, kv_dtype)
 
 
-def test_qwen3_tts_writes_only_lora_by_hand():
-    assert {spec.resource_key for spec in _tts().get_node_resources()} == {LORA_RESOURCE_KEY}
+def test_qwen3_tts_writes_no_spec_by_hand():
+    assert _tts().get_node_resources() == []
 
 
 def test_canary_qwen_differs_only_in_a_page_size_that_means_the_same_pages():
@@ -384,7 +383,7 @@ def test_declarations_have_no_problems_and_one_digest(name):
     build, _ = MODELS[name]
     model = build()
     assert state_declaration_problems(model) == []
-    assert declaration_digest(model.declare_state()) == declaration_digest(build().declare_state())
+    assert declaration_digests(model.declare_state()) == declaration_digests(build().declare_state())
 
 
 # Steps

@@ -204,9 +204,14 @@ class _FakeSelfAttention:
     def _check_open(self, call):
         pass
 
-    def at_last_token(self, hidden):
+    def at_last_token(self, hidden, *, label=None):
         self.seen = hidden
         return hidden[-1:]
+
+    def _add_read(self, layer, q, *, keep, k, v):
+        assert keep is None, "this fake keeps every add"
+        self.add(layer, k=k, v=v)
+        return self.read(layer, q)
 
     def add(self, layer, *, k, v):
         self._pending = (k, v)

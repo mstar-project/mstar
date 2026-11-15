@@ -224,7 +224,7 @@ def test_the_conductor_sets_env_defaults_before_spawning_workers(monkeypatch, ro
         _dist_init_method="", model=None, enable_nvtx=False, enable_prof=False, device_type="cuda",
         _worker_devices=["cuda:0", "cuda:1"], log_level="INFO", tensor_comm_protocol=None, tcp_transfer_device="",
         _status_interval_s=None,
-        _mps_requested=False, _mps=None,
+        _mps_requested=False, _mps=None, _declaration_digests={},
         shutdown=None,
     )
     conductor.Conductor._launch_workers(spawner)

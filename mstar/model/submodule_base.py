@@ -257,6 +257,24 @@ class StopPolicy:
         )
 
 
+def _clone_stop_buffer(value, clones: dict[int, torch.Tensor]):
+    """``value`` with each tensor cloned once, by identity, into ``clones``."""
+    # A module function: nested in its caller it would close over itself, and that cycle keeps the clones alive
+    # until a collection.
+    if isinstance(value, torch.Tensor):
+        if id(value) not in clones:
+            clones[id(value)] = value.clone()
+        return clones[id(value)]
+    if isinstance(value, list):
+        return [
+            x.clone() if isinstance(x, torch.Tensor) else x for x in value
+        ]
+    if isinstance(value, dict):
+        return {k: _clone_stop_buffer(v, clones) for k, v in value.items()}
+    # pass anything else through: dropping it could lose a stop signal
+    return value
+
+
 @dataclass
 class BatchedModelOutput:
     """A step's outputs, split by how they are addressed.
@@ -360,22 +378,7 @@ class BatchedModelOutput:
             id(rows[name]): clone for name, clone in (reuse or {}).items()
             if name in rows and isinstance(clone, torch.Tensor)
         }
-
-        def _clone(value):
-            if isinstance(value, torch.Tensor):
-                if id(value) not in clones:
-                    clones[id(value)] = value.clone()
-                return clones[id(value)]
-            if isinstance(value, list):
-                return [
-                    x.clone() if isinstance(x, torch.Tensor) else x for x in value
-                ]
-            if isinstance(value, dict):
-                return {k: _clone(v) for k, v in value.items()}
-            # pass anything else through: dropping it could lose a stop signal
-            return value
-
-        return {k: _clone(v) for k, v in self.check_stop_buffers.items()}
+        return {k: _clone_stop_buffer(v, clones) for k, v in self.check_stop_buffers.items()}
 
     def clone_row_outputs(self, num_rows: int) -> dict[str, torch.Tensor]:
         """One clone per row-addressed batch tensor, narrowed to the real rows
@@ -1606,7 +1609,33 @@ def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
     # Imported here because the adapters load the resources' Triton kernels, which importing mstar.model must not need.
     from mstar.engine.state.adapters import state_steps
 
-    return state_steps(step, getattr(submodule, "state_handles", {}))
+    return state_steps(step, getattr(submodule, "state_handles", {}), graph_walk=kwargs.get("graph_walk"))
+
+
+def splice_loopback_ids(ids: torch.Tensor, inputs: list[ARNodeInputs], decode: bool) -> torch.Tensor:
+    """``ids`` (one loop-back token per row) with each row that brought
+    its own ids taking them instead, in row order: a mixed step's prompt
+    rows, or a decode row whose last step ran elsewhere. Runs of loop-back
+    rows go in as one slice each, and the splice is device ops only: an
+    index built from a host list would be a synchronous copy behind the
+    step in flight. A decode step keeps the slot's padding rows past
+    ``inputs``, so its length stays the captured one."""
+    pieces: list[torch.Tensor] = []
+    run = None
+    for i, inp in enumerate(inputs):
+        if inp.input_ids is None or (decode and not inp.input_seq_len):
+            if run is None:
+                run = i
+            continue
+        if run is not None:
+            pieces.append(ids[run:i])
+            run = None
+        pieces.append(inp.input_ids.to(ids.dtype))
+    if run is not None:
+        pieces.append(ids[run:len(inputs)])
+    if decode and ids.shape[0] > len(inputs):
+        pieces.append(ids[len(inputs):])
+    return torch.cat(pieces) if len(pieces) > 1 else pieces[0]
 
 
 class ARNodeSubmodule(NodeSubmodule):

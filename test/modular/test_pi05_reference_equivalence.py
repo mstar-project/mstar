@@ -276,6 +276,13 @@ class MockKVAttention:
         """Pre-populate a layer's cache, standing in for a prefill pass."""
         self._store[layer_idx] = (k, v)
 
+    def _add_read(
+        self, layer: torch.Tensor, q: torch.Tensor, *, keep: bool | None, k: torch.Tensor, v: torch.Tensor,
+    ) -> torch.Tensor:
+        assert keep is None, "this fake keeps every add"
+        self.add(layer, k=k, v=v)
+        return self.read(layer, q)
+
     def add(self, layer: torch.Tensor, *, k: torch.Tensor, v: torch.Tensor) -> None:
         self._pending = (k, v)
 
