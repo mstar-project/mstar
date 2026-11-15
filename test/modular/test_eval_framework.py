@@ -1020,6 +1020,114 @@ def test_speaker_similarity_is_scored_only_for_cloned_requests(tmp_path, monkeyp
     assert ("sim" in row) is clone
 
 
+@pytest.mark.parametrize("include_success", [False, True])
+def test_tts_wer_counts_failed_requests_as_empty_hypotheses(monkeypatch, include_success):
+    import argparse
+
+    import numpy as np
+
+    from benchmark.eval import judges
+    from benchmark.eval.datasets import Item
+    from benchmark.eval.suites.tts import TTSSuite
+
+    calls = []
+
+    class FakeASR:
+        def transcribe(self, clips, langs):
+            calls.append((len(clips), langs))
+            return ["one two"]
+
+    monkeypatch.setattr(judges, "asr_judge", lambda *a: FakeASR())
+    parser = argparse.ArgumentParser()
+    TTSSuite.add_args(parser)
+    args = parser.parse_args(["--normalizer", "basic", "--sim-judge", "none"])
+    items = [Item(id="a", text="one two"), Item(id="b", text="three four")]
+    rows = []
+    if include_success:
+        rows.append({"id": "a", "ok": True, "error": None, "ttfa_s": 0.1, "e2e_s": 0.5,
+                     "audio_s": 1.0, "rtf": 0.5, "chunks": 1, "stalls": 0, "stall_s": 0.0,
+                     "sample_rate": 16000, "_audio": np.zeros(16000, dtype=np.float32)})
+    rows.append({"id": "b", "ok": False, "error": "HTTP 500"})
+
+    metrics = TTSSuite(args).score(items, rows, 1.0, None)
+
+    assert metrics["wer"] == (0.5 if include_success else 1.0)
+    assert metrics["wer_utt_mean"] == (0.5 if include_success else 1.0)
+    assert rows[-1]["wer"] == 1.0
+    assert calls == ([(1, ["en"])] if include_success else [])
+
+
+def test_utmos_loads_explicit_local_code_and_weights_without_a_hub_fetch(tmp_path, monkeypatch):
+    import torch
+
+    from benchmark.eval.judges import MosJudge
+
+    repo = tmp_path / "SpeechMOS"
+    repo.mkdir()
+    (repo / "hubconf.py").write_text(
+        "import torch\n"
+        "def utmos22_strong(pretrained=True):\n"
+        "    assert not pretrained\n"
+        "    return torch.nn.Linear(1, 1)\n"
+    )
+    checkpoint = tmp_path / "utmos.pt"
+    original = torch.nn.Linear(1, 1)
+    torch.save(original.state_dict(), checkpoint)
+    monkeypatch.setattr(torch.hub, "download_url_to_file", lambda *a, **k: pytest.fail("network fetch"))
+    judge = MosJudge(device="cpu", repo_path=repo, checkpoint_path=checkpoint)
+
+    assert torch.equal(judge.model.weight, original.weight)
+    assert torch.equal(judge.model.bias, original.bias)
+    assert judge.id.startswith("utmos22_strong:local:")
+
+
+def test_tts_offline_utmos_paths_reach_the_judge_and_are_checked(tmp_path, monkeypatch):
+    import argparse
+
+    import numpy as np
+
+    from benchmark.eval import judges
+    from benchmark.eval.datasets import Item
+    from benchmark.eval.suites.tts import TTSSuite
+
+    parser = argparse.ArgumentParser()
+    TTSSuite.add_args(parser)
+    repo = tmp_path / "SpeechMOS"
+    repo.mkdir()
+    checkpoint = tmp_path / "utmos.pt"
+    checkpoint.write_bytes(b"weights")
+    paths = ["--mos", "--mos-repo", str(repo), "--mos-checkpoint", str(checkpoint)]
+    with pytest.raises(FileNotFoundError, match="hubconf.py"):
+        TTSSuite(parser.parse_args(paths))
+    (repo / "hubconf.py").write_text("")
+    with pytest.raises(ValueError, match="must be set together"):
+        TTSSuite(parser.parse_args(["--mos", "--mos-repo", str(repo)]))
+    with pytest.raises(ValueError, match="require --mos"):
+        TTSSuite(parser.parse_args(paths[1:]))
+
+    calls = []
+
+    class FakeMOS:
+        def score(self, clip):
+            return 3.5
+
+    def mos_judge(*args):
+        calls.append(args)
+        return FakeMOS()
+
+    monkeypatch.setattr(judges, "mos_judge", mos_judge)
+    args = parser.parse_args(["--asr-judge", "none", *paths])
+    args.model_name = "test"
+    suite = TTSSuite(args)
+    assert suite.config()["mos_judge"].startswith("utmos22_strong:local:")
+    row = {"id": "a", "ok": True, "error": None, "ttfa_s": 0.1, "e2e_s": 0.5, "audio_s": 1.0,
+           "rtf": 0.5, "chunks": 1, "stalls": 0, "stall_s": 0.0, "sample_rate": 16000,
+           "_audio": np.zeros(16000, dtype=np.float32)}
+    metrics = suite.score([Item(id="a", text="one two")], [row], 1.0, None)
+    assert metrics["utmos_mean"] == 3.5
+    assert calls == [(None, repo, checkpoint)]
+
+
 def test_a_server_with_its_own_cwd_resolves_a_relative_python_and_its_tree_there(tmp_path, monkeypatch):
     """The e2e compare starts each arm's server in that arm's checkout; a relative
     ``python`` runs from there, so PATH and the recorded tree come from there too."""

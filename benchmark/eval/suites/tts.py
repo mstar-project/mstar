@@ -59,6 +59,8 @@ class TTSSuite(Suite):
         g.add_argument("--sim-judge", default="microsoft/wavlm-base-plus-sv",
                        help="speaker-similarity judge (used with --clone on items with ref_audio), or 'none'")
         g.add_argument("--mos", action="store_true", help="also score UTMOS22 (torch.hub)")
+        g.add_argument("--mos-repo", type=Path, help="local SpeechMOS checkout for offline UTMOS")
+        g.add_argument("--mos-checkpoint", type=Path, help="local UTMOS22 checkpoint for offline scoring")
         g.add_argument("--judge-device", default=None, help="device for the judges (default cuda if available)")
         g.add_argument("--stall-prebuffer-ms", type=float, default=0.0,
                        help="audio the modeled player buffers before it starts")
@@ -69,6 +71,15 @@ class TTSSuite(Suite):
         super().__init__(args)
         self.extra = parse_extra(args.extra)
         self.normalizer_name, self.normalize = get_normalizer(args.normalizer)
+        if (args.mos_repo is None) != (args.mos_checkpoint is None):
+            raise ValueError("--mos-repo and --mos-checkpoint must be set together")
+        if args.mos_repo is not None and not args.mos:
+            raise ValueError("--mos-repo and --mos-checkpoint require --mos")
+        if args.mos_repo is not None:
+            if not (args.mos_repo / "hubconf.py").is_file():
+                raise FileNotFoundError(f"offline UTMOS needs hubconf.py in {args.mos_repo}")
+            if not args.mos_checkpoint.is_file():
+                raise FileNotFoundError(f"offline UTMOS checkpoint not found: {args.mos_checkpoint}")
         if args.engine == "nanovllm-voxcpm":
             unsent = [f"--{k}" for k in ("voice", "language", "instructions") if getattr(args, k)]
             if unsent:
@@ -80,6 +91,11 @@ class TTSSuite(Suite):
 
     def config(self) -> dict[str, Any]:
         a = self.args
+        mos_id = None
+        if a.mos:
+            mos_id = "utmos22_strong"
+            if a.mos_repo is not None:
+                mos_id = judges.mos_local_id(a.mos_repo, a.mos_checkpoint)
         return {
             "engine": a.engine,
             "request": {k: v for k, v in self._payload(Item(id="", text=""), 0).items() if k != "input"},
@@ -90,7 +106,7 @@ class TTSSuite(Suite):
             "judge_language": a.judge_language,
             "error_unit": "auto (CER for zh/ja/ko/th, WER otherwise)",
             "sim_judge": None if a.sim_judge == "none" else f"wavlm-sv:{a.sim_judge}",
-            "mos_judge": "utmos22_strong" if a.mos else None,
+            "mos_judge": mos_id,
             "stall_prebuffer_ms": a.stall_prebuffer_ms,
             "stall_min_ms": a.stall_min_ms,
         }
@@ -215,13 +231,18 @@ class TTSSuite(Suite):
             audio_dir.mkdir(parents=True, exist_ok=True)
             for r in ok:
                 write_wav(audio_dir / f"{r['id']}.wav", r["_audio"], r["sample_rate"])
-        if ok and a.asr_judge != "none":
-            judge = judges.asr_judge(a.asr_judge, a.judge_device)
-            langs = [by_id[r["id"]].lang or a.judge_language for r in ok]
-            hyps = judge.transcribe([(r["_audio"], r["sample_rate"]) for r in ok], langs)
-            refs = [by_id[r["id"]].text for r in ok]
+        if rows and a.asr_judge != "none":
+            ok_langs = [by_id[r["id"]].lang or a.judge_language for r in ok]
+            ok_hyps = []
+            if ok:
+                judge = judges.asr_judge(a.asr_judge, a.judge_device)
+                ok_hyps = judge.transcribe([(r["_audio"], r["sample_rate"]) for r in ok], ok_langs)
+            answered = iter(ok_hyps)
+            hyps = [next(answered) if r["ok"] else "" for r in rows]
+            refs = [by_id[r["id"]].text for r in rows]
+            langs = [by_id[r["id"]].lang or a.judge_language for r in rows]
             rate, per = error_rate(refs, hyps, self.normalize, langs)
-            for r, hyp, counts in zip(ok, hyps, per, strict=True):
+            for r, hyp, counts in zip(rows, hyps, per, strict=True):
                 r["hyp"], r["wer"] = hyp, counts.rate
             m["wer"] = rate
             m["wer_utt_mean"] = stats.mean(c.rate for c in per)
@@ -233,7 +254,7 @@ class TTSSuite(Suite):
                 r["sim"] = judge.similarity((r["_audio"], r["sample_rate"]), read_wav(by_id[r["id"]].ref_audio))
             m["sim_mean"] = stats.mean(r["sim"] for r in clone)
         if ok and a.mos:
-            judge = judges.mos_judge(a.judge_device)
+            judge = judges.mos_judge(a.judge_device, a.mos_repo, a.mos_checkpoint)
             for r in ok:
                 r["utmos"] = judge.score((r["_audio"], r["sample_rate"]))
             m["utmos_mean"] = stats.mean(r["utmos"] for r in ok)

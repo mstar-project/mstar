@@ -21,8 +21,10 @@ ASR judge is never compared with a WER from another by accident.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Sequence
 from functools import cache
+from pathlib import Path
 
 import numpy as np
 
@@ -106,12 +108,31 @@ class SpeakerSimJudge:
 
 
 class MosJudge:
-    def __init__(self, device: str | None = None, hub_ref: str = "tarepan/SpeechMOS:v1.2.0"):
+    def __init__(
+        self,
+        device: str | None = None,
+        hub_ref: str = "tarepan/SpeechMOS:v1.2.0",
+        repo_path: str | Path | None = None,
+        checkpoint_path: str | Path | None = None,
+    ):
         import torch
 
-        self.id = f"utmos22_strong:{hub_ref}"
+        if (repo_path is None) != (checkpoint_path is None):
+            raise ValueError("offline UTMOS needs both the SpeechMOS repo and checkpoint paths")
         self.device = _device(device)
-        self.model = torch.hub.load(hub_ref, "utmos22_strong", trust_repo=True).to(self.device).eval()
+        if repo_path is None:
+            self.id = f"utmos22_strong:{hub_ref}"
+            model = torch.hub.load(hub_ref, "utmos22_strong", trust_repo=True)
+        else:
+            repo, checkpoint = Path(repo_path), Path(checkpoint_path)
+            if not (repo / "hubconf.py").is_file():
+                raise FileNotFoundError(f"offline UTMOS needs hubconf.py in {repo}")
+            if not checkpoint.is_file():
+                raise FileNotFoundError(f"offline UTMOS checkpoint not found: {checkpoint}")
+            self.id = mos_local_id(repo, checkpoint)
+            model = torch.hub.load(str(repo), "utmos22_strong", source="local", pretrained=False)
+            model.load_state_dict(torch.load(checkpoint, map_location="cpu", weights_only=True))
+        self.model = model.to(self.device).eval()
         self.torch = torch
 
     def score(self, clip: tuple[np.ndarray, int]) -> float | None:
@@ -155,8 +176,27 @@ def sim_judge(model_id: str, device: str | None = None) -> SpeakerSimJudge:
 
 
 @cache
-def mos_judge(device: str | None = None) -> MosJudge:
-    return MosJudge(device)
+def mos_judge(
+    device: str | None = None, repo_path: str | Path | None = None, checkpoint_path: str | Path | None = None
+) -> MosJudge:
+    return MosJudge(device, repo_path=repo_path, checkpoint_path=checkpoint_path)
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        while chunk := f.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()[:16]
+
+
+def mos_local_id(repo_path: str | Path, checkpoint_path: str | Path) -> str:
+    repo = Path(repo_path)
+    digest = hashlib.sha256()
+    for path in sorted(repo.rglob("*.py")):
+        digest.update(path.relative_to(repo).as_posix().encode())
+        digest.update(path.read_bytes())
+    return f"utmos22_strong:local:{digest.hexdigest()[:16]}:{_file_digest(Path(checkpoint_path))}"
 
 
 @cache
