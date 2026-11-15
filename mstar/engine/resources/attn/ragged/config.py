@@ -7,7 +7,7 @@ a submodule can declare a step without pulling FlashInfer in behind it.
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import torch
 
@@ -59,6 +59,43 @@ class KeyPrefixAttentionStep(ResourceStep):
     """
 
     key_lens: tuple[int, ...] = ()
+
+
+class ChunkCausalLayout(NamedTuple):
+    """One request's span in a ``ChunkCausalAttentionStep``, laid out
+    ``[global | noised | clean]`` with lengths in tokens.
+
+    ``global_len`` tokens of conditioning (registers, an anchor frame, text)
+    come first, then ``noised_len`` tokens being denoised, then ``clean_len``
+    tokens of the clean stream: the teacher-forced copy of the chunks already
+    generated (in training, the ground truth). Both streams are cut into
+    chunks of ``chunk_len`` tokens from their own start, so chunk ``c`` of each
+    stream is the same stretch of time; a stream's last chunk may be short. A
+    request with no clean stream (a decoder tower, a first chunk) sets
+    ``clean_len=0``.
+
+    A NamedTuple, like ``Segment``: one is built per request per step.
+    """
+
+    global_len: int
+    chunk_len: int
+    noised_len: int
+    clean_len: int = 0
+
+    @property
+    def span(self) -> int:
+        return self.global_len + self.noised_len + self.clean_len
+
+
+@dataclass(frozen=True)
+class ChunkCausalAttentionStep(ResourceStep):
+    """A step of ``RaggedChunkCausalAttentionSpec``: ``layouts[i]`` is how
+    ``segments[i]`` is laid out, so ``layouts[i].span == segments[i].span``.
+    A zero-span segment takes ``ChunkCausalLayout(0, 1, 0)``. The mask is the
+    layout's own; there is no ``causal`` to set.
+    """
+
+    layouts: tuple[ChunkCausalLayout, ...] = ()
 
 
 @dataclass
@@ -339,3 +376,49 @@ class RaggedKeyPrefixAttentionSpec(_RaggedSpecBase):
         from mstar.engine.resources.attn.ragged.base import RaggedKeyPrefixAttnManager
 
         return RaggedKeyPrefixAttnManager
+
+
+@dataclass
+class RaggedChunkCausalAttentionSpec(_RaggedSpecBase):
+    """Cacheless teacher-forcing attention over a chunked two-stream layout
+    (``ChunkCausalAttentionStep``, one ``ChunkCausalLayout`` per segment). Key
+    ``k`` is visible to query ``q`` of the same segment when:
+
+    * ``k`` is global: every token reads the conditioning prefix, and a global
+      query reads only globals;
+    * both are clean and ``chunk(k) <= chunk(q)``: the clean stream is
+      block-causal;
+    * both are noised and ``chunk(k) == chunk(q)``: the noised stream is
+      block-diagonal, each chunk bidirectional within itself;
+    * ``q`` is noised, ``k`` is clean and ``chunk(k) < chunk(q)``: a chunk is
+      denoised against the clean copies of the chunks before it, never its own
+      (that would leak its target). A clean query never reads a noised key.
+
+    Its own kind, not a ``RaggedBlockCausalAttentionSpec`` with a block per
+    chunk: whether a key is visible depends on the query's stream as well as
+    its chunk, so no layout of key ranges per query block expresses it. It runs
+    ``flex_attention`` over a ``BlockMask`` planned per step
+    (``attn.ragged.chunk_causal``).
+
+    ``mask_block_size`` is the ``BlockMask``'s tile; None takes flex's default
+    (128), rounded up to 256 where the FLASH backend runs on Blackwell, whose
+    query tile is two 128-row stages.
+    """
+
+    mask_block_size: int | None = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.mask_block_size is not None and (
+            type(self.mask_block_size) is not int or self.mask_block_size <= 0
+        ):
+            raise ValueError(
+                f"chunk-causal attention {self.resource_key!r}: mask_block_size must be a "
+                f"positive integer or None, got {self.mask_block_size!r}"
+            )
+
+    @property
+    def resource_class(self) -> "type[Resource]":
+        from mstar.engine.resources.attn.ragged.base import RaggedChunkCausalAttnManager
+
+        return RaggedChunkCausalAttnManager
