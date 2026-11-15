@@ -3547,7 +3547,8 @@ A model serves ``response_format`` and ``structured_outputs`` (see **Structured 
 * sets ``STRUCTURED_OUTPUTS = True`` on its model class, or a deployment with
   ``enable_grammar`` is refused at startup;
 * attaches the request's grammar to its text sampler's settings: in
-  ``get_request_resource_configs``, ``SampleSettings(..., grammar=request_grammar(model_kwargs))``,
+  ``get_request_resource_configs``, the settings the base class builds with
+  ``grammar=request_grammar(model_kwargs)`` added (Qwen3.5: ``replace(settings, grammar=...)``),
   with ``request_grammar`` from ``mstar.engine.state`` (a bad grammar raises the client's 400);
 * lists its reply's stop ids in ``text_output()``, the stops the grammar lets a reply end on (a
   loop that stops through a ``TokenStop`` on the grammar sampler without them is refused at
