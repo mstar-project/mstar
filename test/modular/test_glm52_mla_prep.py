@@ -61,10 +61,11 @@ _POSITIONS = []
 def _positions():
     """GLM-5.2's position resource on the GPU, its fp32 table over MAX_POS positions."""
     from mstar.engine.resources.position.manager import RopeManager
+    from mstar.model.glm52.tests.testing import positions_config
 
     if not _POSITIONS:
         _POSITIONS.append(RopeManager(
-            Glm52ModelConfig().position_config(), torch.device("cuda"), max_seq_len=MAX_POS))
+            positions_config(Glm52ModelConfig()), torch.device("cuda"), max_seq_len=MAX_POS))
     return _POSITIONS[0]
 
 
@@ -157,23 +158,18 @@ def test_fused_prep_needs_the_absorbed_path_and_supported_widths():
 
 
 def test_fused_prep_rotates_only_interleaved_pairs_from_a_table():
-    """The kernels turn (2i, 2i + 1) from the cos/sin table: a NeoX checkpoint, or a position
-    resource without a table, keeps the ops."""
-    from dataclasses import replace
+    """The kernels turn (2i, 2i + 1) from the cos/sin table: a NeoX checkpoint's latent array keeps the ops."""
+    from mstar.engine.state import PagedLatent
+    from mstar.model.glm52.config import KV
+    from mstar.model.glm52.tests.testing import bind_cpu_state, build_cpu_resources
 
-    from mstar.engine.resources.position.manager import RopeManager
-    from mstar.model.glm52.config import ATTN_RESOURCE, KV_RESOURCE, POS_RESOURCE
-
-    cfg = Glm52ModelConfig.reduced()
-    cfg.mla_absorb = True
-    cfg.q_lora_rank, cfg.kv_lora_rank, cfg.qk_rope_head_dim = 256, 256, 8
-    pos = cfg.position_config()
-    for pos_cfg, fused in ((pos, True), (replace(pos, interleave=False), False),
-                           (replace(pos, rope_table_dtype=None), False)):
-        layer = Glm52MLAAttention(cfg)
-        layer.bind_resources({KV_RESOURCE: object(), ATTN_RESOURCE: object(),
-                              POS_RESOURCE: RopeManager(pos_cfg, torch.device("cpu"), max_seq_len=64)})
-        assert layer.mla_fused_prep is fused, pos_cfg
+    for interleave in (True, False):
+        cfg = Glm52ModelConfig.reduced()
+        cfg.mla_absorb = True
+        cfg.rope_interleave = cfg.indexer_rope_interleave = interleave
+        resources, _ = build_cpu_resources(cfg)
+        handles = bind_cpu_state(torch.nn.Module(), cfg, resources)
+        assert handles[KV]._takes_format(PagedLatent(rope_table=True)) is interleave
 
 
 def _gpu_resources(cfg, num_pages):
@@ -182,8 +178,8 @@ def _gpu_resources(cfg, num_pages):
     from mstar.engine.resources.kv.config import KVLayout, PagedKVConfig
     from mstar.engine.resources.position.manager import RopeManager
     from mstar.engine.resources.runner import StepRunner
-    from mstar.model.glm52._testing import _StubTransferManager
-    from mstar.model.glm52.config import ATTN_RESOURCE, KV_RESOURCE, POS_RESOURCE
+    from mstar.model.glm52.config import ATTN, KV, SAMPLER
+    from mstar.model.glm52.tests.testing import POSITIONS, GreedySampler, _StubTransferManager, positions_config
 
     dev = torch.device("cuda")
     kv_cfg = PagedKVConfig(
@@ -194,41 +190,43 @@ def _gpu_resources(cfg, num_pages):
     stub = manager_mod.KVTransferManager
     manager_mod.KVTransferManager = _StubTransferManager
     try:
-        kv = manager_mod.KVManager(cfg=kv_cfg, name=KV_RESOURCE, joint_comm_group=None,
+        kv = manager_mod.KVManager(cfg=kv_cfg, name=KV, joint_comm_group=None,
                                    transfer_engine_info=None, device=dev, dtype=torch.bfloat16)
     finally:
         manager_mod.KVTransferManager = stub
-    attn = FlashInferMLAManager(kv_cache=KV_RESOURCE, device=dev, dtype=torch.bfloat16,
+    attn = FlashInferMLAManager(kv_cache=KV, device=dev, dtype=torch.bfloat16,
                                 kv_config=kv_cfg, sm_scale=cfg.softmax_scale)
-    pos = RopeManager(cfg.position_config(), dev, max_seq_len=cfg.max_seq_len)
-    resources = {KV_RESOURCE: kv, ATTN_RESOURCE: attn, POS_RESOURCE: pos}
+    pos = RopeManager(positions_config(cfg), dev, max_seq_len=cfg.max_seq_len)
+    resources = {KV: kv, ATTN: attn, POSITIONS: pos, SAMPLER: GreedySampler()}
     runner = StepRunner(resources, node_resources={"LLM": list(resources)})
     runner.ingest_request("r0")
     return resources, runner
 
 
-def _step(layer, fwd, runner, h, start):
-    from mstar.engine.resources import AttentionStep, KVStep, Segment, StepContext, SubmoduleStep
-    from mstar.model.glm52.config import ATTN_RESOURCE, KV_RESOURCE
+def _step(fwd, runner, handles, h, start):
+    from mstar.engine.resources import Segment, StepContext, SubmoduleStep
+    from mstar.engine.state import ArrayStep
+    from mstar.engine.state.adapters import state_steps
+    from mstar.model.glm52.config import KV
+    from mstar.model.glm52.tests.testing import close_step, open_step
 
     n = h.shape[0]
-    step = SubmoduleStep(
-        segments=[Segment("r0", "main", n)],
-        steps={KV_RESOURCE: KVStep(), ATTN_RESOURCE: AttentionStep(causal=True)})
-    step.set_ctx(StepContext(request_ids=("r0",), graph_walk="w", slot=0, capture=False))
-    assert runner.admit(step).ok
-    runner.plan(step)
+    step = state_steps(
+        SubmoduleStep(segments=[Segment("r0", "main", n)], state={KV: ArrayStep()}), handles, graph_walk="prefill")
+    ctx = StepContext(request_ids=("r0",), graph_walk="prefill", slot=0, capture=False)
+    assert open_step(runner, step, ctx).ok
     pos = torch.arange(start, start + n, device="cuda")
     with torch.no_grad():
         out = fwd(h, pos)
-    runner.commit(step)
+    close_step(runner, step)
     return out
 
 
 @gpu
 def test_compiled_layer_with_fused_prep_is_the_unfused_layer_bit_for_bit():
     """A 1100-token prefill then three decode steps: same outputs, same cache bytes."""
-    from mstar.model.glm52.config import KV_RESOURCE
+    from mstar.model.glm52.config import KV
+    from mstar.model.glm52.tests.testing import bind_cpu_state
 
     cfg = Glm52ModelConfig(num_hidden_layers=1, num_attention_heads=H)
     torch.manual_seed(0)
@@ -248,14 +246,14 @@ def test_compiled_layer_with_fused_prep_is_the_unfused_layer_bit_for_bit():
     runs = []
     for layer in (base, fused):
         resources, runner = _gpu_resources(cfg, num_pages=16)
-        layer.bind_resources(resources)
+        handles = bind_cpu_state(layer, cfg, resources)
         torch._dynamo.reset()
         fwd = torch.compile(layer)
         g = torch.Generator(device="cuda").manual_seed(1)
         h = torch.randn(1103, cfg.hidden_size, generator=g, device="cuda").to(torch.bfloat16)
-        outs = [_step(layer, fwd, runner, h[:1100], 0)]
-        outs += [_step(layer, fwd, runner, h[t:t + 1], t) for t in range(1100, 1103)]
-        runs.append((outs, resources[KV_RESOURCE].kv_cache.tensor.clone()))
+        outs = [_step(fwd, runner, handles, h[:1100], 0)]
+        outs += [_step(fwd, runner, handles, h[t:t + 1], t) for t in range(1100, 1103)]
+        runs.append((outs, resources[KV].kv_cache.tensor.clone()))
     (base_outs, base_cache), (fused_outs, fused_cache) = runs
     assert torch.equal(_bits(fused_cache), _bits(base_cache))
     for got, want in zip(fused_outs, base_outs, strict=True):

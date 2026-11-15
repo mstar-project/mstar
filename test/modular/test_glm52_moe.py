@@ -36,11 +36,11 @@ def _cpu_flashinfer_without_the_real_one(monkeypatch):
 
 
 from mstar.model.components.moe import NoAuxTcRouter  # noqa: E402
-from mstar.model.glm52._testing import fake_quantize_fp8_block  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.components.indexer import is_full_indexer_layer  # noqa: E402
 from mstar.model.glm52.components.moe import Glm52SparseMoeBlock  # noqa: E402
 from mstar.model.glm52.config import Glm52ModelConfig  # noqa: E402
+from mstar.model.glm52.tests.testing import fake_quantize_fp8_block  # noqa: E402
 from mstar.model.glm52.weight_loader import (  # noqa: E402
     load_glm52_hf_weights,
     restore_fp32_params,

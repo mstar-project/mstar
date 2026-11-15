@@ -421,7 +421,7 @@ def test_resolve_records_the_resource_every_op_runs_on():
 
 
 @pytest.mark.parametrize("field, refusal", [
-    ({"positions": Positions()}, "positions, which only an append-only array that keeps entries holds"),
+    ({"positions": Positions()}, "positions, which today's resources don't keep on HostValueStorage"),
 ])
 def test_a_host_value_is_refused_what_only_another_storage_holds(field, refusal):
     flags = replace(Value("flags", nodes={"talker"}, layers={0}, entry=Entry({}, host={"sent": bool})), **field)
@@ -537,8 +537,8 @@ def test_a_yaml_page_count_overrides_the_hook_as_a_server_builds_the_specs():
 @pytest.mark.parametrize("arrays, key, settings, allowed", [
     (lambda: [_kv()], "kv", {"max_slots": 8}, "['max_num_pages']"),
     (lambda: [_kv()], "kv", {"page_size": 64}, "['max_num_pages']"),
-    (lambda: [_kv(), _gdn()], "gdn", {"max_num_pages": 8}, "['max_slots']"),
-    (lambda: [_kv(), _gdn()], "gdn", {"prefix_slots": 8}, "['max_slots']"),
+    (lambda: [_kv(), _gdn()], "gdn", {"max_num_pages": 8}, "['max_slots', 'max_slots_of']"),
+    (lambda: [_kv(), _gdn()], "gdn", {"prefix_slots": 8}, "['max_slots', 'max_slots_of']"),
     (lambda: [_FLAG], "flag", {"max_slots": 8}, "[]"),
     (lambda: [_FLAG], "flag", {"max_num_pages": 8}, "[]"),
     (lambda: [_within()], "vision", {"max_slots": 8}, "[]"),

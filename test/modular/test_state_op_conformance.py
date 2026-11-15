@@ -19,14 +19,27 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig
+from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
+from mstar.engine.resources.position.config import PositionConfig
+from mstar.engine.resources.position.manager import RopeManager
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
-from mstar.engine.state import Array, ArrayStep, Attend, Causal, KVEntry, Read
+from mstar.engine.state import (
+    Array,
+    ArrayStep,
+    Attend,
+    Causal,
+    KVEntry,
+    LatentAttend,
+    LatentEntry,
+    Positions,
+    Read,
+    Rope,
+)
 from mstar.engine.state.adapters import StateSetup, _resolve, build_handle
 from mstar.engine.state.calls import ArrayHandle
 from mstar.engine.state.state_op import STATE_OPS, bind_state_ops, conformance_problems
-from mstar.model.components import qwen3_lm
+from mstar.model.components import mla, qwen3_lm
 from mstar.model.qwen3_omni.components import attention as omni_attention
 from mstar.model.qwen3_omni.components.rope import compute_3d_cos_sin, compute_rope_freqs
 
@@ -34,6 +47,8 @@ needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused
 
 HQ, HKV, D, LAYERS, PAGE = 8, 2, 128, 3, 16
 EPS, THETA = 1e-6, 1e6
+# GLM-5.2's latent at one TP8 rank: q_lora, rank, rope_dim and the nope head dim
+Q_LORA, RANK, ROPE, NOPE = 2048, 512, 64, 192
 # bf16 rounding, which both the kernel and the reference carry: what the kernel's own tests allow
 TOLERANCE = 2e-2
 
@@ -60,7 +75,7 @@ def _array() -> Array:
     )
 
 
-def _opened_step(kv: KVManager, lengths: dict[int, int]) -> ArrayHandle:
+def _opened_step(kv: KVManager, lengths: dict[int, int], array: Array | None = None, **resources) -> ArrayHandle:
     """A handle on real pages with a planned step over ``lengths`` tokens per request, and some history before it."""
     for rid in lengths:
         kv.ingest_request(rid, KVReqConfig())
@@ -75,12 +90,13 @@ def _opened_step(kv: KVManager, lengths: dict[int, int]) -> ArrayHandle:
     assert kv.admit(step, ctx).ok
     kv.plan(step, ctx)
     # the read hands back its q, so conformance compares what an op that reads passes to its read
-    array = _array()
+    array = array or _array()
     resources = {
         "kv": kv,
         "attn": SimpleNamespace(
             requires_kv_write=True, reads_step_kv=lambda label=None: False, run=lambda q, **kwargs: q.clone()
         ),
+        **resources,
     }
     handle = build_handle(array, resources, _resolve([array], StateSetup()))
     bind_state_ops({"kv": handle})
@@ -121,10 +137,48 @@ def _plain_rope_args(handle: ArrayHandle, layer: int, tokens: int) -> tuple:
     )
 
 
-# How to call each op on a real handle.
+def _opened_latent_step(lengths: dict[int, int]) -> ArrayHandle:
+    """A latent handle on real MLA pages, over the position resource whose fp32 table the fused prep rotates with."""
+    kv = KVManager(
+        cfg=PagedKVConfig(
+            num_layers=LAYERS, num_kv_heads=1, num_qo_heads=HQ, head_dim=RANK + ROPE, max_seq_len=256,
+            max_num_pages=64, page_size=PAGE, layout=KVLayout.MLA, kv_lora_rank=RANK, qk_rope_head_dim=ROPE,
+        ),
+        name="kv", joint_comm_group=None, transfer_engine_info=None, device=torch.device("cuda"), dtype=torch.bfloat16,
+    )
+    array = Array(
+        "kv", nodes={"llm"}, layers=frozenset(range(LAYERS)), entry=LatentEntry(rank=RANK, rope_dim=ROPE),
+        max_len=256, reads={"attn": Read(mask=Causal(), op=LatentAttend(q_heads=HQ, scale=0.1))},
+        positions=Positions(rope=Rope(theta=THETA, rotary_dim=ROPE, interleave=True, table_dtype=torch.float32)),
+    )
+    config = PositionConfig(
+        kv_cache="kv", rotary_dim=ROPE, interleave=True, rope_theta=THETA, rope_table_dtype=torch.float32,
+    )
+    positions = RopeManager(config, torch.device("cuda"), max_seq_len=1024)
+    # the read hands back q and q_pe, the rotated query the fused prep makes
+    attn = SimpleNamespace(
+        requires_kv_write=True, run=lambda q, q_pe=None, **kwargs: torch.cat([q, q_pe], -1),
+    )
+    return _opened_step(kv, lengths, array, attn=attn, rope=positions)
+
+
+def _latent_args(handle: ArrayHandle, layer: int, tokens: int) -> tuple:
+    gen = torch.Generator("cuda").manual_seed(0)
+
+    def randn(*shape):
+        return torch.randn(*shape, device="cuda", generator=gen).to(torch.bfloat16)
+
+    return (
+        handle, layer, randn(tokens, Q_LORA + RANK + ROPE), randn(tokens, HQ, NOPE + ROPE), randn(tokens, HQ, RANK),
+        randn(RANK), EPS, torch.arange(700, 700 + tokens, device="cuda"),
+    )
+
+
+# How to open a handle for each op, and how to call the op on it.
 ARGUMENTS = {
-    omni_attention.qk_norm_rope_table_attend: _thinker_args,
-    qwen3_lm.qk_norm_rope_attend: _plain_rope_args,
+    omni_attention.qk_norm_rope_table_attend: (lambda lengths: _opened_step(_manager(), lengths), _thinker_args),
+    qwen3_lm.qk_norm_rope_attend: (lambda lengths: _opened_step(_manager(), lengths), _plain_rope_args),
+    mla.mla_prep_attend: (_opened_latent_step, _latent_args),
 }
 
 
@@ -149,9 +203,10 @@ def test_every_op_in_the_tree_has_a_conformance_case():
 def test_a_fused_kernel_conforms_to_its_reference(call, layer, lengths):
     for fmt in call.op.formats:
         assert fmt.devices is None or "cuda" in fmt.devices, "this test runs on CUDA, so it couldn't cover that format"
-    handle = _opened_step(_manager(), lengths)
+    opened, arguments = ARGUMENTS[call]
+    handle = opened(lengths)
     assert call.op.name in handle.fused_ops, "a listed format should run the kernel"
-    args = ARGUMENTS[call](handle, layer, sum(lengths.values()))
+    args = arguments(handle, layer, sum(lengths.values()))
     assert conformance_problems(call, args, TOLERANCE) == []
 
 

@@ -20,9 +20,11 @@ from mstar.engine.resources import (
 from mstar.engine.resources.attn.flashinfer_mla import flashinfer_mla_supports
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.model.glm52._testing import per_request_outputs
-from mstar.model.glm52.config import KV_RESOURCE, Glm52ModelConfig
-from mstar.model.submodule_base import ModelInputsFromEngine
+from mstar.engine.state.adapters import node_handles, node_resources
+from mstar.engine.state.state_op import bind_state_ops
+from mstar.model.glm52.config import KV, Glm52ModelConfig
+from mstar.model.glm52.tests.testing import close_step, open_step, per_request_outputs
+from mstar.model.submodule_base import ModelInputsFromEngine, engine_step
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA graph capture needs a GPU",
@@ -31,7 +33,7 @@ pytestmark = pytest.mark.skipif(
 DEVICE = torch.device("cuda:0")
 DTYPE = torch.bfloat16
 NODE = "LLM"
-KV_YAML = {"resources": {KV_RESOURCE: {"max_num_pages": 64, "page_size": 16}}}
+KV_YAML = {"resources": {KV: {"max_num_pages": 64, "page_size": 16}}}
 PROMPTS = {"a": list(range(3, 12)), "b": list(range(40, 45))}
 # W8A8 numerics follow the padded shape, so the fp8 arm's prompts fill the
 # prefill bucket and eager and replay run the same shapes
@@ -98,15 +100,16 @@ def _load(tmp_path, monkeypatch, fp8: bool, cfg_overrides=None, **model_kwargs):
 
 
 class _Node:
-    """The node's resources as the engine builds them, the step cycle around
+    """The node's resources and handles as the engine builds them, the step cycle around
     the submodule, and (``capture=True``) a warmed-up ``AcceleratorGraphRunner``
     whose replay path is the engine's: lease, pad, declare over the padded
     ids, plan on the lease, stage and replay, map the slot's outputs back.
+    ``inputs`` holds the last step's real rows, which the host's cut reads.
     """
 
     def __init__(self, model, submodule, capture: bool, prompts: dict[str, list[int]]):
         self.model, self.sub, self.prompts = model, submodule, prompts
-        specs = model.get_node_resources()
+        specs = node_resources(model)
         apply_yaml_overrides(specs, KV_YAML)
         by_key = resolve_spec_dependencies(specs)
         trivial = CommGroup.trivial()
@@ -127,7 +130,10 @@ class _Node:
             for spec in specs
         }
         self.runner = StepRunner(self.resources, node_resources={NODE: list(self.resources)})
-        submodule.bind_node_resources(self.resources)
+        handles = node_handles(model, NODE, self.resources)
+        bind_state_ops(handles)
+        submodule.bind_node_state(handles)
+        self.inputs = []
         self.overrides = model.get_request_resource_configs(
             [], [], model_kwargs={"temperature": 0.0, "ignore_eos": True},
         )
@@ -149,13 +155,11 @@ class _Node:
             max_tokens=MAX_TOKENS, resource_configs=self.overrides,
         )
 
-    def step(self, walk: str, batch: dict[str, tuple[CurrentForwardPassInfo, torch.Tensor]]):
+    def step(self, walk: str, batch: dict[str, tuple[CurrentForwardPassInfo, dict]]):
+        """``batch``: each request's info and signals."""
         rids = list(batch)
         infos = {rid: info for rid, (info, _) in batch.items()}
-        inputs = [
-            self.sub.prepare_inputs(walk, info, {"text_inputs": [text]})
-            for info, text in batch.values()
-        ]
+        inputs = self.inputs = [self.sub.prepare_inputs(walk, info, signals) for info, signals in batch.values()]
         num_tokens = sum(inp.input_seq_len for inp in inputs)
         lease = None
         if self.cg is not None:
@@ -170,12 +174,10 @@ class _Node:
             request_ids=tuple(rids), graph_walk=walk, slot=0, capture=False, slot_lease=lease,
         )
         ctx.set_padded_rids(step_ids)
-        step = self.sub.declare_step(walk, list(step_ids), inputs, slot_lease=lease)
-        step.set_ctx(ctx)
+        step = engine_step(self.sub, graph_walk=walk, request_ids=list(step_ids), inputs=inputs, slot_lease=lease)
         try:
             with torch.no_grad(), autocast_scope(DTYPE, device_type=DEVICE.type):
-                assert self.runner.admit(step).ok
-                self.runner.plan(step)
+                assert open_step(self.runner, step, ctx).ok
                 engine_inputs = ModelInputsFromEngine(
                     request_ids=list(step_ids), per_request_info=meta,
                     resources=self.resources, step=step, captured=lease is not None,
@@ -187,7 +189,7 @@ class _Node:
                 else:
                     raw = self.cg.run_forward(lease, pre)
                     out_ids = self.cg.slot_for(lease).dummy_rids
-                self.runner.commit(step)
+                close_step(self.runner, step)
         finally:
             if lease is not None:
                 self.cg.release(lease, len(rids))
@@ -203,10 +205,10 @@ class _Node:
         texts = {}
         for rid, prompt in self.prompts.items():
             ids = torch.tensor(prompt, dtype=torch.long, device=DEVICE)
-            out = self.step("prefill", {rid: (infos[rid], ids)})[rid]
+            out = self.step("prefill", {rid: (infos[rid], {"text_inputs": [ids]})})[rid]
             self.sub.postprocess(rid, infos[rid], out)
             streams[rid].append(int(out["new_token"][0].item()))
-            texts[rid] = out["text_inputs"][0].clone()
+            texts[rid] = {"text_inputs": [out["text_inputs"][0].clone()]}
         # check_stop stops on EOS only; the token budget is the loop's cap, which the runtime enforces
         cap = self.model.get_loop_caps(max_output_tokens=MAX_TOKENS)["decode_loop"]
         live = list(self.prompts)
@@ -220,7 +222,7 @@ class _Node:
                 out = outs[rid]
                 self.sub.postprocess(rid, infos[rid], out)
                 streams[rid].append(int(out["new_token"][0].item()))
-                texts[rid] = out["text_inputs"][0].clone()
+                texts[rid] = {"text_inputs": [out["text_inputs"][0].clone()]}
                 infos[rid].dynamic_loop_iter_counts["decode_loop"] = it
                 if self.sub.check_stop(rid, infos[rid], out) or it + 1 >= cap:
                     live.remove(rid)
@@ -229,7 +231,6 @@ class _Node:
     def close(self):
         for rid in self.prompts:
             self.runner.remove_request(rid)
-            self.sub.cleanup_request(rid)
 
 
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])

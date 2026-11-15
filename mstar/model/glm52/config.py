@@ -2,21 +2,15 @@
 
 from dataclasses import dataclass, field
 
-import torch
-
-from mstar.engine.resources.position.config import PositionConfig
 from mstar.utils.fp8_block import Fp8BlockQuantConfig
 
-# Engine resource labels for the one LLM node: the paged (latent) KV cache,
-# the attention resource planned over it, the token positions over it, the
-# sampler. Layers bind the first two by these names (``bind_resources``); the
-# model declares all four in ``get_node_resources``.
-KV_RESOURCE = "kv"
-ATTN_RESOURCE = "attn"
-POS_RESOURCE = "pos"
-SAMPLER_RESOURCE = "sampler"
-# dsa_long_context: the DSA resource (mstar/engine/resources/dsa)
-DSA_RESOURCE = "dsa"
+# The declared state of the one LLM node (`Glm52Model.declare_state`): the latent array and its read, the DSA index
+# keys and their top-k read, the MTP seed and the sampler.
+KV, ATTN = "kv", "attn"
+INDEX_KEYS, TOPK = "index_keys", "index_topk"
+MTP_SEED, SAMPLER = "mtp_seed", "sampler"
+# the walk metadata that carries a request's prompt length, which `process_prompt` sets
+PROMPT_LEN = "prompt_len"
 # Glm52ModelConfig.kernels
 KERNELS = ("auto", "reference")
 
@@ -179,16 +173,6 @@ class Glm52ModelConfig:
     def softmax_scale(self) -> float:
         """MLA's attention scale. Plain RoPE, so no YaRN mscale folds in."""
         return self.qk_head_dim ** -0.5
-
-    def position_config(self) -> PositionConfig:
-        """The positions over the KV cache and the RoPE the layers rotate with: interleaved
-        over ``qk_rope_head_dim``, from an fp32 cos/sin table built once (the angles as the
-        reference computes them, for every position up to ``max_seq_len``)."""
-        return PositionConfig(
-            kv_cache=KV_RESOURCE, rotary_dim=self.qk_rope_head_dim,
-            interleave=self.rope_interleave, rope_theta=self.rope_theta,
-            rope_table_dtype=torch.float32,
-        )
 
     @property
     def padded_head_dim(self) -> int:

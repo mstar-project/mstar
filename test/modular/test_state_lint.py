@@ -38,11 +38,12 @@ PORTED = (
     "mstar/model/nemotron_duplex", "mstar/model/components/fastconformer.py",
     "mstar/model/components/fastconformer_stream.py",
     "mstar/model/waypoint", "mstar/model/lingbot_world",
+    "mstar/model/glm52",
 )
 # The list only shrinks: a package leaves it when its port lands, and nothing is added to it.
 UNPORTED = (
-    "mstar/model/cosmos3", "mstar/model/cosyvoice3", "mstar/model/glm52", "mstar/model/glm5_next",
-    "mstar/model/minicpm_o", "mstar/model/muse", "mstar/model/ripple",
+    "mstar/model/cosmos3", "mstar/model/cosyvoice3", "mstar/model/glm5_next", "mstar/model/minicpm_o",
+    "mstar/model/muse", "mstar/model/ripple",
 )
 # shared code under mstar/model/ that holds no model
 SHARED = ("mstar/model/components", "mstar/model/loader")
@@ -62,7 +63,7 @@ ALLOWED = {
         "AcceleratorGraphConfig", "BatchedAcceleratorGraphConfig", "DETERMINISTIC_COMPILE_MODE",
         "PackedAcceleratorGraphConfig", "PiecewiseAcceleratorGraphConfig", "PiecewiseBatchedConfig",
         "PiecewiseCallInputs", "PiecewiseCaptureShape", "PiecewisePackedConfig", "decode_rows_then_prompt",
-        "check_inductor_options", "geometric_batch_sizes",
+        "check_inductor_options", "distribute_tokens", "geometric_batch_sizes",
     )
 } | {
     ("mstar.engine.accelerator_graph_runner", "compile_kwargs"): _CAPTURE,
@@ -118,6 +119,17 @@ ALLOWED_IN_FUNCTION = {
         "the ViT's eager varlen attention, flash-attn or a masked SDPA, which keeps no state",
     ("mstar/model/bagel/submodules.py", "ViTEncoderSubmodule._replay_block_loop", "disable"):
         "the ViT region's replay, which runs its captured graph; no state call sits behind it",
+    ("mstar/model/glm52/submodules.py", "Glm52LLMSubmodule._broadcast", "disable"):
+        "the TP broadcast of the verdict, which dynamo can't trace in place; no state call sits behind it",
+    ("mstar/model/glm52/submodules.py", "Glm52LLMSubmodule._stage_verdict", "disable"):
+        "the model's own verdict mailbox, whose pinned table a captured replay keeps; no state call sits behind it",
+    ("mstar/model/glm52/components/moe.py", "Glm52SparseMoeBlock._forward_decode", "disable"):
+        "the fused fp8 MoE decode's Triton launches with PDL, which keep no state",
+    ("mstar/model/glm52/components/moe.py", "Glm52SparseMoeBlock._dispatch_prefill", "disable"):
+        "the fused fp8 MoE prefill's Triton launches, which keep no state",
+    ("mstar/model/glm52/components/attention.py", "Glm52MLAAttention._index_pass", "disable"):
+        "the key array's add and top-k read, with the branch on `selects` and the indexer's query between them, "
+        "which stay out of the compiled frame as DSA steps run eager",
 }
 # what a module defines to be handed the node's built resources, rather than its handles (`bind_state`)
 RESOURCE_BINDS = {"bind_resources", "bind_node_resources"}

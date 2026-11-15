@@ -8,6 +8,7 @@ from rust_runtime import build_runtime
 from test_graph_runtime import _sharding_config
 
 from mstar.graph.base import GraphEdge, Loop
+from mstar.graph.runtime.rust import RustGraphRuntime
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import Model, WorkerGraph
 from mstar.model.submodule_base import END_PARTITION
@@ -23,15 +24,11 @@ def _edges(section) -> list[GraphEdge]:
     return (section.section if isinstance(section, Loop) else section).outputs
 
 
-def run_walks(model: Model, step: Step, prompt: torch.Tensor, max_tokens: int,
-              max_steps: int = 64) -> list[int]:
-    """Run the request to completion; returns the token ids it sent to the client."""
-    # a stop counts only if the runtime accepts it for the walk; the conductor also ends
-    # the request once its counted tokens reach max_tokens
-    walks = model.get_graph_walk_graphs()
+def walk_runtime(walks: dict) -> RustGraphRuntime:
+    """A runtime on worker w0 with a worker graph per walk of ``walks``, numbered in the walks' sorted order."""
     names = sorted(walks)
     ids = list(range(len(names)))
-    runtime = build_runtime(
+    return build_runtime(
         my_worker_id="w0",
         my_worker_graphs=[
             WorkerGraph(section=walks[w], graph_walks={w}, ranks=[0], worker_graph_id=i)
@@ -46,7 +43,18 @@ def run_walks(model: Model, step: Step, prompt: torch.Tensor, max_tokens: int,
         node_to_partition={"LLM": PARTITION},
         sharding_config=_sharding_config(),
     )
-    plan = model.walk_plan(PARTITION, ["text"], ["text"], {"text_inputs": [prompt]}, {})
+
+
+def run_walks(model: Model, step: Step, prompt: torch.Tensor, max_tokens: int,
+              max_steps: int = 64, model_kwargs: dict | None = None) -> list[int]:
+    """Run the request to completion; returns the token ids it sent to the client. ``model_kwargs`` are what
+    `process_prompt`'s metadata folds into the request's, which `walk_plan` reads."""
+    # a stop counts only if the runtime accepts it for the walk; the conductor also ends
+    # the request once its counted tokens reach max_tokens
+    walks = model.get_graph_walk_graphs()
+    ids = list(range(len(walks)))
+    runtime = walk_runtime(walks)
+    plan = model.walk_plan(PARTITION, ["text"], ["text"], {"text_inputs": [prompt]}, model_kwargs or {})
     caps = model.get_loop_caps(max_output_tokens=max_tokens)
     rid = runtime.add_request(
         request_id="r", partition=PARTITION, graph_walk=plan[0].walk,

@@ -36,21 +36,24 @@ def _force_cpu_flashinfer(monkeypatch):
 from request_walks import run_walks  # noqa: E402
 
 from mstar.engine.resources import StepContext  # noqa: E402
-from mstar.model.glm52._testing import (  # noqa: E402
-    build_cpu_resources,
-    install_cpu_rope,
-    per_request_outputs,
-)
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
-    KV_RESOURCE,
-    POS_RESOURCE,
-    SAMPLER_RESOURCE,
+    KV,
+    SAMPLER,
     Glm52ModelConfig,
 )
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
-from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine  # noqa: E402
+from mstar.model.glm52.tests.testing import (  # noqa: E402
+    POSITIONS,
+    bind_cpu_state,
+    build_cpu_resources,
+    close_step,
+    install_cpu_rope,
+    open_step,
+    per_request_outputs,
+)
+from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, engine_step  # noqa: E402
 from mstar.model.utils import process_weights_after_loading  # noqa: E402
 from mstar.testing_utils.engine import make_engine, make_mgmt  # noqa: E402
 
@@ -66,7 +69,7 @@ def _fwd_info(rid: str, max_tokens: int, ignore_eos: bool) -> SimpleNamespace:
     return SimpleNamespace(
         request_id=rid,
         max_tokens=max_tokens,
-        resource_configs={SAMPLER_RESOURCE: SimpleNamespace(
+        resource_configs={SAMPLER: SimpleNamespace(
             ignore_eos=ignore_eos, temperature=0.0, repetition_penalty=1,
         )},
         dynamic_loop_iter_counts={},
@@ -79,7 +82,7 @@ class _Driver:
     def __init__(self, sub: Glm52LLMSubmodule, cfg: Glm52ModelConfig, rids: list[str]):
         self.sub = sub
         self.resources, self.runner = build_cpu_resources(cfg, rids)
-        sub.bind_node_resources(self.resources)
+        bind_cpu_state(sub, cfg, self.resources)
 
     def step(self, walk: str, batch: dict[str, tuple[SimpleNamespace, torch.Tensor]]):
         rids = list(batch)
@@ -89,11 +92,9 @@ class _Driver:
             self.sub.prepare_inputs(walk, info, {"text_inputs": [text]})
             for info, text in batch.values()
         ]
-        step = self.sub.declare_step(walk, rids, inputs)
+        step = engine_step(self.sub, graph_walk=walk, request_ids=rids, inputs=inputs)
         ctx = StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0, capture=False)
-        step.set_ctx(ctx)
-        assert self.runner.admit(step).ok
-        self.runner.plan(step)
+        assert open_step(self.runner, step, ctx).ok
         engine_inputs = ModelInputsFromEngine(
             request_ids=rids,
             per_request_info={rid: info for rid, (info, _) in batch.items()},
@@ -102,7 +103,7 @@ class _Driver:
         )
         kw = self.sub.preprocess(walk, engine_inputs, inputs)
         outs = per_request_outputs(self.sub.forward_batched(walk, engine_inputs, **kw), rids)
-        self.runner.commit(step)
+        close_step(self.runner, step)
         failures = {}
         executing = SimpleNamespace(
             node_name="llm", request_ids=rids, inputs=inputs,
@@ -154,7 +155,7 @@ def test_kv_length_and_position_track_the_stream():
     sub = Glm52LLMSubmodule(model, cfg)
     driver = _Driver(sub, cfg, ["r0"])
     info = _fwd_info("r0", 20, True)
-    kv, pos = driver.resources[KV_RESOURCE], driver.resources[POS_RESOURCE]
+    kv, pos = driver.resources[KV], driver.resources[POSITIONS]
     out = driver.step("prefill", {"r0": (info, prompt)})["r0"]
     total = prompt.numel()
     assert kv._streams["r0"]["main"].stored_len == pos.position("r0", "main") == total
@@ -216,26 +217,8 @@ def test_declare_step_shapes():
     sub = Glm52LLMSubmodule(_model(cfg), cfg)
     inputs = [sub.prepare_inputs("prefill", _fwd_info("r0", 8, True), {"text_inputs": [torch.tensor([1, 2, 3])]})]
     step = sub.declare_step("prefill", ["r0"], inputs)
-    assert set(step.keys()) == {"kv", "attn", "pos", "sampler"}
+    assert set(step.state) == {KV, SAMPLER}
     assert step.segments[0].span == 3
-
-
-def test_last_rows_slices_padded_prefill_to_real_requests():
-    # A captured prefill plan pads qo_indptr to the bucket and tail-fills it
-    # with the last real offset. _last_rows must return one row per real
-    # request, not one per bucket slot: a padded slot duplicates the final
-    # request's row and hands the sampler more logit rows than it has
-    # per-request params (an out-of-bounds read on the eager sampler).
-    cfg = _cfg(mla_absorb=True)
-    sub = Glm52LLMSubmodule(_model(cfg), cfg)
-    # three real requests (lengths 5, 7, 3) captured in a bucket of four
-    qo_indptr = torch.tensor([0, 5, 12, 15, 15])
-    hidden = torch.randn(15, cfg.hidden_size)
-    sub._attn = lambda _ei: SimpleNamespace(qo_indptr_buf=lambda _slot: qo_indptr)
-    engine_inputs = SimpleNamespace(request_ids=["a", "b", "c"])
-    rows = sub._last_rows(engine_inputs, hidden, {})
-    assert rows.shape[0] == 3
-    assert torch.equal(rows, hidden[[4, 11, 14]])
 
 
 # ── the context limit ────────────────────────────────────────────────────
@@ -260,7 +243,7 @@ def test_a_request_sized_to_the_window_gets_every_token():
     prompt = torch.arange(prompt_len, dtype=torch.long) + 3
     fits = limit - prompt_len + 1
     stream = _drive(driver, prompt, _fwd_info("r0", fits, True))
-    kv = driver.resources[KV_RESOURCE]
+    kv = driver.resources[KV]
     assert stream.numel() == fits
     assert kv._streams["r0"]["main"].stored_len == limit
     assert len(kv._streams["r0"]["main"].page_indices) == limit // 8
@@ -300,7 +283,7 @@ def test_a_stop_token_from_the_prefill_ends_the_reply(ignore_eos, caplog):
     cfg = _cfg(True)
     eos = cfg.eos_token_ids[0]
     driver = _Driver(Glm52LLMSubmodule(_model(cfg), cfg), cfg, ["r0"])
-    sampler = driver.resources[SAMPLER_RESOURCE]
+    sampler = driver.resources[SAMPLER]
     greedy = sampler.sample
 
     def eos_once(rids, logits, **kw):

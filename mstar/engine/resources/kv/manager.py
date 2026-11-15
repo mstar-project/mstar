@@ -5,12 +5,12 @@ from collections import Counter
 from collections.abc import Callable, Collection, Sequence
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 import numpy as np
 import torch
 
-from mstar.distributed.communication import JointGroups
+from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.resources.base import (
     AttentionResource,
     CachedLease,
@@ -572,6 +572,17 @@ class _SlotBuffer:
         self.zero_prefix = buffer.numel()  # allocated zeroed
 
 
+class Correction(Protocol):
+    """A verify step's moves of the ``label`` stream of each request in ``rids``, known once the step has run on the
+    device."""
+
+    label: str
+    rids: Collection[str]
+
+    def delta(self, rid: str) -> int:
+        """The tokens the request's stream moves by, which waits for the step's counts to reach the host."""
+
+
 class KVManager(AttentionResource):
     prefix_skip_safe = True
     # written through an exchange (`sequence_shard`): the step's every token, or a ring's own ones
@@ -669,6 +680,8 @@ class KVManager(AttentionResource):
         # Each request whose layout holds an exact retention, with each such label's policy. Its commit applies the
         # policy from the layout, where other requests' come from the step.
         self._exact: dict[str, dict[str, RetentionPolicy]] = {}
+        # rid -> label -> a verify step's correction of the stream, which waits for the next admit, offload or drop
+        self._deferred: dict[str, Correction] = {}
         # dropped request -> what it returns with, until its rebuild lands
         self._dropped: dict[str, Dropped] = {}
         # rebuilt request -> the tokens it had written when its rebuild landed
@@ -2132,6 +2145,8 @@ class KVManager(AttentionResource):
             self._looked_up.add(rid)
 
     def admit(self, step: KVStep, ctx: StepContext) -> AdmitOutcome:
+        if self._deferred:
+            self._apply_deferred()
         if self._preplanned and not ctx.is_preplan:
             if self._preplan_key == self._plan_key(step, ctx):
                 # pages were already reserved by the preplan pass — and the record
@@ -3135,6 +3150,33 @@ class KVManager(AttentionResource):
         self._preplan_states = {}
         self._cached_plan_output = None
 
+    @property
+    def tp_group(self) -> CommGroup | None:
+        """The TP group of the ranks this pool spans, which hold the same requests; None on one worker."""
+        return None if self._comm_group is None else self._comm_group.tp_group
+
+    def defer_correct_len(self, correction: Correction) -> None:
+        """Move each of the correction's streams through `correct_len` before anything next reads its length: at the
+        next `admit`, `offload` or `check_drop`. The pool holds the step's one correction under each of its requests."""
+        with self._lock:
+            for rid in correction.rids:
+                assert rid not in self._deferred, (
+                    f"KV {self.name}: a second correction of {rid} before the first applied"
+                )
+                self._deferred[rid] = correction
+
+    def _apply_deferred(self, rids: Collection[str] | None = None) -> None:
+        """Apply the held corrections of ``rids``, or every one. An admit applies every one, not only its step's
+        rows, so a request the next steps leave out can't find its verify step's count table reused. A correction
+        whose count read raises stays held, and the next admit raises again."""
+        with self._lock:
+            for rid in list(self._deferred) if rids is None else rids:
+                correction = self._deferred.get(rid)
+                if correction is not None:
+                    delta = correction.delta(rid)
+                    del self._deferred[rid]
+                    self.correct_len(rid, correction.label, delta)
+
     def correct_len(self, rid: str, label: str, delta: int) -> None:
         """Move a stream's stored length by ``delta`` tokens, pages kept: a
         speculative verify step commits its whole block and its rejected tail
@@ -3536,6 +3578,8 @@ class KVManager(AttentionResource):
             return any(stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values())
 
     def check_drop(self, rid: str, tokens: int) -> str | None:
+        if self._deferred:
+            self._apply_deferred((rid,))
         if self._world_size > 1 and not self._counts:
             return (
                 f"KV {self.name}: dropping {rid} on one of {self._world_size} ranks "
@@ -3684,6 +3728,8 @@ class KVManager(AttentionResource):
         A victim `preempt` chose that doesn't move comes off its earmark with
         nothing freed.
         """
+        if self._deferred:
+            self._apply_deferred((rid,))
         if self._cpu_pool is None or rid not in self._streams:
             return 0
         claimed, read_futures = self._claim_for_offload(rid)
@@ -4232,6 +4278,7 @@ class KVManager(AttentionResource):
             if stream.read_future is not None:
                 wait([stream.read_future])
         with self._lock:
+            self._deferred.pop(rid, None)
             for stream in self._streams.get(rid, {}).values():
                 assert not stream.offloaded and stream.host_copy is None, (
                     f"KV {self.name}: reset {rid}, whose pages are on their way to or from the host"
@@ -4294,6 +4341,7 @@ class KVManager(AttentionResource):
             self._looked_up.discard(rid)
             self._overrides.pop(rid, None)
             self._exact.pop(rid, None)
+            self._deferred.pop(rid, None)
             self._classify(rid, guaranteed=False)
             self._footprints.pop(rid, None)
             self._dropped.pop(rid, None)

@@ -18,12 +18,15 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.model.glm52._testing import per_request_outputs
+from mstar.engine.state import sample
+from mstar.engine.state.adapters import node_handles, node_resources
+from mstar.engine.state.state_op import bind_state_ops
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
 from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
-from mstar.model.glm52.config import ATTN_RESOURCE, DSA_RESOURCE, KV_RESOURCE, Glm52ModelConfig
+from mstar.model.glm52.config import ATTN, INDEX_KEYS, KV, Glm52ModelConfig
 from mstar.model.glm52.submodules import Glm52LLMSubmodule
-from mstar.model.submodule_base import END_PARTITION, ModelInputsFromEngine
+from mstar.model.glm52.tests.testing import close_step, open_step, per_request_outputs
+from mstar.model.submodule_base import END_PARTITION, ModelInputsFromEngine, engine_step
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -38,7 +41,7 @@ PROMPT_LEN = 6
 MAX_TOKENS = 14  # 1 prefill + 13 decode tokens: final context 6 + 13 = 19, far past topk
 # 8-token pages, 16 of them (one is the sink page): 120 cached tokens for a
 # 20-token context, and the torch fallback's page table spans every page.
-KV_YAML = {"resources": {KV_RESOURCE: {"max_num_pages": 16, "page_size": 8}}}
+KV_YAML = {"resources": {KV: {"max_num_pages": 16, "page_size": 8}}}
 
 
 def _fill_layer(layer, cfg):
@@ -142,7 +145,7 @@ class _Serve:
     def __init__(self, model, submodule: Glm52LLMSubmodule, rid: str = "r0"):
         self.submodule = submodule
         self.rid = rid
-        specs = model.get_node_resources()
+        specs = node_resources(model)
         apply_yaml_overrides(specs, KV_YAML)
         by_key = resolve_spec_dependencies(specs)
         groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
@@ -163,7 +166,9 @@ class _Serve:
         }
         self.runner = StepRunner(self.resources, node_resources={NODE: list(self.resources)})
         submodule.requires_grad_(False)
-        submodule.bind_node_resources(self.resources)
+        handles = node_handles(model, NODE, self.resources)
+        bind_state_ops(handles)
+        submodule.bind_node_state(handles)
         # ignore_eos: reduced EOS ids live inside the byte vocab; greedy decode
         # on random weights may hit one and break the exact-length assertions.
         self.overrides = model.get_request_resource_configs(
@@ -184,14 +189,12 @@ class _Serve:
         this step's rows off the KV plan."""
         rid = self.rid
         inputs = [self.submodule.prepare_inputs(walk, info, {"text_inputs": [text]})]
-        step = self.submodule.declare_step(walk, [rid], inputs)
+        step = engine_step(self.submodule, graph_walk=walk, request_ids=[rid], inputs=inputs)
         ctx = StepContext(request_ids=(rid,), graph_walk=walk, slot=0, capture=False)
         with torch.no_grad(), autocast_scope(DTYPE, device_type=DEVICE.type):
             if step is not None:
-                step.set_ctx(ctx)
-                outcome = self.runner.admit(step)
+                outcome = open_step(self.runner, step, ctx)
                 assert outcome.ok, outcome
-                self.runner.plan(step)
             engine_inputs = ModelInputsFromEngine(
                 request_ids=[rid], per_request_info={rid: info},
                 resources=self.resources, step=step,
@@ -202,14 +205,14 @@ class _Serve:
                 out = per_request_outputs(raw, [rid])[rid]
             else:
                 out = self.submodule.forward(walk, engine_inputs, **kw)
+                # the step's one draw, which forward_batched takes and the logits forward leaves
+                sample(self.submodule.sampler, out["logits"][0])
             if step is not None:
-                self.runner.commit(step)
+                close_step(self.runner, step)
         return out
 
-    def close(self, cleanup_request: bool = True):
+    def close(self):
         self.runner.remove_request(self.rid)
-        if cleanup_request:
-            self.submodule.cleanup_request(self.rid)
         for resource in self.resources.values():
             resource.cleanup()
 
@@ -220,7 +223,7 @@ def _generate_greedy(model, submodule, prompt_ids, max_tokens):
     stored key counts of layers 0 and 1 before retirement, the requests it
     still tracks after)."""
     serve = _Serve(model, submodule)
-    dsa = serve.resources[DSA_RESOURCE]
+    dsa = serve.resources[INDEX_KEYS]
     info = serve.info(max_tokens)
     generated: list[int] = []
     try:
@@ -242,7 +245,7 @@ def _generate_greedy(model, submodule, prompt_ids, max_tokens):
                     break
         stored = (dsa.keys.tokens(serve.rid, 0), dsa.keys.tokens(serve.rid, 1))
     finally:
-        serve.close(cleanup_request=False)
+        serve.close()
     return generated, stored, dsa.keys.tracked_requests()
 
 
@@ -280,18 +283,13 @@ def test_dsa_longctx_decode_past_topk(tmp_path):
 
     submodule = model.get_submodule(NODE, device="cuda", autocast_dtype=DTYPE)
     assert isinstance(submodule, Glm52LLMSubmodule)
-    # Long-context serving is eager-only (the DSA resource selects per request
-    # on the host, which a captured graph would not replay): neither
-    # whole-forward nor piecewise.
-    assert submodule.get_accelerator_graph_configs(DEVICE) == []
-    assert submodule.get_piecewise_accelerator_graph_configs(DEVICE, DTYPE) == {}
     # The absorbed declaration: one latent row per token, the MLA resource
     # planned over it (its torch fallback at reduced dims).
-    specs = {spec.resource_key: spec for spec in model.get_node_resources()}
-    assert specs[KV_RESOURCE].config.layout == KVLayout.MLA
-    assert specs[KV_RESOURCE].config.head_dim == cfg.kv_lora_rank + cfg.qk_rope_head_dim
-    assert specs[KV_RESOURCE].config.kv_lora_rank == cfg.kv_lora_rank
-    assert specs[ATTN_RESOURCE].config.backend is AttnBackend.FLASHINFER_MLA
+    specs = {spec.resource_key: spec for spec in node_resources(model)}
+    assert specs[KV].config.layout == KVLayout.MLA
+    assert specs[KV].config.head_dim == cfg.kv_lora_rank + cfg.qk_rope_head_dim
+    assert specs[KV].config.kv_lora_rank == cfg.kv_lora_rank
+    assert specs[ATTN].config.backend is AttnBackend.FLASHINFER_MLA
 
     prompt_ids = torch.arange(10, 10 + PROMPT_LEN, device=DEVICE)
 

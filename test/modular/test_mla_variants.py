@@ -1,7 +1,7 @@
 """MLAAttention's options past GLM-5.2's layout, on CPU: no decoupled dims (``mla_use_nope``,
 GLM-5.3's), whose cache rows carry a zero rope slot, against plain attention from the same
-weights, with the attention supplied through the class's hooks as a sparse attention plugs in;
-and a packed KV plane and stream label reaching the resources."""
+weights, with the naive attention supplied through the class's hook and the absorbed one by a
+stub resource; and a packed KV plane and stream label reaching the resources."""
 import sys
 import types
 from types import SimpleNamespace
@@ -50,15 +50,22 @@ class _DenseNaive(MLAAttention):
         return torch.einsum("hqk,khd->qhd", _causal_softmax(scores), v)
 
 
-class _DenseAbsorbed(MLAAttention):
-    def _select(self, hidden_states, q_c, position_ids, **sparse):
-        return "every row"
+class _StubDenseLatent:
+    """A KV and an MLA attention resource in one: keeps the step's latent rows and attends them densely."""
 
-    def _attend_selected(self, selection, q_nope, q_pe, latent, **sparse):
-        kv_c, k_pe = latent.split([self.kv_lora_rank, self.mla_cache_kpe], dim=-1)
+    def __init__(self, m: MLAAttention):
+        self.m, self.rows = m, None
+
+    def write_kv(self, k, v, layer_idx=None):
+        self.rows = k
+
+    def layer_view(self, layer_idx):
+        return self.rows
+
+    def run(self, q_nope, kv_cache_layer=None, q_pe=None):
+        kv_c, k_pe = kv_cache_layer.split([self.m.kv_lora_rank, self.m.mla_cache_kpe], dim=-1)
         scores = (torch.einsum("qhl,kl->hqk", q_nope, kv_c)
-                  + torch.einsum("qhr,kr->hqk", q_pe, k_pe)) * self.softmax_scale
-        self.rows = latent
+                  + torch.einsum("qhr,kr->hqk", q_pe, k_pe)) * self.m.softmax_scale
         return torch.einsum("hqk,kl->qhl", _causal_softmax(scores), kv_c)
 
 
@@ -105,18 +112,19 @@ def test_latent_only_mla_matches_plain_attention(kpe):
             p.copy_(1.0 + 0.1 * torch.randn_like(p) if "layernorm" in name
                     else 0.1 * torch.randn_like(p))
     params = {k: v.clone() for k, v in naive.state_dict().items()}
-    absorbed = _DenseAbsorbed(_latent_only_config(True, kpe), kv_key="kv", attn_key="attn",
-                              pos_key=None)
+    absorbed = MLAAttention(_latent_only_config(True, kpe), kv_key="kv", attn_key="attn", pos_key=None)
     absorbed.load_state_dict(params, strict=False)
     absorbed.kpe_query_fill = 1.0  # adds 0 against the zero slot
+    dense = _StubDenseLatent(absorbed)
+    absorbed.bind_resources({"kv": dense, "attn": dense})
     x = torch.randn(T, HIDDEN)
     with torch.no_grad():
         ref = _mha_reference(naive, x)
         absorbed.process_weights_after_loading()
         torch.testing.assert_close(naive(x, None), ref, rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(absorbed(x, None), ref, rtol=1e-5, atol=1e-6)
-    assert absorbed.rows.shape == (T, KV_LORA + kpe)
-    assert torch.equal(absorbed.rows[:, KV_LORA:], torch.zeros(T, kpe))
+    assert dense.rows.shape == (T, KV_LORA + kpe)
+    assert torch.equal(dense.rows[:, KV_LORA:], torch.zeros(T, kpe))
 
 
 class _Recorder:

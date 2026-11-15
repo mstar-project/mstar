@@ -5,6 +5,7 @@ reference, then both engine paths through their real resources — the
 and the NHD cache + the reference K/V attention — over a prefill and
 decode steps that cross a page boundary.
 """
+import dataclasses
 import sys
 import types
 from pathlib import Path
@@ -34,22 +35,25 @@ def _force_cpu_flashinfer(monkeypatch):
     install_cpu_rope(monkeypatch)
 
 
-from mstar.engine.resources import (  # noqa: E402
-    AttentionStep,
-    KVStep,
-    Segment,
-    StepContext,
-    SubmoduleStep,
-)
+from mstar.engine.resources import Segment, StepContext  # noqa: E402
 from mstar.engine.resources.attn.flashinfer_mla import flashinfer_mla_supports  # noqa: E402
-from mstar.model.glm52._testing import build_cpu_resources, install_cpu_rope  # noqa: E402
 from mstar.model.glm52.components.attention import Glm52MLAAttention  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
-    ATTN_RESOURCE,
-    KV_RESOURCE,
-    POS_RESOURCE,
+    ATTN,
+    KV,
     Glm52ModelConfig,
 )
+from mstar.model.glm52.tests.testing import (  # noqa: E402
+    bind_cpu_state,
+    build_cpu_resources,
+    close_step,
+    install_cpu_rope,
+    kv_step,
+    open_step,
+)
+
+# a step on one request, outside any walk's capture
+_CTX = StepContext(request_ids=("r0",), graph_walk="prefill", slot=0, capture=False)
 
 
 def _ref_rmsnorm(x, weight, eps):
@@ -193,8 +197,9 @@ def test_rope_position_zero_is_identity():
     attn, cfg, _ = _build_attention_cpu(seed=4)
     q_pe = torch.randn(1, attn.num_heads, cfg.qk_rope_head_dim)
     k_pe = torch.randn(1, 1, cfg.qk_rope_head_dim)
-    resources, _ = build_cpu_resources(cfg)
-    attn.bind_resources(resources)
+    resources, runner = build_cpu_resources(cfg, ["r0"])
+    step = kv_step(bind_cpu_state(attn, cfg, resources), [Segment("r0", "main", 1)])
+    assert open_step(runner, step, _CTX).ok
     q_rot, k_rot = attn._rope(torch.zeros(1, dtype=torch.long), q_pe, k_pe)
     torch.testing.assert_close(q_rot, q_pe, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(k_rot, k_pe, rtol=1e-6, atol=1e-6)
@@ -245,30 +250,27 @@ def test_naive_path_keeps_its_projections():
 
 
 class _Path:
-    """One attention layer bound to the node's resources for its
+    """One attention layer bound to the node's handles for its
     ``mla_absorb`` value, driven a step at a time: declare -> admit ->
-    plan -> layer forward -> commit, what the engine does around a
-    forward.
+    plan -> open -> layer forward -> commit -> close, what the engine does
+    around a forward.
     """
 
     def __init__(self, attn: Glm52MLAAttention, cfg: Glm52ModelConfig, page_size: int):
         self.attn, self.cfg = attn, cfg
-        self.resources, self.runner = build_cpu_resources(cfg, ["r0"], page_size=page_size)
-        attn.bind_resources(self.resources)
+        # the steps drive this one layer, so the array declares one
+        one = dataclasses.replace(cfg, num_hidden_layers=1)
+        self.resources, self.runner = build_cpu_resources(one, ["r0"], page_size=page_size)
+        self.handles = bind_cpu_state(attn, one, self.resources)
 
     def step(self, h: torch.Tensor, start: int) -> torch.Tensor:
         n = h.shape[0]
-        step = SubmoduleStep(
-            segments=[Segment("r0", "main", n)],
-            steps={KV_RESOURCE: KVStep(), ATTN_RESOURCE: AttentionStep(causal=True)},
-        )
-        step.set_ctx(StepContext(request_ids=("r0",), graph_walk="w", slot=0, capture=False))
-        assert self.runner.admit(step).ok
-        self.runner.plan(step)
+        step = kv_step(self.handles, [Segment("r0", "main", n)])
+        assert open_step(self.runner, step, _CTX).ok
         with torch.no_grad():
             out = self.attn(h, torch.arange(start, start + n))
-        self.runner.commit(step)
-        assert self.resources[KV_RESOURCE]._streams["r0"]["main"].stored_len == start + n
+        close_step(self.runner, step)
+        assert self.resources[KV]._streams["r0"]["main"].stored_len == start + n
         return out
 
 
@@ -278,7 +280,7 @@ def _build_pair(seed):
     from it (non-persistent buffers, so the state dicts match)."""
     torch.manual_seed(seed)
     naive_cfg = Glm52ModelConfig.reduced()  # mla_absorb False
-    naive = Glm52MLAAttention(naive_cfg)
+    naive = Glm52MLAAttention(naive_cfg, layer_idx=0)
     for lin in (naive.q_a_proj, naive.q_b_proj, naive.kv_a_proj_with_mqa,
                 naive.kv_b_proj, naive.o_proj):
         lin.weight.data.normal_(0, 0.03)
@@ -286,7 +288,7 @@ def _build_pair(seed):
         norm.weight.data.normal_(1.0, 0.02)
     absorbed_cfg = Glm52ModelConfig.reduced()
     absorbed_cfg.mla_absorb = True
-    absorbed = Glm52MLAAttention(absorbed_cfg)
+    absorbed = Glm52MLAAttention(absorbed_cfg, layer_idx=0)
     absorbed.load_state_dict(naive.state_dict())
     absorbed.process_weights_after_loading()
     return (naive, naive_cfg), (absorbed, absorbed_cfg)
@@ -300,7 +302,7 @@ def test_the_shared_mla_is_glm52s_dense_path(absorb):
 
     (naive, naive_cfg), (absorbed, absorbed_cfg) = _build_pair(seed=11)
     glm, cfg = (absorbed, absorbed_cfg) if absorb else (naive, naive_cfg)
-    base = MLAAttention(cfg, kv_key=KV_RESOURCE, attn_key=ATTN_RESOURCE, pos_key=POS_RESOURCE)
+    base = MLAAttention(cfg, layer_idx=0, kv_key=KV, attn_key=None, pos_key=None)
     base.load_state_dict(naive.state_dict())
     base.process_weights_after_loading()
     torch.manual_seed(12)
@@ -314,13 +316,13 @@ def test_the_unabsorbed_layer_hands_attention_its_k_and_v(monkeypatch):
     multi-token step's own tokens from them and raises without."""
     (naive, cfg), _ = _build_pair(seed=7)
     path = _Path(naive, cfg, 8)
-    run, seen = path.resources[ATTN_RESOURCE].run, {}
+    run, seen = path.resources[ATTN].run, {}
 
     def recorded(*args, **kwargs):
         seen.update(kwargs)
         return run(*args, **kwargs)
 
-    monkeypatch.setattr(path.resources[ATTN_RESOURCE], "run", recorded)
+    monkeypatch.setattr(path.resources[ATTN], "run", recorded)
     path.step(torch.randn(3, cfg.hidden_size) * 0.1, 0)
     assert seen["k"].shape[0] == seen["v"].shape[0] == 3
 
@@ -354,8 +356,8 @@ def test_absorbed_resource_path_matches_naive_and_dense_reference():
 
     # what each cache holds: one 48-wide latent row per token on the
     # absorbed path (32 ckv + 16 rope), padded per-head K/V on the naive one
-    kv_abs = absorbed_path.resources[KV_RESOURCE]
-    kv_naive = naive_path.resources[KV_RESOURCE]
+    kv_abs = absorbed_path.resources[KV]
+    kv_naive = naive_path.resources[KV]
     assert kv_abs.layer_view(0).shape[-1] == absorbed_cfg.cache_latent_dim == 48
     assert kv_naive.layer_view(0).shape[1:] == (2, page, naive_cfg.num_attention_heads, 64)
     assert len(kv_abs._streams["r0"]["main"].page_indices) == 2
@@ -404,24 +406,18 @@ def test_compiled_attention_does_not_recompile_per_layer(mla_absorb, monkeypatch
             layer.process_weights_after_loading()
         layers.append(layer)
     resources, runner = build_cpu_resources(cfg, ["r0"], page_size=8)
-    for layer in layers:
-        layer.bind_resources(resources)
+    handles = bind_cpu_state(torch.nn.ModuleList(layers), cfg, resources)
 
     torch._dynamo.reset()
     counter = CompileCounter()
     compiled = torch.compile(lambda m, h, p: m(h, p), backend=counter)
-    step = SubmoduleStep(
-        segments=[Segment("r0", "main", 3)],
-        steps={KV_RESOURCE: KVStep(), ATTN_RESOURCE: AttentionStep(causal=True)},
-    )
-    step.set_ctx(StepContext(request_ids=("r0",), graph_walk="w", slot=0, capture=False))
-    assert runner.admit(step).ok
-    runner.plan(step)
+    step = kv_step(handles, [Segment("r0", "main", 3)])
+    assert open_step(runner, step, _CTX).ok
     h = torch.randn(3, cfg.hidden_size) * 0.1
     with torch.no_grad():
         compiled(layers[0], h, torch.arange(3))
         first = counter.frame_count
         for layer in layers[1:]:
             compiled(layer, h, torch.arange(3))
-    runner.commit(step)
+    close_step(runner, step)
     assert counter.frame_count == first

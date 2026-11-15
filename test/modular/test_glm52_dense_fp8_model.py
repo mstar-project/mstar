@@ -36,17 +36,18 @@ def _cpu_flashinfer_without_the_real_one(monkeypatch):
 
 
 from mstar.distributed.communication import CommGroup  # noqa: E402
-from mstar.engine.resources import (  # noqa: E402
-    AttentionStep,
-    KVStep,
-    Segment,
-    StepContext,
-    SubmoduleStep,
-)
+from mstar.engine.resources import Segment, StepContext  # noqa: E402
 from mstar.model.components.fp8_linear import COLUMN, ROW, Fp8Linear, Fp8ParallelGatedMLP  # noqa: E402
-from mstar.model.glm52._testing import build_cpu_resources, install_cpu_rope  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
-from mstar.model.glm52.config import ATTN_RESOURCE, KV_RESOURCE, Glm52ModelConfig  # noqa: E402
+from mstar.model.glm52.config import Glm52ModelConfig  # noqa: E402
+from mstar.model.glm52.tests.testing import (  # noqa: E402
+    bind_cpu_state,
+    build_cpu_resources,
+    close_step,
+    install_cpu_rope,
+    kv_step,
+    open_step,
+)
 from mstar.model.utils import process_weights_after_loading  # noqa: E402
 
 
@@ -197,17 +198,13 @@ def test_shared_expert_stays_bf16_under_auto_kernels():
 
 def _forward_cpu(model, cfg, ids):
     resources, runner = build_cpu_resources(cfg, ["r0"], page_size=8)
-    for layer in model.model.layers:
-        layer.self_attn.bind_resources(resources)
+    handles = bind_cpu_state(model, cfg, resources)
     n = ids.shape[0]
-    step = SubmoduleStep(segments=[Segment("r0", "main", n)],
-                         steps={KV_RESOURCE: KVStep(), ATTN_RESOURCE: AttentionStep(causal=True)})
-    step.set_ctx(StepContext(request_ids=("r0",), graph_walk="w", slot=0, capture=False))
-    assert runner.admit(step).ok
-    runner.plan(step)
+    step = kv_step(handles, [Segment("r0", "main", n)])
+    assert open_step(runner, step, StepContext(request_ids=("r0",), graph_walk="prefill", slot=0, capture=False)).ok
     with torch.no_grad():
         logits = model(ids, torch.arange(n))
-    runner.commit(step)
+    close_step(runner, step)
     return logits
 
 

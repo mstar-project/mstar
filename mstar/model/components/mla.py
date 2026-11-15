@@ -19,8 +19,13 @@ need), is zeros, and its query part ``kpe_query_fill``.
 
 ``kv_label`` names the cache stream this layer writes and attends under, and ``cache_layer`` its
 KV layer, where a model packs its attention planes. A model's sparse
-attention plugs in by overriding ``_select`` and ``_attend_selected`` (absorbed) or ``_attend_naive``
-(naive); the keyword arguments ``forward`` takes beyond its own reach them unchanged.
+attention plugs in by overriding ``_select`` (absorbed) or ``_attend_naive`` (naive); the keyword
+arguments ``forward`` takes beyond its own reach them unchanged.
+
+A model that declares its state hands the layer the handle on its latent or KV array (``bind_state``),
+and the layer then adds, reads and rotates through that handle at its own layer id, with ``attn_key``
+None. The absorbed path's fused prep is then the state op `mla_prep_attend`, and ``_select``'s picks
+go to the read as ``selected``.
 """
 from __future__ import annotations
 
@@ -31,6 +36,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.engine.state import PagedLatent, rope, state_op
 from mstar.model.components.distributed import ColumnParallelLinear, RowParallelLinear
 from mstar.model.components.fp8_linear import (
     COLUMN,
@@ -40,9 +46,37 @@ from mstar.model.components.fp8_linear import (
     fp8_block_linear,
     fp8_reference,
 )
-from mstar.model.components.norm import RMSNorm
+from mstar.model.components.norm import RMSNorm, rms_norm
 from mstar.utils import mla_prep
 from mstar.utils.mla_latent_norm import mla_latent_norm, mla_latent_norm_available
+
+
+def _prep_attend(kv, layer, fused, q, q_nope, kv_norm_weight, eps, pos_ids):
+    rank, rope_dim = kv_norm_weight.shape[0], kv.array.entry.tensors["kpe"].shape[0]
+    kv_a, k_pe = fused[:, fused.shape[1] - rank - rope_dim:].split([rank, rope_dim], dim=-1)
+    # Clones, as in `MLAAttention._prep_and_attend`: FlashInfer's RMSNorm needs aligned input, and RoPE rotates in place
+    kv_c = rms_norm(kv_a.clone(memory_format=torch.contiguous_format), kv_norm_weight, eps)
+    q_pe, k_pe = rope(
+        kv, q[..., -rope_dim:].clone(memory_format=torch.contiguous_format),
+        k_pe.reshape(-1, 1, rope_dim).clone(memory_format=torch.contiguous_format), at=pos_ids,
+    )
+    kv.add(layer, ckv=kv_c, kpe=k_pe.squeeze(1))
+    return kv.read(layer, q_nope, q_pe=q_pe)
+
+
+@state_op(
+    adds=("kv",), reads=("kv",), formats=(PagedLatent(dtypes={torch.bfloat16}, devices={"cuda"}, rope_table=True),),
+    reference=_prep_attend,
+)
+def mla_prep_attend(kv, layer, fused, q, q_nope, kv_norm_weight, eps, pos_ids, *, target):
+    """kv_a's RMSNorm, both RoPEs and this layer's latent write in one launch, then the layer's read. ``fused`` is
+    ``(T, q_lora + rank + rope_dim)`` rows of ``[q_a | kv_a | k_pe]``, ``q`` q_b's ``(T, H, nope + rope_dim)`` and
+    ``q_nope`` its absorbed ``(T, H, rank)``."""
+    q_pe = mla_prep.kv_write_q_rope(
+        fused, kv_norm_weight, eps, target.rope_table, pos_ids, q, target.cache, target.page_of_token,
+        target.slot_of_token,
+    )
+    return kv.read(layer, q_nope, q_pe=q_pe)
 
 
 class MLAAttention(nn.Module):
@@ -53,7 +87,7 @@ class MLAAttention(nn.Module):
         layer_idx: int | None = None,
         *,
         kv_key: str,
-        attn_key: str,
+        attn_key: str | None,
         pos_key: str | None,
         kv_label: str | None = None,
         cache_layer: int | None = None,
@@ -78,7 +112,7 @@ class MLAAttention(nn.Module):
         self.padded_head_dim = config.padded_head_dim
         h = self.total_num_heads
         self.use_rope = not getattr(config, "mla_use_nope", False)
-        if self.use_rope and (pos_key is None or self.qk_rope_head_dim == 0):
+        if attn_key is not None and self.use_rope and (pos_key is None or self.qk_rope_head_dim == 0):
             raise ValueError("MLAAttention rotates its decoupled dims through a position "
                              "resource: pass pos_key and qk_rope_head_dim, or set mla_use_nope")
         if not self.use_rope and self.qk_rope_head_dim:
@@ -145,8 +179,13 @@ class MLAAttention(nn.Module):
         self._kv = None
         self._attn = None
         self._pos = None
+        # the model's id for this layer, a plain attribute that `.to(device)` leaves on the CPU
+        self.layer = None if layer_idx is None else torch.tensor(layer_idx, device="cpu")
+        self.state = None
 
     def bind_resources(self, resources: dict) -> None:
+        if self._attn_key is None:
+            return
         self._kv = resources[self._kv_key]
         self._attn = resources[self._attn_key]
         self._pos = resources[self._pos_key] if self.use_rope else None
@@ -154,6 +193,9 @@ class MLAAttention(nn.Module):
             # the fused prep turns interleaved pairs from the position resource's cos/sin
             # table (PositionConfig.rope_table_dtype); otherwise the op-by-op path serves
             self.mla_fused_prep = False
+
+    def bind_state(self, handles: dict) -> None:
+        self.state = handles.get(self._kv_key)
 
     def _rope(
         self, position_ids: torch.Tensor, q_pe: torch.Tensor, k_pe: torch.Tensor,
@@ -163,6 +205,11 @@ class MLAAttention(nn.Module):
         copied out first. Without decoupled dims (``mla_use_nope``), they pass through."""
         if not self.use_rope:
             return q_pe, k_pe
+        if self.state is not None:
+            return rope(
+                self.state, q_pe.clone(memory_format=torch.contiguous_format),
+                k_pe.clone(memory_format=torch.contiguous_format), at=position_ids,
+            )
         return self._pos.apply_qk(
             q_pe.clone(memory_format=torch.contiguous_format),
             k_pe.clone(memory_format=torch.contiguous_format), pos_ids=position_ids)
@@ -182,7 +229,14 @@ class MLAAttention(nn.Module):
     # The layer index is read only here, outside dynamo: a traced frame that
     # reads it guards on it and compiles once per layer.
     @torch.compiler.disable
-    def _write_and_attend(self, q, k, v, q_pe=None):
+    def _write_and_attend(self, q, k, v, q_pe=None, *, keep=None, selected=None):
+        """``keep`` and ``selected`` reach the handle's add and read, where the layer has a handle."""
+        if self.state is not None:
+            if q_pe is None:
+                self.state.add(self.layer, keep=keep, k=k, v=v)
+                return self.state.read(self.layer, q)
+            self.state.add(self.layer, keep=keep, ckv=k[:, :self.kv_lora_rank], kpe=k[:, self.kv_lora_rank:])
+            return self.state.read(self.layer, q, q_pe=q_pe, selected=selected)
         layer_idx = self.cache_layer_idx
         label = self._label
         self._kv.write_kv(k, v, layer_idx=layer_idx, **label)
@@ -262,12 +316,26 @@ class MLAAttention(nn.Module):
             fused = fp8_block_linear(hidden_states, self.fused_qkv_a_proj_weight,
                                      self.fused_qkv_a_proj_scale_inv, self.fp8_block,
                                      use_reference=self.fp8_reference)
-        if (self.mla_fused_prep and (self._attends_written or not self._selects(**sparse))
-                and fused.is_cuda and fused.dtype == torch.bfloat16):
+        if self.state is not None:
+            attn_latent = self._attend_state(fused, hidden_states, position_ids, **sparse)
+        elif self.mla_fused_prep and fused.is_cuda and fused.dtype == torch.bfloat16:
             attn_latent = self._fused_prep_and_attend(fused, hidden_states, position_ids, **sparse)
         else:
             attn_latent = self._prep_and_attend(fused, hidden_states, position_ids, **sparse)
         return self.o_proj(self._out(attn_latent))
+
+    def _attend_state(self, fused, hidden_states, position_ids, **sparse) -> torch.Tensor:
+        """The absorbed path on the latent array's handle: `mla_prep_attend` on a layer that picks no positions, whose
+        fused kernel the handle takes or leaves, and the calls op by op otherwise."""
+        if not (self.mla_fused_prep and fused.is_cuda and fused.dtype == torch.bfloat16) or self._selects(**sparse):
+            return self._prep_and_attend(fused, hidden_states, position_ids, **sparse)
+        q_c = mla_prep.q_norm(fused, self.q_a_layernorm.weight, self.q_a_layernorm.variance_epsilon)
+        q = self.q_b_proj(q_c).view(fused.shape[0], self.num_heads, self.qk_head_dim)
+        q_nope = torch.einsum("thd,hdl->thl", q[..., : self.qk_nope_head_dim], self.w_kc)
+        return mla_prep_attend(
+            self.state, self.layer, fused, q, q_nope, self.kv_a_layernorm.weight,
+            self.kv_a_layernorm.variance_epsilon, position_ids,
+        )
 
     def _out(self, attn_latent: torch.Tensor) -> torch.Tensor:
         """``attn_latent (T, H_local, L)`` through ``w_vc``: ``(T, H_local * Dv)``. Eager, bmm
@@ -319,7 +387,7 @@ class MLAAttention(nn.Module):
         q_nope_all[:, row] = torch.einsum("thd,hdl->thl", q_nope, self.w_kc)
         attn = self._write_and_attend(
             q_nope_all.view(n * block, h, -1), latents.view(n * block, -1), None,
-            q_pe=q_pe_all.view(n * block, h, -1))
+            q_pe=q_pe_all.view(n * block, h, -1), keep=False)
         out = self._out(attn.view(n, block, h, -1)[:, row])
         return self.o_proj(out)
 
@@ -343,7 +411,7 @@ class MLAAttention(nn.Module):
         q_all = q.new_zeros(n, block, h, pad)
         q_all[:, row] = q * self.softmax_scale_boost
         attn = self._write_and_attend(
-            q_all.view(n * block, h, pad), k_rows.view(n * block, h, pad), v_rows.view(n * block, h, pad))
+            q_all.view(n * block, h, pad), k_rows.view(n * block, h, pad), v_rows.view(n * block, h, pad), keep=False)
         attn = attn.view(n, block, h, pad)[:, row, :, : self.v_head_dim]
         return self.o_proj(attn.reshape(n, h * self.v_head_dim))
 
@@ -387,10 +455,7 @@ class MLAAttention(nn.Module):
 
         if latent is None:
             latent = torch.cat([kv_c, k_pe], dim=-1).squeeze(1)  # the cache rows (T, L + Drope)
-        if selection is None:
-            # dense: the paged kernel path over every cached row
-            return self._write_and_attend(q_nope, latent, None, q_pe=q_pe)
-        return self._attend_selected(selection, q_nope, q_pe, latent, **sparse)
+        return self._write_and_attend(q_nope, latent, None, q_pe=q_pe, selected=selection)
 
     def _latent_rows(self, fused: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """No decoupled dims: ``fused (T, q_lora + L)`` -> ``q_a_layernorm`` of the q half
@@ -416,50 +481,34 @@ class MLAAttention(nn.Module):
     ) -> torch.Tensor:
         """``_prep_and_attend`` in two kernels: q_a's norm before q_b, then kv_a's norm, both
         RoPEs (from the position resource's cos/sin table) and the latent's cache write inside
-        the attention call. A selecting subclass selects from the normed ``q_c`` in between."""
+        the attention call."""
         q_c = mla_prep.q_norm(
             fused, self.q_a_layernorm.weight, self.q_a_layernorm.variance_epsilon)
-        selection = (self._select(hidden_states, q_c, position_ids, **sparse)
-                     if self._attends_written else None)
         q = self.q_b_proj(q_c).view(fused.shape[0], self.num_heads, self.qk_head_dim)
         q_nope = torch.einsum("thd,hdl->thl", q[..., : self.qk_nope_head_dim], self.w_kc)
-        return self._write_fused_and_attend(q_nope, q, fused, position_ids, selection, **sparse)
+        return self._write_fused_and_attend(q_nope, q, fused, position_ids)
 
     # outside dynamo for the layer index, as _write_and_attend
     @torch.compiler.disable
-    def _write_fused_and_attend(self, q_nope, q, fused, position_ids, selection=None, **sparse):
+    def _write_fused_and_attend(self, q_nope, q, fused, position_ids):
         layer = self._kv.layer_view(self.cache_layer_idx)
         label = self._label
         pages, offsets = self._kv.write_slots(**label)
         q_pe = mla_prep.kv_write_q_rope(
             fused, self.kv_a_layernorm.weight, self.kv_a_layernorm.variance_epsilon,
             self._pos.cos_sin_table, position_ids, q, layer, pages, offsets)
-        if selection is None:
-            return self._attn.run(q_nope, kv_cache_layer=layer, q_pe=q_pe, **label)
-        return self._attend_written(selection, q_nope, q_pe, **sparse)
-
-    # A selecting subclass that implements ``_attend_written`` takes the fused prep too.
-    _attends_written = False
+        return self._attn.run(q_nope, kv_cache_layer=layer, q_pe=q_pe, **label)
 
     def _selects(self, **sparse) -> bool:
-        """Whether this forward may select rows: the fused prep serves only one that doesn't,
-        unless the class sets ``_attends_written``."""
+        """Whether this forward may pick rows, which the fused prep doesn't serve."""
         del sparse
         return False
 
     def _select(self, hidden_states, q_c, position_ids, **sparse) -> torch.Tensor | None:
-        """The rows each query attends, or None for every cached row (the default)."""
+        """The rows each query attends, which the handle's read takes as ``selected``, or None
+        for every cached row (the default)."""
         del hidden_states, q_c, position_ids, sparse
         return None
-
-    def _attend_selected(self, selection, q_nope, q_pe, latent, **sparse) -> torch.Tensor:
-        """Write the step's cache rows ``latent (T, L + kpe)``, then absorbed attention over
-        ``_select``'s rows: ``(T, H_local, kv_lora_rank)``."""
-        raise NotImplementedError(f"{type(self).__name__} selects rows but attends none")
-
-    def _attend_written(self, selection, q_nope, q_pe, **sparse) -> torch.Tensor:
-        """``_attend_selected`` over cache rows the fused prep already wrote."""
-        raise NotImplementedError(f"{type(self).__name__} selects rows but attends none")
 
     # The absorbed forward reads only w_kc / w_vc / fused_qkv_a_proj_weight;
     # these source projections would otherwise stay resident for the process

@@ -31,7 +31,6 @@ def _force_cpu_flashinfer(monkeypatch):
 from test_glm52_moe import BLOCK, _fabricate_checkpoint  # noqa: E402
 
 from mstar.engine.resources.dsa.manager import index_topk, select_topk_causal  # noqa: E402
-from mstar.model.glm52._testing import cpu_positions, install_cpu_rope  # noqa: E402
 from mstar.model.glm52.components.attention import (  # noqa: E402
     Glm52MLAAttention,
     masked_reference_attention,
@@ -42,11 +41,10 @@ from mstar.model.glm52.components.indexer import (  # noqa: E402
     is_full_indexer_layer,
 )
 from mstar.model.glm52.config import (  # noqa: E402
-    ATTN_RESOURCE,
-    KV_RESOURCE,
-    POS_RESOURCE,
+    KV,
     Glm52ModelConfig,
 )
+from mstar.model.glm52.tests.testing import cpu_positions, install_cpu_rope  # noqa: E402
 from mstar.model.glm52.weight_loader import load_glm52_hf_weights  # noqa: E402
 
 # Observed in the GLM-5.2 checkpoint: 21 FULL main layers (indexer_types),
@@ -99,14 +97,21 @@ def _build_indexer(seed):
     return idx, cfg
 
 
-def _positions():
-    """The position resource the indexer rotates with, past the longest history here (no
-    test changes the RoPE fields)."""
-    return {POS_RESOURCE: cpu_positions(Glm52ModelConfig.reduced(), max_seq_len=4096)}
+class _StubLatentHandle:
+    """The latent array's handle the indexer rotates with, open outside a step, its positions past the longest
+    history here (no test changes the RoPE fields)."""
+
+    label, rope_dtype = "main", None
+
+    def __init__(self):
+        self.positions = cpu_positions(Glm52ModelConfig.reduced(), max_seq_len=4096)
+
+    def _check_open(self, call):
+        pass
 
 
 def _randomize_indexer(idx):
-    idx.bind_resources(_positions())
+    idx.bind_state({KV: _StubLatentHandle()})
     idx.wq_b.weight.data.normal_(0, 0.05)
     idx.wk.weight.data.normal_(0, 0.05)
     idx.weights_proj.weight.data.normal_(0, 0.05)
@@ -170,23 +175,16 @@ def test_indexer_rope_hits_first_dims_only():
     assert not torch.allclose(q_rot[1, :, :r], q[1, :, :r])
 
 
-class _CausalDenseResources:
-    """The naive path's two resources, on CPU, for ONE dense pass: the layer
-    writes K/V through ``kv.write_kv`` and attends through ``attn.run``.
-    """
+class _StubDenseHandle(_StubLatentHandle):
+    """The KV array's handle on the naive path, for ONE dense pass: the layer adds its K/V and reads them back,
+    attended causally."""
 
-    def __init__(self):
-        self.k = self.v = None
+    k = v = None
 
-    # kv side
-    def write_kv(self, k, v, layer_idx=None):
+    def add(self, layer, keep=None, k=None, v=None):
         self.k, self.v = k, v
 
-    def layer_view(self, layer_idx=None):
-        return None
-
-    # attention side
-    def run(self, q, kv_cache_layer=None, **kwargs):
+    def read(self, layer, q):
         t = q.shape[0]
         mask = torch.triu(q.new_full((t, t), float("-inf")), diagonal=1)
         return masked_reference_attention(q, self.k, self.v, mask)
@@ -211,9 +209,8 @@ def test_sparse_forward_matches_dense_bitwise_within_topk():
     """At ctx <= topk the selection IS the full prefix, so DSA attention is
     dense causal attention — bitwise, not merely close."""
     attn, cfg = _build_attention(seed=2)
-    dense_resources = _CausalDenseResources()
-    attn.bind_resources(
-        {KV_RESOURCE: dense_resources, ATTN_RESOURCE: dense_resources, **_positions()})
+    dense = _StubDenseHandle()
+    attn.bind_state({KV: dense})
     t = cfg.index_topk  # ctx <= topk regime
     h = torch.randn(t, cfg.hidden_size) * 0.1
     pos = torch.arange(t)
@@ -223,10 +220,10 @@ def test_sparse_forward_matches_dense_bitwise_within_topk():
     sel = _select(attn.indexer, q_c, h, pos, k_hist, cfg.index_topk)
     assert (sel == -1).any()  # early rows really are padded
 
-    dense = attn(h, pos)
-    assert dense_resources.k is not None  # the dense pass went through the resources
+    out = attn(h, pos)
+    assert dense.k is not None  # the dense pass went through the handle
     sparse = attn(h, pos, dsa_selection=sel)
-    assert torch.equal(dense, sparse)
+    assert torch.equal(out, sparse)
 
 
 def test_load_indexer_keys_land_dequantized_on_full_layer():

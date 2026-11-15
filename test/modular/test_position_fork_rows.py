@@ -22,6 +22,7 @@ def _rope(counters) -> RopeManager:
     rope = RopeManager.__new__(RopeManager)
     rope._kv_cache_name = "kv"
     rope._counters = counters
+    rope._deferred = {}
     return rope
 
 

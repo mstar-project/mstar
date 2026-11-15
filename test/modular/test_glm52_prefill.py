@@ -130,7 +130,7 @@ def _cpu_flashinfer(monkeypatch):
     fi = types.ModuleType("flashinfer")
     fi.norm = types.SimpleNamespace(rmsnorm=rmsnorm)
     monkeypatch.setitem(sys.modules, "flashinfer", fi)
-    from mstar.model.glm52._testing import install_cpu_rope
+    from mstar.model.glm52.tests.testing import install_cpu_rope
 
     install_cpu_rope(monkeypatch)
 
@@ -145,10 +145,10 @@ def test_compiled_forward_does_not_recompile_per_request(monkeypatch):
     from torch._dynamo.testing import CompileCounter
 
     from mstar.engine.resources import StepContext
-    from mstar.model.glm52._testing import build_cpu_resources
     from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
-    from mstar.model.glm52.config import SAMPLER_RESOURCE
-    from mstar.model.submodule_base import ModelInputsFromEngine
+    from mstar.model.glm52.config import SAMPLER
+    from mstar.model.glm52.tests.testing import bind_cpu_state, build_cpu_resources, close_step, open_step
+    from mstar.model.submodule_base import ModelInputsFromEngine, engine_step
     from mstar.model.utils import process_weights_after_loading
 
     _cpu_flashinfer(monkeypatch)
@@ -161,7 +161,7 @@ def test_compiled_forward_does_not_recompile_per_request(monkeypatch):
     sub = Glm52LLMSubmodule(lm.eval(), cfg)
     rids = ["a", "b", "c", "d"]
     resources, runner = build_cpu_resources(cfg, rids)
-    sub.bind_node_resources(resources)
+    bind_cpu_state(sub, cfg, resources)
     counter = CompileCounter()
     torch._dynamo.reset()
     fwd = torch.compile(sub.forward_batched, backend=counter, fullgraph=False, dynamic=None)
@@ -169,19 +169,17 @@ def test_compiled_forward_does_not_recompile_per_request(monkeypatch):
     def prefill(rid):
         info = SimpleNamespace(
             request_id=rid, max_tokens=8, dynamic_loop_iter_counts={},
-            resource_configs={SAMPLER_RESOURCE: SimpleNamespace(
+            resource_configs={SAMPLER: SimpleNamespace(
                 ignore_eos=True, temperature=0.0, repetition_penalty=1)})
         inputs = [sub.prepare_inputs("prefill", info, {"text_inputs": [torch.arange(6) + 3]})]
-        step = sub.declare_step("prefill", [rid], inputs)
-        step.set_ctx(StepContext(request_ids=(rid,), graph_walk="prefill", slot=0,
-                                 capture=False))
-        assert runner.admit(step).ok
-        runner.plan(step)
+        step = engine_step(sub, graph_walk="prefill", request_ids=[rid], inputs=inputs)
+        ctx = StepContext(request_ids=(rid,), graph_walk="prefill", slot=0, capture=False)
+        assert open_step(runner, step, ctx).ok
         ei = ModelInputsFromEngine(request_ids=[rid], per_request_info={rid: info},
                                    resources=resources, step=step)
         with torch.no_grad():
             out = fwd("prefill", ei, **sub.preprocess("prefill", ei, inputs))
-        runner.commit(step)
+        close_step(runner, step)
         return out
 
     try:
@@ -262,10 +260,16 @@ def test_last_layer_ffn_runs_on_the_sampled_rows(monkeypatch):
     from types import SimpleNamespace
 
     from mstar.engine.resources import StepContext
-    from mstar.model.glm52._testing import build_cpu_resources, per_request_outputs
     from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
-    from mstar.model.glm52.config import SAMPLER_RESOURCE
-    from mstar.model.submodule_base import ModelInputsFromEngine
+    from mstar.model.glm52.config import SAMPLER
+    from mstar.model.glm52.tests.testing import (
+        bind_cpu_state,
+        build_cpu_resources,
+        close_step,
+        open_step,
+        per_request_outputs,
+    )
+    from mstar.model.submodule_base import ModelInputsFromEngine, engine_step
     from mstar.model.utils import process_weights_after_loading
 
     _cpu_flashinfer(monkeypatch)
@@ -286,25 +290,24 @@ def test_last_layer_ffn_runs_on_the_sampled_rows(monkeypatch):
         cfg.kernels = "auto" if rows_only else "reference"
         sub = Glm52LLMSubmodule(lm, cfg)
         resources, runner = build_cpu_resources(cfg, rids)
-        sub.bind_node_resources(resources)
+        bind_cpu_state(sub, cfg, resources)
         info = {rid: SimpleNamespace(
             request_id=rid, max_tokens=8, dynamic_loop_iter_counts={},
-            resource_configs={SAMPLER_RESOURCE: SimpleNamespace(
+            resource_configs={SAMPLER: SimpleNamespace(
                 ignore_eos=True, temperature=0.0, repetition_penalty=1)}) for rid in rids}
         prompts = [torch.arange(5) + 3, torch.arange(7) + 11]
         inputs = [sub.prepare_inputs("prefill", info[rid], {"text_inputs": [p]})
                   for rid, p in zip(rids, prompts, strict=True)]
-        step = sub.declare_step("prefill", rids, inputs)
-        step.set_ctx(StepContext(request_ids=tuple(rids), graph_walk="prefill", slot=0,
-                                 capture=False))
-        assert runner.admit(step).ok
-        runner.plan(step)
+        step = engine_step(sub, graph_walk="prefill", request_ids=rids, inputs=inputs)
+        ctx = StepContext(request_ids=tuple(rids), graph_walk="prefill", slot=0, capture=False)
+        assert open_step(runner, step, ctx).ok
         ei = ModelInputsFromEngine(request_ids=rids, per_request_info=info,
                                    resources=resources, step=step)
         rows_seen.clear()
         with torch.no_grad():
             out = per_request_outputs(
                 sub.forward_batched("prefill", ei, **sub.preprocess("prefill", ei, inputs)), rids)
+        close_step(runner, step)
         return [out[rid]["new_token"][0] for rid in rids], list(rows_seen)
 
     full_tokens, full_rows = prefill(False, ["a", "b"])

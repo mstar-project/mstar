@@ -2,6 +2,7 @@
 decode across ``index_topk`` — over the real ``KVManager`` (MLA latent layout), MLA attention
 resource and DSA resource on CPU. The resource's own math is test_dsa_resource.py's.
 """
+import logging
 import sys
 import types
 from pathlib import Path
@@ -34,47 +35,29 @@ def _force_cpu_flashinfer(monkeypatch):
 from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.engine.resources.attn.flashinfer_mla import flashinfer_mla_supports  # noqa: E402
 from mstar.engine.resources.dsa.manager import DSAManager  # noqa: E402
-from mstar.model.glm52._testing import build_cpu_resources, install_cpu_rope  # noqa: E402
+from mstar.engine.state import sample  # noqa: E402
+from mstar.engine.state.analysis import state_declaration_problems  # noqa: E402
 from mstar.model.glm52.components.attention import Glm52MLAAttention  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
-    ATTN_RESOURCE,
-    DSA_RESOURCE,
-    KV_RESOURCE,
-    POS_RESOURCE,
-    SAMPLER_RESOURCE,
+    ATTN,
+    INDEX_KEYS,
+    KV,
+    SAMPLER,
     Glm52ModelConfig,
 )
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
-from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine  # noqa: E402
+from mstar.model.glm52.tests.testing import (  # noqa: E402
+    POSITIONS,
+    bind_cpu_state,
+    build_cpu_resources,
+    close_step,
+    install_cpu_rope,
+    open_step,
+)
+from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, engine_step  # noqa: E402
 from mstar.model.utils import process_weights_after_loading  # noqa: E402
-
-
-def test_cleanup_request_drops_the_request_state():
-    """Retirement leaves NO per-request growth: the engine's request removal calls
-    cleanup_request on every managed submodule, which drops the MTP counters and the MTP token
-    budget (the index keys are the DSA resource's, which remove_request drops)."""
-    sub = object.__new__(Glm52LLMSubmodule)
-    sub.config = Glm52ModelConfig.reduced()
-    sub.request_states = {}
-    sub._mtp_emitted = {"r0": 7}
-    sub._mtp_checked = {"r0": 7}
-    sub._mtp_max_tokens = {"r0": 32}
-    sub._mtp_ignore_eos = {"r0": False}
-    sub._mtp_pending, sub._mtp_verdict, sub._mtp_trimmed = {"r0": (3, 0, 0)}, {"r0": ()}, {"r0": 3}
-    sub._mtp_slot, sub._mtp_free_slots = {"r0": 5}, []
-
-    sub.request_state("r0").add("token_budget", 20)
-    sub.cleanup_request("r0")
-    assert sub.request_states == {}
-    assert sub._mtp_emitted == {}
-    assert sub._mtp_max_tokens == {}
-    assert sub._mtp_ignore_eos == {}
-    assert not (sub._mtp_pending or sub._mtp_verdict or sub._mtp_trimmed or sub._mtp_slot)
-    assert sub._mtp_free_slots == [5]  # the seed slot goes back
-    sub.cleanup_request("r0")  # idempotent, like the base hook
-
 
 # ---------------------------------------------------------------------------
 # preprocess guard, both flag states
@@ -96,6 +79,7 @@ def _make_submodule(config) -> Glm52LLMSubmodule:
 
 def _preprocess(sub, starts, seq_len):
     sub.get_device = lambda: torch.device("cpu")
+    sub.kv = SimpleNamespace(positions=_FakePositions(starts))
     inputs = [
         ARNodeInputs(
             input_ids=torch.zeros(seq_len, dtype=torch.long),
@@ -103,10 +87,7 @@ def _preprocess(sub, starts, seq_len):
         )
         for _ in starts
     ]
-    engine_inputs = SimpleNamespace(
-        request_ids=list(starts),
-        resources={POS_RESOURCE: _FakePositions(starts)},
-    )
+    engine_inputs = SimpleNamespace(request_ids=list(starts))
     return sub.preprocess("prefill", engine_inputs, inputs)
 
 
@@ -160,8 +141,9 @@ def test_model_kwarg_dsa_long_context():
 
     with pytest.raises(ValueError, match="mla_absorb"):
         Glm52Model(model_path_hf="", config_variant="reduced", dsa_long_context=True)
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        Glm52Model(model_path_hf="", dsa_long_context=True, mtp_num_draft_tokens=2)
+    # the verify step would settle the latent array and leave the index keys a block ahead
+    mtp = Glm52Model(model_path_hf="", dsa_long_context=True, mtp_num_draft_tokens=2)
+    assert any(f"Array {INDEX_KEYS!r} has other verify_span" in each for each in state_declaration_problems(mtp))
 
 
 def test_reduced_variant_grows_trunk_for_mtp():
@@ -182,12 +164,29 @@ def test_reduced_variant_grows_trunk_for_mtp():
         Glm52MTPModule(m.config)  # the SHARED-slot guard no longer fires
 
 
-def test_no_cuda_graphs_when_long_context():
-    cfg = Glm52ModelConfig.reduced()  # would otherwise register 2 configs
-    cfg.dsa_long_context = True
-    sub = _make_submodule(cfg)
-    assert sub.get_accelerator_graph_configs(torch.device("cpu")) == []
-    assert sub.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32) == {}
+def test_the_runner_drops_every_capture_under_long_context(monkeypatch, caplog):
+    """The submodule offers its configs, and the runner drops each one, since every step holds the index keys,
+    which the DSA resource can't capture."""
+    from unittest.mock import Mock
+
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+
+    cfg = _longctx_reduced_cfg(topk=4)
+    sub = Glm52LLMSubmodule(language_model=_build_absorbed_model(cfg, seed=0), config=cfg)
+    resources, _ = build_cpu_resources(cfg)
+    bind_cpu_state(sub, cfg, resources)
+    for key, resource in resources.items():
+        if key != INDEX_KEYS:
+            monkeypatch.setattr(resource, "can_capture", lambda: True)
+    runner = AcceleratorGraphRunner(
+        submodule_name="LLM", submodule=sub, resources=resources, step_runner=Mock(),
+        device=torch.device("cpu"), autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1),
+        num_slots=1, head_shards=1,
+    )
+    assert {spec.bucket.graph_walk for spec in runner._get_slot_specs()} == {"prefill", "decode"}
+    with caplog.at_level(logging.ERROR):
+        assert runner.prepare_for_capture() == []
+    assert f"resources cannot capture: ['{INDEX_KEYS}']" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -243,20 +242,21 @@ class _Driver:
     def __init__(self, sub: Glm52LLMSubmodule, cfg: Glm52ModelConfig, rid="r0", page_size=8):
         self.sub, self.rid = sub, rid
         self.resources, self.runner = build_cpu_resources(cfg, [rid], page_size=page_size)
-        sub.bind_node_resources(self.resources)
+        bind_cpu_state(sub, cfg, self.resources)
 
     def step(self, walk: str, ids: torch.Tensor) -> torch.Tensor:
         ar = ARNodeInputs(input_ids=ids, input_seq_len=ids.shape[0])
-        step = self.sub.declare_step(walk, [self.rid], [ar])
-        step.set_ctx(StepContext(request_ids=(self.rid,), graph_walk=walk, slot=0, capture=False))
-        assert self.runner.admit(step).ok
-        self.runner.plan(step)
+        step = engine_step(self.sub, graph_walk=walk, request_ids=[self.rid], inputs=[ar])
+        ctx = StepContext(request_ids=(self.rid,), graph_walk=walk, slot=0, capture=False)
+        assert open_step(self.runner, step, ctx).ok
         engine_inputs = ModelInputsFromEngine(
             request_ids=[self.rid], per_request_info={}, resources=self.resources, step=step)
         packed = self.sub.preprocess(walk, engine_inputs, [ar])
         with torch.no_grad():
             logits = self.sub.forward(walk, engine_inputs, **packed)["logits"][0]
-        self.runner.commit(step)
+        # the step's one draw, which forward_batched takes and the logits forward leaves
+        sample(self.sub.sampler, logits)
+        close_step(self.runner, step)
         return logits
 
 
@@ -279,21 +279,21 @@ def _longctx_reduced_cfg(topk):
 def test_declared_step_under_dsa_adds_the_dsa_step():
     cfg = _longctx_reduced_cfg(topk=4)
     sub = Glm52LLMSubmodule(language_model=_build_absorbed_model(cfg, seed=0), config=cfg)
+    bind_cpu_state(sub, cfg, build_cpu_resources(cfg)[0])
     ar = ARNodeInputs(input_ids=torch.tensor([1, 2, 3]), input_seq_len=3)
-    step = sub.declare_step("prefill", ["r0"], [ar])
-    assert set(step.keys()) == {
-        KV_RESOURCE, ATTN_RESOURCE, POS_RESOURCE, SAMPLER_RESOURCE, DSA_RESOURCE}
+    step = engine_step(sub, graph_walk="prefill", request_ids=["r0"], inputs=[ar])
+    assert set(step.steps) == {KV, ATTN, POSITIONS, SAMPLER, INDEX_KEYS}
     assert step.segments[0].span == 3
 
 
 def test_full_to_shared_threading_order(monkeypatch):
-    """Layer 1 (SHARED, no indexer weights) must consume the selection layer
-    0 (FULL) published THIS forward — the IndexShare reuse window."""
+    """Layer 1 (SHARED, no indexer weights) must consume the pick layer 0 (FULL) carried
+    THIS forward — the IndexShare reuse window."""
     cfg = _longctx_reduced_cfg(topk=4)
     model = _build_absorbed_model(cfg, seed=0)
     sub = Glm52LLMSubmodule(language_model=model, config=cfg)
     driver = _Driver(sub, cfg)
-    dsa = driver.resources[DSA_RESOURCE]
+    dsa = driver.resources[INDEX_KEYS]
 
     trace = []
     layer = {}
@@ -303,13 +303,13 @@ def test_full_to_shared_threading_order(monkeypatch):
         return torch.zeros_like(q_nope)
 
     monkeypatch.setattr(DSAManager, "attend", spy)
-    attend_selected = Glm52MLAAttention._attend_selected
+    index_pass = Glm52MLAAttention._index_pass
 
     def tagged(self, *args, **kwargs):
         layer["idx"] = self.layer_idx
-        return attend_selected(self, *args, **kwargs)
+        return index_pass(self, *args, **kwargs)
 
-    monkeypatch.setattr(Glm52MLAAttention, "_attend_selected", tagged)
+    monkeypatch.setattr(Glm52MLAAttention, "_index_pass", tagged)
 
     picks = []
     select = DSAManager.select
@@ -335,29 +335,10 @@ def test_full_to_shared_threading_order(monkeypatch):
     # FULL layer stored prompt + decode token; SHARED layer stored nothing.
     assert dsa.keys.tokens("r0", 0) == 5
     assert dsa.keys.tokens("r0", 1) == 0
-    assert driver.resources[KV_RESOURCE]._streams["r0"]["main"].stored_len == 5
+    assert driver.resources[KV]._streams["r0"]["main"].stored_len == 5
 
     driver.runner.remove_request("r0")
     assert dsa.keys.tracked_requests() == set()
-
-
-def test_a_layer_built_flag_off_refuses_the_dsa_resource():
-    """Flag-off, no indexer was built or loaded: a FULL layer would pass for SHARED."""
-    cfg = _longctx_reduced_cfg(topk=4)
-    resources, _ = build_cpu_resources(cfg)
-    cfg.dsa_long_context = False
-    attn = Glm52MLAAttention(cfg, layer_idx=0)
-    with pytest.raises(RuntimeError, match="dsa_long_context off"):
-        attn.bind_resources(resources)
-
-
-def test_the_naive_path_refuses_the_dsa_resource():
-    cfg = _longctx_reduced_cfg(topk=4)
-    resources, _ = build_cpu_resources(cfg)
-    cfg.mla_absorb = False
-    attn = Glm52MLAAttention(cfg, layer_idx=0)
-    with pytest.raises(RuntimeError, match="mla_absorb"):
-        attn.bind_resources(resources)
 
 
 # ---------------------------------------------------------------------------
@@ -382,9 +363,9 @@ def test_decode_across_topk_prefix_property_and_divergence():
     driver = _Driver(sub, cfg, page_size=4)  # the sparse steps span 3 pages
     assert not flashinfer_mla_supports(cfg.kv_lora_rank, cfg.qk_rope_head_dim)
     sparse_logits = _serve_steps(driver, prompt, decode)
-    dsa = driver.resources[DSA_RESOURCE]
+    dsa = driver.resources[INDEX_KEYS]
     assert dsa.keys.tokens("r0", 0) == 3 + len(decode)
-    assert driver.resources[KV_RESOURCE]._streams["r0"]["main"].stored_len == 3 + len(decode)
+    assert driver.resources[KV]._streams["r0"]["main"].stored_len == 3 + len(decode)
     driver.runner.remove_request("r0")
     assert dsa.keys.tracked_requests() == set()
 

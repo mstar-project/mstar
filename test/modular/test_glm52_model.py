@@ -40,13 +40,14 @@ from mstar.engine.resources import (  # noqa: E402
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.state import SampleSettings  # noqa: E402
+from mstar.engine.state.adapters import node_resources  # noqa: E402
 from mstar.graph.base import Loop  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
-    ATTN_RESOURCE,
-    KV_RESOURCE,
-    POS_RESOURCE,
-    SAMPLER_RESOURCE,
+    ATTN,
+    KV,
+    SAMPLER,
     Glm52ModelConfig,
 )
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
@@ -87,19 +88,19 @@ def test_glm52_graph_walks_are_one_node():
     # every walk runs the one fat LLM node, and every resource is declared
     # for exactly that node
     assert {n for g in walks.values() for n in g.get_nodes()} == {"LLM"}
-    assert all(spec.nodes == {"LLM"} for spec in model.get_node_resources())
+    assert all(spec.nodes == {"LLM"} for spec in node_resources(model))
 
 
 # ── resource declaration ──
 
 
 def _specs(config):
-    kv, attn, pos, sampler = _make_model(config).get_node_resources()
-    assert isinstance(kv, KVSpec) and kv.resource_key == KV_RESOURCE
-    assert isinstance(sampler, SamplerSpec) and sampler.resource_key == SAMPLER_RESOURCE
-    assert attn.resource_key == ATTN_RESOURCE
+    specs = {spec.resource_key: spec for spec in node_resources(_make_model(config))}
+    assert {KV, ATTN, "rope", SAMPLER} <= set(specs)
+    kv, attn, pos, sampler = specs[KV], specs[ATTN], specs["rope"], specs[SAMPLER]
+    assert isinstance(kv, KVSpec) and isinstance(sampler, SamplerSpec)
     # positions over the latent cache; the layers rotate themselves
-    assert pos.resource_key == POS_RESOURCE and pos.config.kv_cache == KV_RESOURCE
+    assert pos.config.kv_cache == KV
     return kv, attn, sampler
 
 
@@ -118,9 +119,9 @@ def test_glm52_resources_absorbed_is_mla_latent_layout():
     assert kv.config.qk_rope_head_dim == cfg.qk_rope_head_dim == 64
     assert isinstance(attn, AttentionSpec)
     assert attn.config.backend is AttnBackend.FLASHINFER_MLA
-    assert attn.config.kv_cache == KV_RESOURCE
+    assert attn.config.kv_cache == KV
     assert attn.config.sm_scale == cfg.qk_head_dim ** -0.5  # 256**-0.5, no mscale
-    assert attn.depends_on() == {KV_RESOURCE}
+    assert attn.depends_on() == {KV}
     assert sampler.vocab_size == cfg.vocab_size
 
 
@@ -141,7 +142,7 @@ def test_glm52_resources_flag_off_is_naive():
     assert kv.config.num_qo_heads == 4
     assert isinstance(attn, AttentionSpec)
     assert attn.config.backend is AttnBackend.AUTO  # #603: the platform picks, FlashInfer here
-    assert attn.config.kv_cache == KV_RESOURCE
+    assert attn.config.kv_cache == KV
 
 
 # ── walks ──
@@ -179,14 +180,14 @@ def test_glm52_request_config_is_the_sampler_config():
     model = _make_model()
     cfg = model.config
     configs = model.get_request_resource_configs([], [], {})
-    assert set(configs) == {SAMPLER_RESOURCE}
-    sampling = configs[SAMPLER_RESOURCE]
-    assert isinstance(sampling, SamplingReqConfig)
+    assert set(configs) == {SAMPLER}
+    sampling = configs[SAMPLER]
+    assert isinstance(sampling, SampleSettings)
     # the checkpoint's generation defaults, unless the request overrides them
     assert (sampling.temperature, sampling.top_p) == (1.0, 0.95)
     assert (sampling.repetition_penalty, sampling.ignore_eos) == (1, False)
     over = model.get_request_resource_configs(
-        [], [], {"top_p": 0.5, "ignore_eos": True, "repetition_penalty": 1.1})[SAMPLER_RESOURCE]
+        [], [], {"top_p": 0.5, "ignore_eos": True, "repetition_penalty": 1.1})[SAMPLER]
     assert (over.top_p, over.ignore_eos, over.repetition_penalty) == (0.5, True, 1.1)
     assert over.temperature == 1.0
 
@@ -238,7 +239,7 @@ def _fwd_info(max_tokens=100, ignore_eos=False, iters=0, walk="decode") -> Curre
         fwd_index=0,
         random_seed=0,
         max_tokens=max_tokens,
-        resource_configs={SAMPLER_RESOURCE: SamplingReqConfig(ignore_eos=ignore_eos)},
+        resource_configs={SAMPLER: SamplingReqConfig(ignore_eos=ignore_eos)},
         dynamic_loop_iter_counts={"decode_loop": iters},
     )
 
@@ -332,7 +333,7 @@ def test_glm52_graph_compile_off_captures_eager():
 
 
 class _FakePositions:
-    """Only what preprocess reads off the position resource: each stream's next position."""
+    """Only what preprocess reads off the latent array's positions: each stream's next position."""
 
     def __init__(self, starts):
         self._starts = starts
@@ -346,6 +347,7 @@ def _preprocess(sub, starts, seq_len):
     from mstar.model.submodule_base import ARNodeInputs
 
     sub.get_device = lambda: torch.device("cpu")
+    sub.kv = SimpleNamespace(positions=_FakePositions(starts))
     inputs = [
         ARNodeInputs(
             input_ids=torch.zeros(seq_len, dtype=torch.long),
@@ -353,27 +355,8 @@ def _preprocess(sub, starts, seq_len):
         )
         for _ in starts
     ]
-    engine_inputs = SimpleNamespace(
-        request_ids=list(starts), resources={POS_RESOURCE: _FakePositions(starts)},
-    )
+    engine_inputs = SimpleNamespace(request_ids=list(starts))
     return sub.preprocess("prefill", engine_inputs, inputs)
-
-
-def test_glm52_preprocess_supplies_eager_last_token_indices():
-    sub = _make_submodule(Glm52ModelConfig())
-    out = _preprocess(sub, {"r0": 0, "r1": 0}, seq_len=16)
-    assert torch.equal(out["last_token_indices"], torch.tensor([15, 31]))
-
-
-def test_glm52_positions_are_the_position_resources_plan():
-    """The forward takes the ids ``PositionManager.plan`` built (from the stream counters, in
-    KV plan order); preprocess builds none of its own."""
-    sub = _make_submodule(Glm52ModelConfig())
-    assert "position_ids" not in _preprocess(sub, {"r0": 5, "r1": 0}, seq_len=3)
-    planned = torch.tensor([5, 6, 7, 0, 1, 2, 2, 2])  # a captured bucket's buffer, padded
-    pos = SimpleNamespace(pos_ids=lambda label: planned if label == "main" else None)
-    engine_inputs = SimpleNamespace(resources={POS_RESOURCE: pos})
-    assert sub._positions(engine_inputs, 6).tolist() == [5, 6, 7, 0, 1, 2]
 
 
 def test_glm52_preprocess_refuses_context_beyond_dsa_window():
