@@ -71,6 +71,9 @@ def _conductor(comm):
     c._liveness_interval_s = c._status_interval_s = FAR_S
     c._status = lambda: ConductorStatus(metrics=[])
     c._declaration_digests = {}
+    c._episode_array_names = frozenset()
+    c._episode_records = conductor_mod.EpisodeRecords()
+    c._episode_idle_timeout_s = FAR_S
     return c
 
 

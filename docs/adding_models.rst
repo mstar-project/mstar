@@ -461,6 +461,38 @@ A prompt on a walk the keys don't name sets 0, because the data worker refuses a
 from any other walk. This key is temporary, with ``kv_labels``.
 A name either key doesn't declare fails the request.
 
+Within-step chunk attention uses an ``Array(max_len=0)`` with one
+``Read(mask=ChunkCausal(chunk_len), op=Attend(...))``. The request gives that
+read's ``ChunkCausalLayout(global_len=, noised_len=, clean_len=)`` under
+``Layout(chunk_causal={read_key: ...})``. Those lengths describe the global,
+noised and clean parts of one step; they must sum to its segment length.
+When the lengths depend on an episode or another admission result, ``walk_plan``
+can set ``step_metadata["__state_chunk_causal_layout__"]`` instead, as
+``{array: {label: {read: [global_len, noised_len, clean_len]}}}``. The model may
+still return paged KV or sized Value layouts from ``process_prompt``. A walk's
+value wins for a read it also names at prompt intake. Every planned walk
+containing a node that declares this mask must receive lengths, even if that
+node skips the read on one walk: ``Array.nodes`` does not identify which walks
+use it. The conductor refuses missing or malformed lengths before dispatch.
+
+Within-step expert attention uses the same array and walk rule with
+``ExpertSelf(chunk_len, future_per_chunk=...)`` or
+``ExpertCross(chunk_len, future_per_chunk=..., tokens_per_frame=..., window_frames=..., include_noised=True)``.
+The typed prompt layouts are ``Layout(expert_self={read: ExpertSelfLayout(num_chunks=)})``
+and ``Layout(expert_cross={read: ExpertCrossLayout(num_chunks=, global_len=,
+clean_frames=, noised_frames=)})``. A walk can instead set
+``step_metadata["__state_expert_layout__"]`` with
+``{array: {label: {read: [num_chunks]}}}`` for self attention or
+``{array: {label: {read: [num_chunks, global_len, clean_frames, noised_frames]}}}``
+for cross attention. The walk's read-keyed value overrides the prompt's value;
+the conductor checks the names and frame counts before dispatch. For cross
+attention, ``noised_frames`` equals ``num_chunks * chunk_len``. With
+``clean_frames > 0``, it must also be ``1``, ``chunk_len``,
+``clean_frames + 1``, or ``clean_frames + chunk_len``. The engine checks the
+segment span: ``global_len + (clean_frames + noised_frames) * tokens_per_frame``
+for cross attention, and ``num_chunks * (1 + future_per_chunk + chunk_len)``
+for self attention. A span mismatch fails when the engine plans the step.
+
 The footprint adds the spans, the growth at each loop's iterations (up to the layout's
 ``max_growth``) and the scratch, and rounds up to whole pages per label. A span's own scratch counts only with the spans before
 it, so a window's denoise steps and its commit count once. Under a ``RetentionPolicy`` it
@@ -704,9 +736,10 @@ follow its CFG placement. Every worker and the API server check the digest of ea
 and of ``kernel_settings()`` against the conductor's at startup, and a mismatch stops the
 server, naming what differs.
 
-An **array** holds, per request, per label and per declared layer, entries at log positions
-``0`` to ``n - 1``, with ``n <= max_len``, or with no bound when ``max_len`` is None. An entry's
-index is its log position, never its RoPE position or a ring slot.
+An **array** holds entries per request or episode, per label and per declared layer,
+at log positions ``0`` to ``n - 1``. A finite ``max_len`` bounds ``n``; ``None``
+leaves the logical count unbounded while a Window read bounds resident storage.
+An entry's index is its log position, never its RoPE position or a ring slot.
 
 .. code-block:: python
 
@@ -731,6 +764,15 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   positions=)``. ``nodes`` lists who may touch the array, and ``layers`` holds the model's
   own layer ids. Layer sets of different arrays may overlap. ``labels`` names the streams a
   request may open, ``{"main"}`` by default.
+  ``max_len=None`` permits an unbounded logical append count for a tensor array with one
+  no-op ``Window(size)`` read over all its layers. The engine keeps only the latest
+  ``size`` entries per row in a dense ring, and ``read`` returns those entries packed
+  with row offsets. This path runs eagerly because packed lengths change between calls.
+  Set ``resources: {<array name>: {max_slots: N}}`` to hold more concurrent rows; one
+  slot is reserved for padding. The conservative default is two slots, so a
+  deployment must size this resource for its request or episode capacity. A
+  request-lifetime row is freed at request teardown; an episode-lifetime row
+  stays until its episode ends.
 - ``Entry({field: TensorType(shape, dtype=, shard=)})``: what one entry holds. Shapes are
   global, before sharding. ``dtype=None`` is the engine's compute dtype, and ``shard`` is
   the axis split across TP ranks, ``None`` when every GPU holds all of it.
@@ -784,11 +826,12 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   Its one read uses ``Block()``, which sees only the entries of the token's own segment. See
   `Cacheless attention (encoder towers)`_.
 - ``max_len=None``: the log has no bound, and the engine keeps what the reads can still reach.
-  Today such an array takes one label and one ``Window`` read through ``Attend``, with
+  A ``KVEntry`` takes one label and one ``Window`` read through ``Attend``, with
   ``packed=False`` and as many query heads as the entry, over every layer. A bounded KV holds it,
   one slot per request (`Bounded (sink + window) caches`_). Its read takes ``distance_bias``,
   ``(rows, q_heads, T, size)``, whose entry ``d`` adds to the score of the key at distance ``d``,
   and ``Positions()`` is each request's count of committed entries.
+  A non-K/V tensor entry with a no-op ``Window`` read uses the dense ring described above.
 - ``Positions(rope=)``: a position counter per request and label, on an append-only array
   that keeps entries. ``rope=None`` is a counter only. ``Rope`` carries ``theta``,
   ``rotary_dim``, ``interleave``, ``scale``, the Llama 3.1 factors (all three or none), the
@@ -880,8 +923,8 @@ refused at load.
 A read takes its queries packed, ``(tokens, heads, head_dim)`` over every row. A read whose layers
 pass rows of one length, ``(rows, len, heads, head_dim)``, as a DiT's do, declares
 ``packed=False``, and a packed call to it is refused. A read on an array with a ``max_len`` above 0
-takes packed queries, since the paged kernels take no others. A read on an unbounded array takes
-rows, each row's span first and the rest of its length padding.
+takes packed queries, since the paged kernels take no others. An ``Attend`` read on an unbounded
+K/V array takes rows, each row's span first and the rest of its length padding.
 A read whose request's segments lie end to end in one row, as a DiT's packed rows and their pad
 do, declares ``segmented=True``. It takes ``Block()``, ``packed=False`` and no ``queries``, and it
 runs one request a step. Under sequence parallelism its shard splits the whole row (``axis=0``),
@@ -1542,9 +1585,9 @@ Bounded (sink + window) caches
 
 A streaming decoder that keeps a fixed amount of context per request (a prompt or voice
 prefix plus the last N steps, as StreamingLLM-style sinks or a streaming vocoder's chunk
-caches do) declares a ``BoundedKVSpec``, or on the state contract an ``Array`` with
-``max_len=None``. A request takes a slot when it first runs and
-keeps it; the window is a ring overwritten in place, so a step reserves and releases
+caches do) declares a ``BoundedKVSpec``, or on the state contract a ``KVEntry`` array with
+``max_len=None`` and a ``Window`` read through ``Attend``. A request takes a slot when it first
+runs and keeps it; the window is a ring overwritten in place, so a step reserves and releases
 nothing. A step's layout is at most five key ranges and three write ranges per row,
 computed on the host from the position the step declares, which is also what lets rows at
 different positions share a batch and a captured graph.

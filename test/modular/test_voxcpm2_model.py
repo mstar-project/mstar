@@ -1057,10 +1057,12 @@ def test_talker_fields_go_with_the_request_when_the_engine_removes_it(model):
     info = _info("r", 0, meta)
     _commit(talker, "talker_prefill", ["r"], [talker.prepare_inputs("talker_prefill", info, request)])
     engine = Engine.__new__(Engine)
+    engine._episode_pools = {}
     engine._loopback_steps, engine._resources, engine._submodules = {}, {}, {}
     engine._runner = SimpleNamespace(remove_request=lambda rid: None)
     engine._chunking = SimpleNamespace(forget_request=lambda rid: None)
     engine._state_setup = StateSetup(host_fields=talker.progress.host_fields)
+    engine._episode_pools = {}
     engine.remove_request("r")
     assert talker.progress.host_fields._fields == {}, "a recycled handle would read this request's progress"
     with pytest.raises(ValueError, match="no host fields"):
@@ -1121,6 +1123,23 @@ def test_talker_cuda_draw_reaches_any_count_from_the_seed_and_the_offset(model):
     expected = [torch.randn((1, 8, 4), generator=kept, device="cuda", dtype=talker._dtype())[0] for _ in range(8)]
     for count in (0, 1, 7, 2, 2, 5):
         assert torch.equal(talker._draw(count, 4), expected[count]), f"draw {count}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_talker_noise_through_host_bytes_equals_one_kept_cuda_generator(model):
+    """A CUDA generator's state is its seed and Philox offset, so bytes carry it across steps, with a refused step in
+    between, as one kept generator would have drawn."""
+    talker = TalkerSubmodule(_random_generator(model.config).cuda(), model.config, 4)
+    kept = torch.Generator(device="cuda").manual_seed(4)
+    state = b""
+    for step in range(4):
+        noise, after = talker._draw(state, 4)
+        if step == 2:
+            again, _ = talker._draw(state, 4)
+            assert torch.equal(again, noise), "a refused step draws the same noise from the same committed state"
+        expected = torch.randn((1, 8, 4), generator=kept, device="cuda", dtype=talker._dtype())[0]
+        assert torch.equal(noise, expected), f"draw {step}"
+        state = after
 
 
 def test_talker_declares_the_same_span_in_both_caches(model):

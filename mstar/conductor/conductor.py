@@ -23,6 +23,7 @@ from mstar.api_server.request_types import (
     WorkersReady,
 )
 from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.conductor.episodes import EpisodeCallLimitError, EpisodeCapacityError, EpisodeRecords, EpisodeSlots
 from mstar.conductor.lora_ops import LoraAdapterOps
 from mstar.conductor.mps import MpsDaemon
 from mstar.conductor.request_info import (
@@ -45,14 +46,25 @@ from mstar.engine.resources.kv.config import (
     refuse_undeclared_labels,
     without_layouts,
 )
-from mstar.engine.resources.lora.config import LoraSpec
-from mstar.engine.state import SampleSettings
-from mstar.engine.state.adapters import sampling_configs
+from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG, LoraSpec
+from mstar.engine.state import Array, ChunkCausal, ExpertCross, ExpertSelf, Layout, SampleSettings
+from mstar.engine.state.adapters import (
+    CHUNK_CAUSAL_LAYOUT_KWARG,
+    EXPERT_LAYOUT_KWARG,
+    check_wire_chunk_layouts,
+    check_wire_expert_layouts,
+    checked_step_mask_layouts,
+    chunk_causal_layouts,
+    expert_layouts,
+    kv_layouts,
+    sampling_configs,
+)
 from mstar.engine.state.analysis import declaration_digests
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import Model, WorkerGraph, serving_resources, streamed_inputs
 from mstar.model.submodule_base import chunk_loop_name
 from mstar.observability import catalog
+from mstar.observability.recorders import Counter as MetricCounter
 from mstar.observability.recorders import Gauge, MetricSnapshot, merge
 from mstar.platforms import apply_process_env_defaults, current_platform
 from mstar.profile.format import RxInfo, TxInfo
@@ -67,6 +79,8 @@ from mstar.utils.ipc_format import (
     ClientStreamRoute,
     ConductorMessageType,
     DrainRequest,
+    EndEpisode,
+    EndEpisodeConductor,
     FailRequests,
     InputSignals,
     NewRequest,
@@ -87,6 +101,109 @@ from mstar.validation.resources import streamed_partitions
 
 logger = logging.getLogger(__name__)
 request_log = logging.getLogger(REQUEST_LOGGER)
+
+
+def _with_mask_layout(
+    plan: list[WalkStep], layout: dict | None, key: str, declarations: list | None, *, expert: bool,
+) -> list[WalkStep]:
+    """Carry data-worker lengths, with checked walk-plan lengths for episode-dependent reads."""
+    if not layout and not any(key in step.step_metadata for step in plan):
+        return plan
+    result = []
+    for step in plan:
+        merged = {
+            name: {label: dict(reads) for label, reads in by_label.items()}
+            for name, by_label in (layout or {}).items()
+        }
+        if key in step.step_metadata:
+            if declarations is None:
+                raise RuntimeError("planned mask layout needs state declarations")
+            planned = checked_step_mask_layouts(declarations, step.step_metadata[key], expert=expert)
+            for name, by_label in planned.items():
+                for label, reads in by_label.items():
+                    merged.setdefault(name, {}).setdefault(label, {}).update(reads)
+        result.append(replace(step, step_metadata={**step.step_metadata, key: merged}))
+    return result
+
+
+def _with_planned_state_layout(plan: list[WalkStep], declarations: list) -> list[WalkStep]:
+    """Convert only mask lengths from a typed walk layout before the plan goes on the wire."""
+    result = []
+    for step in plan:
+        if "state_layout" not in step.step_metadata:
+            result.append(step)
+            continue
+        metadata = {key: value for key, value in step.step_metadata.items() if key != "state_layout"}
+        layout = step.step_metadata["state_layout"]
+        if not isinstance(layout, dict):
+            raise RuntimeError("planned state_layout must map array names to labels")
+        for name, labels in layout.items():
+            if not isinstance(labels, dict):
+                raise RuntimeError(f"planned state_layout[{name!r}] must map labels to Layout values")
+            for label, value in labels.items():
+                if not isinstance(value, Layout):
+                    raise RuntimeError(f"planned state_layout[{name!r}][{label!r}] must be a Layout")
+                if value.spans or value.growth or value.scratch or value.kept_windows:
+                    raise RuntimeError(
+                        f"planned state_layout[{name!r}][{label!r}] supports mask lengths only"
+                    )
+        if kv_layouts(declarations, layout, {}):
+            raise RuntimeError("planned state_layout supports within-step mask arrays only")
+        chunk = chunk_causal_layouts(declarations, layout)
+        expert = expert_layouts(declarations, layout)
+        if chunk:
+            metadata[CHUNK_CAUSAL_LAYOUT_KWARG] = chunk
+        if expert:
+            metadata[EXPERT_LAYOUT_KWARG] = expert
+        result.append(replace(step, step_metadata=metadata))
+    return result
+
+
+def _with_chunk_causal_layout(
+    plan: list[WalkStep], layout: dict | None, declarations: list | None = None,
+) -> list[WalkStep]:
+    """Carry request mask lengths with each planned walk, including later passes of a partition."""
+    return _with_mask_layout(plan, layout, CHUNK_CAUSAL_LAYOUT_KWARG, declarations, expert=False)
+
+
+def _with_expert_layout(
+    plan: list[WalkStep], layout: dict | None, declarations: list | None = None,
+) -> list[WalkStep]:
+    """Carry small expert row geometry on every walk of the request."""
+    return _with_mask_layout(plan, layout, EXPERT_LAYOUT_KWARG, declarations, expert=True)
+
+
+def _required_mask_layouts(model: Model, declarations: list) -> dict[str, tuple[tuple[str, str, str, str], ...]]:
+    """Within-step mask reads whose declared nodes run in each graph walk."""
+    result = {}
+    for walk, graph in model.get_graph_walk_graphs().items():
+        nodes = graph.get_nodes().keys()
+        result[walk] = tuple(
+            (CHUNK_CAUSAL_LAYOUT_KWARG if isinstance(read.mask, ChunkCausal) else EXPERT_LAYOUT_KWARG,
+             array.name, label, key)
+            for array in declarations if isinstance(array, Array) and not array.nodes.isdisjoint(nodes)
+            for label in array.labels
+            for key, read in array.reads.items()
+            if isinstance(read.mask, (ChunkCausal, ExpertCross, ExpertSelf))
+            and (read.walks is None or walk in read.walks)
+        )
+    return result
+
+
+def _check_mask_layouts(
+    plan: list[WalkStep], required: dict[str, tuple[tuple[str, str, str, str], ...]], declarations: list,
+) -> None:
+    """Refuse a missing per-request mask before it can fail a batched engine step."""
+    for step in plan:
+        check_wire_chunk_layouts(declarations, step.step_metadata.get(CHUNK_CAUSAL_LAYOUT_KWARG, {}))
+        check_wire_expert_layouts(declarations, step.step_metadata.get(EXPERT_LAYOUT_KWARG, {}))
+        for wire_key, name, label, key in required.get(step.walk, ()):
+            given = step.step_metadata.get(wire_key, {})
+            if given.get(name, {}).get(label, {}).get(key) is None:
+                kind = "chunk-causal" if wire_key == CHUNK_CAUSAL_LAYOUT_KWARG else "expert"
+                raise RuntimeError(
+                    f"walk {step.walk!r} has no {kind} layout for {name!r}/{label!r}/{key!r}"
+                )
 
 
 def _walk_io(model: Model) -> tuple[dict[str, tuple[tuple[str, str], ...]], dict[str, frozenset[str]], frozenset[str]]:
@@ -387,6 +504,11 @@ class RequestData:
     sharding_config: ShardingConfig | None = None
     # what the replica pick recorded for the request; released in _drop_request
     routing: RoutingHandle | None = None
+    episode_id: str | None = None
+    episode_slot: int | None = None
+    episode_workers: set[str] = field(default_factory=set)
+    episode_held: dict[str, int] = field(default_factory=dict)
+    episode_admitted: bool = False
     # set once a NewRequest goes out; before that a failed ingest has nothing to drain
     dispatched: bool = False
     # persisted name -> the (partition, pass) whose reports wrote what is held
@@ -553,6 +675,43 @@ class Conductor:
         # Computed after the placement is read, since a declaration may read it. Each worker and the API server
         # compare their own digests against these.
         self._declaration_digests = declaration_digests(self._declarations(), model.kernel_settings())
+        self._episode_array_names = frozenset(
+            declaration.name for declaration in self._declarations()
+            if getattr(declaration, "lifetime", "request") == "episode"
+        )
+        episode_config = self.model_config.get("episodes") or {}
+        if not isinstance(episode_config, dict):
+            raise ValueError("episodes must be a mapping")
+        self._episode_records = EpisodeRecords(self._episode_array_names)
+        # Workers load base weights once at process startup. A future hot-reload
+        # path must end affected episodes before replacing those weights.
+        self._episode_weight_epoch = os.urandom(16)
+        self._episode_slots = EpisodeSlots(episode_config.get("max_episodes", 16))
+        for spec in self._node_resources():
+            if spec.resource_key in self._episode_array_names:
+                usable = getattr(spec.config, "usable_slots", None)
+                capacity = self._episode_slots.capacity
+                shortage = spec.capacity_problem(capacity, None)
+                if usable is None or usable < capacity or shortage is not None:
+                    labels = getattr(spec.config, "labels", ())
+                    need = capacity * max(1, len(labels))
+                    raise ValueError(
+                        f"episode array {spec.resource_key!r} has {usable} usable slots; "
+                        f"episodes.max_episodes needs {need} slots"
+                        + (f" ({len(labels)} per episode)" if len(labels) > 1 else "")
+                    )
+        self._episode_max_calls = episode_config.get("max_calls")
+        self._episode_max_queued_calls = episode_config.get("max_queued_calls", 1)
+        self._episode_idle_timeout_s = episode_config.get("idle_timeout_s", 600)
+        if self._episode_max_calls is not None and (
+            type(self._episode_max_calls) is not int or self._episode_max_calls < 1
+        ):
+            raise ValueError("episodes.max_calls must be a positive int or null")
+        if type(self._episode_max_queued_calls) is not int or self._episode_max_queued_calls < 1:
+            raise ValueError("episodes.max_queued_calls must be a positive int")
+        if (type(self._episode_idle_timeout_s) not in (int, float) or
+                not math.isfinite(self._episode_idle_timeout_s) or self._episode_idle_timeout_s <= 0):
+            raise ValueError("episodes.idle_timeout_s must be a positive finite number")
         self.device_type = accelerator_type()
         self.enable_nvtx = nvtx_enabled(enable_nvtx, torch.device(self.device_type))
         logger.info("Detected worker device type: %s", self.device_type)
@@ -584,6 +743,17 @@ class Conductor:
             worker_graph.worker_graph_id: worker_graph
             for worker_graph in worker_graphs
         }
+        for declaration in self._declarations():
+            if getattr(declaration, "lifetime", "request") != "episode":
+                continue
+            groups = {
+                wg._group_id for wg in self.worker_graphs.values()
+                if declaration.nodes & set(wg.section.get_nodes())
+            }
+            if len(groups) != 1:
+                raise ValueError(
+                    f"episode array {declaration.name!r} needs one node group, got {sorted(groups)}"
+                )
 
         # Set up worker graph TP ranks; validate_deployment checked each worker
         # graph belongs to one sharding group of its instance size.
@@ -672,6 +842,9 @@ class Conductor:
         )
         self._requests_gauge = Gauge(catalog.CONDUCTOR_REQUESTS)
         self._in_flight_gauge = Gauge(catalog.COMPONENT_IN_FLIGHT)
+        self._episodes_gauge = Gauge(catalog.EPISODES)
+        self._episode_slots_gauge = Gauge(catalog.EPISODE_SLOTS_USED)
+        self._episode_evictions = MetricCounter(catalog.EPISODE_EVICTIONS)
         # worker id -> its latest WorkerStatus snapshots (cumulative)
         self._worker_metrics: dict[str, list[MetricSnapshot]] = {}
 
@@ -764,6 +937,12 @@ class Conductor:
         built = getattr(self, "_declarations_cache", None)
         if built is None:
             built = self._declarations_cache = self.model.declare_state()
+        return built
+
+    def _mask_layout_reads(self) -> dict[str, tuple[tuple[str, str, str, str], ...]]:
+        built = getattr(self, "_mask_layout_reads_cache", None)
+        if built is None:
+            built = self._mask_layout_reads_cache = _required_mask_layouts(self.model, self._declarations())
         return built
 
     def _streamed_partitions(self) -> frozenset[str]:
@@ -1268,18 +1447,40 @@ class Conductor:
             )
 
     def _try_admit_waiting(self):
-        """Drain the waiting queue up to the concurrency cap."""
-        while self.waiting_queue:
+        """Scan the queue up to the concurrency cap, preserving survivor order."""
+        if not self._episode_array_names:
+            while self.waiting_queue and (self.max_concurrent_requests is None or
+                                          len(self.requests) < self.max_concurrent_requests):
+                body = self.waiting_queue.pop(0)
+                request_log.debug(
+                    "Admitting queued request %s (%d/%s in-flight)", body.request_id,
+                    len(self.requests), str(self.max_concurrent_requests),
+                )
+                self._admit_request(body)
+            return
+        blocked_episodes: set[str] = set()
+        waiting, self.waiting_queue = self.waiting_queue, []
+        for body in waiting:
+            if (self._uses_episode_records(body) and body.episode is not None and
+                    self._episode_records.closed_or_ending(body.episode)):
+                self._reject_request(body.request_id, "episode ended", status=410)
+                continue
             if (self.max_concurrent_requests is not None
                     and len(self.requests) >= self.max_concurrent_requests):
-                break
-            body = self.waiting_queue.pop(0)
+                self.waiting_queue.append(body)
+                continue
+            if (self._uses_episode_records(body) and body.episode is not None and
+                    (body.episode in blocked_episodes or self._episode_records.busy(body.episode))):
+                blocked_episodes.add(body.episode)
+                self.waiting_queue.append(body)
+                continue
             request_log.debug(
                 "Admitting queued request %s (%d/%s in-flight)",
                 body.request_id, len(self.requests),
                 str(self.max_concurrent_requests),
             )
-            self._admit_request(body)
+            if not self._admit_request(body) and body.episode is not None:
+                blocked_episodes.add(body.episode)
 
     def _ingest_request(
         self, body: NewRequestConductor
@@ -1301,9 +1502,36 @@ class Conductor:
             )
             return
         try:
-            _request_seed(body.model_kwargs or {}, _seed_id(body))
+            model_kwargs = body.model_kwargs or {}
+            _request_seed(model_kwargs, _seed_id(body))
+            check_seed(model_kwargs.get("episode_seed"))
+            if model_kwargs.get("seed") is not None and model_kwargs.get("episode_seed") is not None:
+                raise ValueError("seed and episode_seed cannot both be set")
         except ValueError as exc:
             self._reject_request(body.request_id, str(exc), status=400)
+            return
+        episode_active = self._uses_episode_records(body)
+        if episode_active and self._expire_episode_slots(time.monotonic()):
+            self._try_admit_waiting()
+        if episode_active and body.episode is not None and (
+            type(body.episode) is not str or not body.episode
+        ):
+            self._reject_request(body.request_id, "episode id must be a non-empty string", status=400)
+            return
+        if (episode_active and body.episode is not None and
+                self._episode_records.closed_or_ending(body.episode)):
+            self._reject_request(body.request_id, "episode ended", status=410)
+            return
+        if (episode_active and body.episode is not None and
+                (self._episode_records.busy(body.episode) or
+                 any(waiting.episode == body.episode for waiting in self.waiting_queue))):
+            queued = sum(waiting.episode == body.episode for waiting in self.waiting_queue)
+            if queued >= self._episode_max_queued_calls or body.input_open:
+                self._reject_request(body.request_id, "episode call queue full", status=429)
+                return
+            self.waiting_queue.append(body)
+            if self._status_interval_s is not None:
+                self._queued_since[body.request_id] = time.perf_counter()
             return
         if (self.max_concurrent_requests is not None
                 and len(self.requests) >= self.max_concurrent_requests):
@@ -1342,6 +1570,25 @@ class Conductor:
         """
         try:
             self._do_ingest_request(body)
+        except EpisodeCallLimitError as exc:
+            self._drop_request(body.request_id)
+            self._end_episode(EndEpisodeConductor(body.episode))
+            self._reject_request(body.request_id, str(exc), status=400)
+            return True
+        except EpisodeCapacityError:
+            # Planning registered the request before slot reservation. It sent
+            # nothing to workers, so keep the preprocess inputs for the retry.
+            self._drop_request(body.request_id)
+            if body.input_open:
+                self._reject_request(
+                    body.request_id, "server at capacity: a call with open input can't wait for a slot",
+                    status=503,
+                )
+                return True
+            self.waiting_queue.append(body)
+            if self._status_interval_s is not None:
+                self._queued_since.setdefault(body.request_id, time.perf_counter())
+            return False
         # Any failure must reach the client.
         except Exception as exc:  # noqa: BLE001
             request_data = self.requests.get(body.request_id)
@@ -1365,6 +1612,7 @@ class Conductor:
                 self._remove_request(
                     body.request_id, request_data, failure_error=f"Ingest failed: {text}",
                 )
+        return True
 
     def _reject_request(self, request_id: str, error: str, status: int):
         """Fail a request that was never dispatched to any worker.
@@ -1373,6 +1621,7 @@ class Conductor:
         them there, as an abort before admission does, then tell the client.
         """
         logger.info("Rejecting request %s (%d): %s", request_id, status, error)
+        self._queued_since.pop(request_id, None)
         self._early_reads_done.pop(request_id, None)
         self._send_remove_to_preprocess_worker(request_id)
         self._send_for_teardown(
@@ -1392,15 +1641,48 @@ class Conductor:
         # A request admitted on arrival never waited.
         arrival_time = (
             None if self._status_interval_s is None
-            else self._queued_since.pop(body.request_id, ingest_time)
+            else self._queued_since.get(body.request_id, ingest_time)
         )
         model_kwargs = body.model_kwargs or {}
         max_output_tokens = self._max_output_tokens(model_kwargs)
         loop_caps = self._loop_caps(model_kwargs)
-        # Honor an explicit per-request seed (e.g. OpenAI ``seed``) when given;
-        # otherwise derive a stable seed from the request id. ``_ingest_request``
-        # already rejected a bad one.
+        # Use an episode's existing call count for session sampling. Ordinary
+        # requests keep their explicit seed or the request-id-derived seed.
         seed = _request_seed(model_kwargs, _seed_id(body))
+
+        episode_active = self._uses_episode_records(body)
+        episode_keys = {} if body.episode_keys is None else body.episode_keys
+        episode_reset = False
+        if episode_active:
+            if type(body.reset_episode) is not bool:
+                raise ValueError("reset_episode must be a bool")
+            if not isinstance(episode_keys, dict) or any(
+                type(name) is not str or type(key) is not str for name, key in episode_keys.items()
+            ):
+                raise ValueError("episode_keys must map array names to strings")
+            if unknown := sorted(episode_keys.keys() - self._episode_array_names):
+                raise ValueError(f"episode_keys names undeclared episode arrays {unknown}")
+            digest = body.episode_adapter_digest
+            if digest is not None and type(digest) is not bytes:
+                raise ValueError("episode_adapter_digest must be bytes or None")
+            selected_adapter = model_kwargs.get(LORA_ADAPTER_KWARG)
+            if selected_adapter is None:
+                if digest is not None:
+                    raise ValueError("base-model episode must not have an adapter digest")
+            elif digest is None or digest != model_kwargs.get(LORA_DIGEST_KWARG):
+                raise ValueError("episode adapter digest does not match the selected adapter")
+            episode_identity = (self._episode_weight_epoch, digest)
+            self._episode_records.can_admit(body.episode, self._episode_max_calls)
+            if (self._episode_records.slot_for(body.episode) is None and
+                    not self._episode_slots.has_free_on_any(self.worker_ids)):
+                raise EpisodeCapacityError
+            episode_view = self._episode_records.view(
+                body.episode, episode_keys, body.reset_episode, episode_identity,
+            )
+            episode_reset = body.reset_episode or episode_view.cold == "identity"
+            episode_seed = self._episode_records.seed_for(body.episode, model_kwargs.get("episode_seed"))
+            if episode_seed is not None:
+                seed = episode_seed
 
         partitions = self.model.get_partitions()
         topology = self.model.get_partition_topology()
@@ -1416,10 +1698,22 @@ class Conductor:
         # doesn't use is done from the start
         for p in partitions:
             pstate = partition_states[p.name]
-            pstate.plan = self.model.walk_plan(
+            plan_args = (
                 p.name, body.initial_input_modalities, body.initial_output_modalities,
                 body.initial_signals, model_kwargs,
             )
+            pstate.plan = (
+                self.model.walk_plan(*plan_args, episode=episode_view)
+                if episode_active else self.model.walk_plan(*plan_args)
+            )
+            pstate.plan = _with_planned_state_layout(pstate.plan, self._declarations())
+            pstate.plan = _with_chunk_causal_layout(
+                pstate.plan, model_kwargs.get(CHUNK_CAUSAL_LAYOUT_KWARG), self._declarations(),
+            )
+            pstate.plan = _with_expert_layout(
+                pstate.plan, model_kwargs.get(EXPERT_LAYOUT_KWARG), self._declarations(),
+            )
+            _check_mask_layouts(pstate.plan, self._mask_layout_reads(), self._declarations())
             stream_moved = p.name in self.producer_triggered_partitions
             # refuse a plan the conductor can't run: a step whose walk isn't one of the
             # partition's (which startup checked are the model's), or a ``bind`` key
@@ -1504,7 +1798,11 @@ class Conductor:
         groups_run = self._router.groups_run(
             name for name, pstate in partition_states.items() if not pstate.is_done
         )
-        placement = self._router.pick(resource_configs, groups_run)
+        placement = (
+            self._episode_records.placement_for(
+                body.episode, lambda: self._pick_episode_placement(resource_configs, groups_run),
+            ) if episode_active else self._router.pick(resource_configs, groups_run)
+        )
         worker_graph_to_workers = self._assign_worker_graphs_to_workers(placement.replicas)
 
         # Build per-connection streaming state. None for a client stream: the
@@ -1542,6 +1840,7 @@ class Conductor:
             conductor_ingest_time=ingest_time,
             conductor_arrival_time=arrival_time,
             prompt_tokens=body.prompt_tokens,
+            episode_id=body.episode if episode_active else None,
         )
         self._register_request(body.request_id, request_data)
 
@@ -1553,8 +1852,35 @@ class Conductor:
             self._set_partition_worker_graph_ids(body.request_id, p.name, pstate.graph_walk)
         released = self._consumed(request_data, [name for name, ps in partition_states.items() if not ps.is_done])
 
+        episode_clear: list[str] = []
+        if episode_active:
+            workers = set(worker_to_worker_graph_ids)
+            slot = self._episode_records.slot_for(body.episode)
+            new_slot = slot is None
+            owner = self._episode_owner(body.episode, body.request_id)
+            if new_slot:
+                slot = self._reserve_episode_slot(owner, workers)
+            try:
+                if not episode_reset:
+                    episode_clear = self._episode_records.clear_arrays(body.episode, episode_keys)
+                self._episode_records.admit(
+                    body.episode, body.request_id, slot, placement,
+                    keys=episode_keys, reset=body.reset_episode,
+                    max_calls=self._episode_max_calls, workers=workers,
+                    seed_base=model_kwargs.get("episode_seed"),
+                    identity=episode_identity,
+                )
+            except Exception:
+                if new_slot:
+                    self._episode_slots.release(owner, workers, slot)
+                raise
+            request_data.episode_slot = slot
+            request_data.episode_workers = workers
+            request_data.episode_admitted = True
+
         # only now: a request refused before this leaves nothing in the mirrors
         request_data.routing = self._router.add(placement, resource_configs, groups_run)
+        self._queued_since.pop(body.request_id, None)
 
         # Send NewRequest to each worker with the appropriate partition's inputs
         request_data.dispatched = True
@@ -1580,6 +1906,10 @@ class Conductor:
                     worker_graph_to_workers=worker_graph_to_workers,
                     initial_inputs=initial_inputs,
                     loop_caps=loop_caps,
+                    episode_id=request_data.episode_id,
+                    episode_slot=request_data.episode_slot,
+                    reset_episode=episode_reset,
+                    episode_clear=episode_clear,
                     request_info=CurrentForwardPassInfo(
                         request_id=body.request_id,
                         graph_walk=pstate.graph_walk,
@@ -1656,6 +1986,97 @@ class Conductor:
     def _register_request(self, request_id: str, request_data: RequestData) -> None:
         self.requests[request_id] = request_data
 
+    @staticmethod
+    def _episode_owner(episode_id: str | None, request_id: str) -> str:
+        return f"episode:{episode_id}" if episode_id is not None else f"request:{request_id}"
+
+    def _uses_episode_records(self, body: NewRequestConductor) -> bool:
+        """A seeded session uses the existing record even without stored arrays."""
+        return bool(
+            self._episode_array_names
+            or (body.model_kwargs or {}).get("episode_seed") is not None
+            or (type(body.episode) is str and (
+                self._episode_records.has(body.episode)
+                or self._episode_records.closed_or_ending(body.episode)))
+        )
+
+    def _send_end_episode(self, episode_id: str, slot: int, workers: set[str]) -> None:
+        for worker_id in sorted(workers):
+            self.communicator.send(
+                worker_id, WorkerMessage(
+                    message_type=WorkerMessageType.END_EPISODE, body=EndEpisode(episode_id, slot),
+                ),
+            )
+
+    def _close_episode(self, episode_id: str) -> None:
+        if not self._episode_records.has(episode_id):
+            return
+        slot, workers = self._episode_records.end(episode_id)
+        if slot is not None:
+            self._send_end_episode(episode_id, slot, workers)
+            self._episode_slots.release(self._episode_owner(episode_id, ""), workers, slot)
+
+    def _end_episode(self, body: EndEpisodeConductor) -> None:
+        if (not self._episode_array_names and not (
+                type(body.episode_id) is str and self._episode_records.has(body.episode_id))
+                and not any(request.episode == body.episode_id for request in self.waiting_queue)):
+            return
+        episode_id = body.episode_id
+        if type(episode_id) is not str or not episode_id:
+            raise ValueError("episode id must be a non-empty string")
+        queued = [request for request in self.waiting_queue if request.episode == episode_id]
+        self.waiting_queue = [request for request in self.waiting_queue if request.episode != episode_id]
+        for request in queued:
+            self._reject_request(request.request_id, "episode ended", status=410)
+        if not self._episode_records.mark_ending(episode_id):
+            self._close_episode(episode_id)
+            self._try_admit_waiting()
+
+    def _reserve_episode_slot(self, owner: str, workers: set[str]) -> int:
+        slot = self._episode_slots.reserve(owner, workers)
+        if slot is None:
+            raise EpisodeCapacityError
+        return slot
+
+    def _pick_episode_placement(self, configs: dict[str, ResourceReqConfig], groups_run: frozenset[int]):
+        """Use the normal replica pick when it has a slot; constrain it only when full."""
+        def workers_for(placement) -> set[str]:
+            return {
+                worker for worker_ids in self._assign_worker_graphs_to_workers(placement.replicas).values()
+                for worker in worker_ids
+            }
+
+        preferred = self._router.pick(configs, groups_run)
+        if self._episode_slots.free_slot(workers_for(preferred)) is not None:
+            return preferred
+        for slot in range(self._episode_slots.capacity):
+            placement = self._router.pick(
+                configs, groups_run,
+                eligible=lambda instance, slot=slot: self._episode_slots.available(
+                    {f"worker_{rank}" for rank in instance}, slot,
+                ),
+            )
+            if placement is not None and self._episode_slots.available(workers_for(placement), slot):
+                return placement
+        raise EpisodeCapacityError
+
+    def _expire_episode_slots(self, now: float) -> bool:
+        freed = False
+        queued = {request.episode for request in self.waiting_queue}
+        for episode_id, record in self._episode_records.idle():
+            if now - record.last_end < self._episode_idle_timeout_s:
+                break
+            if episode_id in queued:
+                continue
+            slot, workers = record.slot, record.workers
+            self._send_end_episode(episode_id, slot, workers)
+            self._episode_records.evict(episode_id, "idle")
+            self._episode_evictions.inc(("idle",))
+            self._episode_slots.release(self._episode_owner(episode_id, ""), workers, slot)
+            freed = True
+        self._episode_records.forget_expired_closed(now, self._episode_idle_timeout_s)
+        return freed
+
     def _drop_request(self, request_id: str) -> None:
         """The one way a request leaves ``self.requests``, so what the replica pick recorded cannot leak."""
         request_data = self.requests.pop(request_id, None)
@@ -1663,6 +2084,22 @@ class Conductor:
             self._router.remove(request_data.routing, [
                 name for name, pstate in request_data.partition_states.items() if pstate.fwd_pass_number
             ])
+        if request_data is None or not request_data.episode_admitted:
+            return
+        slot = request_data.episode_slot
+        workers = request_data.episode_workers
+        episode_id = request_data.episode_id
+        if episode_id is None:
+            self._episode_slots.release(self._episode_owner(None, request_id), workers, slot)
+        elif request_data.completion_sent:
+            self._episode_records.finish(episode_id, request_id, request_data.episode_held)
+            if self._episode_records.ending(episode_id):
+                self._close_episode(episode_id)
+        else:
+            self._episode_records.fail(episode_id, request_id)
+            self._send_end_episode(episode_id, slot, workers)
+            self._episode_slots.release(self._episode_owner(episode_id, request_id), workers, slot)
+            self._end_episode(EndEpisodeConductor(episode_id))
 
     def _register_draining(
         self, request_id: str, expected_acks: set[str], participants: set[str],
@@ -1774,6 +2211,8 @@ class Conductor:
         a stalled drain barrier through, and drop stale early-message entries so
         they can't accumulate for requests that never come back."""
         now = time.perf_counter()
+        if self._expire_episode_slots(time.monotonic()):
+            self._try_admit_waiting()
         for request_id in self._pop_expired(self._draining_deadlines, now):
             dr = self.draining.get(request_id)
             if dr is None:
@@ -1944,6 +2383,15 @@ class Conductor:
             participants=workers | {self.PREPROCESS_WORKER},
         )
 
+    def _record_episode_held(self, body: WorkerGraphsDone, request_data: RequestData) -> None:
+        if not request_data.episode_admitted or not body.is_first_tp_rank or not body.episode_held:
+            return
+        if unknown := set(body.episode_held) - self._episode_array_names:
+            raise ValueError(f"worker reported undeclared episode arrays {sorted(unknown)}")
+        if any(type(count) is not int or count < 0 for count in body.episode_held.values()):
+            raise ValueError("worker reported invalid episode held counts")
+        request_data.episode_held.update(body.episode_held)
+
     def _process_worker_graphs_done(
         self, body: WorkerGraphsDone
     ) -> list[str]:
@@ -1960,6 +2408,7 @@ class Conductor:
             return []
 
         request_data = self.requests[body.request_id]
+        self._record_episode_held(body, request_data)
         partition_name = body.partition_name
         if self.enable_prof:
             request_data.graph_timings.update(body.graph_timings)
@@ -2356,6 +2805,8 @@ class Conductor:
         that finishes a partition's pass is queued on ``done_partition_forwards``."""
         if message.message_type == ConductorMessageType.NEW_REQUEST:
             self._ingest_request(message.body)
+        elif message.message_type == ConductorMessageType.END_EPISODE:
+            self._end_episode(message.body)
         elif message.message_type == ConductorMessageType.ABORT_REQUEST:
             self._abort_request(message.body.request_id)
         elif message.message_type == ConductorMessageType.FAIL_REQUESTS:
@@ -2472,6 +2923,11 @@ class Conductor:
         states.set(("draining",), len(self.draining))
         for node, count in in_flight.items():
             self._in_flight_gauge.set((node,), count)
+        for state, count in self._episode_records.state_counts().items():
+            self._episodes_gauge.set((state,), count)
+        used = self._episode_slots.used_by_worker()
+        for worker in self.worker_ids:
+            self._episode_slots_gauge.set((worker,), used.get(worker, 0))
         # Summed across workers: a node's replicas each report their own; for
         # the engine families the other ranks of a lockstep instance report
         # nothing, while every rank counts the tensor transfers it reads.
@@ -2480,7 +2936,9 @@ class Conductor:
             for snap in snapshots:
                 by_family.setdefault(snap.name, []).append(snap)
         return ConductorStatus(metrics=[
-            states.snapshot(), self._in_flight_gauge.snapshot(), self._router.predicted_saving.snapshot(),
+            states.snapshot(), self._in_flight_gauge.snapshot(),
+            self._episodes_gauge.snapshot(), self._episode_slots_gauge.snapshot(),
+            self._episode_evictions.snapshot(), self._router.predicted_saving.snapshot(),
             *(merge(family, by_family.get(name, ()))
               for name, family in catalog.WORKER_FAMILIES.items()),
         ])

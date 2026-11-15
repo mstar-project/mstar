@@ -40,6 +40,7 @@ SNAPSHOT = {
         ["rewritable", "KEYWORD_ONLY", 'False'],
         ["labels", "KEYWORD_ONLY", "frozenset({'main'})"],
         ["positions", "KEYWORD_ONLY", 'None'],
+        ["lifetime", "KEYWORD_ONLY", "'request'"],
         ["largest", "KEYWORD_ONLY", '{}'],
     ],
     "ArrayStep": [
@@ -64,9 +65,37 @@ SNAPSHOT = {
     "CausalConv": [
         ["activation", "KEYWORD_ONLY", "'silu'"],
     ],
+    "ChunkCausal": [
+        ["chunk_len", "POSITIONAL_OR_KEYWORD", None],
+    ],
+    "ChunkCausalLayout": [
+        ["global_len", "KEYWORD_ONLY", None],
+        ["noised_len", "KEYWORD_ONLY", None],
+        ["clean_len", "KEYWORD_ONLY", '0'],
+    ],
     "Entry": [
         ["tensors", "POSITIONAL_OR_KEYWORD", None],
         ["host", "KEYWORD_ONLY", '{}'],
+    ],
+    "ExpertCross": [
+        ["chunk_len", "POSITIONAL_OR_KEYWORD", None],
+        ["future_per_chunk", "KEYWORD_ONLY", None],
+        ["tokens_per_frame", "KEYWORD_ONLY", None],
+        ["window_frames", "KEYWORD_ONLY", None],
+        ["include_noised", "KEYWORD_ONLY", 'True'],
+    ],
+    "ExpertCrossLayout": [
+        ["num_chunks", "KEYWORD_ONLY", None],
+        ["global_len", "KEYWORD_ONLY", None],
+        ["clean_frames", "KEYWORD_ONLY", None],
+        ["noised_frames", "KEYWORD_ONLY", None],
+    ],
+    "ExpertSelf": [
+        ["chunk_len", "POSITIONAL_OR_KEYWORD", None],
+        ["future_per_chunk", "KEYWORD_ONLY", None],
+    ],
+    "ExpertSelfLayout": [
+        ["num_chunks", "KEYWORD_ONLY", None],
     ],
     "Fork": [
         ["src", "KEYWORD_ONLY", None],
@@ -97,6 +126,9 @@ SNAPSHOT = {
         ["scratch", "KEYWORD_ONLY", '0'],
         ["max_growth", "KEYWORD_ONLY", 'None'],
         ["kept_windows", "KEYWORD_ONLY", '{}'],
+        ["chunk_causal", "KEYWORD_ONLY", '{}'],
+        ["expert_cross", "KEYWORD_ONLY", '{}'],
+        ["expert_self", "KEYWORD_ONLY", '{}'],
         ["sizes", "KEYWORD_ONLY", '{}'],
     ],
     "Mamba2": [
