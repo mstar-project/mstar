@@ -1649,6 +1649,10 @@ class RingHandle(ArrayHandle):
             raise self._no_layout("keep=False on a ring, whose commit counts a frame for every row the step lists")
         super()._check_storage(declared, segments, ctx)
 
+    def _calls_cover(self, declared: ArrayStep, ctx) -> bool:
+        # a compiled region traces the adds, which record nothing, and `_check_storage` holds each row to one frame
+        return True
+
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
         layer = self._layer_id(layer)
         if not torch.compiler.is_compiling():
@@ -1710,6 +1714,10 @@ class RollingHandle(ArrayHandle):
         super().check_step(step)
         if not self._kept:
             raise self._refusal("a step adds nothing, and the store's commit keeps each row's span")
+
+    def _calls_cover(self, declared: ArrayStep, ctx) -> bool:
+        # `check_step` refuses a step that adds nothing, with the store's own reason
+        return True
 
     def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
         if not declared.keep:
@@ -1903,6 +1911,10 @@ class SizedValueHandle(ArrayHandle):
             if lost:
                 raise self._refusal(f"the step read layer {layer} and neither wrote nor cleared {lost}, whose tensors "
                                     "its read took from the store")
+
+    def _calls_cover(self, declared: ArrayStep, ctx) -> bool:
+        # a step may leave a field unset, and `check_step` holds it to what its read handed over
+        return True
 
     def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
         if not declared.keep:
