@@ -25,9 +25,8 @@ window. The VAE node writes and reads that window, and the backbone consumes
 its clean encoding. The predicted video latents end at the denoise
 loop, and nothing predicted leaves the walk except the action rows.
 
-Serving stays gated until the published weights and session path have been
-validated. The constructor refuses a served model before it fetches anything.
-Dummy mode (``skip_weight_loading``) builds the graph for CPU tests.
+Live serving permits the checked DROID layout and session recipe. Other rigs
+remain gated. Dummy mode (``skip_weight_loading``) builds the graph for CPU tests.
 """
 
 from __future__ import annotations
@@ -130,15 +129,25 @@ class Praxis1Model(Model):
     INTERNAL_KWARGS = (MODEL_POSE_KWARG,)
     PREPROCESS_ONLY_KWARGS = (STATE_KWARG, MODEL_POSE_KWARG, "pose_descriptor", "control_mode")
 
+    def _validated_droid_layout(self) -> bool:
+        """The camera and action geometry checked with the DROID client."""
+        config = self.config
+        return (
+            config.embodiment == "single_arm"
+            and config.views == ("exterior", "wrist")
+            and (config.canvas_height, config.canvas_width) == (224, 832)
+            and (config.tile_height, config.tile_width) == (224, 416)
+            and config.antialias is True
+            and (config.action_dim, config.action_chunk, config.action_frames_per_token) == (10, 24, 4)
+            and config.grid_hz == 15.0
+        )
+
     @property
     def POSITRONIC_SESSION_READY(self) -> bool:
         """Only the DROID episode recipe checked with the live session may serve."""
         recipe = self.sampler_defaults
         return (
-            "single_arm" in _SERVABLE_RIGS and self.config.embodiment == "single_arm"
-            and self.config.tile_height == 224
-            and self.config.tile_width == 416
-            and self.config.num_cameras == 2
+            "single_arm" in _SERVABLE_RIGS and self._validated_droid_layout()
             and recipe["max_context_chunks"] == 1
             and self.max_text_tokens == 256
             and all(
@@ -192,6 +201,8 @@ class Praxis1Model(Model):
             raise Praxis1ConfigError(
                 f"checkpoint rig {self.config.embodiment!r} does not match deployment rig {self._rig()!r}"
             )
+        if not skip_weight_loading and self._rig() == "single_arm" and not self._validated_droid_layout():
+            raise Praxis1ConfigError("DROID serving requires the checked camera and action layout")
         context_chunks = self.sampler_defaults["max_context_chunks"]
         if type(context_chunks) is not int or not 0 <= context_chunks < self.config.n_chunks:
             raise Praxis1ConfigError(

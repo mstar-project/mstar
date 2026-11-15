@@ -269,16 +269,29 @@ def test_droid_session_config_keeps_idless_openpi_cold(tmp_path, monkeypatch):
 
 
 def test_droid_session_refuses_a_different_checkpoint_canvas(tmp_path, monkeypatch):
-    shipped = yaml.safe_load((ROOT / "configs/praxis1_droid.yaml").read_text())
     config = json.loads(json.dumps(DROID_CONFIG))
     config["video"]["tile_height"] = 256
     config["video"]["height"] = 256
-    model = _model(
-        tmp_path, config, monkeypatch,
-        max_context_chunks=1, max_text_tokens=256,
-    )
-    with pytest.raises(ValueError, match="no ready Positronic session adapter"):
-        PositronicPolicy.from_config(shipped["positronic"], model)
+    with pytest.raises(Praxis1ConfigError, match="DROID serving requires the checked camera and action layout"):
+        _model(tmp_path, config, monkeypatch, max_context_chunks=1, max_text_tokens=256)
+
+
+@pytest.mark.parametrize("field,value,message", [
+    ("views", ["wrist", "exterior"], "the single_arm rig has the views"),
+    ("antialias", False, "DROID serving requires the checked camera and action layout"),
+])
+def test_droid_serving_refuses_an_unchecked_camera_layout(tmp_path, monkeypatch, field, value, message):
+    config = json.loads(json.dumps(DROID_CONFIG))
+    config["video"][field] = value
+    with pytest.raises(Praxis1ConfigError, match=message):
+        _model(tmp_path, config, monkeypatch)
+
+
+def test_droid_serving_refuses_an_unchecked_action_schedule(tmp_path, monkeypatch):
+    config = json.loads(json.dumps(DROID_CONFIG))
+    config["chunking"]["grid_hz"] = 12.0
+    with pytest.raises(Praxis1ConfigError, match="DROID serving requires the checked camera and action layout"):
+        _model(tmp_path, config, monkeypatch)
 
 
 @pytest.mark.parametrize("changed", [
