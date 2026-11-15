@@ -31,6 +31,7 @@ from mstar.engine.resources import (
 from mstar.engine.resources.attn.dense import _fa3_unavailable_reason
 from mstar.engine.resources.attn.ragged.dense import DenseRaggedCrossManager, DenseRaggedManager
 from mstar.engine.resources.attn.ragged.dense_wrappers import (
+    DensePrefixedPrefillWrapper,
     DenseRaggedCrossPrefillWrapper,
     DenseRaggedPrefillWrapper,
 )
@@ -115,6 +116,164 @@ def test_eager_causal_matches_reference():
     q, k, v = qkv(264)
     w.plan(layout, causal=True)
     close(w.run(q, k, v), ref(q, k, v, layout, causal=True))
+
+
+def _count_fixed_length_calls(monkeypatch):
+    import mstar.engine.resources.attn.ragged.dense_wrappers as dw
+
+    if not dw.fixed_one_segment(DEVICE):
+        pytest.skip(f"no FA3 fixed-length kernel, or none measured for {dw.current_platform.arch(DEVICE)}")
+    calls, fixed = [], dw.flash_attn_func
+    monkeypatch.setattr(dw, "flash_attn_func", lambda *a, **kw: calls.append(1) or fixed(*a, **kw))
+    return dw, calls
+
+
+def _varlen(dw, q, k, v, q_len, kv_len, causal, scale):
+    out = dw.flash_attn_varlen_func(
+        q, k, v, cu([q_len]).to(DEVICE), cu([kv_len]).to(DEVICE), q_len, kv_len, causal=causal, softmax_scale=scale,
+    )
+    return out[0] if isinstance(out, tuple) else out
+
+
+# the test file's 4 heads at 72, and Cosmos3's GQA geometry at an even and an odd count of 128-row blocks
+@pytest.mark.parametrize("heads,kv_heads,head_dim,q_len,kv_len", [
+    (HEADS, HEADS, HEAD_DIM, 300, 300),
+    (32, 8, 128, 256, 256),
+    (32, 8, 128, 384, 475),
+])
+def test_one_segment_runs_the_fixed_length_kernel_bit_exactly(monkeypatch, heads, kv_heads, head_dim, q_len, kv_len):
+    """A lone non-causal eager segment runs on FA3's fixed-length kernel, with the
+    varlen kernel's output bit for bit; rows past the plan keep it on varlen."""
+    dw, calls = _count_fixed_length_calls(monkeypatch)
+    geometry = dict(num_qo_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim)
+    gen = torch.Generator(device=DEVICE).manual_seed(3)
+    q = torch.randn(q_len, heads, head_dim, dtype=DTYPE, device=DEVICE, generator=gen)
+    k, v = (torch.randn(kv_len, kv_heads, head_dim, dtype=DTYPE, device=DEVICE, generator=gen) for _ in range(2))
+    if q_len == kv_len:
+        w = wrapper(**geometry)
+        w.plan(cu([q_len]))
+    else:
+        w = cross_wrapper(**geometry)
+        w.plan(cu([q_len]), cu([kv_len]))
+    got = w.run(q, k, v)
+    assert calls, "a one-segment eager plan should take the fixed-length kernel"
+    assert torch.equal(got, _varlen(dw, q, k, v, q_len, kv_len, False, w.sm_scale))
+    calls.clear()
+    pad = torch.zeros(10, heads, head_dim, dtype=DTYPE, device=DEVICE)
+    w.run(torch.cat([q, pad]), k, v)  # rows the plan doesn't cover
+    assert not calls
+
+
+def test_causal_and_captured_single_segments_stay_on_varlen(monkeypatch):
+    """The fixed-length kernel is slower on short causal segments, and a graph
+    replays its bucket's kernel, so neither takes it."""
+    _, calls = _count_fixed_length_calls(monkeypatch)
+    w, layout = wrapper(), cu([300])
+    q, k, v = qkv(300)
+    w.plan(layout, causal=True)
+    close(w.run(q, k, v), ref(q, k, v, layout, causal=True))
+    g = graph_wrapper()
+    g.plan(cu([MAX_TOKENS]))
+    q, k, v = qkv(MAX_TOKENS)
+    g.run(q, k, v)
+    assert not calls
+
+
+def _count_fixed_segment_calls(monkeypatch):
+    import mstar.engine.resources.attn.ragged.dense_wrappers as dw
+
+    if dw.fa3_fixed_into is None:
+        pytest.skip("no FA3 fixed-length entry point that writes into an output (fa3-fwd 0.0.2)")
+    if dw.fixed_segment_min_rows(DEVICE, 128) is None:
+        pytest.skip(f"no per-segment threshold measured for {dw.current_platform.arch(DEVICE)}")
+    calls, into = [], dw.fa3_fixed_into
+    monkeypatch.setattr(dw, "fa3_fixed_into", lambda *a: calls.append(a[0].shape[1]) or into(*a))
+    return dw, calls
+
+
+def _varlen_segments(dw, q, k, v, q_lens, kv_lens, scale):
+    out = dw.flash_attn_varlen_func(
+        q, k, v, cu(q_lens).to(DEVICE), cu(kv_lens).to(DEVICE), max(q_lens), max(kv_lens),
+        causal=False, softmax_scale=scale,
+    )
+    return out[0] if isinstance(out, tuple) else out
+
+
+# Cosmos3's guidance pair (one context longer than the other) and a three-request pack,
+# through the cross wrapper and the prefixed one Cosmos3's DiT plans, with q / k / v
+# as separate tensors or as strided slices of one fused projection
+@pytest.mark.parametrize("q_lens,kv_lens", [
+    ([1536, 1536], [2436, 1596]),
+    ([1600, 2000, 1536], [1700, 2900, 1536]),
+])
+@pytest.mark.parametrize("cls", [DenseRaggedCrossPrefillWrapper, DensePrefixedPrefillWrapper])
+@pytest.mark.parametrize("strided", [False, True])
+def test_long_segments_each_run_the_fixed_length_kernel_bit_exactly(monkeypatch, q_lens, kv_lens, cls, strided):
+    """Every segment of an eager non-causal plan at least the threshold long runs
+    on its own fixed-length call into one output, with the varlen kernel's output
+    bit for bit."""
+    dw, calls = _count_fixed_segment_calls(monkeypatch)
+    gen = torch.Generator(device=DEVICE).manual_seed(5)
+    if strided:
+        # one [N, 32 + 8 + 8, 128] projection: the rows of q, k and v are 48 heads apart
+        rows = max(sum(q_lens), sum(kv_lens))
+        fused = torch.randn(rows, 48, 128, dtype=DTYPE, device=DEVICE, generator=gen)
+        q, k, v = fused[:sum(q_lens), :32], fused[:sum(kv_lens), 32:40], fused[:sum(kv_lens), 40:]
+    else:
+        q = torch.randn(sum(q_lens), 32, 128, dtype=DTYPE, device=DEVICE, generator=gen)
+        k, v = (torch.randn(sum(kv_lens), 8, 128, dtype=DTYPE, device=DEVICE, generator=gen) for _ in range(2))
+    w = cls(num_qo_heads=32, num_kv_heads=8, head_dim=128, device=DEVICE, q_data_type=DTYPE)
+    w.plan(cu(q_lens), cu(kv_lens))
+    got = w.run(q, k, v)
+    assert calls == q_lens
+    assert torch.equal(got, _varlen_segments(dw, q, k, v, q_lens, kv_lens, w.sm_scale))
+
+
+def test_short_or_causal_segments_stay_on_varlen(monkeypatch):
+    """One segment under the threshold keeps the whole plan on varlen, where the
+    launches would cost more than they save; so does a causal plan."""
+    dw, calls = _count_fixed_segment_calls(monkeypatch)
+    short = dw.fixed_segment_min_rows(DEVICE, 128) - 1
+    gen = torch.Generator(device=DEVICE).manual_seed(6)
+    for q_lens, causal in (([2048, short], False), ([2048, 2048], True)):
+        q, k, v = (torch.randn(sum(q_lens), 32, 128, dtype=DTYPE, device=DEVICE, generator=gen) for _ in range(3))
+        w = wrapper(num_qo_heads=32, num_kv_heads=32, head_dim=128)
+        w.plan(cu(q_lens), causal=causal)
+        w.run(q, k, v)
+    assert not calls
+
+
+def test_a_head_dim_not_measured_keeps_long_segments_on_varlen(monkeypatch):
+    """The split is measured at head dim 128 only; at the vision towers' 72 it
+    loses, so long segments there stay on one varlen call."""
+    dw, calls = _count_fixed_segment_calls(monkeypatch)
+    q_lens = [2048, 2048]
+    q, k, v = (t.repeat(1, 4, 1) for t in qkv(sum(q_lens)))
+    w = wrapper(num_qo_heads=HEADS * 4, num_kv_heads=HEADS * 4)
+    w.plan(cu(q_lens))
+    w.run(q, k, v)
+    assert not calls
+
+
+def test_an_unmeasured_architecture_or_head_dim_keeps_varlen(monkeypatch):
+    """Both fixed-length cases are looked up per architecture, and the split per
+    head dim too; one with no measurement, or a build without the entry point,
+    gets none."""
+    import mstar.engine.resources.attn.ragged.dense_wrappers as dw
+
+    monkeypatch.setattr(dw, "flash_attn_func", lambda *a, **kw: None)
+    monkeypatch.setattr(dw, "fa3_fixed_into", lambda *a: None)
+    monkeypatch.setattr(dw.current_platform, "arch", lambda device=None: "sm_90")
+    assert dw.fixed_one_segment(DEVICE)
+    assert dw.fixed_segment_min_rows(DEVICE, 128) == 1536
+    assert dw.fixed_segment_min_rows(DEVICE, 72) is None
+    for arch in ("sm_80", "sm_100"):
+        monkeypatch.setattr(dw.current_platform, "arch", lambda device=None, arch=arch: arch)
+        assert not dw.fixed_one_segment(DEVICE)
+        assert dw.fixed_segment_min_rows(DEVICE, 128) is None
+    monkeypatch.setattr(dw, "fa3_fixed_into", None)
+    monkeypatch.setattr(dw.current_platform, "arch", lambda device=None: "sm_90")
+    assert dw.fixed_segment_min_rows(DEVICE, 128) is None
 
 
 def capture_wrapper(w):
