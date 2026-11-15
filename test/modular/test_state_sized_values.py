@@ -261,8 +261,8 @@ def test_two_stores_that_fit_the_device_alone_and_not_together_are_refused_at_lo
 
 def test_a_step_that_lists_a_sized_value_isn_t_captured():
     handle, store, _ = _store("a")
-    step = _step(handle, "a").steps["caches"]
-    assert isinstance(step, SizedValueStep) and not store.can_capture(step)
+    assert not store.can_capture()
+    assert isinstance(_step(handle, "a").steps["caches"], SizedValueStep)
     assert blocked_capture_resources(_step(handle, "a"), {"caches": store}) == ["caches"]
 
 

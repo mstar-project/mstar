@@ -54,7 +54,7 @@ class SizedValueStore(Resource):
         # calls on the main thread share with a step's take, put and clear on the GPU thread.
         self._lock = threading.Lock()
 
-    def can_capture(self, step) -> bool:
+    def can_capture(self) -> bool:
         return False
 
     @property

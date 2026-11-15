@@ -196,7 +196,7 @@ class KDAManager(LinearAttnManager):
         """Whether a captured prefill replays with each step's spans on these kernels."""
         return self.kernels.prefill_capturable
 
-    def can_capture(self, step: LinearAttnStep) -> bool:
+    def can_capture_step(self, step: LinearAttnStep) -> bool:
         """False for a prefill step these kernels can't replay. A packed config whose step has one token a row reads
         as a decode here, and still raises at capture."""
         spans = [max(segment.span, 0) for segment in step.segments or ()]

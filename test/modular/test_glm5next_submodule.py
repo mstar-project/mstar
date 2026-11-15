@@ -428,7 +428,7 @@ class TestCudaGraphs:
             runner._capture_configs = configs
             runner._blocked_configs = frozenset(
                 i for i, config in enumerate(configs)
-                if config.capture_graph_walk == "prefill" and not h.kda.can_capture(prefill)
+                if config.capture_graph_walk == "prefill" and not h.kda.can_capture_step(prefill)
             )
             engine = make_engine(_submodules={"LLM": make_mgmt(submodule=sub, capture_runner=runner)})
             return engine.get_max_batch_size("LLM", walk)

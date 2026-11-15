@@ -215,9 +215,13 @@ class Resource(ResidentHooks, ABC):
     def depends_on(self) -> set[str]:
         return set()
 
-    def can_capture(self, step) -> bool:
-        """Whether a graph captured over ``step``, this resource's part of a declared step, replays as it ran."""
+    def can_capture(self) -> bool:
         return True
+
+    def can_capture_step(self, step) -> bool:
+        """Whether a graph captured over ``step``, this resource's part of a declared step, replays as it ran:
+        `can_capture`, unless the answer depends on the step."""
+        return self.can_capture()
 
     @property
     def deferred_bytes(self) -> int:
