@@ -531,6 +531,7 @@ class LoraRoot:
     names: Mapping[str, str] = dataclasses.field(default_factory=dict)
     rules: CheckpointRules | None = None
     adapters: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    convert_keys: Callable | None = None
 
 
 def declared_lora_spec(roots: Sequence[LoraRoot]) -> LoraSpec | None:
@@ -551,7 +552,7 @@ def declared_lora_spec(roots: Sequence[LoraRoot]) -> LoraSpec | None:
             root.build, nodes={root.node}, root_path=root.root_path, rules=root.rules,
             adapter_stacked_params=root.adapter_stacked_params, adapter_roots=root.adapter_roots,
             aliases=root.aliases, rows=root.rows, names=root.names, exclude=root.exclude, ignore=root.ignore,
-            embeddings=root.embeddings,
+            embeddings=root.embeddings, convert_keys=root.convert_keys,
         )
         for root in roots
     ]
