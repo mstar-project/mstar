@@ -158,7 +158,9 @@ should only compare runs scored by the same judge and normalizer.
   offline TTS judge, supply a local SpeechMOS v1.2.0 checkout and its
   ``utmos22_strong_step7459_v1.pt`` checkpoint with ``--mos-repo`` and
   ``--mos-checkpoint`` alongside ``--mos``. Both paths are required; the
-  results record fingerprints of the local Python code and checkpoint.
+  results record fingerprints of the local Python code and checkpoint. A run
+  rejects changes to either file set between repeats; restart the judge process
+  after changing the local code.
 
 Judges run between repeats, after the load has finished, so they never compete with
 measured requests; ``--judge-device`` moves them to another GPU or the CPU.

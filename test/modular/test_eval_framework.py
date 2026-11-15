@@ -1115,7 +1115,7 @@ def test_utmos_cache_reloads_when_local_weights_change(tmp_path):
     with torch.no_grad():
         model.weight.fill_(2)
     torch.save(model.state_dict(), checkpoint)
-    second_id = suite.config()["mos_judge"]
+    second_id = TTSSuite(args).config()["mos_judge"]
     second = judges.mos_judge("cpu", repo, checkpoint)
     assert second_id != first_id
     assert second.id == second_id
@@ -1151,6 +1151,30 @@ def test_utmos_rejects_a_checkpoint_replaced_during_load(tmp_path, monkeypatch):
 
     monkeypatch.setattr(torch, "load", replace_then_load)
     with pytest.raises(RuntimeError, match="local UTMOS files changed while loading"):
+        judges.mos_judge("cpu", repo, checkpoint)
+
+
+def test_utmos_refuses_changed_imported_code_at_the_same_repo_path(tmp_path):
+    import torch
+
+    from benchmark.eval import judges
+
+    repo = tmp_path / "SpeechMOS"
+    repo.mkdir()
+    (repo / "hubconf.py").write_text(
+        "from local_utmos_model import make_model\n"
+        "def utmos22_strong(pretrained=True):\n"
+        "    assert not pretrained\n"
+        "    return make_model()\n"
+    )
+    model_code = repo / "local_utmos_model.py"
+    model_code.write_text("import torch\ndef make_model():\n    return torch.nn.Linear(1, 1)\n")
+    checkpoint = tmp_path / "utmos.pt"
+    torch.save(torch.nn.Linear(1, 1).state_dict(), checkpoint)
+    judges.mos_judge("cpu", repo, checkpoint)
+
+    model_code.write_text(model_code.read_text() + "# changed code\n")
+    with pytest.raises(RuntimeError, match="local UTMOS code changed.*restart"):
         judges.mos_judge("cpu", repo, checkpoint)
 
 
@@ -1227,6 +1251,47 @@ def test_tts_offline_utmos_paths_reach_the_judge_and_are_checked(tmp_path, monke
     metrics = suite.score([Item(id="a", text="one two")], [row], 1.0, None)
     assert metrics["utmos_mean"] == 3.5
     assert calls == [(None, repo, checkpoint)]
+
+
+def test_tts_run_pins_local_utmos_id_across_repeats(tmp_path, monkeypatch):
+    import argparse
+
+    import numpy as np
+
+    from benchmark.eval import judges
+    from benchmark.eval.datasets import Item
+    from benchmark.eval.suites.tts import TTSSuite
+
+    repo = tmp_path / "SpeechMOS"
+    repo.mkdir()
+    (repo / "hubconf.py").write_text("")
+    checkpoint = tmp_path / "utmos.pt"
+    checkpoint.write_bytes(b"first weights")
+    parser = argparse.ArgumentParser()
+    TTSSuite.add_args(parser)
+    args = parser.parse_args(["--asr-judge", "none", "--mos", "--mos-repo", str(repo),
+                              "--mos-checkpoint", str(checkpoint)])
+    args.model_name = "test"
+    suite = TTSSuite(args)
+    pinned_id = suite.config()["mos_judge"]
+    calls = []
+
+    class FakeMOS:
+        def score(self, clip):
+            calls.append(clip)
+            return 3.5
+
+    monkeypatch.setattr(judges, "mos_judge", lambda *a: FakeMOS())
+    row = {"id": "a", "ok": True, "error": None, "ttfa_s": 0.1, "e2e_s": 0.5, "audio_s": 1.0,
+           "rtf": 0.5, "chunks": 1, "stalls": 0, "stall_s": 0.0, "sample_rate": 16000,
+           "_audio": np.zeros(16000, dtype=np.float32)}
+    suite.score([Item(id="a", text="one two")], [row.copy()], 1.0, None)
+    checkpoint.write_bytes(b"second weights")
+
+    assert suite.config()["mos_judge"] == pinned_id
+    with pytest.raises(RuntimeError, match="local UTMOS files changed during this run"):
+        suite.score([Item(id="a", text="one two")], [row.copy()], 1.0, None)
+    assert len(calls) == 1
 
 
 def test_a_server_with_its_own_cwd_resolves_a_relative_python_and_its_tree_there(tmp_path, monkeypatch):

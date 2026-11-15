@@ -25,12 +25,15 @@ import hashlib
 from collections.abc import Sequence
 from functools import cache, lru_cache
 from pathlib import Path
+from threading import Lock
 
 import numpy as np
 
 from benchmark.eval.audio import resample
 
 RATE = 16000
+_MOS_REPO_CODE: dict[Path, str] = {}
+_MOS_REPO_CODE_LOCK = Lock()
 
 
 def _device(device: str | None) -> str:
@@ -124,11 +127,17 @@ class MosJudge:
             self.id = f"utmos22_strong:{hub_ref}"
             model = torch.hub.load(hub_ref, "utmos22_strong", trust_repo=True)
         else:
-            repo, checkpoint = Path(repo_path), Path(checkpoint_path)
+            repo, checkpoint = Path(repo_path).resolve(), Path(checkpoint_path)
             if not (repo / "hubconf.py").is_file():
                 raise FileNotFoundError(f"offline UTMOS needs hubconf.py in {repo}")
             if not checkpoint.is_file():
                 raise FileNotFoundError(f"offline UTMOS checkpoint not found: {checkpoint}")
+            code_id = _mos_code_id(repo)
+            with _MOS_REPO_CODE_LOCK:
+                loaded = _MOS_REPO_CODE.get(repo)
+                if loaded is not None and loaded != code_id:
+                    raise RuntimeError("local UTMOS code changed at this repo path; restart the judge process")
+                _MOS_REPO_CODE[repo] = code_id
             self.id = mos_local_id(repo, checkpoint)
             model = torch.hub.load(str(repo), "utmos22_strong", source="local", pretrained=False)
             model.load_state_dict(torch.load(checkpoint, map_location="cpu", weights_only=True))
@@ -205,12 +214,15 @@ def _file_digest(path: Path) -> str:
 
 
 def mos_local_id(repo_path: str | Path, checkpoint_path: str | Path) -> str:
-    repo = Path(repo_path)
+    return f"utmos22_strong:local:{_mos_code_id(Path(repo_path))}:{_file_digest(Path(checkpoint_path))}"
+
+
+def _mos_code_id(repo: Path) -> str:
     digest = hashlib.sha256()
     for path in sorted(repo.rglob("*.py")):
         digest.update(path.relative_to(repo).as_posix().encode())
         digest.update(path.read_bytes())
-    return f"utmos22_strong:local:{digest.hexdigest()[:16]}:{_file_digest(Path(checkpoint_path))}"
+    return digest.hexdigest()[:16]
 
 
 @cache

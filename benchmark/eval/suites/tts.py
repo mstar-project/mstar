@@ -80,6 +80,8 @@ class TTSSuite(Suite):
                 raise FileNotFoundError(f"offline UTMOS needs hubconf.py in {args.mos_repo}")
             if not args.mos_checkpoint.is_file():
                 raise FileNotFoundError(f"offline UTMOS checkpoint not found: {args.mos_checkpoint}")
+        self._mos_local_id = (judges.mos_local_id(args.mos_repo, args.mos_checkpoint)
+                              if args.mos_repo is not None else None)
         if args.engine == "nanovllm-voxcpm":
             unsent = [f"--{k}" for k in ("voice", "language", "instructions") if getattr(args, k)]
             if unsent:
@@ -94,8 +96,8 @@ class TTSSuite(Suite):
         mos_id = None
         if a.mos:
             mos_id = "utmos22_strong"
-            if a.mos_repo is not None:
-                mos_id = judges.mos_local_id(a.mos_repo, a.mos_checkpoint)
+            if self._mos_local_id is not None:
+                mos_id = self._mos_local_id
         return {
             "engine": a.engine,
             "request": {k: v for k, v in self._payload(Item(id="", text=""), 0).items() if k != "input"},
@@ -208,6 +210,10 @@ class TTSSuite(Suite):
 
     def score(self, items: list[Item], rows: list[dict[str, Any]], wall_s: float, audio_dir: Path | None) -> dict:
         a = self.args
+        if self._mos_local_id is not None:
+            current = judges.mos_local_id(a.mos_repo, a.mos_checkpoint)
+            if current != self._mos_local_id:
+                raise RuntimeError("local UTMOS files changed during this run")
         ok = [r for r in rows if r["ok"]]
         audio_total = sum(r["audio_s"] for r in ok)
         m: dict[str, float | None] = {
