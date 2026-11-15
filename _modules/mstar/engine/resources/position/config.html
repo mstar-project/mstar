@@ -747,7 +747,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.model.parakeet.html">mstar.model.parakeet</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.phi4mm.html">mstar.model.phi4mm</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.phi4mm.components.html">mstar.model.phi4mm.components</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.phi4mm.config.html">mstar.model.phi4mm.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.phi4mm.tests.html">mstar.model.phi4mm.tests</a></li>
 </ul>
 </details></li>
@@ -1229,10 +1228,16 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">request_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_kwargs</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"PositionReqConfig | None"</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Under LongRoPE, the length the request's table is chosen by, from</span>
 <span class="sd">        ``MAX_POSITION_KWARG``, which a model sets in ``process_prompt`` (the data worker</span>
-<span class="sd">        drops a client's); without it, the short table."""</span>
-        <span class="n">length</span> <span class="o">=</span> <span class="p">(</span><span class="n">model_kwargs</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">MAX_POSITION_KWARG</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">length</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">longrope</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+<span class="sd">        drops a client's)."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">longrope</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
+        <span class="n">length</span> <span class="o">=</span> <span class="p">(</span><span class="n">model_kwargs</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">MAX_POSITION_KWARG</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">length</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"position resource </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> picks each request's LongRoPE table by "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">MAX_POSITION_KWARG</span><span class="si">!r}</span><span class="s2">, which the model's process_prompt didn't set, so the request would rotate "</span>
+                <span class="s2">"with the short table whatever its length"</span>
+            <span class="p">)</span>
         <span class="k">return</span> <span class="n">PositionReqConfig</span><span class="p">(</span><span class="n">max_position</span><span class="o">=</span><span class="n">length</span><span class="p">)</span></div>
 
 

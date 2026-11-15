@@ -393,7 +393,6 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.parakeet.html">mstar.model.parakeet</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.phi4mm.html">mstar.model.phi4mm</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.phi4mm.components.html">mstar.model.phi4mm.components</a></li>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.phi4mm.config.html">mstar.model.phi4mm.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.phi4mm.tests.html">mstar.model.phi4mm.tests</a></li>
 </ul>
 </details></li>
@@ -1518,7 +1517,10 @@ and <code class="docutils literal notranslate"><span class="pre">Positions()</sp
 <li><p><code class="docutils literal notranslate"><span class="pre">Positions(rope=)</span></code>: a position counter per request and label, on an append-only array
 that keeps entries. <code class="docutils literal notranslate"><span class="pre">rope=None</span></code> is a counter only. <code class="docutils literal notranslate"><span class="pre">Rope</span></code> carries <code class="docutils literal notranslate"><span class="pre">theta</span></code>,
 <code class="docutils literal notranslate"><span class="pre">rotary_dim</span></code>, <code class="docutils literal notranslate"><span class="pre">interleave</span></code>, <code class="docutils literal notranslate"><span class="pre">scale</span></code>, the Llama 3.1 factors (all three or none), the
-rotation’s <code class="docutils literal notranslate"><span class="pre">dtype</span></code> and a <code class="docutils literal notranslate"><span class="pre">table_dtype</span></code> for a cos/sin table built once. On the contract
+rotation’s <code class="docutils literal notranslate"><span class="pre">dtype</span></code> and a <code class="docutils literal notranslate"><span class="pre">table_dtype</span></code> for a cos/sin table built once. <code class="docutils literal notranslate"><span class="pre">longrope</span></code> takes
+a <code class="docutils literal notranslate"><span class="pre">LongRoPE</span></code>’s short and long factor sets, and a request rotates with the long set when the
+prompt length <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> sets under <code class="docutils literal notranslate"><span class="pre">MAX_POSITION_KWARG</span></code> passes the original context
+(Phi-4-multimodal). On the contract
 this picks the kernel, and a shared layer’s <code class="docutils literal notranslate"><span class="pre">rope_*</span></code> arguments have no effect, so a port
 declares what its layer passed before. The counter is
 separate from log positions: a kept step advances it by each row’s advance, a fork copies
@@ -1628,7 +1630,7 @@ a refused admit draws the same noise.</p>
 <p><code class="docutils literal notranslate"><span class="pre">kernel_settings(self)</span></code> is a temporary hook for what the engine doesn’t pick itself yet:
 <code class="docutils literal notranslate"><span class="pre">splits</span></code>, <code class="docutils literal notranslate"><span class="pre">decode_fmha</span></code> and <code class="docutils literal notranslate"><span class="pre">decode_tensor_cores</span></code> on a read of a paged array,
 <code class="docutils literal notranslate"><span class="pre">splits</span></code> on a <code class="docutils literal notranslate"><span class="pre">GatedDeltaNet</span></code>, and <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code>, <code class="docutils literal notranslate"><span class="pre">max_segments_per_step</span></code>,
-<code class="docutils literal notranslate"><span class="pre">compile_op</span></code> and <code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code> on a <code class="docutils literal notranslate"><span class="pre">Block</span></code> read. Under an array’s name it sets the default size of the array’s pool, <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code>
+<code class="docutils literal notranslate"><span class="pre">compile_op</span></code>, <code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code> and <code class="docutils literal notranslate"><span class="pre">backend</span></code> on a <code class="docutils literal notranslate"><span class="pre">Block</span></code> read. Under an array’s name it sets the default size of the array’s pool, <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code>
 on a paged array and <code class="docutils literal notranslate"><span class="pre">max_slots</span></code> on a <code class="docutils literal notranslate"><span class="pre">Value</span></code> with tensor fields or an unbounded array, which a deployment’s
 <code class="docutils literal notranslate"><span class="pre">resources:</span></code> block overrides. A cross read on an array that keeps entries takes
 <code class="docutils literal notranslate"><span class="pre">decode_tensor_cores</span></code> alone, and two reads that share a resource can’t set one field to two
