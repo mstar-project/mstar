@@ -4,6 +4,7 @@ seed, the prompt length rides the walk's step metadata, and a verify step's coun
 ``main``'s per-request counters did and reaches the step speculated after it."""
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -26,10 +27,12 @@ from mstar.engine.resources import (
 from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.step import StepContext
 from mstar.engine.state.adapters import node_resources
+from mstar.model.base import serving_resources
 from mstar.model.glm52.config import INDEX_KEYS, KV, MTP_SEED, PROMPT_LEN, SAMPLER, Glm52ModelConfig
 from mstar.model.glm52.glm52_model import Glm52Model
 from mstar.model.glm52.submodules import Glm52LLMSubmodule
 from mstar.model.submodule_base import END_PARTITION, ARNodeInputs
+from mstar.model.utils import check_kv_pools_fit
 from mstar.testing_utils.worker import make_worker
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.speculation import Speculation
@@ -93,6 +96,21 @@ def test_the_declarations_build_main_s_specs_but_for_three_named_differences(kwa
             assert got.config == spec.config, f"{spec.resource_key}: the engine would build another resource"
     # the third: the seed's pool, where main kept fixed buffers on the submodule
     assert set(built) == ({MTP_SEED} if model.config.mtp_num_draft_tokens else set())
+
+
+def test_the_seed_pool_admits_every_request_the_kv_pool_can():
+    """``main`` sized its seed buffers at ``max_num_pages + 1``, so the seed never capped concurrency."""
+    model, log = _model(mtp_num_draft_tokens=3), logging.getLogger(__name__)
+    config = {"max_concurrent_requests": 300, "resources": {KV: {"max_num_pages": 8192}}}
+    check_kv_pools_fit(model, config, "glm52.yaml", log)
+    seed = {spec.resource_key: spec for spec in serving_resources(model, config)}[MTP_SEED]
+    assert seed.config.max_slots == 8193, "a slot for every request the KV pool can hold, and the sink"
+    config["resources"][MTP_SEED] = {"max_slots": 256}
+    with pytest.raises(ValueError, match="300 slots of resources.mtp_seed"):
+        check_kv_pools_fit(model, config, "glm52.yaml", log)
+    config["resources"][MTP_SEED] = {"max_slots_of": SAMPLER}
+    with pytest.raises(ValueError, match="max_slots_of names 'sampler', which is no paged KV pool"):
+        serving_resources(model, config)
 
 
 @pytest.mark.parametrize("k", [0, 3])
