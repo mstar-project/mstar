@@ -67,7 +67,7 @@ class _StubAPIServer:
     def submit_request(self, *, text=None, file_paths=None,
                        input_modalities, output_modalities,
                        model_kwargs=None, prompt_parts=None, streaming=True,
-                       request_id=None, report_usage=False):
+                       request_id=None, report_usage=False, parse_reply=False):
         if text and "boom" in text:
             raise ValueError("scripted ingest failure")
         self.texts[request_id] = text

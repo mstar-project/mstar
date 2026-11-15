@@ -16,6 +16,7 @@ from fastapi import HTTPException
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
+from mstar.api_server.reply_parser import REASONING
 from mstar.api_server.request_types import USAGE
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
@@ -48,6 +49,7 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
             streaming=bool(req.stream),
             request_id=request_id,
             report_usage=True,
+            parse_reply=True,
         )
         if req.stream:
             # a request the engine refuses gets its status, not a 200
@@ -89,12 +91,15 @@ def _finish_reason(reported: dict | None) -> str:
 
 def _build_response(model_name, request_id, chunks, sample_rate, audio_format="wav") -> dict:
     text_parts: list[bytes] = []
+    reasoning: list[str] = []
     audio_pcm: list[bytes] = []
     images: list[bytes] = []
     usage = None
     for c in chunks:
         if c.modality == "text":
             text_parts.append(c.data)
+            if REASONING in c.metadata:
+                reasoning.append(c.metadata[REASONING])
         elif c.modality == "audio":
             audio_pcm.append(c.data)
         elif c.modality == "image":
@@ -105,6 +110,9 @@ def _build_response(model_name, request_id, chunks, sample_rate, audio_format="w
     # a byte-level BPE token's bytes can end inside a character
     text = b"".join(text_parts).decode("utf-8", "replace")
     message: dict = {"role": "assistant", "content": text}
+    if reasoning:
+        # a reasoning model's thinking, split off its answer (`ReplyParser`), under vLLM's name
+        message[REASONING] = "".join(reasoning)
 
     if audio_pcm:
         audio, _ = media_io.pcm16_to_container(b"".join(audio_pcm), sample_rate, audio_format)
@@ -163,9 +171,14 @@ async def _stream_events(batches, model_name, request_id, sample_rate, include_u
             text_events: list[str] = []
             for c in batch:
                 if c.modality == "text":
+                    delta = {}
+                    if REASONING in c.metadata:
+                        delta[REASONING] = c.metadata[REASONING]
                     content = text.feed(c.data)
                     if content:
-                        text_events.append(chunk({**role, "content": content}))
+                        delta["content"] = content
+                    if delta:
+                        text_events.append(chunk({**role, **delta}))
                         role = {}
                     continue
                 if c.modality == USAGE:

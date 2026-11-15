@@ -117,6 +117,9 @@ struct SubmitMsg<'a> {
     /// `submit_request`'s `report_usage`; left out when false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     report_usage: bool,
+    /// `submit_request`'s `parse_reply`; left out when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    parse_reply: bool,
     /// `submit_request`'s `raw_inputs`, `end_input` and `file_streams`, each
     /// left out when unset.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -385,6 +388,7 @@ impl Bridge {
             prompt_parts: &args.parts,
             streaming,
             report_usage: args.report_usage,
+            parse_reply: args.parse_reply,
             raw_inputs: &args.raw_inputs,
             end_input: args.end_input.as_ref(),
             file_streams: args.file_streams.as_ref(),
@@ -698,6 +702,7 @@ mod tests {
             prompt_parts: parts,
             streaming: true,
             report_usage,
+            parse_reply: false,
             raw_inputs: &raw_inputs,
             end_input: None,
             file_streams: None,

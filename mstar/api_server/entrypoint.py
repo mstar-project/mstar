@@ -46,6 +46,7 @@ from mstar.api_server.body_limit import BodyLimitMiddleware, max_body_bytes
 from mstar.api_server.data_worker import PreprocessWorker, unlink_files
 from mstar.api_server.lora_admin import LoraAdmin
 from mstar.api_server.openpi import OpenpiPolicy, serve_connection
+from mstar.api_server.reply_parser import REASONING, REPLY_IN_REASONING, ReplyParser
 from mstar.api_server.request_types import (
     USAGE,
     APIServerMessage,
@@ -373,6 +374,10 @@ class PendingRequest:
     stopped: bool = False
     prompt_tokens: int | None = None
     max_output_tokens: int | None = None
+    # submit_request's parse_reply, and the reply's parser, built on its first text chunk; only
+    # the message thread touches it
+    parse_reply: bool = False
+    parser: ReplyParser | None = None
 
     def notify(self) -> None:
         """Wake the streaming handler, from any thread."""
@@ -817,6 +822,38 @@ class APIServer:
     # Submitting a request
     # ----------------------------------------------------------
 
+    def _reply_reasoning_end(self) -> str | None:
+        """The text that ends the model's reasoning (`TextOutput.reasoning_end`), read once; None
+        for a model that doesn't reason, whose replies aren't parsed."""
+        try:
+            return self._reasoning_end
+        except AttributeError:
+            model = getattr(self, "model", None)
+            text = model.text_output() if model is not None else None
+            self._reasoning_end = None if text is None else text.reasoning_end
+            return self._reasoning_end
+
+    def _parse_reply_chunk(self, req: PendingRequest, chunk: ResultChunk) -> None:
+        """A parsed chat reply's text chunk, split: its answer stays the chunk's text, its reasoning
+        moves to ``metadata["reasoning"]``. On the message thread, in the request's chunk order."""
+        if req.parser is None:
+            starts = bool(chunk.metadata.pop(REPLY_IN_REASONING, False))
+            req.parser = ReplyParser(self._reply_reasoning_end(), starts)
+        reasoning, answer = req.parser.feed(chunk.data)
+        chunk.data = answer.encode()
+        if reasoning:
+            chunk.metadata[REASONING] = reasoning
+
+    @staticmethod
+    def _finish_reply(req: PendingRequest, rid: str) -> None:
+        """The text a parsed reply's parser still holds, as its last text chunk."""
+        reasoning, answer = req.parser.finish()
+        if reasoning or answer:
+            req.chunks.append(ResultChunk(
+                request_id=req.request_id or rid, modality="text", data=answer.encode(),
+                metadata={REASONING: reasoning} if reasoning else {},
+            ))
+
     def _report_ignored_params(self, model_kwargs: dict) -> None:
         """Log the keys the model does not read, once per set of keys; the
         request is served regardless."""
@@ -846,6 +883,7 @@ class APIServer:
         file_streams: dict[str, list[str | None]] | None = None,
         raw_inputs: dict[str, list[torch.Tensor]] | None = None,
         report_usage: bool = False,
+        parse_reply: bool = False,
     ) -> str:
         """Build a :class:`NewRequestConductor` and send it to the conductor.
 
@@ -882,8 +920,10 @@ class APIServer:
         is written or decoded.
 
         ``report_usage`` ends a successful request's chunks with a ``usage``
-        chunk (:func:`usage_chunk`).
+        chunk (:func:`usage_chunk`). ``parse_reply`` (a chat reply) splits its text, on a model
+        that reasons, into the answer and ``metadata["reasoning"]`` (`ReplyParser`).
         """
+        parse_reply = parse_reply and self._reply_reasoning_end() is not None
         if raw_inputs is not None:
             _check_raw_inputs(raw_inputs, file_paths)
         if request_id is None:
@@ -945,6 +985,7 @@ class APIServer:
                 open_streams=open_streams,
                 input_bytes=input_bytes,
                 report_usage=report_usage,
+                parse_reply=parse_reply,
             )
         if self.metrics is not None:
             mark_submitted()
@@ -962,6 +1003,7 @@ class APIServer:
             ends=ending,
             streaming=streaming,
             raw_inputs=raw_inputs,
+            parse_reply=parse_reply,
         ))
 
         request_log.debug(
@@ -1188,6 +1230,8 @@ class APIServer:
                             "result delivery timed out; response is incomplete"
                         )
                         req.error_status = 500
+                elif req.parser is not None and req.error is None:
+                    self._finish_reply(req, rid)
                 req.event.set()
                 req.notify()
                 # Snapshot the data worker's tx/rx now: the request is done (all
@@ -1432,6 +1476,8 @@ class APIServer:
                                 result_chunk.data.decode("utf-8", "replace"),
                                 rid, req.request_id,
                             ).encode("utf-8")
+                        if req.parse_reply and result_chunk.modality == "text":
+                            self._parse_reply_chunk(req, result_chunk)
                         req.chunks.append(result_chunk)
                         if self.log_stats:
                             info = req.output_totals.get(result_chunk.modality)

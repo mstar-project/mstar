@@ -73,7 +73,7 @@ class _Server:
 
     def submit_request(self, *, text=None, file_paths=None, input_modalities, output_modalities, model_kwargs=None,
                        prompt_parts=None, streaming=True, request_id=None, model=None, end_input=True,
-                       file_streams=None, raw_inputs=None, report_usage=False):
+                       file_streams=None, raw_inputs=None, report_usage=False, parse_reply=False):
         if text == "refuse me":
             raise ValueError("the model refuses this text")
         rid = request_id or f"gen-{len(self.submitted)}"

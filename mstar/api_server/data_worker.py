@@ -27,6 +27,7 @@ try:
 except (ImportError, RuntimeError, OSError):
     VideoDecoder = None
 
+from mstar.api_server.reply_parser import REPLY_IN_REASONING
 from mstar.api_server.request_types import (
     ClientAppend,
     DataWorkerProfile,
@@ -620,6 +621,8 @@ class RequestOutputState:
     order: dict[str, tuple[int, NestedLoopIndices]] = field(default_factory=dict)
     next_sequence: int = 0
     next_emit: int = 0
+    # a parsed reply's, until its first text chunk carries it (`REPLY_IN_REASONING`)
+    reply_in_reasoning: bool | None = None
     # sequence -> completed chunk waiting on an earlier one
     pending: dict[int, ResultChunk] = field(default_factory=dict)
     # A video_frame chunk can carry several frames, so this advances by
@@ -680,6 +683,8 @@ class PreparedInput(NamedTuple):
     model_kwargs: dict
     # for the response's usage (``Model.prompt_tokens``)
     prompt_tokens: int
+    # a parsed reply's: whether it starts inside the reasoning its prompt opened (`after_reasoning`)
+    reply_in_reasoning: bool | None = None
 
 
 class PreparingInput(NamedTuple):
@@ -1010,6 +1015,7 @@ class PreprocessWorkerThread:
             model_kwargs.pop(name, None)
         open_streams = self._client_edges - input.ends
         num_prompt_tokens = 0
+        reply_in_reasoning = None
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
                 input.text,
@@ -1032,9 +1038,13 @@ class PreprocessWorkerThread:
                 prompt_tensors = prompt_tensors.new_input_tensors
             if prompt_tensors:
                 tensors.update(prompt_tensors)
-            if model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None and tensors.get("text_inputs"):
+            if (input.parse_reply or model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None) \
+                    and tensors.get("text_inputs"):
+                # one answer for the grammar and the reply's parser
                 after = after_reasoning(self.model.text_output(), tensors["text_inputs"][0])
-                if after is not None:
+                if input.parse_reply:
+                    reply_in_reasoning = after is not None
+                if after is not None and model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None:
                     model_kwargs[GRAMMAR_AFTER_KWARG] = after
             state_layout = model_kwargs.pop("state_layout", None)
             keyed_spans = model_kwargs.pop("keyed_spans", {})
@@ -1068,7 +1078,7 @@ class PreprocessWorkerThread:
             tensors["text_inputs"] = [torch.tensor(
                 list(byte_data), dtype=torch.uint8, device=self.device
             )]
-        return PreparedInput(tensors, input_metadata, model_kwargs, num_prompt_tokens)
+        return PreparedInput(tensors, input_metadata, model_kwargs, num_prompt_tokens, reply_in_reasoning)
 
     def _model_chose(
         self, output: ProcessPromptOutput, model_kwargs: dict, selected: dict, root: bytes,
@@ -1105,7 +1115,7 @@ class PreprocessWorkerThread:
         self, input: PreprocessInput, prepared: PreparedInput, profile: DataWorkerProfile | None,
     ) -> None:
         """Store a prepared request's tensors and hand it to the conductor."""
-        tensors, input_metadata, model_kwargs, num_prompt_tokens = prepared
+        tensors, input_metadata, model_kwargs, num_prompt_tokens, _ = prepared
 
         # A client stream's first chunk, not a prompt signal: a one-shot upload
         # is a stream of one chunk. Stored before the request reaches the
@@ -1123,7 +1133,7 @@ class PreprocessWorkerThread:
             call.held.append(HeldItems(self._store_held(input.request_id, stream_items), None))
 
         self.request_model_kwargs[input.request_id] = model_kwargs
-        self.request_output_state[input.request_id] = RequestOutputState()
+        self.request_output_state[input.request_id] = RequestOutputState(reply_in_reasoning=prepared.reply_in_reasoning)
         preprocess_only = getattr(self.model, "PREPROCESS_ONLY_KWARGS", ())
         conductor_kwargs = {k: v for k, v in model_kwargs.items() if k not in preprocess_only}
         msg = ConductorMessage(
@@ -1872,6 +1882,9 @@ class PreprocessWorkerThread:
 
         while state.next_emit in state.pending:
             ready = state.pending.pop(state.next_emit)
+            if ready.modality == "text" and state.reply_in_reasoning is not None:
+                # the reply's first text, whichever path made it, tells the API server's parser
+                ready.metadata[REPLY_IN_REASONING], state.reply_in_reasoning = state.reply_in_reasoning, None
             if ready.modality == "video_frame":
                 ready.metadata["frame_index"] = state.frame_index
                 state.frame_index += ready.metadata["frame_count"]
