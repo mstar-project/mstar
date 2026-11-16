@@ -277,6 +277,17 @@ impl RequestState {
     fn note_ingested_for_streaming(&mut self, id: NodeId) {
         let spec = self.graph.node(id);
         let st = &self.nodes[id as usize];
+        // A top-level stream consumer sharing a worker graph with a successor
+        // cannot start the next chunk until the whole graph has completed.
+        // Otherwise two completions of the consumer can close one pass while
+        // the successor still holds the first chunk.
+        if spec.only_streaming && spec.loop_id.is_none()
+            && self.graph.n_root_entities() > 1 && st.completed
+        {
+            let (w, b) = Self::bit(id);
+            self.ready_streaming[w] &= !(1 << b);
+            return;
+        }
         // The mask alone, no liveness: Python's `ReadySignals.is_ready`.
         let full = st.cur.mask == spec.full_mask;
         // input_names ⊆ ready_names ∪ streaming_inputs, as bits: nothing is
@@ -319,6 +330,12 @@ impl RequestState {
         &mut self, g: &CompiledGraph, node: NodeId, slot: u8,
         tensors: &[TensorRef], can_buffer: bool, final_chunk: bool,
     ) -> bool {
+        let spec = g.node(node);
+        if spec.only_streaming && spec.loop_id.is_none()
+            && g.n_root_entities() > 1 && self.nodes[node as usize].completed
+        {
+            return false;
+        }
         let name = g.node(node).inputs[slot as usize];
         {
             let st = &mut self.nodes[node as usize];
@@ -524,7 +541,7 @@ impl RequestState {
         // The slot was just cleared, so streaming membership goes back to its
         // seed; Python's `WorkerGraphStateRegistry.mark_entity_complete`
         // does exactly this right after `entity.ready_signals.clear()`.
-        if spec.loop_id.is_none() {
+        if spec.loop_id.is_none() && (!spec.only_streaming || g.n_root_entities() == 1) {
             self.reseed_streaming_ready(node);
         }
 
@@ -1113,6 +1130,43 @@ mod tests {
             "an only-streaming node must accept its next chunk after completing",
         );
         assert!(st.ingest(&g, snac, 0, &[t(2)], false, false));
+    }
+
+    #[test]
+    fn streaming_consumer_waits_for_successor_before_next_chunk() {
+        let mut it = StrToId::default();
+        let nodes = vec![
+            node("vocoder", &["codes"], &["codes"], vec![edge("wave", "post")]),
+            node("post", &["wave"], &[], vec![edge("audio", "emit_to_client")]),
+        ];
+        let g = compile_one(&mut it, &nodes, &[]).unwrap();
+        let (vocoder, post) = (0, 1);
+        let mut st = RequestState::new(g.clone());
+
+        assert!(st.is_ready_for_streaming(vocoder));
+        assert!(st.ingest(&g, vocoder, 0, &[t(1)], false, false));
+        st.clear_consumed_inputs(&g, vocoder);
+        let first = st.complete(&g, vocoder, &[vec![t(2)]]);
+        assert!(!st.is_done);
+        assert!(!st.is_ready_for_streaming(vocoder), "chunk 2 must wait for post");
+        assert!(!st.ingest(&g, vocoder, 0, &[t(4)], false, true));
+        assert!(st.ingest(&g, post, 0, &first.edges[0].tensors, false, false));
+        st.clear_consumed_inputs(&g, post);
+        st.complete(&g, post, &[vec![t(3)]]);
+        assert!(st.is_done);
+        assert_eq!(st.num_times_run, 1);
+
+        st.reset();
+        assert!(st.is_ready_for_streaming(vocoder), "the next pass can take chunk 2");
+        assert!(st.ingest(&g, vocoder, 0, &[t(4)], false, true));
+        st.clear_consumed_inputs(&g, vocoder);
+        let second = st.complete(&g, vocoder, &[vec![t(5)]]);
+        assert!(!st.is_ready_for_streaming(vocoder));
+        assert!(st.ingest(&g, post, 0, &second.edges[0].tensors, false, false));
+        st.clear_consumed_inputs(&g, post);
+        st.complete(&g, post, &[vec![t(6)]]);
+        assert!(st.is_done);
+        assert_eq!(st.num_times_run, 2);
     }
 
     #[test]

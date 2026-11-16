@@ -4,10 +4,10 @@ are rejected when it starts, not served wrongly later.
 ``validate_deployment`` refuses: a walk in no partition or in two, a
 partition naming an undefined walk, a node placed by no node_group or by two
 for one walk, a node_group naming an undefined walk, a rank no walk runs on,
-and the stream-driven
-shapes the runtime and conductor can't account for: a self-triggered consumer
-(every input streamed) sharing its worker graph with another top-level entity,
-and a consumer walk across worker graphs, unless its consumers are gated.
+and the stream-driven shapes the runtime and conductor can't account for: a
+self-triggered consumer loop sharing its worker graph with another top-level
+entity, or a self-triggered consumer walk across worker graphs. A top-level
+consumer node and successor on one worker graph run serially.
 The sweep at the bottom builds every shipped config
 through ``Conductor.__init__`` (workers and sockets stubbed, no weights) so
 none of them trips the new checks.
@@ -243,16 +243,24 @@ def _gated_vocoder_then_post():
     return walk
 
 
-def test_self_triggered_consumer_sharing_its_worker_graph_is_rejected(tmp_path):
-    """A consumer and a same-group successor merge into one worker graph. Its
-    completion counts entity runs (the re-armed consumer running twice reads
-    as done) and the pass-end reset drops the successor's buffered input."""
+def test_self_triggered_node_sharing_its_worker_graph_is_serialized(tmp_path, monkeypatch):
+    """The next chunk waits for the successor to finish this graph's pass."""
     cfg = _config(tmp_path, [{"node_names": ["producer", "vocoder", "post"], "ranks": [0]}])
-    with pytest.raises(ValueError, match=(
-        r"graph walk 'chunk' of consumer partition 'C' has self-triggered consumers \['vocoder'\] "
-        r"\(every input streamed\) among 2 top-level entities \['post', 'vocoder'\] in one worker graph"
-    )):
-        _validate(_stream_model(_vocoder_then_post), cfg)
+    _start_conductor(_stream_model(_vocoder_then_post), cfg, tmp_path, monkeypatch)
+
+
+def test_unrelated_entity_beside_self_triggered_consumer_is_rejected(tmp_path):
+    def independent():
+        return Sequential([
+            _vocoder(),
+            GraphNode(name="post", input_names=["trigger"], outputs=[
+                GraphEdge(next_node=EMIT_TO_CLIENT, name="audio", output_modality="audio"),
+            ]),
+        ])
+
+    cfg = _config(tmp_path, [{"node_names": ["producer", "vocoder", "post"], "ranks": [0]}])
+    with pytest.raises(ValueError, match="self-triggered consumers"):
+        _validate(_stream_model(independent), cfg)
 
 
 def _loop_then_post():
@@ -276,8 +284,8 @@ class _ChunkWalkRuntime:
     """The graph runtime of worker_0, hosting the 'chunk' walk's worker graphs,
     driven the way the worker drives it."""
 
-    def __init__(self, node_groups, tmp_path):
-        wgs = _stream_model(_gated_vocoder_then_post).get_worker_graphs(_config(tmp_path, node_groups))
+    def __init__(self, node_groups, tmp_path, chunk_walk=_gated_vocoder_then_post):
+        wgs = _stream_model(chunk_walk).get_worker_graphs(_config(tmp_path, node_groups))
         for i, wg in enumerate(wgs):
             wg.worker_graph_id = i
         self.wgs = [wg for wg in wgs if "chunk" in wg.graph_walks]
@@ -343,6 +351,20 @@ def test_gated_consumer_sharing_its_worker_graph_runs_once_per_pass(tmp_path):
         assert w.run("vocoder") == []
         assert w.feed_chunk(), "the next chunk is refused until the next pass's trigger"
         assert w.run("post") == [wg.worker_graph_id]
+
+
+def test_self_triggered_consumer_waits_for_successor_on_same_worker_graph(tmp_path):
+    w = _ChunkWalkRuntime(
+        [{"node_names": ["producer", "vocoder", "post"], "ranks": [0]}],
+        tmp_path, chunk_walk=_vocoder_then_post,
+    )
+    wg, = w.wgs
+    for _ in range(3):
+        assert w.feed_chunk() == []
+        assert w.run("vocoder") == []
+        assert w.feed_chunk(), "the next stream chunk must stay buffered"
+        assert w.run("post") == [wg.worker_graph_id]
+    assert len(w.reports()) == 3
 
 
 def test_colocated_successor_reports_the_final_stream(tmp_path):
