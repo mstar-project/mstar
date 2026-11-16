@@ -13,7 +13,7 @@ from mstar.engine.resources.context_parallel import position_pools
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
 from mstar.engine.resources.spec import NodeResourceSpec
-from mstar.graph.base import GraphSection, self_triggered, top_level_entities
+from mstar.graph.base import GraphNode, GraphSection, self_triggered, top_level_entities
 from mstar.model.base import Model, WorkerGraph
 
 if TYPE_CHECKING:
@@ -311,26 +311,19 @@ def _input_limits(walk_to_wgs: Mapping[str, list[WorkerGraph]]) -> Iterator[str]
                     )
 
 
-def _on_same_workers(wgs: list[WorkerGraph]) -> bool:
-    """Whether every request runs all of these worker graphs on the same
-    workers: the conductor picks one replica for every node_group on the same
-    lockstep instances (``ReplicaRouter``), so they share those instances."""
-    return len({tuple(map(tuple, wg.replica_ranks)) for wg in wgs}) == 1
-
-
 def _stream_driven_walks(model: Model, walk_to_wgs: Mapping[str, list[WorkerGraph]]) -> Iterator[str]:
     """Stream-driven walk shapes the runtime and conductor can't account for.
 
-    A worker graph counts entity completions per pass, and a self-triggered
-    consumer (every input streamed) is re-armed for the next chunk as soon as
-    it completes, so a second top-level entity can be counted done before it
-    runs, and the pass-end reset drops input it has buffered. A consumer
-    gated on a non-streamed input waits for that input instead, which is
-    safe when it arrives once per pass (from the conductor, say).
+    A self-triggered node feeding one successor in the same worker graph can
+    wait for that successor before taking another chunk. Other self-triggered
+    shapes still need pass identity: independent entities may receive different
+    numbers of chunks, and a loop can re-arm before its successor finishes.
+    A consumer gated on a non-streamed input waits for that input instead,
+    which is safe when it arrives once per pass (from the conductor, say).
     Across worker graphs, self-triggered passes overlap with no pass
-    identity, and the conductor reads the final-stream flag only off the
-    report that closes a pass: the flag is per worker, so it is there only
-    if every worker graph of the walk runs on the consumer's workers. A walk
+    identity. A gated consumer waits for its next non-streamed input until the
+    conductor closes the current pass; the conductor retains the final-stream
+    flag from any report of that pass, including a different worker's. A walk
     with no stream-consuming node is conductor driven and unaffected, and a
     TP worker graph is one worker graph on several ranks.
     """
@@ -349,18 +342,30 @@ def _stream_driven_walks(model: Model, walk_to_wgs: Mapping[str, list[WorkerGrap
         triggered = sorted(
             name for ents in entities for name, e in ents.items() if self_triggered(e)
         )
-        if len(wgs) > 1 and (triggered or not _on_same_workers(wgs)):
+        if len(wgs) > 1 and triggered:
             yield (
                 f"{where} consumes a stream and spans {len(wgs)} worker graphs "
                 f"{[sorted(wg.section.get_nodes()) for wg in wgs]} on ranks "
                 f"{[wg.ranks for wg in wgs]}. Across worker graphs a stream-driven walk "
                 "is served only with every consumer gated on a non-streamed input that "
-                "arrives once per pass and every worker graph on the same workers (node_groups "
-                "on the same ranks, instance for instance); otherwise run it as "
+                "arrives once per pass; otherwise run it as "
                 "one worker graph, or move the work after the consumer into a "
                 "downstream partition fed by a StreamingGraphEdge."
             )
-        if len(wgs) == 1 and len(entities[0]) > 1 and triggered:
+        # The runtime serializes a top-level all-streaming node until its
+        # worker graph ends. This only guarantees progress for a single
+        # consumer feeding one successor, with no independent input to wait
+        # for. Two separate streams can have different chunk counts and
+        # strand each other, even though both nodes are GraphNodes.
+        serial_pair = False
+        if len(wgs) == 1 and len(entities[0]) == 2 and len(triggered) == 1:
+            source = entities[0][triggered[0]]
+            other_name = next(name for name in entities[0] if name != triggered[0])
+            target = entities[0][other_name]
+            if isinstance(source, GraphNode) and isinstance(target, GraphNode):
+                delivered = {e.name for e in source.outputs if e.next_node == other_name}
+                serial_pair = bool(delivered) and target.input_names == delivered and not target.consumes_stream
+        if len(wgs) == 1 and len(entities[0]) > 1 and triggered and not serial_pair:
             yield (
                 f"{where} has self-triggered consumers {triggered} (every input "
                 f"streamed) among {len(entities[0])} top-level entities {sorted(entities[0])} "
