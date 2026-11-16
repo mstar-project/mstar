@@ -232,15 +232,21 @@ def test_a_carrying_drafter_reads_its_carry_and_stores_a_prompt_rows_first():
     assert draft.accepted == before + 2 * K
 
 
-def test_a_node_whose_resources_correct_a_verify_steps_state_refuses_mixed_steps(monkeypatch):
+@pytest.mark.parametrize("mode", ["synchronous", "asynchronous"])
+def test_a_node_whose_resources_correct_a_verify_steps_state_refuses_mixed_steps(monkeypatch, mode):
     """A resource that corrects a verify step's state in its graph (GDN's) reads every row as a verify
-    block, which a mixed step's prompt rows aren't: the node refuses at load, and without a mixed walk loads."""
+    block, which a mixed step's prompt rows aren't: the node refuses at load in either mode, before any
+    resource binds its verify walk, and the refusal offers no mode; without a mixed walk it loads."""
     from mstar.engine.resources.position.manager import RopeManager
 
+    bound = []
     monkeypatch.setattr(RopeManager, "correct_verify_state", lambda self, result: None)
-    with pytest.raises(ValueError, match=r"resources \['rope'\] correct a verify step's state in its graph"):
-        engine(K, oracle, mixed=True)
-    engine(K, oracle)
+    monkeypatch.setattr(RopeManager, "bind_verify_walk", lambda self, *args: bound.append(args))
+    with pytest.raises(ValueError, match=r"resources \['rope'\] correct a verify step's state in its graph") as info:
+        engine(K, oracle, mode=mode, mixed=True)
+    assert "asynchronously" not in str(info.value) and "'mixed'" in str(info.value)
+    assert not bound, "refused after binding"
+    engine(K, oracle, mode=mode)
 
 
 def test_a_prompt_row_leaves_with_its_first_token_and_counts_no_verify_row():
