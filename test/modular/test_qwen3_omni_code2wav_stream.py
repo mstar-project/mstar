@@ -34,6 +34,10 @@ from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo
 UPSAMPLE = 1920
 
 
+def test_code2wav_autotunes_only_during_its_capture():
+    assert Code2WavSubmodule.capture_cudnn_benchmark is True
+
+
 def _to_pcm(wav: torch.Tensor) -> torch.Tensor:
     """The submodule's float -> int16 conversion."""
     return (wav.clamp(-1, 1) * 32767).to(torch.int16)

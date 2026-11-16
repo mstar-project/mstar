@@ -23,12 +23,16 @@ executor threads' initializers apply only the per-thread dynamo config
 setting. A model that flips the flags itself still can.
 """
 import contextlib
+import threading
 from typing import NamedTuple
 
 import torch
 
 _MATMUL_PRECISIONS = ("highest", "high", "medium")
 _NO_CHANGE = contextlib.nullcontext()
+_native_lock = threading.Lock()
+_native_holders = 0
+_native_saved = True
 
 
 class Fp32Precision(NamedTuple):
@@ -38,6 +42,30 @@ class Fp32Precision(NamedTuple):
     matmul: str | None
     # ``torch.backends.cudnn.allow_tf32``: cuDNN convolutions and RNNs
     cudnn_allow_tf32: bool | None
+
+
+@contextlib.contextmanager
+def native_convolutions():
+    """Bypass cuDNN within a block, restoring its process-wide flag afterward.
+
+    A model's CPU-side reference encoder can overlap a GPU forward on another
+    thread. Count overlapping windows so the first exit cannot turn cuDNN back
+    on while the other window is still running. Change only ``enabled``;
+    ``cudnn.flags`` would also reset TF32 and benchmark settings.
+    """
+    global _native_holders, _native_saved
+    with _native_lock:
+        if _native_holders == 0:
+            _native_saved = torch.backends.cudnn.enabled
+            torch.backends.cudnn.enabled = False
+        _native_holders += 1
+    try:
+        yield
+    finally:
+        with _native_lock:
+            _native_holders -= 1
+            if _native_holders == 0:
+                torch.backends.cudnn.enabled = _native_saved
 
 
 def node_fp32_precision(node_name: str, submodule) -> Fp32Precision | None:
