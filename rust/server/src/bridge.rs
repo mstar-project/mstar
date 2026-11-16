@@ -456,6 +456,39 @@ impl Bridge {
         }
     }
 
+    /// Ask the Python CosyVoice3 adapter for chunk boundaries when spoken
+    /// number normalization can change the length of a written piece.
+    pub async fn cosyvoice3_pieces(
+        &self,
+        input: &str,
+        requested: Option<&Value>,
+        text_frontend: Option<&Value>,
+        timeout: Duration,
+    ) -> Result<Vec<String>, (u16, String)> {
+        let mut args = serde_json::Map::new();
+        args.insert("text".into(), Value::from(input));
+        if let Some(value) = requested {
+            args.insert("sentence_chunking".into(), value.clone());
+        }
+        if let Some(value) = text_frontend {
+            args.insert("text_frontend".into(), value.clone());
+        }
+        match self.round_trip("plan_speech_chunks", Extras { op: Some(&args), ..Extras::default() }, timeout).await {
+            Some(StreamItem::Chunk(chunk)) => {
+                if let Some(error) = chunk.metadata.get("error") {
+                    return Err((
+                        error.get("status").and_then(Value::as_u64).unwrap_or(500) as u16,
+                        error.get("message").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    ));
+                }
+                serde_json::from_value(chunk.metadata.get("pieces").cloned().unwrap_or(Value::Null))
+                    .map_err(|_| (500, "the API server gave no speech chunk plan".to_string()))
+            }
+            Some(StreamItem::Error { status, message, .. }) => Err((status, message)),
+            _ => Err((503, "backend bridge unreachable".to_string())),
+        }
+    }
+
     /// `/v1/load_lora_adapter` (`op` "load", with `lora_path`) or
     /// `/v1/unload_lora_adapter` ("unload"): the API server's `LoraAdmin` call,
     /// its text or the `(status, message)` the Python route answers with.
@@ -630,7 +663,7 @@ fn deliver(routes: &Routes, msg: Inbound) {
             Some(message) => (Some(StreamItem::Error { status: msg.status.unwrap_or(400), message, refused: false }), true),
             None => (Some(StreamItem::Done), true),
         },
-        "metrics" | "voices" | "windows" | "live" | "end_of_turn" | "lora" => (
+        "metrics" | "voices" | "windows" | "live" | "end_of_turn" | "lora" | "plan_speech_chunks" => (
             Some(StreamItem::Chunk(ResultChunk {
                 modality: msg.t,
                 data: msg.data.into_vec(),

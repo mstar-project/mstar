@@ -1167,11 +1167,21 @@ async fn audio_speech(
         }
     }
     let chunking = adapter.speech_chunking();
-    let pieces =
-        match speech_chunking::plan_chunks(req.extra.get("sentence_chunking"), &chunking, &req.input) {
+    let requested = req.extra.get("sentence_chunking");
+    let pieces = if let Some(bridge) = st.bridge.as_ref().filter(|_| {
+        req.extra.get("text_frontend") != Some(&Value::Bool(false))
+            && speech_chunking::needs_cosyvoice3_spoken_plan(requested, &chunking, &req.input)
+    }) {
+        match bridge.cosyvoice3_pieces(&req.input, requested, req.extra.get("text_frontend"), st.request_timeout).await {
+            Ok(pieces) => pieces,
+            Err((status, message)) => return error(status, &message, error_type(status)),
+        }
+    } else {
+        match speech_chunking::plan_chunks(requested, &chunking, &req.input) {
             Ok(pieces) => pieces,
             Err(e) => return error(400, &e, "invalid_request_error"),
-        };
+        }
+    };
     if let Err(r) = select_lora(&st, req.model.as_deref(), &mut args) {
         return r;
     }

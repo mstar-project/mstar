@@ -15,6 +15,7 @@ protocol are untouched):
                        | {t:"metrics", rid, sub, refusals:{route, status, count}}
                        | {t:"check_ref_audio", rid, sub, path, decoder, bare}
                        | {t:"voices", rid, sub}
+                       | {t:"plan_speech_chunks", rid, sub, text, sentence_chunking?, text_frontend?}
                        | {t:"windows", rid, sub, op, plan, ...}
                        | {t:"live", rid, sub, op, call, ..., stream?, audio?(bin)}
                        | {t:"end_of_turn", rid, sub, audio(bin)}
@@ -26,6 +27,7 @@ protocol are untouched):
                        | {t:"metrics", rid, sub, data(bin), metadata}
                        | {t:"checked", rid, sub, error?, status?}
                        | {t:"voices", rid, sub, metadata:{voices?}}
+                       | {t:"plan_speech_chunks", rid, sub, metadata:{pieces} | {error}}
                        | {t:"windows", rid, sub, metadata:{duration, single, windows} | {error}}
                        | {t:"live", rid, sub, metadata:{taking | accepted | rejected | error, status, error_id?}}
                        | {t:"end_of_turn", rid, sub, metadata:{p} | {error}}
@@ -673,6 +675,34 @@ class RustFrontendBridge:
 
         self.loop.create_task(answer())
 
+    def _plan_speech_chunks(self, msg: dict) -> None:
+        """Use the CosyVoice3 adapter's spoken-text length rules for numeric text."""
+        reply = {"t": "plan_speech_chunks", "rid": msg.get("rid"), "sub": msg.get("sub"),
+                 "data": b"", "metadata": {}}
+
+        async def answer() -> None:
+            try:
+                from types import SimpleNamespace
+
+                from fastapi import HTTPException
+
+                from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
+                from mstar.api_server.openai.serving_speech import _plan_chunks
+
+                extra = {key: msg[key] for key in ("sentence_chunking", "text_frontend") if key in msg}
+                request = SimpleNamespace(model_extra=extra)
+                pieces = await asyncio.to_thread(
+                    _plan_chunks, request, ADAPTER_REGISTRY["cosyvoice3"], msg["text"])
+                reply["metadata"] = {"pieces": pieces}
+            except HTTPException as exc:
+                reply["metadata"] = {"error": {"status": exc.status_code, "message": str(exc.detail)}}
+            except Exception:  # noqa: BLE001 — a failed plan must answer its waiting request
+                logger.exception("bridge: planning CosyVoice3 speech chunks raised")
+                reply["metadata"] = {"error": {"status": 500, "message": "the server could not plan speech chunks"}}
+            self._send(reply)
+
+        self.loop.create_task(answer())
+
     def _live(self, msg: dict) -> None:
         """One operation on a live call (``/generate/ws``, or a ``/v1/realtime``
         conversation, whose appends carry ``audio``: float32 samples for the
@@ -893,6 +923,8 @@ class RustFrontendBridge:
             self._check_ref_audio(msg)
         elif t == "voices":
             self._voices(msg)
+        elif t == "plan_speech_chunks":
+            self._plan_speech_chunks(msg)
         elif t == "windows":
             self._windows(msg)
         elif t == "live":

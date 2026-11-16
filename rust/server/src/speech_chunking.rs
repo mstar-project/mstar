@@ -253,11 +253,15 @@ pub enum Splitter {
     CosyVoice3,
 }
 
+pub(crate) fn cosyvoice3_has_chinese(text: &str) -> bool {
+    text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+}
+
 /// `CosyVoice3Adapter.split_speech_text`: Chinese text as the reference's
 /// `split_paragraph(lang="zh")` cuts it, anything else as sentences sized by
 /// an estimate of its BPE tokens.
 fn cosyvoice3_split(text: &str, max_chars: usize) -> Vec<String> {
-    if text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) {
+    if cosyvoice3_has_chinese(text) {
         return cosyvoice3_split_chinese(text);
     }
     // `_estimated_tokens`: an upper estimate of the Qwen2 BPE token count
@@ -368,6 +372,20 @@ pub fn plan_chunks(
         ));
     }
     Ok(if chunks.is_empty() { vec![input.to_string()] } else { chunks })
+}
+
+/// Written digits can expand when the Python CosyVoice3 frontend speaks them,
+/// so its fitted boundaries must be planned there. Keep the common short
+/// request and unchunked request on the local path.
+pub fn needs_cosyvoice3_spoken_plan(requested: Option<&Value>, chunking: &SpeechChunking, input: &str) -> bool {
+    if chunking.splitter != Splitter::CosyVoice3 || !input.chars().any(char::is_numeric) {
+        return false;
+    }
+    let requested = requested.filter(|v| !v.is_null());
+    if requested == Some(&Value::Bool(false)) {
+        return false;
+    }
+    requested.is_some() || chunking.min_chars.is_some_and(|min| input.chars().count() >= min)
 }
 
 /// `_chunk_kwargs`: a piece's model kwargs, the request's except that
