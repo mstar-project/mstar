@@ -431,6 +431,15 @@ def test_internal_id_counter_does_not_wrap(monkeypatch):
     assert not s.pending_requests and not s._live and not pw.inputs
 
 
+def test_largest_internal_id_fits_signed_i64(monkeypatch):
+    monkeypatch.setattr(entrypoint.secrets, "randbelow", lambda n: n - 1)
+    pw = _PreprocessWorker()
+    s = _api_server(pw)
+    s._generation = iter([(1 << 32) - 1])
+    s.submit_request(text="last", request_id="X", **TEXT)
+    assert pw.inputs[0].request_id == (1 << 63) - 1
+
+
 def test_an_empty_pinned_request_id_keeps_its_seed():
     from mstar.utils.request_ids import client_id_seed
 

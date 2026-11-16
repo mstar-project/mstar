@@ -26,10 +26,8 @@ from mstar.graph.base import TensorPointerInfo
 
 NameToTensorList = dict[str, list[torch.Tensor]]
 
-# The worker interns request ids to integer handles; the api-server data and
-# preprocess workers never did and still pass the string id. Both work: the id
-# is an opaque dict key here, never arithmetic, and it reaches the bookkeeper --
-# the half that is actually typed -- not at all.
+# Workers use recycled integer handles; the API data worker uses the global
+# integer submission ID. Neither sends the client-visible string here.
 Rid = int
 
 
