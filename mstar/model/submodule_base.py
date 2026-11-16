@@ -1635,20 +1635,22 @@ def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
     """What the engine calls for a node's step: its ``declare_step``, with a step of its
     segments under each resource that takes them as they are (``with_segment_steps``),
     so a model declares nothing for such a resource (a LoRA pool), what it declares
-    about its state expanded (``state_steps``), and a drafter's share of its prompt and
-    verify steps (``drafter_step``, from the ``drafter_share`` the engine binds at load),
-    so a target declares none of it."""
+    about its state expanded (``state_steps``), and then a drafter's share of its
+    prompt and verify steps (``drafter_step``, from the ``drafter_share`` the engine
+    binds at load), so a target declares none of it. The share comes after the
+    expansion: it marks the resource steps a node on the state contract declares as state."""
     # the engine drives duck-typed submodules too
     step = with_segment_steps(submodule.declare_step(*args, **kwargs), getattr(submodule, "segment_keys", ()))
+    # Imported here because the adapters load the resources' Triton kernels, which importing mstar.model must not need.
+    from mstar.engine.state.adapters import state_steps
+
+    step = state_steps(step, getattr(submodule, "state_handles", {}), graph_walk=kwargs.get("graph_walk"))
     share = getattr(submodule, "drafter_share", None)
     if share is not None:
         from mstar.engine.resources.draft.node import drafter_step
 
         step = drafter_step(step, kwargs["graph_walk"], share)
-    # Imported here because the adapters load the resources' Triton kernels, which importing mstar.model must not need.
-    from mstar.engine.state.adapters import state_steps
-
-    return state_steps(step, getattr(submodule, "state_handles", {}), graph_walk=kwargs.get("graph_walk"))
+    return step
 
 
 def splice_loopback_ids(ids: torch.Tensor, inputs: list[ARNodeInputs], decode: bool) -> torch.Tensor:

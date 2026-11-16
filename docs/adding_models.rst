@@ -683,13 +683,14 @@ root it had.
 Step 2a — Declare your state
 ----------------------------
 
-``declare_state(self) -> list[Array | Sampler | SeqShard]`` says what each node keeps between
+``declare_state(self) -> list[Array | Sampler | SeqShard | Draft]`` says what each node keeps between
 steps, and whether its steps may split over SP ranks. The declaration says only what the model's
 math needs: the shape of each entry, its dtype, which earlier entries each layer reads, and what
 its kernels update. How the state is stored, such as a cache's page size and layout, depends on
 the deployment, so the engine decides it. ``mstar.engine.state`` is the whole surface a model
 imports, and its ``__all__`` only grows. ``SubmoduleStep`` imports from there too, and stays out
-of ``__all__``, since it is the engine's own dataclass and its fields will change.
+of ``__all__``, since it is the engine's own dataclass and its fields will change. A node that
+drafts tokens also declares a ``Draft``; see `Speculative decoding (drafting and verifying)`_.
 
 Every process calls ``declare_state`` and ``kernel_settings``, so each must be a pure function
 of the model's config and the deployment's settings, with no device and no process state.
@@ -1949,6 +1950,21 @@ What the model writes, and nothing more:
   ``process_prompt``'s ``kv_layout``: the conductor floors each label's scratch at it
   (``KVSpec.request_layout``), and a verifying label that declares scratch of its own is
   refused for now.
+- A model on the state contract writes neither of the two above. ``declare_state`` lists a
+  ``Draft`` beside the node's arrays and sampler, all plain values: the node, the paged KV
+  array the drafter's layers join, the sampler that verifies, the verify walk (and a mixed
+  walk, when the node runs one), the drafter by its draft-block ``method``, ``model`` and
+  resolved ``checkpoint`` directory, ``num_draft_tokens`` and ``mode``, and the target's
+  ``num_layers``, ``hidden_size`` and weight ``dtype`` (HF's name). The adapter checks the
+  settings as a draft block (``draft_config``), takes the drafter's declaration from
+  ``Model.drafter(draft)``, which the model builds from the ``Draft`` with its family's code,
+  passes the declared specs through ``drafter_resources`` and declares the ``VerifyNode``;
+  ``Model.declared_verify_nodes`` builds one per ``Draft``, ``Model.draft_node_fields`` adding the node's
+  ``token_stop`` and ``device_loopback``; the model's ``verify_nodes`` returns them when its draft block is
+  given, so a model that doesn't draft never reads its declarations for it. Its verify
+  steps declare their state as any step does, and the engine runs every attention of a step
+  with verify rows on its verify kernel and gives a verify step's sampler one row a request
+  (``drafter_step``), which a node on resources declares itself.
 - Every row of a verify step runs ``k + 1`` tokens: its last emitted token and ``k`` drafts.
   ``prepare_inputs`` returns ``input_seq_len = k + 1`` on the verify walk, on a row's first verify
   step too, when the token arrives routed rather than on the loop-back slot (later rows get the

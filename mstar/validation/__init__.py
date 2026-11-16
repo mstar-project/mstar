@@ -206,7 +206,9 @@ def validate_deployment(
             # the placement checks still see the specs built whole; a per-node one (LoRA) may be what
             # failed, and reading it again would raise again
             specs = [spec for spec in specs if not spec.per_node]
-    problems += _checked("checking speculative decoding", check_draft, model, config, specs)
+    if specs is not None:
+        # the verify nodes of a model on the state contract are its declarations', which failed above otherwise
+        problems += _checked("checking speculative decoding", check_draft, model, config, specs)
     # after get_worker_graphs too: a model may shape its walks from the deployment (BAGEL)
     problems += _checked("checking the LoRA roots", _lora_root_problems, model)
     problems += _checked(

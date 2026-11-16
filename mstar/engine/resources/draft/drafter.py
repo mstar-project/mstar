@@ -149,13 +149,20 @@ class DraftInputs(NamedTuple):
 
 
 class DrafterDecl(Protocol):
-    """A drafter as its node declares it, from config alone: its needs and the
-    resources it adds to the node's (`drafter_resources`). Subclass it."""
+    """A drafter as its node declares it, from config alone: its needs, the
+    resources it adds to the node's (`drafter_resources`), and those resources'
+    steps on the node's prompt and verify steps (`VerifyNode`). Subclass it."""
     needs: DrafterNeeds
 
     @abstractmethod
     def node_resources(self, nodes: set[str]) -> list[NodeResourceSpec]:
         ...
+
+    def prefill_steps(self) -> Mapping[str, ResourceStep]:
+        return MappingProxyType({})
+
+    def verify_steps(self) -> Mapping[str, ResourceStep]:
+        return MappingProxyType({})
 
 
 def drafter_resources(

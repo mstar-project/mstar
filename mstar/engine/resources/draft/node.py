@@ -11,10 +11,11 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
+from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.draft.config import DraftMode
 from mstar.engine.resources.draft.drafter import VERIFY_ACCEPTED, VERIFY_STOPPED, VERIFY_TOKENS, VerifyNode
 from mstar.engine.resources.draft.ledger import VerifyLedger
-from mstar.engine.resources.step import ResourceStep
+from mstar.engine.resources.step import ResourceStep, Segment
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,9 @@ class DrafterShare(NamedTuple):
 def drafter_step(step, graph_walk: str, share: DrafterShare | None):
     """``step`` with its drafter's share, as a new step: on a prompt or verify step, the drafter's resource
     steps. The engine derives them from the drafter's declaration, so a captured graph and each step it
-    replays agree by construction."""
+    replays agree by construction. A step with verify rows also runs the node's attentions on their verify
+    kernels, and a verify step samples one row a request: what verifying means, which a node on the state
+    contract has no step field to declare and a node on resources declares the same."""
     if share is None or step is None:
         return step
     if graph_walk == share.verify_walk:
@@ -60,9 +63,21 @@ def drafter_step(step, graph_walk: str, share: DrafterShare | None):
     steps = dict(step.steps)
     if clash := sorted(steps.keys() & own.keys()):
         raise RuntimeError(f"a {graph_walk!r} step declares {clash}, its drafter's steps, which the engine adds")
+    if graph_walk in (share.verify_walk, share.mixed_walk):
+        steps.update(
+            (key, replace(resource_step, verify=True)) for key, resource_step in steps.items()
+            if isinstance(resource_step, AttentionStep) and not resource_step.verify
+        )
+    sampler_step = steps.get(share.sampler_key)
+    if graph_walk == share.verify_walk and sampler_step is not None:
+        rows = [Segment(seg.request_id, seg.label, 1) for seg in step.segments]
+        steps[share.sampler_key] = replace(sampler_step, segments=rows)
     # fresh each step, as a declaration's are: a resource may stamp its own step (KV's commit count)
     steps.update((key, replace(resource_step)) for key, resource_step in own.items())
-    return replace(step, steps=steps)
+    out = replace(step, steps=steps)
+    # the handles of the state an expanded step declares, which `replace` leaves behind
+    out.set_state_handles(step.state_handles)
+    return out
 
 
 class TokenCut:
