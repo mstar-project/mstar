@@ -8,6 +8,9 @@ max_seq_len: 1024
 # encoder + connectors (30 GB) and both decoders on rank 1, so one request's text
 # encoding and decode overlap another's denoising.
 model_kwargs:
+  # Opt in to block-scaled FP8 for the DiT's block attention and FF projections
+  # after loading bf16 weights. The default keeps the reference bf16 path.
+  linear_dtype: bf16
   max_batch_size: 4
   # the video VAE decode compiled for the capture shapes (a two-stage 1088x1920 decode runs
   # eager unless listed in vae_compile_shapes), ~55 dB from the eager decode; false for

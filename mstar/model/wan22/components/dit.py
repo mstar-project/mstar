@@ -47,10 +47,29 @@ from mstar.model.components.diffusion.ffn import gelu_tanh_ffn
 from mstar.model.components.diffusion.modulation import ada_layer_norm
 from mstar.model.components.diffusion.qk_norm_rope import rms_norm_rope
 from mstar.model.components.mlp import MLP
+from mstar.model.components.quant_linear import QuantizableLinears
 from mstar.model.wan22.config import DIT_TOKENS, Wan22Config
 
 # 3D RoPE base frequency (reference WanRotaryPosEmbed default `theta`).
 ROPE_THETA = 10000.0
+
+# Only the block GEMMs are eligible for load-time dense FP8. Keep the condition
+# projections and output head in their checkpoint dtypes. QuantizableLinears
+# requires every linear to be classified, including ones added in future.
+QUANTIZABLE_LINEARS = QuantizableLinears(
+    candidates=(
+        "blocks.*.self_attn.*_proj", "blocks.*.cross_attn.*_proj",
+        "blocks.*.ffn.linear_in", "blocks.*.ffn.linear_out",
+    ),
+    keep_bf16=(
+        "condition_embedder.time_embedder.linear_in",
+        "condition_embedder.time_embedder.linear_out",
+        "condition_embedder.time_proj",
+        "condition_embedder.text_embedder.linear_in",
+        "condition_embedder.text_embedder.linear_out",
+        "proj_out",
+    ),
+)
 
 
 class WanFP32LayerNorm(nn.LayerNorm):

@@ -47,8 +47,10 @@ from mstar.graph.base import (
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, WalkStep
 from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
+from mstar.model.components.quant_linear import apply_linear_dtype
 from mstar.model.components.video_encode import encode_mp4
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.wan22.components.dit import QUANTIZABLE_LINEARS
 from mstar.model.wan22.config import DIT_SHARD, DIT_TOKENS, SELF_ATTN, WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
     DENOISE_LOOP_NAME,
@@ -94,6 +96,7 @@ class Wan22Model(Model):
         dit_max_batch_size: int = Wan22Config.dit_max_batch_size,
         max_video_pixels: int = Wan22Config.max_video_pixels,
         skip_weight_loading: bool = False,
+        linear_dtype: str = "bf16",
         vae_decode_fast: bool = True,
         vae_decode_fast_sizes: tuple[str, ...] | None = None,
         **kwargs,
@@ -106,6 +109,9 @@ class Wan22Model(Model):
             )
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
+        if linear_dtype not in ("bf16", "dense_fp8"):
+            raise ValueError(f"Wan2.2 linear_dtype must be 'bf16' or 'dense_fp8', got {linear_dtype!r}")
+        self.linear_dtype = linear_dtype
         self.config = Wan22Config(
             variant=variant, compile_dit_sizes=compile_dit_sizes,
             dit_max_batch_size=self._require_positive_int("dit_max_batch_size", dit_max_batch_size),
@@ -670,6 +676,7 @@ class Wan22Model(Model):
             transformer = build_wan22_dit(
                 self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir,
             )
+            apply_linear_dtype(transformer, self.linear_dtype, QUANTIZABLE_LINEARS, what="Wan2.2 DiT")
             return Wan22DitSubmodule(transformer, self.config, cfg_group=cfg_group)
         logger.warning("Wan2.2 has no submodule for node %r; running it dummy.", node_name)
         return None

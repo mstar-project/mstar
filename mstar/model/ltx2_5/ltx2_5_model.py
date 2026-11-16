@@ -43,6 +43,7 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel,
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, WalkStep
 from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
+from mstar.model.components.quant_linear import apply_linear_dtype
 from mstar.model.components.video_encode import encode_mp4
 from mstar.model.ltx2_5.config import (
     AUDIO,
@@ -138,6 +139,7 @@ class LTX25Model(Model):
         vae_compile_shapes: list[list[float]] | None = None,
         max_video_tokens: int = 64 * 1024,
         async_scheduling: bool = True,
+        linear_dtype: str = "bf16",
         **kwargs,
     ):
         refuse_attention_backend_kwarg(kwargs)
@@ -145,6 +147,9 @@ class LTX25Model(Model):
         self.cache_dir = cache_dir
         # Dummy mode: get_submodule returns None for every node (CPU tests).
         self.skip_weight_loading = skip_weight_loading
+        if linear_dtype not in ("bf16", "dense_fp8"):
+            raise ValueError(f"LTX-2.5 linear_dtype must be 'bf16' or 'dense_fp8', got {linear_dtype!r}")
+        self.linear_dtype = linear_dtype
         self.compile_transformer = bool(compile)
         self.compile_eager_rounding = bool(compile_eager_rounding)
         self.accelerator_graph = bool(accelerator_graph)
@@ -519,8 +524,12 @@ class LTX25Model(Model):
                 self.config, max_batch_size=self.max_batch_size,
             )
         if node_name == DIT_NODE:
+            from mstar.model.ltx2_5.components.transformer import QUANTIZABLE_LINEARS
+
+            transformer = weight_loader.build_transformer(self.config, snapshot, device, comm_group=tp_group)
+            apply_linear_dtype(transformer, self.linear_dtype, QUANTIZABLE_LINEARS, what="LTX-2.5 DiT")
             return LTXDenoiseSubmodule(
-                weight_loader.build_transformer(self.config, snapshot, device, comm_group=tp_group),
+                transformer,
                 self.config,
                 loop_name=DENOISE_LOOP,
                 refine_walks=frozenset(REFINE_WALKS.values()),
