@@ -35,6 +35,7 @@ from mstar.api_server.openai.protocol import (
     UnloadLoraAdapterRequest,
     VideoGenerationRequest,
 )
+from mstar.api_server.unicode_input import reject_lone_surrogates
 from mstar.utils.client_errors import exception_status_text
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,16 @@ router = APIRouter()
 _TRANSCRIPTION_TEXT_FIELDS = frozenset(
     name for name, f in TranscriptionRequest.model_fields.items() if f.annotation in (str, str | None)
 )
+
+
+def _form_json_or_text(value: str):
+    """Match the Rust form parser: invalid JSON values stay literal text."""
+    try:
+        parsed = json.loads(value)
+        reject_lone_surrogates(parsed)
+        return parsed
+    except (ValueError, TypeError):
+        return value
 
 
 def _api():
@@ -148,6 +159,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     if err is not None:
         return err
     try:
+        reject_lone_surrogates(request)
         result = await serving_chat.create_chat_completion(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001 — surface as an OpenAI error envelope
         return _exception_error(e, "/v1/chat/completions")
@@ -162,6 +174,7 @@ async def audio_speech(request: SpeechRequest, raw_request: Request):
     if err is not None:
         return err
     try:
+        reject_lone_surrogates(request)
         return await serving_speech.create_speech(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001
         return _exception_error(e, "/v1/audio/speech")
@@ -196,14 +209,12 @@ async def audio_transcriptions(request: Request):
             if key in _TRANSCRIPTION_TEXT_FIELDS:
                 fields[key] = value
                 continue
-            try:
-                fields[key] = json.loads(value)
-            except (json.JSONDecodeError, TypeError):
-                fields[key] = value
+            fields[key] = _form_json_or_text(value)
         try:
             req = TranscriptionRequest(**fields)
         except Exception as e:  # noqa: BLE001 — pydantic validation
             return _error(400, str(e))
+        reject_lone_surrogates(req)
         return await serving_transcriptions.create_transcription(
             api, model_name, adapter, req, audio_bytes,
             getattr(upload, "filename", None), raw_request=request,
@@ -271,6 +282,7 @@ async def images_generations(request: ImageGenerationRequest, raw_request: Reque
     if err is not None:
         return err
     try:
+        reject_lone_surrogates(request)
         result = await serving_images.create_images(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001
         return _exception_error(e, "/v1/images/generations")
@@ -283,6 +295,7 @@ async def videos_generations(request: VideoGenerationRequest, raw_request: Reque
     if err is not None:
         return err
     try:
+        reject_lone_surrogates(request)
         result = await serving_videos.create_videos(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001
         return _exception_error(e, "/v1/videos/generations")
@@ -319,19 +332,17 @@ async def images_edits(request: Request):
         limit = max_body_bytes()
         if (getattr(image, "size", None) or 0) > limit:
             return _error(413, f"images/edits accepts files up to {limit // 2**20} MiB (MSTAR_MAX_BODY_MB)")
-        image_bytes = await image.read()
         prompt = form.get("prompt") or ""
         known = {"image", "image[]", "prompt", "model", "n", "size", "response_format"}
         extra: dict = {}
         for key, value in form.multi_items():
             if key in known or hasattr(value, "filename"):
                 continue
-            try:
-                extra[key] = json.loads(value)
-            except (json.JSONDecodeError, TypeError):
-                extra[key] = value
+            extra[key] = _form_json_or_text(value)
         if form.get("size"):
             extra["size"] = form.get("size")  # the adapter maps "WxH" to the model's width / height
+        reject_lone_surrogates((prompt, extra))
+        image_bytes = await image.read()
         result = await serving_images.create_image_edit(
             api,
             model_name,

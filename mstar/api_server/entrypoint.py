@@ -56,6 +56,7 @@ from mstar.api_server.request_types import (
 )
 from mstar.api_server.served_models import Selected, ServedModels
 from mstar.api_server.streaming_response import ReleasingStreamingResponse, errors_in_band
+from mstar.api_server.unicode_input import reject_lone_surrogates
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.tensors import ensure_deployment_token
 from mstar.conductor.workers import accelerator_type, deployment_workers
@@ -884,6 +885,9 @@ class APIServer:
         ``report_usage`` ends a successful request's chunks with a ``usage``
         chunk (:func:`usage_chunk`).
         """
+        reject_lone_surrogates((text, model_kwargs, request_id, model))
+        if prompt_parts:
+            reject_lone_surrogates(tuple(part.text for part in prompt_parts))
         if raw_inputs is not None:
             _check_raw_inputs(raw_inputs, file_paths)
         if request_id is None:
@@ -1059,6 +1063,7 @@ class APIServer:
         ended; raises ``ValueError`` for input past the call's budget
         (``max_call_input_mb``) or a stream the model doesn't have.
         """
+        reject_lone_surrogates((text, model_kwargs))
         named = self._check_streams(
             name for names in (file_streams or {}).values() for name in names if name is not None
         ) | self._check_streams(samples or ())
@@ -2418,6 +2423,7 @@ def _ws_model_kwargs(value) -> dict | None:
         value = json.loads(value)
     if value is not None and not isinstance(value, dict):
         raise ValueError("model_kwargs must be a JSON object")
+    reject_lone_surrogates(value)
     return value
 
 
@@ -2917,6 +2923,11 @@ async def generate(
             status_code=400,
             detail="model_kwargs must be a JSON object",
         )
+    try:
+        reject_lone_surrogates((text, parsed_kwargs))
+    except ValueError as e:
+        _remove_uploads(file_paths)
+        raise HTTPException(status_code=400, detail=str(e)) from None
 
     try:
         await api_server.wait_for_request_id(request_id)

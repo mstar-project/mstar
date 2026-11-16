@@ -279,6 +279,21 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_lone_surrogate_before_adapting_a_request() {
+        assert!(serde_json::from_str::<SpeechRequest>(r#"{"input":"\ud800"}"#).is_err());
+        assert!(serde_json::from_str::<ChatCompletionRequest>(
+            r#"{"messages":[{"role":"user","content":"\udfff"}]}"#
+        )
+        .is_err());
+        assert_eq!(
+            serde_json::from_str::<SpeechRequest>(r#"{"input":"\ud83d\ude00"}"#)
+                .unwrap()
+                .input,
+            "😀"
+        );
+    }
+
+    #[test]
     fn coerces_stringy_scalars_like_pydantic() {
         // String- and integral-float-encoded scalars are accepted (forms / env
         // vars / YAML / loosely-typed SDKs send strings), matching FastAPI.
