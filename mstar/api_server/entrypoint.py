@@ -338,6 +338,7 @@ class PendingRequest:
     # Unread outputs; a streaming consumer takes ownership of each drained list.
     chunks: list[ResultChunk] = field(default_factory=list)
     output_chunk_counts: dict[str, int] = field(default_factory=dict)
+    has_audio_output: bool = False
     output_totals: dict[str, OutputInfo] = field(default_factory=dict)
     error: Any | None = None
     error_status: int = 500
@@ -1188,6 +1189,14 @@ class APIServer:
                             "result delivery timed out; response is incomplete"
                         )
                         req.error_status = 500
+                elif (drained and self.model_name == "orpheus"
+                      and "audio" in req.output_modalities
+                      and not req.has_audio_output and req.error is None):
+                    # An EOS before one SNAC frame can produce a final empty
+                    # audio chunk. It is not a successful speech answer.
+                    logger.error("Orpheus request %s completed without audio", rid)
+                    req.error = "Orpheus produced no audio; retry the request"
+                    req.error_status = 500
                 req.event.set()
                 req.notify()
                 # Snapshot the data worker's tx/rx now: the request is done (all
@@ -1423,6 +1432,14 @@ class APIServer:
                         req.profile.timing.output_postprocess_s += result_chunk.postprocess_s
                         req.completion_tokens += result_chunk.num_tokens
                         req.stopped |= result_chunk.stopped
+                        if self.model_name == "orpheus" and result_chunk.modality == "audio":
+                            if not result_chunk.data:
+                                # SNAC can flush an unfinished frame as an
+                                # empty chunk. Keep it out of both frontends;
+                                # completion below reports an error if no
+                                # nonempty audio follows.
+                                continue
+                            req.has_audio_output = True
                         if metrics is not None and result_chunk.modality != "error":
                             req.first_chunk_times.setdefault(result_chunk.modality, now)
                         if req.request_id is not None:
