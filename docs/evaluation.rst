@@ -356,6 +356,16 @@ mid-transfer and ``timeout`` runs on a second server whose ``--timeout`` is shor
 every case the server is checked: its processes still alive, no mstar ``/dev/shm`` entry left behind, no crash or
 transfer-failure line in its log. A finding head has and base does not fails the row; base crashing reports it broken.
 
+The optional ``e2e matrix`` workflow starts only when a maintainer adds ``e2e-matrix``
+or ``e2e-matrix-full`` to a PR and ``E2E_MATRIX_ENABLED=true`` is set as a repository
+variable. It is disabled until maintainers provide a fresh, disposable GPU runner
+with the ``e2e-ephemeral`` and ``gpu`` labels, an installed M* evaluation environment
+and approved spending limits. The small label selects ``tag:small``; the full label
+selects ``all`` (the manifest's non-optional models). The GPU job gets a read-only token and no secrets, checks the pinned
+PR head, and uploads the report and chart. A separate trusted job posts a bounded
+table and an ``e2e-matrix`` check; a missing report is neutral, not a pass. Re-adding
+the label runs it again and updates the same comment.
+
 The run directory holds every results file and ``report/report.md`` (a table for a PR body, details in toggles),
 ``report/chart.png`` and ``report/summary.json``. ``compare`` exits with 1 when any row is flagged, else with 2
 when any row has no verdict (its job failed or was interrupted, the model was skipped or never got a GPU, base
