@@ -101,6 +101,13 @@ metrics = [
     "prometheus-client>=0.20",
 ]
 
+# Optional: request traces exported by the API server.
+tracing = [
+    "opentelemetry-sdk>=1.30,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.30,<2",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.30,<2",
+]
+
 # Optional: the eval framework (`python -m benchmark.eval`, docs/evaluation.rst).
 # The runner, metrics and reports need only aiohttp and numpy; the judges
 # (Whisper, WavLM speaker similarity, UTMOS via torch.hub), the dataset
