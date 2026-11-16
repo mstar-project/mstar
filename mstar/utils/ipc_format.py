@@ -48,6 +48,7 @@ class WorkerMessageType(Enum):
     CLIENT_STREAM_ROUTE = "client_stream_route"
     LOAD_LORA_ADAPTER = "load_lora_adapter"
     UNLOAD_LORA_ADAPTER = "unload_lora_adapter"
+    WEIGHT_CONTROL = "weight_control"
 
 
 @dataclass
@@ -339,6 +340,21 @@ class TPNoSpeculation(MessageBody):
     graph_walk: str
     spec_from_seq: int
 
+
+class WeightOp(str, Enum):
+    QUIESCE = "quiesce"
+    PREPARE = "prepare"
+    APPLY = "apply"
+    VERIFY = "verify"
+
+
+@dataclass
+class WeightControl(MessageBody):
+    op: str
+    epoch: int
+    model_path: str = ""
+    weight_version: str | None = None
+
 @dataclass
 class WorkerMessage:
     message_type: WorkerMessageType
@@ -361,6 +377,11 @@ class ConductorMessageType(Enum):
     LOAD_LORA_ADAPTER = "load_lora_adapter"
     UNLOAD_LORA_ADAPTER = "unload_lora_adapter"
     LORA_ADAPTER_ACK = "lora_adapter_ack"
+    PAUSE_GENERATION = "pause_generation"
+    CONTINUE_GENERATION = "continue_generation"
+    UPDATE_WEIGHTS_FROM_DISK = "update_weights_from_disk"
+    GET_GENERATION_STATE = "get_generation_state"
+    WEIGHT_CONTROL_ACK = "weight_control_ack"
 
 
 @dataclass
@@ -480,6 +501,40 @@ class LoraAdapterAck(MessageBody):
     op_id: str
     worker_id: str
     error: str | None = None
+
+
+@dataclass
+class PauseGeneration(MessageBody):
+    op_id: str
+    mode: str = "abort"
+
+
+@dataclass
+class ContinueGeneration(MessageBody):
+    op_id: str
+
+
+@dataclass
+class UpdateWeightsFromDisk(MessageBody):
+    op_id: str
+    model_path: str
+    weight_version: str
+
+
+@dataclass
+class GetGenerationState(MessageBody):
+    op_id: str
+
+
+@dataclass
+class WeightControlAck(MessageBody):
+    epoch: int
+    worker_id: str
+    op: str
+    error: str | None = None
+    weight_version: str | None = None
+    weight_epoch: int = 0
+    dirty: bool = False
 
 
 @dataclass

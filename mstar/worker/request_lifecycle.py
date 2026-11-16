@@ -248,6 +248,13 @@ class RequestLifecycle:
             or self.pending_drains or self.draining
         )
 
+    def pending_teardown_count(self) -> int:
+        """Removes and drains that still must land before a rank is idle."""
+        return (
+            len(self.pending_removes) + len(self.pending_drains)
+            + sum(len(rids) for rids in self._removes_awaiting_step.values())
+        )
+
     def no_new_work(self, *also: Iterable[int]) -> Set[int]:
         """The rids a scan gives no new step: failed or with a remove pending,
         plus ``also``'s. Unlike `closing`, a drain counts only once begun, when

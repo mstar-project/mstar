@@ -86,6 +86,9 @@ class RequestComplete:
     # (the model's default, or what fits its resources, when the client set none).
     prompt_tokens: int | None = None
     max_output_tokens: int | None = None
+    # The weight version the request was admitted under; None until a reload
+    # names one.
+    weight_version: str | None = None
 
 
 @dataclass
@@ -98,6 +101,8 @@ class RequestFailed:
     request_id: str
     error_message: str
     status: int = 500
+    # As on RequestComplete; None also for a request never admitted.
+    weight_version: str | None = None
 
 
 @dataclass
@@ -119,6 +124,19 @@ class LoraAdapterResult:
 
 
 @dataclass
+class GenerationControlResult:
+    """The conductor's answer to a pause, continue, weight update, or state query."""
+    op_id: str
+    status: int
+    state: str
+    paused: bool
+    weight_version: str | None = None
+    error_message: str | None = None
+    ranks: dict[str, str] = field(default_factory=dict)
+    rank_versions: dict[str, str | None] = field(default_factory=dict)
+
+
+@dataclass
 class WorkersReady:
     """The conductor's ``setup_done``: every worker is ready, and these are its declarations' digests by name
     (`declaration_digests`), which the API server checks its own against."""
@@ -130,7 +148,7 @@ class WorkersReady:
 # required field of every branch before it.
 APIServerMessageBody = (
     ResultTensors | ResultTokens | RequestComplete | RequestFailed | ConductorStatus
-    | LoraAdapterResult | WorkersReady | None
+    | GenerationControlResult | LoraAdapterResult | WorkersReady | None
 )
 
 
@@ -138,7 +156,7 @@ APIServerMessageBody = (
 class APIServerMessage:
     """Envelope for messages received by the API server."""
     # "result_tensors" | "result_tokens" | "request_complete" | "request_failed"
-    # | "conductor_status" | "lora_adapter_result" | "setup_done"
+    # | "conductor_status" | "lora_adapter_result" | "generation_control_result" | "setup_done"
     message_type: str
     body: APIServerMessageBody = None
 
