@@ -45,6 +45,13 @@ if TYPE_CHECKING:
     from mstar.engine.resources.resident import CapturedResidentStep
 
 
+def _one_fa3_label(plan_outputs, kind: str) -> None:
+    """A verify, lagged or mixed step on FA3 plans one KV label: its wrappers are kept per (bucket, slot) and
+    pass, whichever label, so a second label's plan would overwrite the first's, and a mixed step's resident
+    gather fills one wrapper over every row of the bucket."""
+    if len(plan_outputs) > 1:
+        raise RuntimeError(f"a {kind} step plans one KV label on FA3, not {sorted(plan_outputs)}")
+
 class FlashInferManager(PlacedAttention):
     supports_split_steps = True
     supports_drop = True
@@ -361,6 +368,8 @@ class FlashInferManager(PlacedAttention):
         FlashInfer plans each pass on the host (synchronous mode only)."""
         if not step.verify or step.hide_last or not step.causal:
             raise ValueError("a lagged attention step is a causal verify step that hides nothing")
+        if self._verify_fa3:
+            _one_fa3_label(plan_outputs, "lagged verify")
         lease = ctx.slot_lease
         page = self._group.page_size
         captured = []
@@ -614,12 +623,8 @@ class FlashInferManager(PlacedAttention):
         # FlashInfer's own plans them where FA3 doesn't run
         fa3 = step.verify and self._verify_fa3 and ctx.graph_walk == self._verify_walk
         mixed_fa3 = step.verify and self._verify_fa3 and not fa3
-        if (fa3 or mixed_fa3) and len(plan_outputs) > 1:
-            # one FA3 wrapper per (bucket, slot), whichever label: a second label's plan would overwrite the first's,
-            # and a mixed step's resident gather fills one wrapper over every row of the bucket
-            raise RuntimeError(
-                f"a {'verify' if fa3 else 'mixed'} step plans one KV label on FA3, not {sorted(plan_outputs)}"
-            )
+        if fa3 or mixed_fa3:
+            _one_fa3_label(plan_outputs, "verify" if fa3 else "mixed")
         for label, kv_out in plan_outputs.items():
             indptrs = kv_out.cpu_indptrs
             r = None if shard_plan is None else shard_plan.ranges.get(label)
