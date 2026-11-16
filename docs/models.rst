@@ -841,7 +841,9 @@ when the tool is ``strict`` (vLLM's rule). ``tool_choice`` ``none`` keeps the
 tools in the prompt and asks for no call, and a call written anyway stays text. Calls are found
 only after the reasoning, and a call cut off by ``max_tokens`` stays text, with
 ``finish_reason`` ``length``. Refused with a 400: ``functions`` / ``function_call`` (send
-``tools``), and ``tools`` with a JSON ``response_format``. Through Dynamo, tools are refused.
+``tools``), and ``tools`` with a JSON ``response_format`` unless ``tool_choice`` is ``none``. On
+``/generate``, ``tools`` and ``tool_choice`` in ``model_kwargs`` reach the prompt and the grammar
+the same way; the reply comes back as generated. Through Dynamo, tools are refused.
 
 **LoRA adapters.** A ``resources: lora:`` block in the serving config serves
 per-request LoRA adapters (PEFT ``adapter_model.safetensors``; the scaling comes

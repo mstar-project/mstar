@@ -52,7 +52,14 @@ class QwenXmlFormat(ToolCallFormat):
         if not sep or not name or "\n" in name:
             return None
         types = schemas.get(name, {})
-        return name, {key: _typed(value, types.get(key)) for key, value in self._param.findall(params)}
+        args, at = {}, 0
+        for m in self._param.finditer(params):
+            # text between the blocks, or a value that ran into the next block: not a call as written
+            if params[at:m.start()].strip() or "</parameter>" in m[2] or "<parameter=" in m[2]:
+                return None
+            args[m[1]] = _typed(m[2], types.get(m[1]))
+            at = m.end()
+        return None if params[at:].strip() else (name, args)
 
 
 # `Model.TOOL_FORMAT` -> its format
@@ -70,11 +77,12 @@ class ReplyParser:
     as the chat template does when it renders a reply back. Calls are found only after the
     reasoning (as vLLM finds them), and only with ``tools``; a call's parameters are typed by its
     tool's schema. `finish` returns what is held when the reply ends: a reply cut inside its
-    reasoning keeps it as reasoning, and a call that never closed comes out as text, verbatim
-    (no repairs). Outside the reasoning, with no tools, a chunk passes through as text."""
+    reasoning keeps it as reasoning, and a call that never closed, or doesn't parse, comes out as
+    text, unrepaired (the newlines around its markers are dropped, as around a call). Outside the
+    reasoning, with no tools, a chunk passes through as text."""
 
     __slots__ = ("_end", "_in_reasoning", "_held", "_opening", "_thinking", "_utf8", "_format", "_types",
-                 "_in_call", "calls")
+                 "_in_call", "_call_parts", "_call_tail", "calls")
 
     def __init__(self, reasoning_end: str | None, starts_in_reasoning: bool,
                  tool_format: ToolCallFormat | None = None, tools: list | None = None):
@@ -90,6 +98,10 @@ class ReplyParser:
         # tool name -> parameter name -> its schema (a client's malformed one counts as none)
         self._types = {t["function"]["name"]: _properties(t["function"]) for t in tools or ()}
         self._in_call = False
+        # an open call's text so far, in pieces, and its last characters, where its end may begin:
+        # a long call isn't copied or searched again on every token
+        self._call_parts: list[str] = []
+        self._call_tail = ""
         # how many calls have closed so far: the next one's index
         self.calls = 0
 
@@ -117,7 +129,8 @@ class ReplyParser:
         if self._in_reasoning:
             reasoning, self._held = reasoning + self._held, ""
         elif self._in_call:
-            answer, self._held, self._in_call = answer + self._format.begin + self._held, "", False
+            answer += self._format.begin + "".join(self._call_parts)
+            self._call_parts, self._call_tail, self._in_call = [], "", False
         else:
             answer, self._held = answer + self._held, ""
         return reasoning, answer, calls
@@ -142,17 +155,30 @@ class ReplyParser:
         fmt = self._format
         if fmt is None:
             return self._open(text), []
-        buf = self._held + text
-        self._held = ""
         out: list[str] = []
         calls: list[dict] = []
+        at = -1
+        if self._in_call:
+            window = self._call_tail + text
+            at = window.find(fmt.end)
+            if at < 0:
+                self._call_parts.append(text)
+                self._call_tail = window[1 - len(fmt.end):]
+                return "", []
+            held = "".join(self._call_parts)
+            buf, at = held + text, at + len(held) - len(self._call_tail)
+            self._call_parts, self._call_tail = [], ""
+        else:
+            buf = self._held + text
+            self._held = ""
         while True:
             if self._in_call:
-                at = buf.find(fmt.end)
                 if at < 0:
-                    self._held = buf
-                    break
-                block, buf = buf[:at], buf[at + len(fmt.end):]
+                    at = buf.find(fmt.end)
+                    if at < 0:
+                        self._call_parts, self._call_tail = [buf], buf[1 - len(fmt.end):]
+                        break
+                block, buf, at = buf[:at], buf[at + len(fmt.end):], -1
                 call = self._call(block)
                 if call is None:
                     out.append(fmt.begin + block + fmt.end)  # not a call after all: as written
@@ -161,14 +187,14 @@ class ReplyParser:
                 self._in_call, self._opening = False, True
                 continue
             buf = self._open(buf)
-            at = buf.find(fmt.begin)
-            if at < 0:
+            begin = buf.find(fmt.begin)
+            if begin < 0:
                 self._held, rest = _hold(buf, fmt.begin)
                 out.append(rest)
                 break
             # the template writes the answer's text, a blank line, then the call
-            out.append(buf[:at].rstrip("\n"))
-            buf, self._in_call = buf[at + len(fmt.begin):], True
+            out.append(buf[:begin].rstrip("\n"))
+            buf, self._in_call = buf[begin + len(fmt.begin):], True
         return "".join(out), calls
 
     def _call(self, block: str) -> dict | None:
@@ -177,9 +203,15 @@ class ReplyParser:
         if parsed is None:
             return None
         name, args = parsed
+        arguments = json.dumps(args, ensure_ascii=False)
+        try:
+            arguments.encode()
+        except UnicodeEncodeError:
+            # a lone surrogate the model wrote as an escape: kept escaped, so the text stays UTF-8
+            arguments = json.dumps(args)
         index, self.calls = self.calls, self.calls + 1
         return {"index": index, "id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
-                "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
+                "function": {"name": name, "arguments": arguments}}
 
     def _open(self, text: str) -> str:
         if self._opening:
@@ -208,26 +240,55 @@ def _marker_prefix(text: str, marker: str) -> int:
     return 0
 
 
+_JSON_KIND = {bool: "boolean", int: "integer", float: "number", str: "string", list: "array", dict: "object",
+              type(None): "null"}
+
+
 def _typed(raw: str, schema: dict | None):
-    """A parameter's text as its schema's type: a string stays as written (``94110`` included); a
-    number, boolean, object, array or null is parsed, Python's ``True`` / ``False`` too (Qwen's
-    template prints booleans that way); text that doesn't parse, or parses only as Python's
-    ``NaN`` / ``Infinity``, stays a string. No schema: parsed if it parses."""
-    kind = schema.get("type") if isinstance(schema, dict) else None
-    kinds = kind if isinstance(kind, list) else [kind]
-    if kinds == ["string"]:
+    """A parameter's text as one of the types its schema allows (``type``, a list of them, or
+    ``anyOf`` / ``oneOf``): parsed as JSON, Python's ``True`` / ``False`` too (Qwen's template
+    prints booleans that way), and kept if it parses to an allowed type; otherwise the text as
+    written, so a string stays a string (``94110`` included, for a nullable string too). Text
+    that parses only as Python's ``NaN`` / ``Infinity``, or overflows a float, stays text, so the
+    arguments are strict JSON. No type in the schema: parsed if it parses."""
+    kinds = _kinds(schema)
+    if kinds == {"string"}:
         return raw
-    if raw in ("True", "False") and ("boolean" in kinds or kind is None):
-        return raw == "True"
-    try:
-        return json.loads(raw, parse_constant=_not_json)
-    except ValueError:
-        return raw
+    if raw in ("True", "False"):
+        value = raw == "True"
+    else:
+        try:
+            value = json.loads(raw, parse_constant=_not_json, parse_float=_finite)
+        except (ValueError, RecursionError):
+            return raw
+    kind = _JSON_KIND.get(type(value))
+    if not kinds or kind in kinds or (kind == "integer" and "number" in kinds):
+        return value
+    return raw
+
+
+def _kinds(schema) -> set[str]:
+    """The JSON types a schema allows; empty when it names none."""
+    if not isinstance(schema, dict):
+        return set()
+    named = schema.get("type")
+    kinds = {k for k in (named if isinstance(named, list) else [named]) if isinstance(k, str)}
+    for key in ("anyOf", "oneOf"):
+        for sub in schema.get(key) or ():
+            kinds |= _kinds(sub)
+    return kinds
 
 
 def _not_json(constant: str):
     """``NaN`` and ``Infinity``, which Python's JSON reads but strict JSON doesn't: left as text."""
     raise ValueError(constant)
+
+
+def _finite(text: str) -> float:
+    value = float(text)
+    if value in (float("inf"), float("-inf")):
+        raise ValueError(text)  # overflowed: strict JSON has no infinity
+    return value
 
 
 def _properties(function: dict) -> dict:

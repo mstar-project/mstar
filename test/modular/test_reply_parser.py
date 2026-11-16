@@ -171,3 +171,53 @@ def test_another_format_needs_only_its_markers_and_its_parse():
         answer = "".join(a for _, a, _ in out)
         calls = [(c["function"]["name"], json.loads(c["function"]["arguments"])) for _, _, cs in out for c in cs]
         assert (answer, calls) == ("Checking.", [("get_weather", {"city": "Paris"})]), chunks
+
+
+@pytest.mark.parametrize("body", [
+    "<parameter=city>Paris</parameter>\n",  # no newlines around the value
+    "<parameter=days>\n1</parameter>\n<parameter=city>\nParis\n</parameter>\n",  # a value that runs into the next
+    "<parameter=city>\nParis\n</parameter>\nand some words\n",  # text after the parameters
+], ids=["no-newlines", "runs-into-next", "trailing-text"])
+def test_a_call_whose_parameters_are_malformed_stays_text(body):
+    """Under auto nothing holds a reply to the format: a block that isn't written as the template
+    writes it comes back as the text it is, not as a call with arguments dropped or merged."""
+    block = f"<tool_call>\n<function=get_weather>\n{body}</function>\n</tool_call>"
+    assert _feed([("x</think>\n\n" + block).encode()], tools=TOOLS) == ("x", block, [])
+
+
+SCHEMAS = [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {
+    "zip": {"type": ["string", "null"]}, "code": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+    "temp": {"type": "number"}, "count": {"type": ["integer", "null"]}}}}}]
+
+
+@pytest.mark.parametrize(("value", "param", "want"), [
+    ("94110", "zip", "94110"), ("null", "zip", None), ("1.10", "code", "1.10"),  # nullable strings stay strings
+    ("21.5", "temp", 21.5), ("3", "temp", 3), ("1e999", "temp", "1e999"),  # an overflow stays text
+    ("4", "count", 4), ("null", "count", None), ("lots", "count", "lots"),
+])
+def test_a_parameter_is_typed_by_every_type_its_schema_allows(value, param, want):
+    reply = "x</think>\n\n" + _call(**{param: value})
+    (call,) = ReplyParser(END, True, QWEN, SCHEMAS).feed(reply.encode())[2]
+    assert json.loads(call["function"]["arguments"]) == {param: want}
+
+
+def test_an_escaped_lone_surrogate_stays_escaped():
+    """The arguments must stay UTF-8: the relay to the Rust frontend encodes them."""
+    reply = "x</think>\n\n" + _call(where='{"name": "\\ud800 café"}')
+    (call,) = ReplyParser(END, True, QWEN, TOOLS).feed(reply.encode())[2]
+    call["function"]["arguments"].encode()
+    assert json.loads(call["function"]["arguments"]) == {"where": {"name": "\ud800 café"}}
+
+
+def test_every_registered_models_tool_format_is_one_the_parser_reads():
+    """A model that declares ``TOOL_FORMAT`` without an entry in `TOOL_FORMATS` would serve tools
+    with its calls left unparsed."""
+    from mstar.model.registry import MODEL_REGISTRY, get_model_class
+
+    for name in MODEL_REGISTRY:
+        try:
+            cls = get_model_class(name)
+        except ImportError:  # an optional package the CPU suite doesn't install
+            continue
+        fmt = getattr(cls, "TOOL_FORMAT", None)
+        assert fmt is None or fmt in TOOL_FORMATS, (name, fmt)

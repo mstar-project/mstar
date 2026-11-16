@@ -118,6 +118,7 @@ def test_qwen3_5_attaches_the_requests_grammar_to_its_sampler_settings(tmp_path)
 def test_a_forced_tool_call_gets_its_grammar_from_the_data_worker(tmp_path):
     """``tool_choice`` required: the data worker builds Qwen3.5's call format for the sampler, past
     the reasoning a thinking prompt left open; ``auto`` gets none, and a client's own is dropped."""
+    pytest.importorskip("xgrammar")
     from mstar.engine.resources.sampler.grammar import GRAMMAR_TOOLS_KWARG
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 

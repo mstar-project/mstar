@@ -11,6 +11,10 @@ Client processes run closed-loop streaming ``/v1/chat/completions``.
 
     python -m benchmark.api_output_path.http_e2e --concurrency 128 --step-ms 8
 
+With ``--burst-period 4`` the streams send together every 4 s instead of
+back to back, so each period starts with a burst of 128 requests at an
+otherwise idle server: the time to first token of a burst.
+
 The engine's step period is fixed, so the offered rate is about
 ``concurrency / step``; the client-side token rate says whether the API
 server kept up, and the thread CPU says how close it came to a full core
@@ -130,6 +134,12 @@ def run_client(args):
     async def one(session):
         nonlocal tokens_in_window, done_reqs, wrong_count
         while time.time() < t_meas1:
+            if args.burst_period:
+                # every stream sends on the same boundaries: a burst of --concurrency requests at once
+                k = int((time.time() - args.t0) // args.burst_period) + 1
+                await asyncio.sleep(max(0.0, args.t0 + k * args.burst_period - time.time()))
+                if time.time() >= t_meas1:
+                    break
             start = time.time()
             last = None
             n = 0
@@ -271,6 +281,7 @@ def run_server(args):
         clients = [subprocess.Popen(
             [PY, "-m", "benchmark.api_output_path.http_e2e", "client", "--port", str(port),
              "--streams", str(n), "--seconds", str(args.seconds), "--warmup", str(args.warmup),
+             "--burst-period", str(args.burst_period),
              "--t0", str(t0), "--tokens", str(args.tokens)],
             stdout=subprocess.PIPE, env=env) for n in per if n > 0]
         await asyncio.sleep(max(0.0, t0 + args.warmup - time.time()))
@@ -382,6 +393,9 @@ def main():
     # engine / client
     p.add_argument("--sock-dir")
     p.add_argument("--token-ids")
+    p.add_argument("--burst-period", type=float, default=0.0,
+                   help="seconds; every stream sends its next request on the same boundary, so each period "
+                        "starts with a burst of --concurrency requests (longer than a request takes)")
     p.add_argument("--streams", type=int)
     p.add_argument("--t0", type=float)
     args = p.parse_args()

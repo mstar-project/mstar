@@ -8,7 +8,6 @@ refuses a call for a model that doesn't, as Dynamo's bridge does.
 
 from __future__ import annotations
 
-import json
 from dataclasses import replace
 
 from mstar.engine.resources.sampler.grammar import STRUCTURED_OUTPUTS_KWARG
@@ -58,25 +57,22 @@ def check_tools(mk: dict) -> None:
         raise ValueError(_TOOL_CHOICE_SHAPE)
     if parallel is not None and not isinstance(parallel, bool):
         raise ValueError("parallel_tool_calls must be true or false")
-    if mk.get(STRUCTURED_OUTPUTS_KWARG) is not None:
-        raise ValueError("send tools or a JSON response_format (structured_outputs), not both")
+    if mk.get(STRUCTURED_OUTPUTS_KWARG) is not None and choice != "none":
+        raise ValueError("tools with a JSON response_format (structured_outputs) need tool_choice none")
 
 
 def asks_for_tools(model_kwargs: dict, parts: list[PromptPart] | None) -> bool:
     """Whether a request asks for a tool call (``tools`` that ``tool_choice`` doesn't turn off) or
-    carries a tool turn (a ``tool`` message, or an assistant message's ``tool_calls``). An
-    assistant message's reasoning alone is not one."""
+    carries a ``tool`` message, as the chat adapters refused before they served tools. An
+    assistant message's ``tool_calls`` and reasoning don't count: they were dropped then."""
     if model_kwargs.get("tools") not in (None, []) and model_kwargs.get("tool_choice") != "none":
         return True
-    return any(
-        p.role == "tool" or (p.extras is not None and "tool_calls" in json.loads(p.extras))
-        for p in parts or ()
-    )
+    return any(p.role == "tool" for p in parts or ())
 
 
 def without_tools(model_kwargs: dict, parts: list[PromptPart] | None) -> list[PromptPart] | None:
     """A request that `asks_for_tools` not, for a model that calls none: its tool fields dropped,
-    and its assistant turns' reasoning, as before tools were served."""
+    and its assistant turns' ``tool_calls`` and reasoning, as before tools were served."""
     for name in TOOL_KWARGS:
         model_kwargs.pop(name, None)
     if parts is None or all(p.extras is None for p in parts):

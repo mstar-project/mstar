@@ -868,11 +868,12 @@ class APIServer:
             self._reasoning_end = None if text is None else text.reasoning_end
             return self._reasoning_end
 
-    def _parse_reply_chunk(self, req: PendingRequest, chunk: ResultChunk) -> ResultChunk:
+    def _parse_reply_chunk(self, req: PendingRequest, chunk: ResultChunk, rid: str) -> ResultChunk:
         """A parsed chat reply's text chunk, split: its answer stays the chunk's text, its reasoning
         moves to ``metadata["reasoning"]``, its closed calls to ``metadata["tool_calls"]``. On the
         message thread, in the request's chunk order. The thread carries every request's chunks, so
-        a parser error fails only its own request: the chunk becomes the error that ends it."""
+        a parser error fails only its own request: the chunk becomes the error that ends it, and the
+        engine stops generating it."""
         try:
             parser = req.parser
             if parser is None:
@@ -897,6 +898,7 @@ class APIServer:
         except Exception:  # noqa: BLE001 - one request's reply, never the thread
             logger.exception("Parsing the reply of %s failed", chunk.request_id)
             req.parse_reply, req.parser = False, None
+            self.preprocess_worker.forward_abort(rid)
             return ResultChunk(request_id=chunk.request_id, modality="error", data=_REPLY_PARSE_FAILED.encode(),
                                metadata={"status": 500})
 
@@ -1544,8 +1546,11 @@ class APIServer:
                                 result_chunk.data.decode("utf-8", "replace"),
                                 rid, req.request_id,
                             ).encode("utf-8")
+                        # the bytes that arrived, which the counts below report; a parsed reply's
+                        # chunk keeps only its answer as its data
+                        received = result_chunk.data
                         if req.parse_reply and result_chunk.modality == "text":
-                            result_chunk = self._parse_reply_chunk(req, result_chunk)
+                            result_chunk = self._parse_reply_chunk(req, result_chunk, rid)
                         req.chunks.append(result_chunk)
                         if self.log_stats:
                             info = req.output_totals.get(result_chunk.modality)
@@ -1553,7 +1558,7 @@ class APIServer:
                                 info = OutputInfo(modality=result_chunk.modality, count=0, total_bytes=0)
                                 req.output_totals[result_chunk.modality] = info
                             info.count += 1
-                            info.total_bytes += len(result_chunk.data)
+                            info.total_bytes += len(received)
                         sink = req.sink
                         if sink is not None and result_chunk.modality != "error":
                             batch = to_relay.get(id(sink))
@@ -1580,7 +1585,7 @@ class APIServer:
                             self.recently_completed[rid] = time.time()
                     if metrics is not None and result_chunk.modality != "error":
                         metrics.record_chunk(
-                            result_chunk.modality, result_chunk.data, result_chunk.metadata,
+                            result_chunk.modality, received, result_chunk.metadata,
                         )
                 if to_wake:
                     notify_many(to_wake.values())

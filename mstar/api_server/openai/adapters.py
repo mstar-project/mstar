@@ -206,6 +206,17 @@ def _message_text(content) -> str:
     return "\n".join(p["text"] for p in content if isinstance(p, dict) and p.get("type") == "text" and p.get("text"))
 
 
+def _strict_json(constant: str):
+    raise ValueError(f"{constant} is not JSON")
+
+
+def _finite_json(text: str) -> float:
+    value = float(text)
+    if value in (float("inf"), float("-inf")):
+        raise ValueError(f"{text} overflows")
+    return value
+
+
 def turn_extras(tool_calls, reasoning) -> str | None:
     """An assistant message's ``tool_calls`` and reasoning, for the chat template
     (``PromptPart.extras``, read back by `messages_from_parts`): each call's name and its
@@ -228,8 +239,8 @@ def turn_extras(tool_calls, reasoning) -> str | None:
             elif isinstance(args, str):
                 text = args
                 try:
-                    args = json.loads(args)
-                except json.JSONDecodeError:
+                    args = json.loads(args, parse_constant=_strict_json, parse_float=_finite_json)
+                except ValueError:  # not JSON, or not strict JSON (NaN, an overflow), as Rust reads it
                     args = None
             else:
                 text = json.dumps(args, sort_keys=True, separators=(",", ":"), ensure_ascii=False)

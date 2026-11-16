@@ -291,7 +291,7 @@ fn an_adapter_that_serves_tools_checks_and_keeps_them() {
             (format!(r#""tools":[{tool}],"tool_choice":"some""#), r#"tool_choice must be none, auto, required or {"type": "function", "function": {"name": ...}}"#),
             (format!(r#""tools":[{tool}],"tool_choice":{{"type":"function","function":{{"name":"other"}}}}"#), "tool_choice names 'other', which tools doesn't list"),
             (format!(r#""tools":[{tool}],"parallel_tool_calls":"yes""#), "parallel_tool_calls must be true or false"),
-            (format!(r#""tools":[{tool}],"response_format":{{"type":"json_object"}}"#), "send tools or a JSON response_format (structured_outputs), not both"),
+            (format!(r#""tools":[{tool}],"response_format":{{"type":"json_object"}}"#), "tools with a JSON response_format (structured_outputs) need tool_choice none"),
         ] {
             let got = adapter.chat_to_request(&chat_with(&fields), Path::new("/unused"), false).unwrap_err();
             assert_eq!(got, err, "{fields} on {name}");

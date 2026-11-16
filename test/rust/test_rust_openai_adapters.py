@@ -605,6 +605,9 @@ TOOL_CASES = {
     "bad-tool": {"tools": [{"name": "get_weather"}]},
     "bad-parallel": {"tools": [_TOOL], "parallel_tool_calls": 1},
     "tools-and-json": {"tools": [_TOOL], "response_format": {"type": "json_object"}},
+    "tools-none-and-json": {"tools": [_TOOL], "tool_choice": "none", "response_format": {"type": "json_object"}},
+    "nan-arguments": {"tools": [_TOOL], "messages": [_LOOP[0], {"role": "assistant", "tool_calls": [
+        {"type": "function", "function": {"name": "get_weather", "arguments": '{"days": NaN}'}}]}]},
     "functions": {"functions": [{"name": "get_weather"}]},
     "bad-arguments": {"tools": [_TOOL], "messages": [_LOOP[0], {"role": "assistant", "tool_calls": [
         {"type": "function", "function": {"name": "get_weather", "arguments": "[1]"}}]}]},

@@ -3561,6 +3561,35 @@ A model serves ``response_format`` and ``structured_outputs`` (see **Structured 
 The deployment then sets ``enable_grammar: true`` on that sampler, and installs the ``grammar``
 extra.
 
+Serving tool calls
+~~~~~~~~~~~~~~~~~~
+
+A chat model serves ``tools`` and ``tool_choice`` (see **Reasoning and tool calls** in
+:doc:`models`) once it does these things; Qwen3.5 is the reference:
+
+* sets ``TOOL_FORMAT`` on its model class to the name of xgrammar's builtin structural tag for
+  its call format (``get_model_structural_tag``; Qwen3.5: ``"qwen_3_5"``), which holds a forced
+  call (``required``, a named function, a ``strict`` tool) to that format;
+* adds a ``ToolCallFormat`` subclass under the same key in ``TOOL_FORMATS``
+  (``mstar/api_server/reply_parser.py``): the text that begins and ends a call, which the reply
+  parser holds text at as a reply streams, and ``parse``, which reads a closed call's text into its
+  name and arguments and returns None for text that isn't a call (``QwenXmlFormat``). A test checks
+  every registered model's ``TOOL_FORMAT`` has an entry;
+* passes ``tools`` to its chat template (``apply_chat_template(..., tools=...)``), and renders an
+  assistant turn's ``tool_calls`` and reasoning and each ``tool`` message: the chat adapter hands
+  them over as prompt parts, a ``tool`` message as its own part and an assistant message's calls
+  and reasoning in ``PromptPart.extras``, which ``messages_from_parts`` turns back into the fields
+  the template reads;
+* lists ``tools``, ``tool_choice`` and ``parallel_tool_calls`` in ``request_kwargs`` (they are
+  read) and in ``PREPROCESS_ONLY_KWARGS`` (the data worker renders them; the conductor never needs
+  them);
+* serves chat through an OpenAI adapter with ``serves_tools = True``, in both frontends
+  (``mstar/api_server/openai/adapters.py`` and ``rust/server/src/adapters/``); the tool fields are
+  checked the same way in both.
+
+Forced calls need ``enable_grammar`` on the model's sampler, and the ``STRUCTURED_OUTPUTS`` steps
+above.
+
 Routing across data-parallel replicas
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

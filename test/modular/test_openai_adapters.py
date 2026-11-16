@@ -303,7 +303,7 @@ def test_an_adapter_that_serves_tools_checks_and_keeps_them(tmp_path, adapter):
          "tool_choice names 'other', which tools doesn't list"),
         ({"tools": [_TOOL], "parallel_tool_calls": "yes"}, "parallel_tool_calls must be true or false"),
         ({"tools": [_TOOL], "response_format": {"type": "json_object"}},
-         "send tools or a JSON response_format (structured_outputs), not both"),
+         "tools with a JSON response_format (structured_outputs) need tool_choice none"),
     ]:
         req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
         with pytest.raises(ValueError) as refused:

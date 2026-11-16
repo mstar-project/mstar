@@ -437,7 +437,7 @@ pub(super) fn refuse_unserved_chat(
 const TOOL_CHOICE_SHAPE: &str =
     r#"tool_choice must be none, auto, required or {"type": "function", "function": {"name": ...}}"#;
 
-/// `_check_tools` in `api_server/openai/adapters.py`, word for word: a chat's tool fields,
+/// `check_tools` in `api_server/tool_fields.py`, word for word: a chat's tool fields,
 /// checked and kept, for an adapter whose models may call tools.
 fn check_tools(mk: &mut BTreeMap<String, Value>) -> Result<(), String> {
     let function_call = mk.get("function_call");
@@ -514,8 +514,9 @@ fn check_tools(mk: &mut BTreeMap<String, Value>) -> Result<(), String> {
     if mk.get("parallel_tool_calls").is_some_and(|p| !p.is_null() && !p.is_boolean()) {
         return Err("parallel_tool_calls must be true or false".to_string());
     }
-    if mk.get("structured_outputs").is_some_and(|x| !x.is_null()) {
-        return Err("send tools or a JSON response_format (structured_outputs), not both".to_string());
+    let choice_none = matches!(&choice, Some(Value::String(c)) if c == "none");
+    if mk.get("structured_outputs").is_some_and(|x| !x.is_null()) && !choice_none {
+        return Err("tools with a JSON response_format (structured_outputs) need tool_choice none".to_string());
     }
     Ok(())
 }

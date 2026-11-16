@@ -571,13 +571,17 @@ def test_tools_with_tool_choice_none_are_dropped_through_dynamo(tmp_path):
     assert not {"tools", "tool_choice", "parallel_tool_calls"} & set(sub["model_kwargs"])
 
 
-def test_an_assistant_turn_with_only_reasoning_is_served_through_dynamo(tmp_path):
-    """A client that sends a reply back with its reasoning asks for no tool call: served, the
-    reasoning dropped, as before the chat adapter kept it."""
+@pytest.mark.parametrize("fields", [
+    {"reasoning_content": "Greet them."},
+    {"tool_calls": [{"type": "function", "function": {"name": "get_weather", "arguments": "{}"}}]},
+], ids=["reasoning", "tool-calls"])
+def test_an_assistant_turn_that_asks_for_no_call_is_served_through_dynamo(tmp_path, fields):
+    """A client that sends a reply back with its reasoning or its calls asks for no new call:
+    served, those fields dropped, as before the chat adapter kept them."""
     server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
     _chat_through_bridge(server, {"messages": [
         {"role": "user", "content": "hi"},
-        {"role": "assistant", "content": "Hello!", "reasoning_content": "Greet them."},
+        {"role": "assistant", "content": "Hello!", **fields},
         {"role": "user", "content": "how are you?"},
     ]}, ADAPTER_REGISTRY["qwen3_5_0.8b"])
     (sub,) = server.submitted

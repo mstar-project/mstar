@@ -280,6 +280,7 @@ class _DataWorker:
     def __init__(self):
         self.inputs: list[PreprocessInput] = []
         self.chunks: list[ResultChunk] = []
+        self.aborted: list[str] = []
         self.results_wakeup = EventWakeup()
 
     def new_request(self, input):
@@ -302,7 +303,7 @@ class _DataWorker:
         pass
 
     def forward_abort(self, rid):
-        pass
+        self.aborted.append(rid)
 
 
 class _OnePass:
@@ -325,13 +326,13 @@ class _OnePass:
 
 
 def _served(token_counts, cap, report_usage=True, error=False, stopped=False, chunks=None, model=None,
-            parse_reply=False, model_kwargs=None):
+            parse_reply=False, model_kwargs=None, metrics=None):
     """A request run through ``submit_request`` and one pass of the message
     thread: text chunks carrying ``token_counts`` tokens, the last one ended by
     a stop token when ``stopped``, or the data worker's own ``chunks``; then
     its completion."""
     worker = _DataWorker()
-    server = make_test_api_server(preprocess_worker=worker, model=model)
+    server = make_test_api_server(preprocess_worker=worker, model=model, metrics=metrics)
     server.submit_request(
         text=PROMPT, input_modalities=["text"], output_modalities=["text"],
         request_id="r", report_usage=report_usage, parse_reply=parse_reply, model_kwargs=model_kwargs,
@@ -479,9 +480,13 @@ def test_a_parser_error_fails_only_its_own_request(monkeypatch):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(ReplyParser, "feed", broken)
-    chunks = _parsed(["I think", "</think>Hi"], True, _streamed)
+    texts = [ResultChunk(request_id="r", modality="text", data=t, num_tokens=1) for t in (b"I think", b"</think>Hi")]
+    texts[0].metadata[REPLY_IN_REASONING] = True
+    server = _served(None, cap=64, chunks=texts, model=_ReasoningModel(), parse_reply=True)
+    chunks = _streamed(server)
     assert [c.modality for c in chunks] == ["error"]
     assert chunks[0].metadata["status"] == 500
+    assert len(server.preprocess_worker.aborted) == 1, "the engine stops generating the failed reply"
     with pytest.raises(HTTPException) as failed:
         _parsed(["I think"], True)
     assert failed.value.status_code == 500
@@ -500,6 +505,18 @@ def test_a_reply_past_its_reasoning_stops_being_parsed_once_nothing_is_held(read
     assert "".join(c.metadata.get(REASONING, "") for c in got) == "hmm"
     assert b"".join(c.data for c in got).decode() == "café ok</think> é"
     assert got[-1].data == "</think> é".encode(), "the last chunk passed through as it came"
+
+
+def test_the_output_byte_counts_are_the_bytes_that_arrived():
+    """The metrics count a reply's text as it came, reasoning included, not only its answer."""
+    seen = []
+    metrics = SimpleNamespace(record_chunk=lambda modality, data, metadata: seen.append((modality, len(data))),
+                              record_end=lambda *a, **k: None, request_finished=lambda *a, **k: None)
+    texts = [b"I think", b"</think>Hi"]
+    chunks = [ResultChunk(request_id="r", modality="text", data=t, num_tokens=1) for t in texts]
+    chunks[0].metadata[REPLY_IN_REASONING] = True
+    _served(None, cap=64, chunks=chunks, model=_ReasoningModel(), parse_reply=True, metrics=metrics)
+    assert [n for modality, n in seen if modality == "text"] == [len(t) for t in texts]
 
 
 def test_a_reply_with_nothing_to_split_passes_through_unparsed():
