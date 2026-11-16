@@ -495,7 +495,7 @@ class LTX25Model(Model):
         # The dit's linears and qk-norms shard by head (tensor parallelism), and its video
         # tokens by rank (the sequence shard); what crosses node edges stays replicated, so
         # nothing needs a shard_dim.
-        return ShardingConfig(groups=[], tp_enabled_nodes={DIT_NODE}, shard_dim={})
+        return ShardingConfig(groups=[], tp_enabled_nodes={DIT_NODE, VAE_DECODER_NODE}, shard_dim={})
 
     def get_submodule(self, node_name: str, device="cpu", tp_group=None, autocast_dtype=None):
         if node_name in self._submodule_cache:
@@ -541,6 +541,7 @@ class LTX25Model(Model):
             return LTXVideoDecoderSubmodule(
                 vae.to(device).eval(), self.config, tile_min_pixels=self.vae_tile_min_pixels,
                 compile_decode=self.vae_compile and bool(warm), warmup_shapes=warm,
+                comm_group=tp_group,
             )
         if node_name == UPSAMPLER_NODE:
             from diffusers import AutoencoderKLLTX2Video
