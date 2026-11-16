@@ -520,6 +520,7 @@ def test_a_socket_closed_while_its_files_decode_leaves_none(monkeypatch, tmp_pat
         def __init__(self):
             self.frames = [{"type": "websocket.receive", "text": json.dumps(
                 {"text": "hi", "files": [_OBS], "request_id": "r"})}]
+            self.headers = {}
 
         async def accept(self):
             pass
