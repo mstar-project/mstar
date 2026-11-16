@@ -1,5 +1,6 @@
 """CPU checks for the served LingBot-World chunk timing report."""
 
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -8,7 +9,14 @@ import numpy as np
 import pytest
 
 from mstar.client import VideoFrameChunk
-from test.lingbot_world import serve_first_chunk as probe
+
+# CPU Core imports this file as a standalone test module. Load the harness by
+# path so its tests do not depend on `test` resolving as a namespace package.
+_HARNESS = Path(__file__).resolve().parents[1] / "lingbot_world" / "serve_first_chunk.py"
+_SPEC = importlib.util.spec_from_file_location("serve_first_chunk", _HARNESS)
+assert _SPEC is not None and _SPEC.loader is not None
+probe = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(probe)
 
 summarize_chunks = probe.summarize_chunks
 
