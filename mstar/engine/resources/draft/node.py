@@ -72,8 +72,16 @@ def drafter_step(step, graph_walk: str, share: DrafterShare | None):
     if graph_walk == share.verify_walk and sampler_step is not None:
         rows = [Segment(seg.request_id, seg.label, 1) for seg in step.segments]
         steps[share.sampler_key] = replace(sampler_step, segments=rows)
-    # fresh each step, as a declaration's are: a resource may stamp its own step (KV's commit count)
-    steps.update((key, replace(resource_step)) for key, resource_step in own.items())
+    # fresh each step, as a declaration's are: a resource may stamp its own step (KV's commit count). On a
+    # mixed step the drafter's attentions run on the verify kernels too, its prompt steps' included: an
+    # attention left off them plans the step's verify rows on the host, which in asynchronous mode holds
+    # their reserved lengths, not their true ones
+    mixed = graph_walk == share.mixed_walk
+    steps.update(
+        (key, replace(resource_step, verify=True) if mixed and isinstance(resource_step, AttentionStep)
+         else replace(resource_step))
+        for key, resource_step in own.items()
+    )
     out = replace(step, steps=steps)
     # the handles of the state an expanded step declares, which `replace` leaves behind
     out.set_state_handles(step.state_handles)

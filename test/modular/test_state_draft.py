@@ -205,6 +205,14 @@ def test_a_mixed_step_verifies_its_attention_and_keeps_its_samplers_rows():
     assert step.steps["attn"].verify and step.steps["sampler"] == declared.steps["sampler"]
 
 
+def test_a_mixed_step_runs_its_drafters_attentions_on_the_verify_kernel_its_prompt_ones_included():
+    """A drafter attention declared for prompt steps alone also runs on a mixed step, beside its verify rows:
+    left off the verify kernel, it would plan their attention on the host, over their reserved lengths."""
+    share = SHARE._replace(prompt_steps={"draft_attn": AttentionStep(causal=True)})
+    assert drafter_step(_step(), "mixed", share).steps["draft_attn"].verify
+    assert not drafter_step(_step(), "prefill", share).steps["draft_attn"].verify
+
+
 def test_a_prompt_step_and_a_node_without_a_drafter_are_left_alone():
     plain = _step()
     assert drafter_step(plain, "prefill", SHARE).steps["attn"] == plain.steps["attn"]
