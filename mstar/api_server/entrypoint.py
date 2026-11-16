@@ -1063,6 +1063,7 @@ class APIServer:
         ended; raises ``ValueError`` for input past the call's budget
         (``max_call_input_mb``) or a stream the model doesn't have.
         """
+        reject_lone_surrogates((text, model_kwargs))
         named = self._check_streams(
             name for names in (file_streams or {}).values() for name in names if name is not None
         ) | self._check_streams(samples or ())
@@ -2422,6 +2423,7 @@ def _ws_model_kwargs(value) -> dict | None:
         value = json.loads(value)
     if value is not None and not isinstance(value, dict):
         raise ValueError("model_kwargs must be a JSON object")
+    reject_lone_surrogates(value)
     return value
 
 

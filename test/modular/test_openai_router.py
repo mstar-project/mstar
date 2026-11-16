@@ -147,17 +147,17 @@ def test_json_routes_refuse_lone_surrogates_before_submit(client_and_stub, model
     assert stub.last_submit is None
 
 
+@pytest.mark.parametrize("raw", ['"\\ud800"', '{"nested":"\\ud800"}'])
 @pytest.mark.parametrize("model,path,files", [
     ("whisper_large", "/v1/audio/transcriptions", {"file": ("clip.wav", b"RIFF")}),
     ("bagel", "/v1/images/edits", {"image": ("image.png", b"PNG")}),
 ])
-def test_multipart_routes_refuse_a_decoded_lone_surrogate(client_and_stub, model, path, files):
+def test_multipart_json_fields_keep_an_invalid_escape_as_literal_text(client_and_stub, model, path, files, raw):
     client, stub = client_and_stub
     stub.model_name = model
-    response = client.post(path, files=files, data={"instructions": '"\\ud800"'})
-    assert response.status_code == 400
-    assert response.json()["error"]["message"] == "text is not valid UTF-8 (contains a lone surrogate)"
-    assert stub.last_submit is None
+    response = client.post(path, files=files, data={"instructions": raw})
+    assert response.status_code == 200, response.text
+    assert stub.last_submit["model_kwargs"]["instructions"] == raw
 
 
 def test_models(client_and_stub):

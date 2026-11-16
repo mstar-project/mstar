@@ -48,6 +48,16 @@ _TRANSCRIPTION_TEXT_FIELDS = frozenset(
 )
 
 
+def _form_json_or_text(value: str):
+    """Match the Rust form parser: invalid JSON values stay literal text."""
+    try:
+        parsed = json.loads(value)
+        reject_lone_surrogates(parsed)
+        return parsed
+    except (ValueError, TypeError):
+        return value
+
+
 def _api():
     # The server runs either as the package module (console scripts ``mstar`` /
     # ``mstar-serve``) or as ``__main__`` (``python mstar/api_server/entrypoint.py``,
@@ -199,10 +209,7 @@ async def audio_transcriptions(request: Request):
             if key in _TRANSCRIPTION_TEXT_FIELDS:
                 fields[key] = value
                 continue
-            try:
-                fields[key] = json.loads(value)
-            except (json.JSONDecodeError, TypeError):
-                fields[key] = value
+            fields[key] = _form_json_or_text(value)
         try:
             req = TranscriptionRequest(**fields)
         except Exception as e:  # noqa: BLE001 — pydantic validation
@@ -331,10 +338,7 @@ async def images_edits(request: Request):
         for key, value in form.multi_items():
             if key in known or hasattr(value, "filename"):
                 continue
-            try:
-                extra[key] = json.loads(value)
-            except (json.JSONDecodeError, TypeError):
-                extra[key] = value
+            extra[key] = _form_json_or_text(value)
         if form.get("size"):
             extra["size"] = form.get("size")  # the adapter maps "WxH" to the model's width / height
         reject_lone_surrogates((prompt, extra))

@@ -32,3 +32,13 @@ def test_submit_refuses_before_any_server_state_is_read(kwargs):
     server = object.__new__(APIServer)
     with pytest.raises(ValueError, match="text is not valid UTF-8"):
         server.submit_request(input_modalities=["text"], output_modalities=["text"], **kwargs)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"text": "\ud800"},
+    {"model_kwargs": {"instructions": ["okay", {"text": "\ud800"}]}},
+])
+def test_stream_append_refuses_before_any_server_state_is_read(kwargs):
+    server = object.__new__(APIServer)
+    with pytest.raises(ValueError, match="text is not valid UTF-8"):
+        server.stream_input("request", **kwargs)

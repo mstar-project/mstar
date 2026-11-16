@@ -138,6 +138,11 @@ def test_json_frame_refuses_lone_surrogate_before_saving_files(monkeypatch, tmp_
     assert messages[-1] == {"request_id": "ok", "finish": True}
 
 
+def test_model_kwargs_json_text_refuses_nested_lone_surrogate():
+    with pytest.raises(ValueError, match="text is not valid UTF-8.*lone surrogate"):
+        entrypoint._ws_model_kwargs('{"nested":{"text":"\\ud800"}}')
+
+
 def test_msgpack_frames_and_pipelining(monkeypatch, tmp_path):
     fake = _FakeServer(tmp_path, chunks_per_request=1)
     monkeypatch.setattr(entrypoint, "api_server", fake)
@@ -548,6 +553,7 @@ class _ListeningFakeServer(_FakeServer):
     def __init__(self, upload_dir):
         super().__init__(upload_dir, chunks_per_request=1)
         self.appends = []
+        self.rejected = set()
 
     def taking_input(self, key):
         return True
@@ -556,15 +562,36 @@ class _ListeningFakeServer(_FakeServer):
         self.appends.append((key, sorted(file_paths or {}), end_input, append))
         return True
 
+    def reject_input(self, key, error, status):
+        self.rejected.add(key)
+        self.error_for[key] = (error, status)
+        return True
+
     async def iter_result_chunks(self, request_id):
         # a call finishes once its input has ended, at its opening or by an append
         while not (
             any(s["request_id"] == request_id and s["end_input"] is True for s in self.submitted)
             or any(a[0] == request_id and a[2] is True for a in self.appends)
+            or request_id in self.rejected
         ):
             await asyncio.sleep(0.01)
         async for chunk in super().iter_result_chunks(request_id):
             yield chunk
+
+
+def test_live_append_refuses_surrogate_in_json_text_kwargs(monkeypatch, tmp_path):
+    fake = _ListeningFakeServer(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({"request_id": "call", "end_input": False}))
+        ws.send_text(json.dumps({
+            "request_id": "call", "append": {"model_kwargs": '{"nested":{"text":"\\ud800"}}'},
+            "end_input": True,
+        }))
+        messages = _recv_until_finish(ws, binary=False)
+    assert messages[-1]["status"] == 400
+    assert "text is not valid UTF-8 (contains a lone surrogate)" in messages[-1]["error"]
+    assert fake.appends == []
 
 
 def test_an_opening_with_input_and_settings_is_never_an_append(monkeypatch, tmp_path):
