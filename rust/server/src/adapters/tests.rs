@@ -436,3 +436,29 @@ fn fish_forwards_a_sent_voice_to_be_logged_as_ignored() {
     assert_eq!(mk(r#"{"input":"x","voice":"ryan"}"#)["voice"], serde_json::json!("ryan"));
     assert!(!mk(r#"{"input":"x"}"#).contains_key("voice"));
 }
+
+#[test]
+fn ministral_maps_sampling_and_rejects_unsupported_media_before_io() {
+    assert_eq!(surfaces(&Ministral3), [true, false, false, false, false]);
+    let req: ChatCompletionRequest = serde_json::from_str(r#"{
+        "messages":[{"role":"developer","content":"Be brief."},{"role":"user","content":"Hello"}],
+        "max_tokens":32,"max_completion_tokens":2,"temperature":0.0,"top_k":5
+    }"#).unwrap();
+    let args = Ministral3.chat_to_request(&req, Path::new("/unused"), false).unwrap();
+    assert_eq!(args.output_modalities, ["text"]);
+    assert_eq!(args.model_kwargs["max_output_tokens"], 2);
+    assert_eq!(args.model_kwargs["temperature"], 0.0);
+    assert_eq!(args.model_kwargs["top_k"], 5);
+    assert_eq!(args.parts[0].role.as_deref(), Some("system"));
+    for kind in ["video_url", "audio_url", "input_audio", "unknown"] {
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages":[{"role":"user","content":[{"type":kind}]}]
+        })).unwrap();
+        assert_eq!(Ministral3.chat_to_request(&req, Path::new("/unused"), false).unwrap_err(),
+                   "Ministral 3 accepts only text and image_url content parts");
+    }
+    for fields in [r#""modalities":["audio"]"#, r#""audio":{}"#] {
+        assert_eq!(Ministral3.chat_to_request(&chat_with(fields), Path::new("/unused"), false).unwrap_err(),
+                   "Ministral 3 supports text output only");
+    }
+}

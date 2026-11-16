@@ -1,0 +1,29 @@
+{
+  "repo": "mistralai/Ministral-3-3B-Instruct-2512",
+  "revision": "b35d4dfe56c142746f54dbd64f579faab2744308",
+  "retrieval": "HTTP Range: first 8 bytes for header length, then only the JSON header. No tensor payloads read.",
+  "files": [
+    {
+      "filename": "model.safetensors",
+      "header_bytes": 108688,
+      "header_sha256": "4b99d0668272e8c6e80055c7364918f6bbf1de6745cec53af71758e44313b72a",
+      "file_bytes": 4672099184,
+      "tensor_count": 822,
+      "dtypes": {
+        "BF16": 640,
+        "F8_E4M3": 182
+      }
+    },
+    {
+      "filename": "consolidated.safetensors",
+      "header_bytes": 98456,
+      "header_sha256": "faf4f5ae007ff7d234249d99c58d3bb1b8286ea1d4605a2443a77bc145bda201",
+      "file_bytes": 4672089108,
+      "tensor_count": 900,
+      "dtypes": {
+        "BF16": 718,
+        "F8_E4M3": 182
+      }
+    }
+  ]
+}

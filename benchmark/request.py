@@ -103,6 +103,9 @@ class RequestMetrics:
     # overwritten by `usage.completion_tokens` from the final SSE chunk for
     # vllm-omni / sglang-omni (see Fix 3).
     output_text_tokens: int = 0
+    # Populated by the shared OpenAI streaming parser only when usage is present.
+    # None distinguishes an estimated chunk count from a server token count.
+    server_completion_tokens: Optional[int] = None
     # Prompt-token count from `usage.prompt_tokens` when emitted by the server.
     input_tokens: int = 0
 
@@ -941,6 +944,7 @@ def _record_vllm_omni_chunk(chunk: dict, metrics: "RequestMetrics") -> None:
         ct = usage.get("completion_tokens")
         if ct:  # audio chunks carry completion_tokens=0; keep the text count
             metrics.output_text_tokens = ct
+            metrics.server_completion_tokens = ct
         pt = usage.get("prompt_tokens")
         if pt is not None:
             metrics.input_tokens = pt

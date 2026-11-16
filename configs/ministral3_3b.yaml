@@ -1,0 +1,13 @@
+# Experimental: full-checkpoint GPU logits parity and lifecycle acceptance remain open.
+model: ministral3_3b
+max_seq_len: 8192
+node_groups:
+  # Pixtral runs once for images; the decoder performs prefill and autoregressive decode.
+  - node_names: [LLM, vision_encoder]
+    ranks: [0]
+resources:
+  kv_cache:
+    page_size: 128
+    # 16,384 resident tokens, about 1.625 GiB of BF16 K/V for 26 layers.
+    # This is a starting capacity, not a benchmarked concurrency recommendation.
+    max_num_pages: 128
