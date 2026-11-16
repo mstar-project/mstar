@@ -3,7 +3,7 @@ model: "ltx2_5"
 max_seq_len: 1024
 
 # The DiT uses Ulysses SP2. The video VAE has full weights and latents on both
-# ranks; its TP2 node group splits independent spatial tiles over those ranks.
+# ranks; its SP2 node group splits independent spatial tiles over those ranks.
 # Untiled and framewise decodes keep the stock path.
 model_kwargs:
   max_batch_size: 4
@@ -20,6 +20,6 @@ node_groups:
     ranks: [1]
   - node_names: [vae_decoder]
     ranks: [0, 1]
-    tp_size: 2
+    sp_size: 2
   - node_names: [audio_decoder, latent_upsampler]
     ranks: [0]

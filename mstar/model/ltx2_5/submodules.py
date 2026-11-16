@@ -513,7 +513,7 @@ class LTXVideoDecoderSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):
     def forward_batched(self, graph_walk, engine_inputs, **kwargs):
         out = self.run_batch(**kwargs)
         if not out:
-            # This follower joined the decode's TP collective, but only rank
+            # This follower joined the decode's SP collective, but only rank
             # zero owns the assembled frames and emits them to the client.
             return {rid: {} for rid in engine_inputs.request_ids}
         return {
@@ -529,11 +529,12 @@ class LTXVideoDecoderSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):
         x = x * std / self.vae.config.scaling_factor + mean
         self.vae.use_tiling = self._tiled(shape)
         group = self.comm_group
-        if (
+        distributed = (
             group is not None and group.world_size > 1 and self.vae.use_tiling
             and not self.vae.use_framewise_decoding
             and not (self.vae.use_slicing and x.shape[0] > 1)
-        ):
+        )
+        if distributed:
             from mstar.model.ltx2_5.tiled_decode import distributed_tiled_decode, spatial_tile_count
 
             # Stock decode only enters the spatial tile path when the latent
@@ -546,9 +547,11 @@ class LTXVideoDecoderSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):
             if spatial and spatial_tile_count(self.vae, x) >= group.world_size:
                 video = distributed_tiled_decode(self.vae, x, group)
             else:
-                video = self.vae.decode(x, None, return_dict=False)[0]
+                # This call is still one SP instance. A full fallback decode
+                # belongs to its leader alone, including on the small stage.
+                video = self.vae.decode(x, None, return_dict=False)[0] if group.rank == 0 else None
         else:
-            video = self.vae.decode(x, None, return_dict=False)[0]
+            video = self.vae.decode(x, None, return_dict=False)[0] if group is None or group.rank == 0 else None
         if video is None:
             return {}
         frames = ((video / 2 + 0.5).clamp(0, 1).float() * 255).round().to(torch.uint8)

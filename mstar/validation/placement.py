@@ -133,7 +133,7 @@ def check_worker_graphs(
         *_loop_successors(walk_to_wgs),
         *_sharding_groups(worker_graphs, sharding_config),
         *_worker_parallelism(worker_graphs, specs or ()),
-        *_sequence_parallel(worker_graphs, specs, moe_parallel or {}),
+        *_sequence_parallel(worker_graphs, specs, sharding_config, moe_parallel or {}),
         *_paged_kv_on_cfg_ranks(worker_graphs, specs or ()),
     ]
 
@@ -589,6 +589,7 @@ def _worker_parallelism(
 
 def _sequence_parallel(
     worker_graphs: Sequence[WorkerGraph], specs: Sequence[NodeResourceSpec] | None,
+    sharding_config: ShardingConfig,
     moe_parallel: "Mapping[str, MoeParallelConfig]",
 ) -> Iterator[str]:
     """What a node group's SP ranks can't run (`sequence_parallel_refusals`, which the engine
@@ -613,7 +614,10 @@ def _sequence_parallel(
         # rather than keeping KV by head while its steps split (heads over TP x SP)
         placed = {}
         for node in sorted(nodes):
-            refusals = sequence_parallel_refusals(specs, node, tp, sp, moe_parallel.get(node))
+            refusals = sequence_parallel_refusals(
+                specs, node, tp, sp, moe_parallel.get(node),
+                sp_collective=node in sharding_config.sp_collective_nodes,
+            )
             for refusal in refusals:
                 yield f"node_groups[{i}]: {refusal}"
             if sp > 1 and not refusals:

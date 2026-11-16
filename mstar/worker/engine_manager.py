@@ -477,7 +477,7 @@ class EngineManager:
             if name in moe_parallel:
                 extra["moe_parallel"] = moe_parallel[name]
             submodule = model.get_submodule(
-                name, device, tp_group=joint.tp_group,
+                name, device, tp_group=model.submodule_comm_group(name, joint),
                 autocast_dtype=autocast_dtype, **extra,
             )
             if submodule is None:
@@ -515,6 +515,7 @@ class EngineManager:
             transfer_engine_info=transfer_engine_info,
             kv_cache_type=autocast_dtype,
             model=model,
+            sp_collective_nodes=model.get_default_sharding_config().sp_collective_nodes,
             moe_parallel=moe_parallel,
             token_ladders=walk_ladders,
             region_ladders=region_ladders,

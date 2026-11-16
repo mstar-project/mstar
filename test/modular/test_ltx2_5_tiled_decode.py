@@ -10,16 +10,24 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
+import yaml
 
-from mstar.distributed.communication import CommGroup
+from mstar.distributed.base import ShardingConfig, ShardingGroup
+from mstar.distributed.communication import CommGroup, GlobalParallelConfig
+from mstar.engine.engine import Engine
+from mstar.engine.resources.sequence_shard import SeqShardSpec, sequence_parallel_refusals
 from mstar.graph.base import GraphEdge, GraphNode, NodeAndGraphWalk
 from mstar.graph.runtime.base import RouteInput
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.model.base import WorkerGraph
 from mstar.model.ltx2_5.config import LTX25Config
 from mstar.model.ltx2_5.ltx2_5_model import GENERATE_VIDEO_WALK, LTX25Model
 from mstar.model.ltx2_5.submodules import VIDEO_OUTPUT, LTXVideoDecoderSubmodule
 from mstar.model.ltx2_5.tiled_decode import distributed_tiled_decode, spatial_tile_count
+from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.containers import ParallelList
+from mstar.validation import DeploymentError, validate_deployment
+from mstar.validation.placement import check_worker_graphs
 
 
 class _ToyDecoder(torch.nn.Module):
@@ -112,12 +120,81 @@ def test_tile_count_covers_partial_edge_tiles():
     assert spatial_tile_count(vae, torch.zeros(1, 2, 3, 7, 7)) == 9
 
 
+def test_non_sequence_sp_requires_explicit_capability_and_no_engine_shard():
+    assert "neither splits tokens" in sequence_parallel_refusals([], "vae_decoder", 1, 2)[0]
+    assert sequence_parallel_refusals([], "vae_decoder", 1, 2, sp_collective=True) == []
+    shard = SeqShardSpec("vae_shard", {"vae_decoder"}, ("tiles",), 0)
+    assert "also declares engine resources" in sequence_parallel_refusals(
+        [shard], "vae_decoder", 1, 2, sp_collective=True,
+    )[0]
+    assert sequence_parallel_refusals([], "vae_decoder", 1, 1, sp_collective=True) == []
+    assert "2 TP ranks" in sequence_parallel_refusals([], "vae_decoder", 2, 1, sp_collective=True)[0]
+    assert "2 TP ranks" in sequence_parallel_refusals([], "vae_decoder", 2, 2, sp_collective=True)[0]
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("fallback,batch", [
+    ("untiled", 1), ("too_few_tiles", 1), ("framewise", 1), ("sliced", 2),
+])
+def test_sp_fallback_decodes_only_on_leader(rank, fallback, batch, monkeypatch):
+    from mstar.model.ltx2_5 import submodules
+
+    decoder = LTXVideoDecoderSubmodule.__new__(LTXVideoDecoderSubmodule)
+    torch.nn.Module.__init__(decoder)
+    calls = []
+    x = torch.ones(batch, 1, 1, 3, 3)
+
+    def decode(z, *args, **kwargs):
+        calls.append(tuple(z.shape))
+        return (z,)
+
+    decoder.vae = SimpleNamespace(
+        dtype=torch.float32, latents_mean=torch.zeros(1), latents_std=torch.ones(1),
+        config=SimpleNamespace(scaling_factor=1.0), decode=decode,
+        use_framewise_decoding=fallback == "framewise", use_slicing=fallback == "sliced",
+        spatial_compression_ratio=2, tile_sample_min_height=4, tile_sample_min_width=4,
+        tile_sample_stride_height=8, tile_sample_stride_width=8,
+    )
+    decoder.comm_group = SimpleNamespace(rank=rank, world_size=2)
+    decoder.get_device = lambda: torch.device("cpu")
+    decoder._tiled = lambda shape: fallback != "untiled"
+    monkeypatch.setattr(submodules, "unpack_video", lambda latents, shape: latents)
+    out = decoder.run_batch(x, shape=None)
+    assert bool(out) is (rank == 0)
+    assert calls == ([tuple(x.shape)] if rank == 0 else [])
+
+
+def test_direct_too_few_tile_fallback_is_leader_only():
+    z = torch.ones(1, 1, 1, 2, 2)
+    calls = []
+    vae = SimpleNamespace(
+        spatial_compression_ratio=2,
+        tile_sample_min_height=8, tile_sample_min_width=8,
+        tile_sample_stride_height=8, tile_sample_stride_width=8,
+        decode=lambda *args, **kwargs: (calls.append(1) or z,),
+    )
+    assert distributed_tiled_decode(vae, z, SimpleNamespace(rank=1, world_size=2)) is None
+    assert calls == []
+    assert torch.equal(distributed_tiled_decode(vae, z, SimpleNamespace(rank=0, world_size=2)), z)
+    assert calls == [1]
+
+
 def test_opt_in_graph_replicates_latents_but_only_rank_zero_emits():
     model = LTX25Model(model_path_hf="test/ltx2_5", skip_weight_loading=True)
     model.set_config(LTX25Config())
     path = "configs/ltx2_5_sp2_tiled_vae.yaml"
     graphs = model.get_worker_graphs(path)
     sharding = model.get_sharding_config(path)
+    assert "vae_decoder" not in sharding.tp_enabled_nodes
+    parallel = GlobalParallelConfig(dict(enumerate(graphs)), ["worker_0", "worker_1"])
+    for rank in (0, 1):
+        groups = parallel.per_worker_config[f"worker_{rank}"]
+        vae = groups.get_joint_group_for_node("vae_decoder")
+        dit = groups.get_joint_group_for_node("dit")
+        assert vae.sp_group.world_size == dit.sp_group.world_size == 2
+        assert vae.tp_group.world_size == dit.tp_group.world_size == 1
+        assert model.submodule_comm_group("vae_decoder", vae) is vae.sp_group
+        assert model.submodule_comm_group("dit", dit) is dit.tp_group
     node_to_workers = {
         NodeAndGraphWalk(node, walk): [f"worker_{rank}" for rank in graph.ranks]
         for graph in graphs
@@ -147,15 +224,55 @@ def test_opt_in_graph_replicates_latents_but_only_rank_zero_emits():
     assert rank_one == []
 
 
+def test_sp_collective_refuses_tp_placement_at_startup(tmp_path):
+    model = LTX25Model(model_path_hf="test/ltx2_5", skip_weight_loading=True)
+    model.set_config(LTX25Config())
+    config = yaml.safe_load(Path("configs/ltx2_5_sp2_tiled_vae.yaml").read_text())
+    config["node_groups"][2].pop("sp_size")
+    config["node_groups"][2]["tp_size"] = 2
+    path = tmp_path / "bad-tp-vae.yaml"
+    path.write_text(yaml.safe_dump(config))
+    with pytest.raises(DeploymentError, match="not in tp_enabled_nodes"):
+        validate_deployment(model, config, str(path))
+
+
+def test_engine_rejects_sp_collective_on_tp_ranks():
+    class _NeverRuns(NodeSubmodule):
+        def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs):
+            raise AssertionError("not stepped")
+
+        def forward(self, graph_walk, engine_inputs, **kwargs):
+            raise AssertionError("not stepped")
+
+    graph = GraphNode(name="vae_decoder", input_names=[], outputs=[])
+    worker_graph = WorkerGraph(
+        section=graph, graph_walks={GENERATE_VIDEO_WALK}, ranks=[0, 1],
+        tp_size=2, worker_graph_id=0,
+    )
+    sharding = ShardingConfig(
+        groups=[ShardingGroup(nodes={"vae_decoder"}, tp_size=2)],
+        tp_enabled_nodes={"vae_decoder"}, shard_dim={},
+        sp_collective_nodes={"vae_decoder"},
+    )
+    model = LTX25Model(model_path_hf="test/ltx2_5", skip_weight_loading=True)
+    model.set_config(LTX25Config())
+    problems = check_worker_graphs(model, [worker_graph], sharding, [])
+    assert any("non-sequence SP collective but also runs on 2 TP ranks" in p for p in problems)
+    groups = GlobalParallelConfig({0: worker_graph}, ["worker_0", "worker_1"])
+    with pytest.raises(ValueError, match="non-sequence SP collective but also runs on 2 TP ranks"):
+        Engine(None, autocast_dtype=None).load_model(
+            {"vae_decoder": _NeverRuns()}, [], groups.per_worker_config["worker_0"],
+            torch.device("cpu"), transfer_engine_info=None,
+            sp_collective_nodes={"vae_decoder"},
+        )
+
+
 @pytest.mark.parametrize("rank", [0, 1])
 def test_follower_completes_worker_route_without_a_video_tensor(rank: int, tmp_path: Path):
     pytest.importorskip("mstar_rust")
     from rust_runtime import build_runtime
 
     from mstar.communication.tensors import SharedMemoryCommunicationManager
-    from mstar.distributed.base import ShardingConfig, ShardingGroup
-    from mstar.model.base import WorkerGraph
-
     worker = f"worker_{rank}"
     manager = SharedMemoryCommunicationManager(
         my_entity_id=worker, hostname="localhost", device="cpu",
@@ -171,7 +288,7 @@ def test_follower_completes_worker_route_without_a_video_tensor(rank: int, tmp_p
         bookkeeping=manager.tensor_store.bookkeeping, my_worker_id=worker,
         my_worker_graphs=[WorkerGraph(
             section=graph, graph_walks={GENERATE_VIDEO_WALK}, ranks=[0, 1],
-            tp_size=2, worker_graph_id=0,
+            sp_size=2, worker_graph_id=0,
         )],
         all_wg_ids_to_graph_walks={0: {GENERATE_VIDEO_WALK}},
         all_wg_ids_to_dyn_loops={0: set()},
@@ -179,7 +296,7 @@ def test_follower_completes_worker_route_without_a_video_tensor(rank: int, tmp_p
         node_to_partition={"vae_decoder": "default"},
         sharding_config=ShardingConfig(
             groups=[sharding_group],
-            tp_enabled_nodes={"vae_decoder"}, shard_dim={},
+            tp_enabled_nodes=set(), shard_dim={},
         ),
     )
     rid = runtime.add_request(

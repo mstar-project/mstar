@@ -749,6 +749,7 @@ class Engine:
         token_ladders: Mapping[str, Any] | None = None,
         region_ladders: Mapping[str, Any] | None = None,
         moe_parallel: "Mapping[str, MoeParallelConfig] | None" = None,
+        sp_collective_nodes: frozenset[str] | set[str] = frozenset(),
     ):
         """``token_ladders`` and ``region_ladders``: the serving config's
         ``prefill_token_buckets``, node -> capture walk -> ladder and node ->
@@ -783,6 +784,7 @@ class Engine:
             sp = group.sp_group.world_size
             refusals = sequence_parallel_refusals(
                 specs, node, group.tp_group.world_size, sp, (moe_parallel or {}).get(node),
+                sp_collective=node in sp_collective_nodes,
             )
             if refusals:
                 raise ValueError("; ".join(refusals))

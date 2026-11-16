@@ -37,7 +37,7 @@ def distributed_tiled_decode(vae, z: torch.Tensor, group: CommGroup) -> torch.Te
         for w in range(0, z.shape[-1], stride_w)
     ]
     if len(positions) < group.world_size:
-        return vae.decode(z, None, return_dict=False)[0]
+        return vae.decode(z, None, return_dict=False)[0] if group.rank == 0 else None
 
     local_tiles = [
         (idx, vae.decoder(z[:, :, :, h:h + tile_h, w:w + tile_w], None, causal=None))
