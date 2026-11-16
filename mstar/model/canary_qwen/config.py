@@ -11,13 +11,14 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from mstar.model import keys
 from mstar.model.components.audio_features import check_nemo_preprocessor
 from mstar.model.components.fastconformer import FastConformerConfig
 from mstar.model.components.qwen3_lm import Qwen3LMConfig
 
-KV_CACHE = "kv_cache"
+KV_CACHE = keys.KV_CACHE
 ATTN = "attn"
-SAMPLER = "sampler"
+SAMPLER = keys.SAMPLER
 DECODE_WALK = "decode"
 DECODE_LOOP = "decode_loop"
 

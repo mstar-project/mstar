@@ -4,6 +4,7 @@ The contract freezes that one surface, so a ported model that also imports a res
 engine's inputs, can break with no contract change, and later PRs can't move what it reached for. Nothing at run time
 would notice, so this reads each package's source. The base classes are the bridge, so they aren't read. Each exception
 says why it stands or which PR deletes it, and an exception nothing uses any more fails too, so the list only shrinks.
+A scaffold node takes its handle calls from `DeclaredTokenDecoder` rather than writing them again.
 
 A package that isn't ported has to be on the frozen list of those that predate this rule, so a new model arrives on
 the contract. ``MODEL_REGISTRY`` loads a model only from a listed package, and from one module per unported package,
@@ -28,7 +29,7 @@ PORTED = (
     "mstar/model/qwen3_5", "mstar/model/command_a_plus", "mstar/model/wan22", "mstar/model/flux2_klein",
     "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/minimax_h3",
     "mstar/model/kokoro", "mstar/model/omnilingual_asr", "mstar/model/omnivoice", "mstar/model/orpheus",
-    "mstar/model/voxcpm2",
+    "mstar/model/higgs_audio", "mstar/model/voxcpm2",
     "mstar/model/canary_qwen", "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
     "mstar/model/qwen3_tts",
     "mstar/model/pi05", "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
@@ -41,7 +42,7 @@ PORTED = (
 # The list only shrinks: a package leaves it when its port lands, and nothing is added to it.
 UNPORTED = (
     "mstar/model/cosmos3", "mstar/model/cosyvoice3", "mstar/model/glm52", "mstar/model/glm5_next",
-    "mstar/model/higgs_audio", "mstar/model/minicpm_o", "mstar/model/muse", "mstar/model/ripple",
+    "mstar/model/minicpm_o", "mstar/model/muse", "mstar/model/ripple",
 )
 # shared code under mstar/model/ that holds no model
 SHARED = ("mstar/model/components", "mstar/model/loader")
@@ -150,6 +151,14 @@ CONTRACT_RESOURCE_IMPORTS = {
     ("mstar.engine.resources.step", "Segment"),
 }
 
+_HOOKS = frozenset({
+    "bind_state", "node_step", "next_position", "loopback_tokens", "last_token_hidden", "sample_tokens",
+})
+# The handle hooks a ported scaffold node still writes itself, by file, class and method.
+OWN_HOOKS = {
+    ("mstar/model/qwen3_5/submodules.py", "LLMSubmodule", "node_step"): "the GDN state's step, beside the KV cache's",
+}
+
 
 def _in_functions(node: ast.AST, prefix: str = "", function: str | None = None):
     """Each node under ``node``, with the qualified name of the function it lies in, decorators included, or None."""
@@ -211,6 +220,50 @@ def _violations(source: str, path: str = "") -> tuple[list[str], set[tuple[str, 
             found.append(f".{node.attr} at line {node.lineno}")
         elif breaks:
             found.append(f"torch.compiler.disable at line {node.lineno}, where the state calls hold the graph breaks")
+    return found, used
+
+
+def _bases(sources: list[Path]) -> dict[str, set[str]]:
+    """The bases of each class ``sources`` define, by name, joined where two files define one name."""
+    bases: dict[str, set[str]] = {}
+    for path in sources:
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ClassDef):
+                bases.setdefault(node.name, set()).update(ast.unparse(base).rsplit(".", 1)[-1] for base in node.bases)
+    return bases
+
+
+def _descendants(bases: dict[str, set[str]], root: str) -> set[str]:
+    """``root`` and the classes in ``bases`` that descend from it."""
+    found = {root}
+    while grown := {name for name, of in bases.items() if name not in found and of & found}:
+        found |= grown
+    return found
+
+
+def _hook_violations(
+    source: str, path: str, bases: dict[str, set[str]],
+) -> tuple[list[str], set[tuple[str, str, str]]]:
+    """The handle hooks a scaffold node in ``source``, the file at ``path``, writes itself, and the exceptions used.
+    ``bases`` gives the bases of the classes the ported files define, so a node under a ported scaffold node counts
+    too."""
+    found, used = [], set()
+    declared = _descendants(bases, "DeclaredTokenDecoder")
+    sampled = _descendants(bases, "SampledTokenDecoder") | declared
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        own = {ast.unparse(base).rsplit(".", 1)[-1] for base in node.bases}
+        if not own & sampled:
+            continue
+        if not own & declared:
+            found.append(f"{node.name} subclasses SampledTokenDecoder")
+        for item in node.body:
+            if isinstance(item, ast.FunctionDef) and item.name in _HOOKS:
+                if (path, node.name, item.name) in OWN_HOOKS:
+                    used.add((path, node.name, item.name))
+                else:
+                    found.append(f"{node.name}.{item.name} at line {item.lineno}")
     return found, used
 
 
@@ -293,6 +346,24 @@ def test_a_ported_package_reaches_the_engine_only_through_the_contract(path):
         "can't avoid goes in ALLOWED with its reason, and state the contract can't declare yet needs its mask or op "
         "and binding in adapters.py first, not a spec returned from `get_node_resources`."
     )
+
+
+def test_a_ported_scaffold_node_writes_no_handle_hook_itself():
+    found, used = [], set()
+    bases = _bases(_sources())
+    for path in _sources():
+        in_file, used_in_file = _hook_violations(path.read_text(), str(path), bases)
+        found += [f"{path}: {violation}" for violation in in_file]
+        used |= used_in_file
+    assert not found, f"these repeat DeclaredTokenDecoder's handle calls: {found}"
+    assert OWN_HOOKS.keys() <= used, f"delete these exceptions: {sorted(OWN_HOOKS.keys() - used)}"
+
+
+def test_a_node_under_a_ported_scaffold_node_is_checked_too():
+    source = "class CanaryDecoderSubmodule(EncoderDecoderNode):\n    def node_step(self):\n        pass\n"
+    bases = {"EncoderDecoderNode": {"DeclaredTokenDecoder"}, "CanaryDecoderSubmodule": {"EncoderDecoderNode"}}
+    found, _ = _hook_violations(source, "x.py", bases)
+    assert found == ["CanaryDecoderSubmodule.node_step at line 2"], "a hook under EncoderDecoderNode would pass"
 
 
 @pytest.mark.parametrize("entry", PORTED)
@@ -424,8 +495,10 @@ def test_an_exception_covers_only_its_own_functions_attribute(path, source, foun
     assert _violations(source, path) == (found, used)
 
 
-def test_the_lint_reads_the_five_speech_packages():
-    assert {path.parts[2] for path in _sources()} >= {"kokoro", "omnilingual_asr", "omnivoice", "orpheus", "voxcpm2"}
+def test_the_lint_reads_the_six_speech_packages():
+    assert {path.parts[2] for path in _sources()} >= {
+        "kokoro", "omnilingual_asr", "omnivoice", "orpheus", "higgs_audio", "voxcpm2",
+    }
 
 
 def test_the_lint_reads_all_five_reference_packages():
