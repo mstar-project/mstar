@@ -77,7 +77,7 @@ class StoredOutputs(NamedTuple):
 class FutureAndPointers:
     future: Future | None
     graph_edges: list[GraphEdge]
-    request_id: Rid = ""
+    request_id: Rid = 0
     rx_time: float | None = None # seconds
     # uuids of the local buffers this read writes into
     transfer_uuids: list[int] = field(default_factory=list)

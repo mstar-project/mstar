@@ -116,7 +116,7 @@ def _tensor_info(uuid):
     )
 
 
-def _admit(runtime, request_id="r1", walk=WALK):
+def _admit(runtime, request_id=101, walk=WALK):
     return runtime.add_request(
         request_id=request_id, partition="default", graph_walk=walk,
         partition_worker_graph_ids=[WG_ID],
@@ -157,9 +157,9 @@ def test_async_schedulability_crosses(runtime):
 
 def test_a_handle_round_trips(runtime):
     rid = _admit(runtime)
-    assert runtime.get_rid_handle("r1") == rid
-    assert runtime.get_rid_string(rid) == "r1"
-    assert runtime.get_rid_handle("never-seen") is None
+    assert runtime.get_rid_handle(101) == rid
+    assert runtime.get_rid_string(rid) == 101
+    assert runtime.get_rid_handle(999) is None
 
 
 def test_admitting_the_same_request_twice_reuses_the_handle(runtime):
@@ -169,19 +169,19 @@ def test_admitting_the_same_request_twice_reuses_the_handle(runtime):
 
 
 def test_removal_frees_the_handle_for_reuse(runtime):
-    rid = _admit(runtime, "r1")
+    rid = _admit(runtime, 101)
     runtime.remove_request(rid)
-    assert runtime.get_rid_handle("r1") is None
+    assert runtime.get_rid_handle(101) is None
     # Recycled, which is why teardown has to be complete.
-    assert _admit(runtime, "r2") == rid
-    assert runtime.get_rid_string(rid) == "r2"
+    assert _admit(runtime, 102) == rid
+    assert runtime.get_rid_string(rid) == 102
 
 
 def test_removing_twice_is_idempotent(runtime):
     rid = _admit(runtime)
     runtime.remove_request(rid)
     runtime.remove_request(rid)
-    assert runtime.get_rid_handle("r1") is None
+    assert runtime.get_rid_handle(101) is None
 
 
 # --- per-request state -------------------------------------------------------
@@ -526,8 +526,8 @@ def test_pop_returns_the_inputs_it_popped(runtime):
 
 def test_pop_with_check_ready_is_all_or_nothing(runtime):
     # One not-ready rid must leave the whole set intact for a later retry.
-    a = _admit(runtime, "ra")
-    b = _admit(runtime, "rb")
+    a = _admit(runtime, 201)
+    b = _admit(runtime, 202)
     runtime.ingest_inputs_batch(_ingest_block([a], [_spec("prompt", "prefill")]))
 
     assert runtime.pop_rids("prefill", WALK, [a, b], check_ready=True) is None
@@ -705,8 +705,8 @@ def test_prep_skips_a_rid_whose_other_input_has_not_arrived():
 
 def test_the_follower_prep_is_all_or_nothing():
     rt = _two_node_runtime()
-    ready = _admit(rt, "ra")
-    blank = _admit(rt, "rb")
+    ready = _admit(rt, 201)
+    blank = _admit(rt, 202)
     rt.ingest_inputs_batch(_ingest_block([ready], [_spec("y", "b")]))
 
     # The leader's best-effort prep takes the one that is ready...
@@ -720,8 +720,8 @@ def test_a_failed_follower_prep_leaves_no_ingest_behind():
     its chunks pulled back out, or they are stranded in a node that never ran.
     """
     rt = _two_node_runtime()
-    ready = _admit(rt, "ra")
-    blank = _admit(rt, "rb")
+    ready = _admit(rt, 201)
+    blank = _admit(rt, 202)
     rt.ingest_inputs_batch(_ingest_block([ready], [_spec("y", "b")]))
 
     assert rt.prep_follow_spec_rids(_ab([ready, blank])) is None
@@ -731,8 +731,8 @@ def test_a_failed_follower_prep_leaves_no_ingest_behind():
 
 def test_the_follower_prep_succeeds_when_every_rid_is_ready():
     rt = _two_node_runtime()
-    a = _admit(rt, "ra")
-    b = _admit(rt, "rb")
+    a = _admit(rt, 201)
+    b = _admit(rt, 202)
     for r in (a, b):
         rt.ingest_inputs_batch(_ingest_block([r], [_spec("y", "b")]))
     out = rt.prep_follow_spec_rids(_ab([a, b]))
@@ -742,8 +742,8 @@ def test_the_follower_prep_succeeds_when_every_rid_is_ready():
 
 def test_prep_room_cap_applies_before_any_ingest():
     rt = _two_node_runtime()
-    a = _admit(rt, "ra")
-    b = _admit(rt, "rb")
+    a = _admit(rt, 201)
+    b = _admit(rt, 202)
     for r in (a, b):
         rt.ingest_inputs_batch(_ingest_block([r], [_spec("y", "b")]))
     assert rt.prep_spec_rids(_ab([a, b], room=1)).ready_rids == [a]
@@ -773,8 +773,8 @@ def _route(runtime, rids, node, signals, per_rid_uuids, walk=WALK):
 def test_routing_decodes_the_flat_rid_major_layout(runtime):
     """num_tensors is indexed [rid_i * n_signals + signal_i]. Getting that
     wrong attaches one rid's tensors to another's edges, silently."""
-    a = _admit(runtime, "ra")
-    b = _admit(runtime, "rb")
+    a = _admit(runtime, 201)
+    b = _admit(runtime, 202)
     for r in (a, b):
         runtime.ingest_inputs_batch(_ingest_block([r], [_spec("prompt", "prefill")]))
         runtime.pop_rids("prefill", WALK, [r])
@@ -1040,7 +1040,7 @@ def test_inline_values_route_per_row():
     """A row with a value rides inline while a row with None takes the tensor
     path in the same step, rather than the step taking one path for all."""
     rt = _client_loop_runtime()
-    rids = [_admit(rt, "r1"), _admit(rt, "r2")]
+    rids = [_admit(rt, 101), _admit(rt, 102)]
     rt._communicator = _Recorder()
     for rid, uuid in zip(rids, (210, 211), strict=True):
         _reach_dec(rt, rid, uuid)

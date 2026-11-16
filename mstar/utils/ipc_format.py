@@ -52,7 +52,7 @@ class WorkerMessageType(Enum):
 
 @dataclass
 class NewRequest(MessageBody):
-    request_id: str
+    request_id: int
     partition_worker_graph_ids: list[int]
     worker_graph_to_workers: dict[int, list[str]]
     initial_inputs: list[GraphEdge]
@@ -67,7 +67,7 @@ class MessageSource(IntEnum):
 
 @dataclass
 class RemoveRequest(MessageBody):
-    request_id: str
+    request_id: int
     source: int = MessageSource.CONDUCTOR
     # Rank 0 forwarding a removal to its followers stamps the last step it had
     # broadcast, so they tear the request down at the same point in the step
@@ -81,13 +81,13 @@ class DrainRequest(MessageBody):
     # read of it is in flight, starting none after (the data worker also stops
     # reading its results and sending its client stream items). Hard cleanup
     # (RemoveRequest) follows once every reader has ACKed.
-    request_id: str
+    request_id: int
     source: int = MessageSource.CONDUCTOR
 
 
 @dataclass
 class InputSignals(MessageBody):
-    request_id: str
+    request_id: int
     inputs: list[GraphEdge]
     # None for a signal with no non-streaming input, which reads none
     request_info: CurrentForwardPassInfo | None
@@ -123,7 +123,7 @@ class EdgeItems(MessageBody):
     # signal, node, walk and arena segment names the columns index
     names: list[str] = field(default_factory=list)
     # per row
-    request_ids: list[str] = field(default_factory=list)
+    request_ids: list[int] = field(default_factory=list)
     signal_idx: list[int] = field(default_factory=list)
     next_node_idx: list[int] = field(default_factory=list)
     walk_idx: list[int] = field(default_factory=list)
@@ -147,7 +147,7 @@ class EdgeItems(MessageBody):
     values: list[int] = field(default_factory=list)
 
     @property
-    def request_id(self) -> str | None:
+    def request_id(self) -> int | None:
         """The request of a one-row frame (one parked for a request that has
         not arrived), None for a frame of several."""
         return self.request_ids[0] if len(self.request_ids) == 1 else None
@@ -163,7 +163,7 @@ class TensorReceived(MessageBody):
 
 @dataclass
 class UnpersistTensors(MessageBody):
-    request_id: str
+    request_id: int
     uuid_to_ref_count: dict[int, int]
 
 
@@ -173,7 +173,7 @@ class ClientStreamRoute(MessageBody):
     request's client streams, where each one goes: once at dispatch, and
     again with no ranks for a stream whose consuming partition has ended,
     which then takes no more items."""
-    request_id: str
+    request_id: int
     # client stream edge -> the consuming node's ranks for this request
     workers: dict[str, list[str]]
     # client stream edge -> that node, from the walks as the deployment shaped
@@ -183,21 +183,21 @@ class ClientStreamRoute(MessageBody):
 
 @dataclass
 class StopLoops(MessageBody):
-    request_id: str
+    request_id: int
     loop_names: set[str]
     partition_name: str
     loop_stop_times: dict[str, NestedLoopIndices] = field(default_factory=dict)
 
 
 class Move(NamedTuple):
-    rid: str
+    rid: int
     kind: MoveKind
     # A move applies to the KV resource keyed `pool`, or, when `pool` is empty, to the whole of node `node`.
     # `count` is the number of pages of a RESERVE, an EARMARK or an ALLOT, the pages a GUARANTEE or a WAIT asks for,
     # 1 for an UNRESERVE whose RESERVE made the allotment rather than grew it, and the tokens a DROP's rebuild writes.
     pool: str = ""
     count: int = 0
-    victims: tuple[str, ...] = ()
+    victims: tuple[int, ...] = ()
     node: str = ""
 
 
@@ -222,11 +222,11 @@ class OffloadDelta:
     """
 
     # parallel lists, one entry per `Move`
-    rids: list[str] = field(default_factory=list)
+    rids: list[int] = field(default_factory=list)
     kinds: list[MoveKind] = field(default_factory=list)
     pools: list[str] = field(default_factory=list)
     counts: list[int] = field(default_factory=list)
-    victims: list[list[str]] = field(default_factory=list)
+    victims: list[list[int]] = field(default_factory=list)
     nodes: list[str] = field(default_factory=list)
 
     @classmethod
@@ -234,7 +234,7 @@ class OffloadDelta:
         return cls()
 
     def add(
-        self, kind: MoveKind, rid: str, pool: str = "", count: int = 0, victims: Sequence[str] = (), node: str = "",
+        self, kind: MoveKind, rid: int, pool: str = "", count: int = 0, victims: Sequence[int] = (), node: str = "",
         at: int | None = None,
     ):
         """Append the move, or put it ahead of the moves from index ``at`` on."""
@@ -246,7 +246,7 @@ class OffloadDelta:
         self.victims.insert(at, list(victims))
         self.nodes.insert(at, node)
 
-    def cancel(self, rid: str, kind: MoveKind, pool: str) -> bool:
+    def cancel(self, rid: int, kind: MoveKind, pool: str) -> bool:
         """Drop the last move if it is ``kind`` on ``rid`` in ``pool`` and moves no victims, and return whether a move
         was dropped."""
         if not (self.rids and (self.rids[-1], self.kinds[-1], self.pools[-1]) == (rid, kind, pool)) or self.victims[-1]:
@@ -307,7 +307,7 @@ class OffloadDelta:
 class ScheduleTPNode(MessageBody):
     node_name: str
     graph_walk: str
-    request_ids: list[str]
+    request_ids: list[int]
     speculative: bool = False
     spec_seq: int = -1
     spec_from_seq: int = -1
@@ -317,8 +317,8 @@ class ScheduleTPNode(MessageBody):
     walks: list[str] = field(default_factory=list)
     walk_idx: list[int] = field(default_factory=list)
     # rank 0's prefix-cache leases, by wire request id and then resource
-    prefix_hits: dict[str, dict[str, CachedLease]] = field(default_factory=dict)
-    page_trails: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    prefix_hits: dict[int, dict[str, CachedLease]] = field(default_factory=dict)
+    page_trails: dict[int, tuple[int, ...]] = field(default_factory=dict)
     # A row of the step takes an input a follower reads from elsewhere: every
     # rank agrees on whose read failed before preparing the step
     read_check: bool = False
@@ -365,15 +365,15 @@ class ConductorMessageType(Enum):
 
 @dataclass
 class NewRequestConductor(MessageBody):
-    request_id: str
+    request_id: int
     initial_signals: dict[str, list[TensorPointerInfo]]
     initial_input_modalities: list[str]
     initial_output_modalities: list[str]
     input_metadata: dict[str, list[dict]]
     model_kwargs: dict
-    # The client's request_id. ``request_id`` is the API server's key for this
-    # one submission, never reused; the seed still derives from the client's.
-    client_request_id: str | None = None
+    # The API server derives this from the client's ID before it enters the
+    # conductor; an explicit model seed still takes precedence.
+    fallback_seed: int = 0
     # A client stream the opening leaves open: a live call, which is refused
     # rather than queued at max_concurrent_requests.
     input_open: bool = False
@@ -384,7 +384,7 @@ class NewRequestConductor(MessageBody):
 
 @dataclass
 class WorkerGraphsDone(MessageBody):
-    request_id: str
+    request_id: int
     worker_graph_ids: list[int]
     is_first_tp_rank: bool
     persist_signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
@@ -412,14 +412,14 @@ class SetupDone(MessageBody):
 
 @dataclass
 class AbortRequest(MessageBody):
-    request_id: str
+    request_id: int
 
 
 @dataclass
 class ReadsDone(MessageBody):
     """An entity confirming it has no in-flight reads for a request and will
     start none — the conductor's gate before sending the hard RemoveRequest."""
-    request_id: str
+    request_id: int
     entity_id: str
 
 
@@ -432,7 +432,7 @@ class FailRequests(MessageBody):
     postprocess) attribute a distinct error to each request, and one
     step can fail several of them for different reasons.
     """
-    errors: dict[str, str]
+    errors: dict[int, str]
 
 
 @dataclass

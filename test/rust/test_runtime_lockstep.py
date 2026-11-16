@@ -125,7 +125,7 @@ class Script:
         self.workers = {None: [WORKER], 0: [WORKER, PEER], 1: [PEER, WORKER]}[tp_rank]
 
     # -- operations ---------------------------------------------------------
-    def admit(self, rid_str="r1"):
+    def admit(self, rid_str=101):
         return self.rt.add_request(
             request_id=rid_str, partition="default", graph_walk=WALK,
             partition_worker_graph_ids=[WG_ID],

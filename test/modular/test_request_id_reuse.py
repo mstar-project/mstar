@@ -41,7 +41,6 @@ from mstar.communication.event import EventWakeup
 from mstar.testing_utils.model import StubModel
 from mstar.utils.ipc_format import (
     ConductorMessageType,
-    NewRequestConductor,
     ReadsDone,
     RemoveRequest,
     WorkerMessage,
@@ -398,19 +397,42 @@ def test_the_older_request_s_release_does_not_release_the_reuse(rig):
 
 
 def test_the_seed_still_derives_from_the_client_request_id(rig):
-    from mstar.conductor.conductor import _req_id_to_seed, _request_seed, _seed_id
+    from mstar.conductor.conductor import _request_seed
+    from mstar.utils.request_ids import client_id_seed
 
     first = rig.submit("first")
     rig.server.abort_request("X")
     second = rig.submit("second")
 
     assert first.request_id != second.request_id
-    assert first.client_request_id == second.client_request_id == "X"
-    assert _request_seed({}, _seed_id(second)) == _req_id_to_seed("X")
+    assert first.fallback_seed == second.fallback_seed == client_id_seed("X")
+    assert _request_seed({}, second.fallback_seed) == client_id_seed("X")
+
+
+def test_internal_ids_use_a_random_launch_prefix_and_monotonic_counter(monkeypatch):
+    monkeypatch.setattr(entrypoint.secrets, "randbelow", lambda n: 6)
+    pw = _PreprocessWorker()
+    s = _api_server(pw)
+    s.submit_request(text="first", request_id="X", **TEXT)
+    s.abort_request("X")
+    s.submit_request(text="second", request_id="X", **TEXT)
+    assert [inp.request_id for inp in pw.inputs] == [(7 << 32) | 1, (7 << 32) | 2]
+    assert all(type(inp.request_id) is int for inp in pw.inputs)
+
+
+def test_internal_id_counter_does_not_wrap(monkeypatch):
+    monkeypatch.setattr(entrypoint.secrets, "randbelow", lambda n: 0)
+    pw = _PreprocessWorker()
+    s = _api_server(pw)
+    s._generation = iter([1 << 32])
+    with pytest.raises(HTTPException) as exc:
+        s.submit_request(text="too many", request_id="X", **TEXT)
+    assert exc.value.status_code == 503
+    assert not s.pending_requests and not s._live and not pw.inputs
 
 
 def test_an_empty_pinned_request_id_keeps_its_seed():
-    from mstar.conductor.conductor import _req_id_to_seed, _seed_id
+    from mstar.utils.request_ids import client_id_seed
 
     pw = _PreprocessWorker()
     s = _api_server(pw)
@@ -418,19 +440,8 @@ def test_an_empty_pinned_request_id_keeps_its_seed():
     s.abort_request("")
     s.submit_request(text="second", request_id="", **TEXT)
 
-    seeds = {
-        _req_id_to_seed(_seed_id(NewRequestConductor(
-            request_id=inp.request_id,
-            initial_signals={},
-            initial_input_modalities=["text"],
-            initial_output_modalities=["text"],
-            input_metadata={},
-            model_kwargs={},
-            client_request_id=inp.client_request_id,
-        )))
-        for inp in pw.inputs
-    }
-    assert seeds == {_req_id_to_seed("")}
+    seeds = {inp.fallback_seed for inp in pw.inputs}
+    assert seeds == {client_id_seed("")}
 
 
 def _run_message_thread(s, pw, chunks=(), messages=(), until=lambda: True):
@@ -494,6 +505,16 @@ def test_an_error_that_names_the_key_reaches_the_client_under_its_own_id(source)
         asyncio.run(s.collect_results("X"))
     assert (failed.value.status_code, failed.value.detail) == (
         400, "request X: min_p must be in [0, 1]",
+    )
+
+
+def test_client_error_mapping_does_not_rewrite_a_different_number():
+    from mstar.api_server.entrypoint import _client_text
+
+    key = (1 << 62) | 7
+    text = f"request {key}: bad input; nearby values {key + 1} and 9{key}4"
+    assert _client_text(text, key, "client-id") == (
+        f"request client-id: bad input; nearby values {key + 1} and 9{key}4"
     )
 
 

@@ -235,7 +235,7 @@ fn str_counts(out: &mut Vec<u8>, pairs: &[(String, i64)]) {
 /// Everything one WORKER_GRAPHS_DONE carries. The `*_encoded` fields are
 /// Python's and ride through untouched.
 pub struct WorkerGraphsDone<'a> {
-    pub request_id: &'a str,
+    pub request_id: i64,
     pub worker_graph_ids: &'a [u32],
     pub is_first_tp_rank: bool,
     pub persist_signals: Vec<(Sym, Vec<TensorPointerInfo>)>,
@@ -257,7 +257,7 @@ pub struct WorkerGraphsDone<'a> {
 impl WorkerGraphsDone<'_> {
     fn body(&self, out: &mut Vec<u8>, it: &StrToId, bk: &StrToId) {
         w_map_counted(out, |m| {
-            w_str(m.key("request_id"), self.request_id);
+            w_i64(m.key("request_id"), self.request_id);
             w_arr(m.key("worker_graph_ids"), self.worker_graph_ids.len() as u32);
             for &w in self.worker_graph_ids {
                 w_u64(m.buf(), w as u64);
@@ -367,7 +367,7 @@ pub struct OutEdge {
 /// is per edge, and a worker taking several of a request's signals should see
 /// one message.
 pub struct InputSignals<'a> {
-    pub request_id: &'a str,
+    pub request_id: i64,
     pub partition_name: &'a str,
     pub edges: &'a [OutEdge],
     /// `CurrentForwardPassInfo`, encoded by Python. Required with no default,
@@ -381,7 +381,7 @@ impl InputSignals<'_> {
         open_frame(&mut out, "worker_msg", "input_signals",
                    Some("input_signals"));
         w_map_counted(&mut out, |m| {
-            w_str(m.key("request_id"), self.request_id);
+            w_i64(m.key("request_id"), self.request_id);
             w_arr(m.key("inputs"), self.edges.len() as u32);
             for e in self.edges {
                 graph_edge(
@@ -419,7 +419,7 @@ pub struct EdgeItems {
     name_at: FxHashMap<String, i64>,
     dtype_names: Vec<String>,
     dtype_at: FxHashMap<Sym, i64>,
-    request_ids: Vec<String>,
+    request_ids: Vec<i64>,
     signal_idx: Vec<i64>,
     next_node_idx: Vec<i64>,
     walk_idx: Vec<i64>,
@@ -476,7 +476,7 @@ impl EdgeItems {
     /// nothing, when its descriptors don't share the frame's fields (or
     /// each other's walk).
     pub fn try_add(
-        &mut self, bk: &StrToId, request_id: &str, signal: &str, next_node: &str,
+        &mut self, bk: &StrToId, request_id: i64, signal: &str, next_node: &str,
         infos: &[TensorPointerInfo],
     ) -> bool {
         let Some(first) = infos.first() else { return false };
@@ -500,7 +500,7 @@ impl EdgeItems {
         // only once the row is taken, as the Python builder: a refused first
         // row mustn't fix the frame's fields for the rows after it
         self.shared = Some(shared);
-        self.request_ids.push(request_id.to_string());
+        self.request_ids.push(request_id);
         let sig = self.name_idx(signal);
         self.signal_idx.push(sig);
         let node = self.name_idx(next_node);
@@ -533,7 +533,7 @@ impl EdgeItems {
     /// of descriptors (a token off the producer's stop check). False, adding
     /// nothing, when the frame holds descriptor rows or another producer's.
     pub fn try_add_values(
-        &mut self, request_id: &str, signal: &str, next_node: &str, walk: Option<&str>,
+        &mut self, request_id: i64, signal: &str, next_node: &str, walk: Option<&str>,
         values: &[i64], source: (&str, &str, Option<&str>, u32, u32),
     ) -> bool {
         if self.shared.is_some() {
@@ -548,7 +548,7 @@ impl EdgeItems {
             Some(_) => {}
             None => self.value_source = Some(src),
         }
-        self.request_ids.push(request_id.to_string());
+        self.request_ids.push(request_id);
         let sig = self.name_idx(signal);
         self.signal_idx.push(sig);
         let node = self.name_idx(next_node);
@@ -600,7 +600,7 @@ impl EdgeItems {
             w_u64(m.key("tp_size"), tp_size as u64);
             w_u64(m.key("tp_rank"), tp_rank as u64);
             strs(m.key("names"), &self.names);
-            strs(m.key("request_ids"), &self.request_ids);
+            ints(m.key("request_ids"), &self.request_ids);
             ints(m.key("signal_idx"), &self.signal_idx);
             ints(m.key("next_node_idx"), &self.next_node_idx);
             ints(m.key("walk_idx"), &self.walk_idx);
@@ -627,7 +627,7 @@ impl EdgeItems {
 
 /// One emitted output to the api server.
 pub struct ResultTensors<'a> {
-    pub request_id: &'a str,
+    pub request_id: i64,
     pub modality: &'a str,
     pub signal: &'a str,
     pub infos: Vec<TensorPointerInfo>,
@@ -643,7 +643,7 @@ impl ResultTensors<'_> {
         // abstract one, so the body rides untagged.
         open_frame(&mut out, "api_msg", "result_tensors", None);
         w_map_counted(&mut out, |m| {
-            w_str(m.key("request_id"), self.request_id);
+            w_i64(m.key("request_id"), self.request_id);
             w_str(m.key("modality"), self.modality);
             graph_edge(
                 m.key("graph_edge"), bk, self.signal, EMIT_TO_CLIENT,
@@ -673,7 +673,7 @@ impl ResultTensors<'_> {
 /// One step's inline emits to the api server: every request's value in one
 /// frame, where ResultTensors was one frame (and one tensor) per request.
 pub struct ResultTokens<'a> {
-    pub request_ids: &'a [String],
+    pub request_ids: &'a [i64],
     pub values: &'a [i64],
     pub loop_indices: &'a [Option<(Vec<Sym>, Vec<(Sym, u32)>, u32)>],
     pub signal: &'a str,
@@ -691,7 +691,7 @@ impl ResultTokens<'_> {
         w_map_counted(&mut out, |m| {
             w_arr(m.key("request_ids"), self.request_ids.len() as u32);
             for r in self.request_ids {
-                w_str(m.buf(), r);
+                w_i64(m.buf(), *r);
             }
             w_arr(m.key("values"), self.values.len() as u32);
             for &v in self.values {
@@ -750,7 +750,7 @@ fn open_frame(
 /// STOP_LOOPS to a peer worker: which loops ended, and the loop context each
 /// was observed to end at.
 pub struct StopLoops<'a> {
-    pub request_id: &'a str,
+    pub request_id: i64,
     pub partition_name: &'a str,
     pub loop_names: &'a [String],
     pub loop_stop_times: Vec<(Sym, (Vec<Sym>, Vec<(Sym, u32)>, u32))>,
@@ -761,7 +761,7 @@ impl StopLoops<'_> {
         let mut out = Vec::with_capacity(128);
         open_frame(&mut out, "worker_msg", "stop_loops", Some("stop_loops"));
         w_map_counted(&mut out, |m| {
-            w_str(m.key("request_id"), self.request_id);
+            w_i64(m.key("request_id"), self.request_id);
             // A set, which msgpack cannot express; the codec sends a list and
             // rebuilds it.
             w_arr(m.key("loop_names"), self.loop_names.len() as u32);
@@ -782,6 +782,23 @@ impl StopLoops<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn python_uint64_msgpack_decodes_as_positive_i64_request_id() {
+        #[derive(serde::Deserialize)]
+        struct IdFrame {
+            request_id: i64,
+        }
+
+        // msgpack.packb({"request_id": (1 << 63) - 8}) in Python emits a
+        // uint64 marker even though the value fits a signed i64.
+        let python_frame = [
+            0x81, 0xaa, b'r', b'e', b'q', b'u', b'e', b's', b't', b'_', b'i', b'd',
+            0xcf, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf8,
+        ];
+        let frame: IdFrame = rmp_serde::from_slice(&python_frame).unwrap();
+        assert_eq!(frame.request_id, i64::MAX - 7);
+    }
 
     /// The whole point of `w_map_counted`: the length comes from the writes.
     #[test]
@@ -820,10 +837,10 @@ mod tests {
         let other = [info(&mut bk, "w1", "a")];
         let first = [info(&mut bk, "w0", "a")];
         let mut frame = EdgeItems::new("p");
-        assert!(!frame.try_add(&bk, "r1", "s", "n", &mixed));
+        assert!(!frame.try_add(&bk, 1, "s", "n", &mixed));
         assert!(frame.is_empty());
-        assert!(frame.try_add(&bk, "r2", "s", "n", &other));
-        assert!(!frame.try_add(&bk, "r3", "s", "n", &first));
+        assert!(frame.try_add(&bk, 2, "s", "n", &other));
+        assert!(!frame.try_add(&bk, 3, "s", "n", &first));
     }
 
     /// A nested counted map must not disturb its parent's count.

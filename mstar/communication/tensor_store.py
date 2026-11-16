@@ -30,7 +30,7 @@ NameToTensorList = dict[str, list[torch.Tensor]]
 # preprocess workers never did and still pass the string id. Both work: the id
 # is an opaque dict key here, never arithmetic, and it reaches the bookkeeper --
 # the half that is actually typed -- not at all.
-Rid = int | str
+Rid = int
 
 
 @dataclass

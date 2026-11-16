@@ -11,6 +11,7 @@ import math
 import multiprocessing as mp
 import os
 import re
+import secrets
 import signal
 import subprocess
 import sys
@@ -83,6 +84,7 @@ from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
 from mstar.utils.logging_config import REQUEST_LOGGER, configure_request_log, log_off_thread, quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
+from mstar.utils.request_ids import client_id_seed
 from mstar.utils.socket_prefix import per_port_socket_prefix
 from mstar.utils.threads import Thread, pin_thread
 from mstar.validation import positive_int
@@ -304,11 +306,15 @@ DUPLICATE_ID_GRACE_S = 0.5
 DISCONNECT_CHECK_S = 0.1
 
 
-def _client_text(text: str, key: str, request_id: str | None) -> str:
-    """``text`` with the submission key ``key`` (``<request_id>#<n>``) shown
+def _client_text(text: str, key: int, request_id: str | None) -> str:
+    """``text`` with the internal submission key ``key`` shown
     as the client's ``request_id``: engine and data-worker errors can name
     the key, which the client never sent."""
-    return text if request_id is None else text.replace(key, request_id)
+    if request_id is None:
+        return text
+    # A key can be a substring of an unrelated number in the error detail.
+    # Rewrite only a complete decimal token.
+    return re.sub(rf"(?<![0-9]){key}(?![0-9])", lambda _: request_id, text)
 
 
 def _until_error(chunks: list[ResultChunk]) -> tuple[list[ResultChunk], bool]:
@@ -659,18 +665,19 @@ class APIServer:
         """
         # Concurrent request tracking, keyed by each submission's internal key
         # (see submit_request), which is what the engine knows the request by.
-        self.pending_requests: dict[str, PendingRequest] = {}
-        self.recently_completed: collections.OrderedDict[str, float] = (
+        self.pending_requests: dict[int, PendingRequest] = {}
+        self.recently_completed: collections.OrderedDict[int, float] = (
             collections.OrderedDict()
         )
         self._recently_completed_ttl = 15.0
         # request_id -> its newest submission's key, and key -> request_id,
         # until the key has left both dicts above.
-        self._live: dict[str, str] = {}
-        self._client_ids: dict[str, str] = {}
+        self._live: dict[str, int] = {}
+        self._client_ids: dict[int, str] = {}
         # request_ids a caller is waiting on in wait_for_request_id
         self._id_waiters: set[str] = set()
         self._generation = itertools.count(1)
+        self._request_id_prefix = secrets.randbelow((1 << 31) - 1) + 1
         self.request_lock = threading.Lock()
         self.running = True
 
@@ -855,11 +862,12 @@ class APIServer:
 
         Returns the ``request_id``. If a ``request_id`` is provided by the
         caller it is used as-is (useful for deterministic-noise debugging,
-        since the conductor's per-request seed is derived from
-        ``hash(request_id)``); otherwise a fresh uuid4 is generated.
+        since the fallback seed is derived from that client ID); otherwise a
+        fresh uuid4 is generated.
 
-        The engine runs the request under a key of its own,
-        ``<request_id>#<generation>``, that is never reused: a client may
+        The engine runs the request under a positive integer key of its own,
+        composed of a per-launch prefix and counter. It is never reused in
+        this launch: a client may
         reuse its ``request_id`` while the engine is still tearing the older
         request down, and every message the engine sends names only the key.
         A submission under an id whose previous request is still running is
@@ -930,7 +938,10 @@ class APIServer:
                 raise HTTPException(status_code=503, detail=self.fatal_error)
             if self._in_flight(request_id):
                 raise HTTPException(status_code=409, detail=request_id_in_use(request_id))
-            key = f"{request_id}#{next(self._generation)}"
+            generation = next(self._generation)
+            if generation >= 1 << 32:
+                raise HTTPException(status_code=503, detail="request ID counter exhausted")
+            key = (self._request_id_prefix << 32) | generation
             self._live[request_id] = key
             self._client_ids[key] = request_id
             self.pending_requests[key] = PendingRequest(
@@ -951,7 +962,7 @@ class APIServer:
 
         self.preprocess_worker.new_request(PreprocessInput(
             request_id=key,
-            client_request_id=request_id,
+            fallback_seed=client_id_seed(request_id),
             text=text,
             file_paths=file_paths,
             input_modalities=input_modalities,
@@ -1012,7 +1023,7 @@ class APIServer:
             with self.request_lock:
                 self._id_waiters.discard(request_id)
 
-    def _retire(self, key: str) -> None:
+    def _retire(self, key: int) -> None:
         """Forget ``key``'s request_id once neither dict holds the key.
         Caller holds ``request_lock``."""
         if key in self.recently_completed:
@@ -1028,7 +1039,7 @@ class APIServer:
 
     def stream_input(
         self,
-        key: str,
+        key: int,
         file_paths: dict[str, list[str]] | None = None,
         end_input: bool | Collection[str] = False,
         *,
@@ -1105,7 +1116,7 @@ class APIServer:
                 "this server's limit (max_call_input_mb)"
             )
 
-    def is_pending(self, key: str) -> bool:
+    def is_pending(self, key: int) -> bool:
         """Whether the submission ``key`` is still waited on: not yet finished,
         failed or aborted. The preprocess thread drops queued input for one
         that is not, rather than send it on."""
@@ -1113,13 +1124,13 @@ class APIServer:
             req = self.pending_requests.get(key)
             return req is not None and not req.event.is_set()
 
-    def taking_input(self, key: str) -> bool:
+    def taking_input(self, key: int) -> bool:
         """Whether the submission ``key`` still takes :meth:`stream_input`."""
         with self.request_lock:
             req = self.pending_requests.get(key)
             return req is not None and bool(req.open_streams) and not req.event.is_set()
 
-    def reject_input(self, key: str, error: str, status: int) -> bool:
+    def reject_input(self, key: int, error: str, status: int) -> bool:
         """End a live call whose append was refused: its stream answers with
         ``error`` and ``status`` in-band, as any failed request's does, and the
         engine request is aborted. False, changing nothing, if the call no
@@ -1513,7 +1524,7 @@ class APIServer:
     # Streaming helper
     # ----------------------------------------------------------
 
-    def relay_chunks_to(self, key: str | None, sink: ChunkSink, tag) -> None:
+    def relay_chunks_to(self, key: int | None, sink: ChunkSink, tag) -> None:
         """Have ``sink`` take submission ``key``'s chunks: once per message
         pass, every such request's new chunks go to ``sink.relay`` in one
         call on its loop, instead of waking each request's handler per chunk.
@@ -1552,7 +1563,7 @@ class APIServer:
             for key in relayed:
                 self._fail_request(key, "internal error while streaming the response", 500)
 
-    def _fail_request(self, key: str, error: str, status: int) -> None:
+    def _fail_request(self, key: int, error: str, status: int) -> None:
         """Fail submission ``key`` in-band, as ``reject_input`` does, and abort
         the engine request if it is still running."""
         with self.request_lock:
@@ -1599,7 +1610,7 @@ class APIServer:
             key = self._live.get(request_id)
             return key, self.pending_requests.get(key)
 
-    def submission_key(self, request_id: str) -> str | None:
+    def submission_key(self, request_id: str) -> int | None:
         """The key of the newest submission under ``request_id``, for a caller
         that aborts it later, when the id may have been submitted again:
         take it right after ``submit_request`` and pass it to
@@ -1619,7 +1630,7 @@ class APIServer:
         return self._iter_result_chunk_batches(request_id, key, own)
 
     async def _iter_result_chunk_batches(
-        self, request_id: str, key: str | None, own: PendingRequest | None,
+        self, request_id: str, key: int | None, own: PendingRequest | None,
     ):
         start = time.monotonic()
         last_activity = start
@@ -1942,7 +1953,7 @@ class APIServer:
             key = self._live.get(request_id)
         self.abort_submission(key)
 
-    def abort_submission(self, key: str | None, outcome: str = "abort") -> None:
+    def abort_submission(self, key: int | None, outcome: str = "abort") -> None:
         """:meth:`abort_request` for one submission, by its key
         (:meth:`submission_key`); a newer submission under the id is untouched.
         ``outcome`` is what the metrics count it as (``abort`` or ``timeout``)."""
@@ -1981,7 +1992,7 @@ class APIServer:
         else:
             self.abort_submission(key)
 
-    def release_submission(self, key: str | None) -> None:
+    def release_submission(self, key: int | None) -> None:
         """:meth:`release_request` for one submission, by its key
         (:meth:`submission_key`); a newer submission under the id is untouched."""
         with self.request_lock:

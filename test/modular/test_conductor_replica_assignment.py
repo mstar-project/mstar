@@ -417,7 +417,7 @@ def test_a_request_refused_at_ingest_leaves_nothing_in_the_mirrors(plan):
     conductor._reject_request = lambda rid, error, status: refused.append(status)
     conductor._admit_request(SimpleNamespace(
         # 80 prompt positions, past the pool's max_seq_len of 64: a 400 in validate
-        request_id="a", client_request_id=None, model_kwargs=_prompt("P", unkeyed=64), initial_signals={},
+        request_id="a", fallback_seed=0, model_kwargs=_prompt("P", unkeyed=64), initial_signals={},
         initial_input_modalities=["text"], initial_output_modalities=["text"], streaming=False,
     ))
     assert refused == [400] and not conductor.requests

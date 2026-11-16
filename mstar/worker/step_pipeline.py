@@ -963,7 +963,7 @@ class StepPipeline:
             self.lifecycle.teardown_failed(rid)
             raise
 
-    def _release_request(self, rid: int, wire_rid: str, laps: PhaseLaps) -> None:
+    def _release_request(self, rid: int, wire_rid: int, laps: PhaseLaps) -> None:
         freed = self.engine_manager.remove_request(rid)
         if freed:
             self.admission.lift_caps(freed)

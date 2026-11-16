@@ -29,12 +29,12 @@ pub struct NestedLoopIdx {
 }
 
 
-/// rid string <-> worker-local handle. Handles are RECYCLED, so everything
+/// deployment-local rid <-> worker-local handle. Handles are RECYCLED, so everything
 /// keyed by one must be purged when it is freed, or the next request to get
 /// that integer inherits the leftovers.
 struct InternedRids {
-    rid_names: Vec<Option<String>>,
-    rid_to_handle: FxHashMap<String, u32>,
+    rid_names: Vec<Option<i64>>,
+    rid_to_handle: FxHashMap<i64, u32>,
     free: Vec<u32>,
 }
 
@@ -49,30 +49,30 @@ impl InternedRids {
 
     /// True in the second slot when the handle is newly allocated rather than
     /// recycled, i.e. the caller has to grow its per-handle vectors.
-    fn intern(&mut self, rid: &str) -> (u32, bool) {
-        if let Some(&h) = self.rid_to_handle.get(rid) {
+    fn intern(&mut self, rid: i64) -> (u32, bool) {
+        if let Some(&h) = self.rid_to_handle.get(&rid) {
             return (h, false);
         }
         let (h, grew) = match self.free.pop() {
             Some(h) => {
-                self.rid_names[h as usize] = Some(rid.to_string());
+                self.rid_names[h as usize] = Some(rid);
                 (h, false)
             }
             None => {
-                self.rid_names.push(Some(rid.to_string()));
+                self.rid_names.push(Some(rid));
                 ((self.rid_names.len() - 1) as u32, true)
             }
         };
-        self.rid_to_handle.insert(rid.to_string(), h);
+        self.rid_to_handle.insert(rid, h);
         (h, grew)
     }
 
-    fn handle(&self, rid: &str) -> Option<u32> {
-        self.rid_to_handle.get(rid).copied()
+    fn handle(&self, rid: i64) -> Option<u32> {
+        self.rid_to_handle.get(&rid).copied()
     }
 
-    fn name(&self, handle: u32) -> Option<&str> {
-        self.rid_names.get(handle as usize)?.as_deref()
+    fn name(&self, handle: u32) -> Option<i64> {
+        *self.rid_names.get(handle as usize)?
     }
 
     fn release(&mut self, handle: u32) -> bool {
@@ -220,11 +220,10 @@ pub struct GraphRuntime {
         })
     }
 
-    /// The request id string behind a handle.
-    fn rid_name(&self, rid: u32) -> PyResult<String> {
+    /// The deployment-local request ID behind a handle.
+    fn rid_name(&self, rid: u32) -> PyResult<i64> {
         self.rids
             .name(rid)
-            .map(|s| s.to_string())
             .ok_or_else(|| PyValueError::new_err("unknown rid handle"))
     }
 
@@ -368,7 +367,7 @@ pub struct GraphRuntime {
             persist.into_iter().map(|(sig, uuids)| (sig, self.infos(&uuids))).collect();
 
         let frame = frames::WorkerGraphsDone {
-            request_id: &request_id,
+            request_id,
             worker_graph_ids,
             is_first_tp_rank,
             persist_signals,
@@ -1741,7 +1740,7 @@ impl GraphRuntime {
     #[allow(clippy::too_many_arguments)]
     fn add_request(
         &mut self,
-        request_id: String,
+        request_id: i64,
         partition: String,
         graph_walk: String,
         partition_worker_graph_ids: Vec<u32>,
@@ -1751,7 +1750,7 @@ impl GraphRuntime {
         loop_names: Vec<String>,
         loop_caps: Vec<u32>,
     ) -> PyResult<u32> {
-        let (handle, grew) = self.rids.intern(&request_id);
+        let (handle, grew) = self.rids.intern(request_id);
         if grew {
             for per_wg in self.states.iter_mut() {
                 per_wg.push(None);
@@ -1897,12 +1896,12 @@ impl GraphRuntime {
         self.pending_loop_stops.retain(|&(r, _, _)| r != rid);
     }
 
-    fn get_rid_handle(&self, rid: &str) -> Option<u32> {
+    fn get_rid_handle(&self, rid: i64) -> Option<u32> {
         self.rids.handle(rid)
     }
 
-    fn get_rid_string(&self, handle: u32) -> Option<String> {
-        self.rids.name(handle).map(|s| s.to_string())
+    fn get_rid_string(&self, handle: u32) -> Option<i64> {
+        self.rids.name(handle)
     }
 
     fn get_walk(&self, rid: u32, partition: &str) -> Option<String> {
@@ -4266,7 +4265,7 @@ impl GraphRuntime {
                 let bytes = {
                     let bk = self.bookkeeping.lock().unwrap();
                     frames::ResultTensors {
-                        request_id: &request_id,
+                        request_id,
                         modality: &modality,
                         signal: &signal,
                         infos,
@@ -4293,7 +4292,7 @@ impl GraphRuntime {
                 }
                 for ((signal, modality), items) in groups {
                     let sig = self.interner.intern(&signal);
-                    let mut request_ids: Vec<String> = Vec::with_capacity(items.len());
+                    let mut request_ids: Vec<i64> = Vec::with_capacity(items.len());
                     let mut values: Vec<i64> = Vec::with_capacity(items.len());
                     let mut loop_indices = Vec::with_capacity(items.len());
                     let with_logprobs = !plan.logprobs.is_empty();
@@ -4366,19 +4365,19 @@ mod tests {
         // The hazard this guards: a leaked handle-keyed entry does not read as
         // stale, it reads as the NEXT request inheriting another's state.
         let mut rids = InternedRids::new();
-        let (a, grew_a) = rids.intern("req-a");
+        let (a, grew_a) = rids.intern(11);
         assert!(grew_a, "first handle has to grow the per-handle vectors");
-        assert_eq!(rids.handle("req-a"), Some(a));
-        assert_eq!(rids.name(a), Some("req-a"));
+        assert_eq!(rids.handle(11), Some(a));
+        assert_eq!(rids.name(a), Some(11));
 
         assert!(rids.release(a));
-        assert_eq!(rids.handle("req-a"), None, "the string must not resolve");
+        assert_eq!(rids.handle(11), None, "the removed ID must not resolve");
         assert_eq!(rids.name(a), None, "and the slot must be empty");
 
-        let (b, grew_b) = rids.intern("req-b");
+        let (b, grew_b) = rids.intern(12);
         assert_eq!(b, a, "the freed handle is reused");
         assert!(!grew_b, "reuse must NOT grow the vectors");
-        assert_eq!(rids.name(b), Some("req-b"));
+        assert_eq!(rids.name(b), Some(12));
         assert_eq!(rids.len(), 1);
     }
 
@@ -4387,8 +4386,8 @@ mod tests {
         // add_request runs once per partition, so this happens on every
         // multi-partition request.
         let mut rids = InternedRids::new();
-        let (a, grew_a) = rids.intern("req");
-        let (b, grew_b) = rids.intern("req");
+        let (a, grew_a) = rids.intern(11);
+        let (b, grew_b) = rids.intern(11);
         assert_eq!(a, b);
         assert!(grew_a && !grew_b, "only the first call allocates a slot");
     }
@@ -4399,12 +4398,12 @@ mod tests {
         // release must not hand the same handle to the free list twice, or two
         // future requests would share it.
         let mut rids = InternedRids::new();
-        let (a, _) = rids.intern("req");
+        let (a, _) = rids.intern(11);
         assert!(rids.release(a));
         assert!(!rids.release(a));
 
-        let (b, _) = rids.intern("x");
-        let (c, _) = rids.intern("y");
+        let (b, _) = rids.intern(12);
+        let (c, _) = rids.intern(13);
         assert_ne!(b, c, "a double free would have aliased these");
     }
 

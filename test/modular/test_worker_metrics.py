@@ -583,7 +583,7 @@ def test_the_data_worker_sends_enable_metrics_before_any_later_request(tmp_path)
 
     def submit(key):
         worker.in_queue.put(PreprocessInput(
-            request_id=key, client_request_id=key, text="hi", file_paths=None,
+            request_id=key, fallback_seed=0, text="hi", file_paths=None,
             model_kwargs={}, **TEXT))
 
     thread = threading.Thread(target=worker.run, daemon=True)
