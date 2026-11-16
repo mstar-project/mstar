@@ -331,9 +331,9 @@ that no sampler declares fails the request.
   greedy token scores 0 there, so a trainer sampling greedily wants ``"raw"``. It renorms
   every step's distribution again, about 0.15 ms at batch 1 and 0.5 ms at batch 128 on a
   GB200 with a 248k vocabulary, so it is a separate switch.
-- ``repetition_window``, ``top_p_first`` and ``top_p_min_keep`` stay at their defaults
-  until a port needs them: they ask the node's sampler for a capability a ``Sampler``
-  declaration doesn't name yet.
+- ``repetition_window`` needs the node's ``Sampler`` to declare at least that window
+  (``repetition_window=``), and ``top_p_first`` or a ``top_p_min_keep`` above 1 needs
+  ``top_p_first=True``.
 
 A step whose every row samples greedily (temperature 0, no repetition penalty, no
 ``min_tokens`` and no log-probs) takes each row's argmax instead of the full sampler's draw,
@@ -781,14 +781,26 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   ``GatedDeltaNet()`` a field ``state`` of shape ``(h_v, d_k, d_v)``, and ``Mamba2()`` a field
   ``ssm`` of shape ``(heads, head_dim, state_size)``.
 - ``max_len=0``: the array keeps nothing between steps, for attention within this step only.
-  Its one read uses ``Block()``, which sees only the entries of the token's own segment. See
-  `Cacheless attention (encoder towers)`_.
+  Its one read uses ``Block()``, which sees only the entries of the token's own segment, or
+  ``BlockCausal(size)``, which sees the segment's blocks of ``size`` entries up to the token's
+  own, as an audio tower that attends in chunks does. See `Cacheless attention (encoder towers)`_.
 - ``max_len=None``: the log has no bound, and the engine keeps what the reads can still reach.
-  Today such an array takes one label and one ``Window`` read through ``Attend``, with
-  ``packed=False`` and as many query heads as the entry, over every layer. A bounded KV holds it,
-  one slot per request (`Bounded (sink + window) caches`_). Its read takes ``distance_bias``,
+  Today such an array takes one label and one ``Window`` or kept-window read through ``Attend``,
+  with ``packed=False`` and as many query heads as the entry, over every layer. A bounded KV holds
+  it, one slot per request (`Bounded (sink + window) caches`_). Its read takes ``distance_bias``,
   ``(rows, q_heads, T, size)``, whose entry ``d`` adds to the score of the key at distance ``d``,
-  and ``Positions()`` is each request's count of committed entries.
+  and ``Positions()`` is each request's count of committed entries. A kept-window read keeps a
+  sink and a window of a stream that begins with the row's start, entries kept once and read
+  where they live, as a voice prompt every request in the voice reads. ``start_lengths`` is the
+  range of lengths a start may have, and ``kept_windows`` gives the read's base
+  ``KeptWindow(sink, window=, grows=)``, whose ``grows`` side, ``"sink"`` or ``"window"``, adds
+  the start's length; either side may be 0. ``Bidirectional(kept_window=True, last_first=True)``
+  joins each step's adds to the kept entries last-first, for attention that ignores key order, so
+  a cut keeps the entries a step adds first the longest, and a step with ``keep=False`` attends its
+  adds and keeps none. The handle takes the starts once at bind
+  (``set_starts``, each field ``(layers, n, *shape)``), and each step names each row's by index
+  (``ArrayStep.starts``), which a region's step takes from the open step. Its ``distance_bias``
+  is ``(rows, q_heads, T, R)``, whose entry ``d + T - 1`` adds to the key at distance ``d``.
 - ``Positions(rope=)``: a position counter per request and label, on an append-only array
   that keeps entries. ``rope=None`` is a counter only. ``Rope`` carries ``theta``,
   ``rotary_dim``, ``interleave``, ``scale``, the Llama 3.1 factors (all three or none), the
@@ -800,9 +812,11 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   declares what its layer passed before. The counter is
   separate from log positions: a kept step advances it by each row's advance, a fork copies
   it, and a prefix hit advances it over the skipped spans.
-- ``Sampler(name, nodes=, vocab_size=, penalty=, min_p=, eos_ids=, draws=)``. ``penalty`` and
-  ``min_p`` declare capabilities, not intentions: each selects which kernel variant is
-  recorded into the captured graph. ``draws`` is how many draws each step that lists the
+- ``Sampler(name, nodes=, vocab_size=, penalty=, min_p=, eos_ids=, draws=, repetition_window=,
+  top_p_first=)``. ``penalty`` and ``min_p`` declare capabilities, not intentions: each selects
+  which kernel variant is recorded into the captured graph. So do ``repetition_window``, the
+  longest window a request's ``repetition_window`` may count, and ``top_p_first``, which lets a
+  request set ``top_p_first`` and ``top_p_min_keep``. ``draws`` is how many draws each step that lists the
   sampler makes, by ``sample`` or ``drew``. Each is a fresh draw that advances each kept row's
   sampling state. Log-probs and a device loop-back take one token per step, so loading refuses both
   above one draw.
@@ -865,7 +879,10 @@ read, over one label, and its queries come from an append-only array that keeps 
 It is refused at load on a node that splits its steps over SP ranks, and where its pool or the
 queried array's pool is stored by position (``context_parallel``). A ``max_len=0`` cross read's
 queries come from an array of one label, and ``queries`` never names the
-read's own array. Separate token sets are separate arrays, and arrays of one kind and geometry on one node share one resource,
+read's own array. Queries that nothing on the node attends among themselves, as a resampler's
+learned queries, come from an array with ``max_len=0``, ``entry=Entry({})`` and no reads: its step
+plans nothing, it takes no add or read, and loading refuses one that no read's ``queries`` names.
+Separate token sets are separate arrays, and arrays of one kind and geometry on one node share one resource,
 each under its own label.
 
 Under sequence parallelism an array declares nothing: the node's sequence shard
@@ -912,8 +929,10 @@ a refused admit draws the same noise.
 
 ``kernel_settings(self)`` is a temporary hook for what the engine doesn't pick itself yet:
 ``splits``, ``decode_fmha`` and ``decode_tensor_cores`` on a read of a paged array,
-``splits`` on a ``GatedDeltaNet``, and ``max_segments_per_request``, ``max_segments_per_step``,
-``compile_op``, ``workspace_mb`` and ``backend`` on a ``Block`` read. Under an array's name it sets the default size of the array's pool, ``max_num_pages``
+``splits`` on a ``GatedDeltaNet``, ``ieee`` on a read of an unbounded array, and
+``max_segments_per_request``, ``max_segments_per_step``, ``compile_op``, ``workspace_mb`` and
+``backend`` on a ``Block`` or ``BlockCausal`` read of an array with ``max_len=0``. Under an
+array's name it sets the default size of the array's pool, ``max_num_pages``
 on a paged array and ``max_slots`` on a ``Value`` with tensor fields or an unbounded array, which a deployment's
 ``resources:`` block overrides. A cross read on an array that keeps entries takes
 ``decode_tensor_cores`` alone, and two reads that share a resource can't set one field to two
@@ -1556,7 +1575,10 @@ writes none), unmasked, and its writes land after. Pass
 from shared prefixes that the slots should not copy; each row reads the one its
 ``StreamPosition.source`` names, so rows of different prefixes share a batch and a graph. ``rel_bias`` adds a term that depends only on
 the query-key distance, for Transformer-XL-style relative positions. A streaming vocoder
-like MiniCPM-o's token2wav fits three of them: its two conformer caches and its DiT's.
+like MiniCPM-o's token2wav fits three of them: its two conformer caches and its DiT's. It
+declares each as an ``Array`` with ``max_len=None`` and a kept-window read
+(``token2wav_state`` in ``mstar/model/components/token2wav/state.py``): its voices' prompts
+are the arrays' starts, and the DiT's two guidance rows are heads of one entry.
 
 Two flags cover retention rules that are not quite a token FIFO.
 ``SinkWindow(window_includes_step=True)`` counts the step's own tokens toward the window.
@@ -1573,6 +1595,8 @@ within itself and matches the offline mask. ``rel_bias`` is then indexed by that
 ``[rows, H, T, left + 1]``, and passed unscaled (the kernel scales the sum by
 ``head_dim ** -0.5``). A per-query window takes no sink, and its right context is 0.
 ``retention`` may be a single ``SinkWindow`` when it does not depend on the source length.
+``BoundedKVConfig(ieee=True)`` attends a float32 cache in IEEE fp32 rather than TF32; on the
+state contract it is the read's kernel setting ``ieee``, on for a float32 entry.
 ``BoundedKVConfig(dtype=None)`` stores the cache in the engine's KV dtype, for layers that
 compute in it. The streaming FastConformer (Nemotron VoiceChat's ``ENCODER_KV``, an ``Array``
 with ``max_len=None`` and a ``Window`` read, which the state contract holds in such a cache) is

@@ -403,6 +403,20 @@ def test_admit_refusal_names_the_request():
     assert not outcome.ok and outcome.reason.request_ids == frozenset({2})
 
 
+def test_a_request_keeps_the_source_it_began_from():
+    """A row's retained keys are read from the source its position names, so a step that names another would attend
+    another prefix's keys as its own."""
+    mgr = _manager(WINDOW, True, torch.float32, "cpu", heads=1, head_dim=4)
+    first, ctx = _step([1], [0], [1])
+    assert mgr.admit(first, ctx).ok
+    mgr.plan(first, ctx)
+    mgr.commit(first, ctx)
+    moved, ctx = _step([1], [1], [1])
+    moved = type(moved)(segments=moved.segments, positions={1: moved.positions[1]._replace(source=1)})
+    outcome = mgr.admit(moved, ctx)
+    assert not outcome.ok and outcome.reason.request_ids == frozenset({1}), "the row would read another source's keys"
+
+
 def test_rollback_admit_frees_only_fresh_slots():
     """A refused step gives back the slots its admit took, not one a request
     already held."""
@@ -587,3 +601,18 @@ def test_a_bounded_pool_holds_as_many_requests_as_its_slots():
         "5 concurrent requests (max_concurrent_requests) need 5 slots of resources.enc, which holds 4; raise "
         "max_slots or lower max_concurrent_requests"
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the bounded kernels need a GPU")
+def test_attend_takes_its_configs_precision_when_given_none():
+    """A declared read sets ``ieee`` on its config, and its handle passes none."""
+    q = torch.randn(1, 2, 4, 128, generator=torch.Generator().manual_seed(1)).cuda()
+    outs = []
+    for config_ieee, ieee in ((True, None), (False, True)):
+        kv = _manager(8, False, torch.float32, "cuda")
+        kv.config.ieee = config_ieee
+        step, ctx = _step(["a"], [0], [4])
+        assert kv.admit(step, ctx).ok
+        kv.plan(step, ctx)
+        outs.append(kv.attend(0, q, q, q, ieee=ieee))
+    assert torch.equal(outs[0], outs[1]), "ieee=None would run the kernel in TF32 although the config asks for IEEE"

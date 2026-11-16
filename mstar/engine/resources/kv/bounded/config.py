@@ -50,6 +50,8 @@ class BoundedKVConfig:
     # None is the engine's KV dtype (``EngineResourceInfo.kv_dtype``), settled when
     # the resource is built
     dtype: torch.dtype | None = torch.float32
+    # attention on a float32 cache in IEEE fp32 rather than TF32, where ``attend`` is given no ``ieee``
+    ieee: bool = False
     # A step's tokens join the stream last-first. Only for attention that
     # ignores key order, where it decides which of the oldest step's tokens are
     # evicted first: Step-Audio2's flow decoder keeps the front of each chunk.

@@ -138,17 +138,25 @@ class Bidirectional(Mask):
     within-step form.
 
     With ``kept_window``, the entries the row kept before this step are cut to the first ``sink`` and the last
-    ``window`` of them, sizes the request's layout gives per read in ``Layout.kept_windows``."""
+    ``window`` of them, sizes the request's layout gives per read in ``Layout.kept_windows``, or on an unbounded array
+    ``Array.kept_windows`` grown by the length of the row's start. There the read takes ``distance_bias``, (rows,
+    q_heads, T, R), whose entry d + T - 1 adds to the score of the key at distance d, negative for the step's later
+    entries. With ``last_first`` each step's adds join the kept entries last-first, so a cut keeps the entries a step
+    adds first the longest; the mask ignores their order, which shows only in what the window keeps."""
 
     uses_query_position = False
     sees_step_whole = True
 
     _: KW_ONLY
     kept_window: bool = False
+    last_first: bool = False
 
     def __post_init__(self):
-        if type(self.kept_window) is not bool:
-            raise ValueError(f"Bidirectional.kept_window must be a bool, got {self.kept_window!r}")
+        for name in ("kept_window", "last_first"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"Bidirectional.{name} must be a bool, got {getattr(self, name)!r}")
+        if self.last_first and not self.kept_window:
+            raise ValueError("Bidirectional.last_first orders what a kept window cuts, and kept_window is False")
 
 
 @dataclass(frozen=True)
@@ -173,6 +181,21 @@ class FrameWindow(Mask):
 
     def split_step_change(self) -> str:
         return "A step boundary inside a frame cuts what the frame's queries see"
+
+
+@dataclass(frozen=True)
+class BlockCausal(Mask):
+    """Blocks are runs of ``size`` entries from the row's first, and q is in block b = q // ``size``. Sees every entry
+    of blocks 0 to b. On an array with ``max_len`` 0, q's row is its segment in this step."""
+
+    uses_query_position = True
+    sees_step_whole = True
+
+    size: int
+
+    def __post_init__(self):
+        if not _is_positive(self.size):
+            raise ValueError(f"BlockCausal.size must be a positive int, got {self.size!r}")
 
 
 class Op:
@@ -332,8 +355,11 @@ class Array:
     the same length at the end of every step. ``nodes`` lists who may touch the array, and the engine places it.
     ``updates`` are kernels that replace a Value's entry with its next version. The version they overwrite is gone,
     so prefix caching and undo save a copy before one runs.
-    With ``max_len`` 0 an array keeps nothing between steps, so every add is scratch.
-    With ``max_len`` None the log has no bound, and the engine keeps what the reads can still reach.
+    With ``max_len`` 0 an array keeps nothing between steps, so every add is scratch, and one with no reads only lays
+    out the queries of a read that names it.
+    With ``max_len`` None the log has no bound, and the engine keeps what the reads can still reach. Its rows may begin
+    from starts the handle holds (`set_starts`), entries kept once and read where they live, of the lengths
+    ``start_lengths`` allows, and each step names each row's (`ArrayStep.starts`).
     A Value with ``largest`` is sized: its fields' `Size` axes take each request's sizes from its layout, and the
     engine holds each request's tensors from admission to its end. A request whose fields take more bytes than at
     ``largest`` is refused at intake, whatever each size is.
@@ -345,11 +371,13 @@ class Array:
     layers: frozenset[int]
     entry: Entry
     max_len: int | None
-    reads: Mapping[str, Read] = EMPTY    # empty: read whole
+    reads: Mapping[str, Read] = EMPTY    # empty: read whole, or with max_len 0 only lay out another read's queries
     updates: Mapping[str, Op] = EMPTY
     rewritable: bool = False
     labels: frozenset[str] = frozenset({"main"})
     positions: Positions | None = None
+    start_lengths: range | None = None                 # with max_len None: the lengths a row's start may have
+    kept_windows: Mapping[str, "KeptWindow"] = EMPTY   # with max_len None: by read key, each kept window's base
     largest: Mapping[str, int] = EMPTY    # a sized Value: the sizes of the request whose fields take the most bytes
 
     def __post_init__(self):
@@ -359,6 +387,7 @@ class Array:
         object.__setattr__(self, "labels", frozenset(self.labels))
         object.__setattr__(self, "reads", FrozenMap(self.reads))
         object.__setattr__(self, "updates", FrozenMap(self.updates))
+        object.__setattr__(self, "kept_windows", FrozenMap(self.kept_windows))
         where = f"Array {self.name!r}"
         if not self.nodes:
             raise ValueError(f"{where}.nodes must be non-empty")
@@ -371,6 +400,7 @@ class Array:
         if not (self.max_len is None or type(self.max_len) is int and self.max_len >= 0):
             raise ValueError(f"{where}.max_len must be None or an int >= 0, got {self.max_len!r}")
         self._check_entry()
+        self._check_starts()
         for key, read in self.reads.items():
             self._check_read(key, read)
         for key, update in self.updates.items():
@@ -394,6 +424,20 @@ class Array:
             if not _is_host_type(kind):
                 raise ValueError(f"Array {self.name!r}.entry.host[{name!r}] must be int, float, bool, str, bytes or a "
                                  f"tuple of these, got {kind!r}")
+
+    def _check_starts(self) -> None:
+        where = f"Array {self.name!r}"
+        if (self.start_lengths is not None or self.kept_windows) and self.max_len is not None:
+            raise ValueError(f"{where}: start_lengths and kept_windows size an unbounded array's kept window, and "
+                             f"max_len is {self.max_len}")
+        lengths = self.start_lengths
+        if lengths is not None and not (isinstance(lengths, range) and lengths.step == 1 and lengths
+                                        and lengths.start >= 0):
+            raise ValueError(f"{where}.start_lengths must be a non-empty range of step 1 over lengths >= 0, got "
+                             f"{lengths!r}")
+        for key, kept in self.kept_windows.items():
+            if not isinstance(kept, KeptWindow):
+                raise ValueError(f"{where}.kept_windows[{key!r}] must be a KeptWindow, got {kept!r}")
 
     def _check_read(self, key: str, read: Read) -> None:
         where = f"Array {self.name!r}.reads[{key!r}]"
@@ -486,12 +530,17 @@ class Sampler:
     min_p: bool = False
     eos_ids: tuple[int, ...] = ()    # the ids min_tokens bars
     draws: int = 1                   # draws in each step that lists it
+    repetition_window: int = 0       # the longest repetition_window a request may set
+    top_p_first: bool = False        # whether a request may set top_p_first or top_p_min_keep
 
     def __post_init__(self):
         object.__setattr__(self, "nodes", frozenset(self.nodes))
         object.__setattr__(self, "eos_ids", tuple(self.eos_ids))
         if not self.nodes:
             raise ValueError(f"Sampler {self.name!r}.nodes must be non-empty")
+        if not (type(self.repetition_window) is int and self.repetition_window >= 0):
+            raise ValueError(f"Sampler {self.name!r}.repetition_window must be an int >= 0, got "
+                             f"{self.repetition_window!r}")
 
 
 @dataclass(frozen=True)
@@ -579,6 +628,7 @@ class ArrayStep:
     advance: tuple[int, ...] | None = None         # positions per row; None: the span
     position_ids: torch.Tensor | None = None       # explicit ids, (tokens,) in segment order
     host: Mapping[tuple[int, str, int], Mapping[str, object]] = EMPTY    # (row, label, layer) -> fields, at commit
+    starts: Mapping[int, int] = EMPTY              # row -> the index of the start it begins from
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -593,17 +643,23 @@ class SampleStep:
 
 @dataclass(frozen=True)
 class KeptWindow:
-    """A kept-window read's sizes for one request and label, in entries."""
+    """A kept-window read's sizes in entries: for one request and label, or on an unbounded array the base that each
+    row's start length adds to, on the side ``grows`` names."""
 
     sink: int
     _: KW_ONLY
     window: int
+    grows: Literal["sink", "window"] | None = None
 
     def __post_init__(self):
-        for name, least in (("sink", 0), ("window", 1)):
+        for name in ("sink", "window"):
             value = getattr(self, name)
-            if not (type(value) is int and value >= least):
-                raise ValueError(f"KeptWindow.{name} must be an int >= {least}, got {value!r}")
+            if not (type(value) is int and value >= 0):
+                raise ValueError(f"KeptWindow.{name} must be an int >= 0, got {value!r}")
+        if not self.sink + self.window:
+            raise ValueError("KeptWindow keeps nothing: its sink and its window are both 0")
+        if self.grows not in (None, "sink", "window"):
+            raise ValueError(f"KeptWindow.grows must be None, 'sink' or 'window', got {self.grows!r}")
 
 
 @dataclass(frozen=True, kw_only=True)

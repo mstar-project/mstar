@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components.decoder_layer import DecoderLayer, run_layers
+from mstar.model.components.decoder_layer import DecoderLayer, no_cursor, run_layers
 from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
 from mstar.model.components.norm import RMSNorm
 
@@ -78,7 +78,7 @@ class TTSBackbone(nn.Module):
     """``tts.model.*``: the Llama layers and final norm (its own token
     embedding is unused; every input is an embedding)."""
 
-    def __init__(self, config: TTSConfig, *, attn_key: str, kv_key: str, pos_key: str):
+    def __init__(self, config: TTSConfig, *, array: str):
         super().__init__()
         comm_group = CommGroup.trivial()
         self.layers = nn.ModuleList(
@@ -89,11 +89,9 @@ class TTSBackbone(nn.Module):
                     num_heads=config.num_attention_heads,
                     num_kv_heads=config.num_key_value_heads,
                     head_dim=config.head_dim,
-                    rope_theta=config.rope_theta,
                     rms_norm_eps=config.rms_norm_eps,
-                    attn_key=attn_key,
-                    kv_key=kv_key,
-                    pos_key=pos_key,
+                    kv_key=array,
+                    layer=layer,
                 ),
                 mlp=ParallelGatedMLP(
                     comm_group=comm_group,
@@ -104,24 +102,22 @@ class TTSBackbone(nn.Module):
                 input_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
                 post_attention_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
             )
-            for _ in range(config.num_hidden_layers)
+            for layer in range(config.num_hidden_layers)
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, hidden_states: torch.Tensor, *, label: str) -> torch.Tensor:
-        # as ``Qwen3DenseLM``: bind the label once, ``run_layers`` advances the index
-        self.layers[0].self_attn.attend.bind_step(label)
-        return run_layers(self.layers, hidden_states, self.norm)
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return run_layers(self.layers, hidden_states, self.norm, no_cursor)
 
 
 class MiniCPMTTS(nn.Module):
     """Parameter paths mirror the checkpoint's ``tts.*`` (``emb_code.0`` and
     ``head_code.0`` flattened, the head's weight norm folded at load)."""
 
-    def __init__(self, config: TTSConfig, *, attn_key: str, kv_key: str, pos_key: str):
+    def __init__(self, config: TTSConfig, *, array: str):
         super().__init__()
         self.config = config
-        self.model = TTSBackbone(config, attn_key=attn_key, kv_key=kv_key, pos_key=pos_key)
+        self.model = TTSBackbone(config, array=array)
         self.emb_text = nn.Embedding(config.num_text_tokens, config.hidden_size)
         self.emb_code = nn.Embedding(config.num_audio_tokens, config.hidden_size)
         self.head_code = nn.Linear(config.hidden_size, config.num_audio_tokens, bias=False)

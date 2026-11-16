@@ -6,9 +6,8 @@ Ported from the checkpoint's ``modeling_navit_siglip.py`` and the
 
 An image arrives as slices (the source image plus up to ``max_slice_nums``
 crops), each an ``(h, w)`` grid of 14x14 patches. Every slice attends within
-itself, so a forward packs all slices of all requests and the ragged
-attention resource keeps them apart; the resampler's 64 queries per slice
-cross-attend that slice's patches through the ragged cross-attention resource.
+itself, so a forward packs all slices of all requests, a segment each; the
+resampler's 64 queries per slice cross-attend that slice's patches.
 
 Grid arithmetic (position buckets, sincos gather indices, segment lengths)
 is host-side, done by ``slice_layout`` in the submodule's ``prepare_inputs``,
@@ -23,13 +22,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.engine.resources.attn.ragged.config import cross_label
 from mstar.model.components.linear import FusedColumnLinear
 from mstar.model.minicpm_o.config import (
-    PATCHES,
-    QUERIES,
-    RESAMPLER_ATTN,
-    VISION_ATTN,
+    RESAMPLER_KV,
+    VISION_TOKENS,
     ResamplerConfig,
     VisionConfig,
 )
@@ -97,29 +93,26 @@ def slice_layout(tgt_sizes: list[tuple[int, int]], vision: VisionConfig) -> Slic
 
 
 class SiglipAttention(nn.Module):
-    """Bidirectional attention within each slice, through the ragged resource."""
+    """Bidirectional attention within each slice, through the node's array."""
 
-    def __init__(self, config: VisionConfig):
+    def __init__(self, config: VisionConfig, layer: int):
         super().__init__()
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         d = config.hidden_size
         self.qkv_proj = FusedColumnLinear(d, {"q": d, "k": d, "v": d}, bias=True)
         self.out_proj = nn.Linear(d, d)
-        self.ragged = None
+        self.layer = layer
+        self.state = None
 
-    def bind_resources(self, resources: dict) -> None:
-        self.ragged = resources.get(VISION_ATTN)
+    def bind_state(self, handles: dict) -> None:
+        self.state = handles[VISION_TOKENS]
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.ragged is None:
-            raise RuntimeError(
-                f"MiniCPM-o's vision tower has no {VISION_ATTN!r} resource; declare a "
-                "RaggedAttentionSpec for the vision_encoder node"
-            )
         n, d = hidden_states.shape
         q, k, v = self.qkv_proj(hidden_states).view(n, 3, self.num_heads, self.head_dim).unbind(1)
-        out = self.ragged.run(q, k, v, label=PATCHES)
+        self.state.add(self.layer, k=k, v=v)
+        out = self.state.read(self.layer, q)
         return self.out_proj(out.reshape(n, d))
 
 
@@ -136,10 +129,10 @@ class SiglipMLP(nn.Module):
 
 
 class SiglipEncoderLayer(nn.Module):
-    def __init__(self, config: VisionConfig):
+    def __init__(self, config: VisionConfig, layer: int):
         super().__init__()
         self.layer_norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.self_attn = SiglipAttention(config)
+        self.self_attn = SiglipAttention(config, layer)
         self.layer_norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.mlp = SiglipMLP(config)
 
@@ -167,7 +160,7 @@ class SiglipEmbeddings(nn.Module):
 class SiglipEncoder(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
-        self.layers = nn.ModuleList(SiglipEncoderLayer(config) for _ in range(config.num_hidden_layers))
+        self.layers = nn.ModuleList(SiglipEncoderLayer(config, layer) for layer in range(config.num_hidden_layers))
 
 
 class NavitSiglip(nn.Module):
@@ -193,7 +186,7 @@ class NavitSiglip(nn.Module):
 
 class ResamplerAttention(nn.Module):
     """``nn.MultiheadAttention``'s parameters (packed ``in_proj``), with the
-    attention itself through the ragged cross-attention resource."""
+    attention itself the resampler array's cross read."""
 
     def __init__(self, config: ResamplerConfig):
         super().__init__()
@@ -203,25 +196,21 @@ class ResamplerAttention(nn.Module):
         self.in_proj_weight = nn.Parameter(torch.empty(3 * d, d))
         self.in_proj_bias = nn.Parameter(torch.empty(3 * d))
         self.out_proj = nn.Linear(d, d)
-        self.ragged = None
+        self.state = None
 
-    def bind_resources(self, resources: dict) -> None:
-        self.ragged = resources.get(RESAMPLER_ATTN)
+    def bind_state(self, handles: dict) -> None:
+        self.state = handles[RESAMPLER_KV]
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         """``query``: ``[num_slices * Q, d]``; ``key``/``value``: ``[total_patches, d]``."""
-        if self.ragged is None:
-            raise RuntimeError(
-                f"MiniCPM-o's resampler has no {RESAMPLER_ATTN!r} resource; declare a "
-                "RaggedCrossAttentionSpec for the vision_encoder node"
-            )
         w_q, w_k, w_v = self.in_proj_weight.chunk(3)
         b_q, b_k, b_v = self.in_proj_bias.chunk(3)
         h, hd = self.num_heads, self.head_dim
         q = F.linear(query, w_q, b_q).view(-1, h, hd)
         k = F.linear(key, w_k, b_k).view(-1, h, hd)
         v = F.linear(value, w_v, b_v).view(-1, h, hd)
-        out = self.ragged.run(q, k, v, label=cross_label(QUERIES, PATCHES))
+        self.state.add(0, k=k, v=v)
+        out = self.state.read(0, q)
         return self.out_proj(out.reshape(-1, h * hd))
 
 
