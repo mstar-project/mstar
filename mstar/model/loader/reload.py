@@ -20,6 +20,8 @@ from pathlib import Path
 
 from safetensors import safe_open
 
+from mstar.model.reload_errors import WeightReloadRefusedError
+
 # A dtype change between these converts on copy; any other change is refused.
 _FLOAT_DTYPES = frozenset({"F64", "F32", "F16", "BF16"})
 # Compared when both checkpoints ship them. config.json minus these keys,
@@ -27,10 +29,6 @@ _FLOAT_DTYPES = frozenset({"F64", "F32", "F16", "BF16"})
 _CONFIG_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json",
                  "special_tokens_map.json", "tokenizer.model")
 _CONFIG_IGNORED_KEYS = frozenset({"_name_or_path", "transformers_version", "torch_dtype", "dtype"})
-
-
-class WeightReloadRefusedError(ValueError):
-    """The checkpoint cannot be reloaded in place; nothing was copied."""
 
 
 @dataclass(frozen=True)
