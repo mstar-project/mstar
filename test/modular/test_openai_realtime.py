@@ -9,6 +9,7 @@ model-gating are all exercised without a GPU.
 import asyncio
 import base64
 import json
+import re
 import sys
 import tempfile
 import threading
@@ -630,6 +631,8 @@ def test_unhandled_transcription_event_reports_one_generic_error_then_closes(cli
     assert closed.value.code == 1011
     records = [r for r in caplog.records if "realtime event handler failed" in r.getMessage()]
     assert len(records) == 1 and created["session"]["id"] in records[0].getMessage()
+    error_id = re.fullmatch(r"realtime event failed \(error id ([0-9a-f]{12})\)", error["error"]["message"])
+    assert error_id is not None and f"error id {error_id.group(1)}" in records[0].getMessage()
     assert "secret /srv/model-path" in caplog.text
 
 
@@ -1283,6 +1286,8 @@ def test_unhandled_conversation_event_reports_one_generic_error_then_closes(dupl
     assert closed.value.code == 1011
     records = [r for r in caplog.records if "realtime event handler failed" in r.getMessage()]
     assert len(records) == 1 and created["session"]["id"] in records[0].getMessage()
+    error_id = re.fullmatch(r"realtime event failed \(error id ([0-9a-f]{12})\)", error["error"]["message"])
+    assert error_id is not None and f"error id {error_id.group(1)}" in records[0].getMessage()
     assert "secret /srv/model-path" in caplog.text
 
 
