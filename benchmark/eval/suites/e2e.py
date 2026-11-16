@@ -1,7 +1,8 @@
 """e2e: the request kinds the speech suites do not cover, for ``compare``'s base vs head matrix.
 
 One ``--kind`` per run: greedy chat (text, image, audio or video in, optionally speech out), seeded image and
-video generation, voice-clone uploads, VLA actions and streamed world-model frames. Requests are seeded and greedy
+video generation, native multimodal ``/generate``, voice-clone uploads, VLA actions and streamed world-model frames.
+Requests are seeded and greedy
 where the route allows it, so two servers given the same requests should return the same outputs; the kept
 repeat's outputs are saved under the run's audio directory (``<id>.txt``, ``.png``, ``.mp4``, ``.f32``, ``.u8``,
 ``.pcm``) for ``compare`` to diff. Per repeat: latency percentiles, time to first output, requests/s.
@@ -26,9 +27,10 @@ from benchmark.eval import stats
 from benchmark.eval.datasets import Item
 from benchmark.eval.suites.base import Suite, error_row, exception_row, parse_extra
 from benchmark.eval.suites.praxis_wire import run_openpi, run_positronic
+from mstar.utils.utf8_stream import decode_joined
 
 KINDS = ("chat_text", "chat_image", "chat_audio", "chat_video", "chat_count", "image", "video", "video_i2v",
-         "gen_clone", "pi05", "frames", "world", "praxis_openpi", "praxis_positronic")
+         "gen_omni", "gen_clone", "pi05", "frames", "world", "praxis_openpi", "praxis_positronic")
 MEDIA_KINDS = {"chat_image", "chat_audio", "chat_video", "video_i2v", "pi05", "frames", "world"}
 PROMPTS = [
     "Describe this in two sentences.",
@@ -88,7 +90,9 @@ class E2ESuite(Suite):
         g.add_argument("--kind", choices=KINDS, required=True)
         g.add_argument("--media", default=None, help="the media/ directory of `data e2e` (image, audio, video inputs)")
         g.add_argument("--max-tokens", type=int, default=96)
-        g.add_argument("--audio-out", action="store_true", help="chat: ask for text and speech")
+        g.add_argument("--audio-out", action="store_true", help="chat or gen_omni: ask for text and speech")
+        g.add_argument("--input-modality", choices=("text", "image", "audio"), default="text",
+                       help="gen_omni: text prompt with optional image or audio upload")
         g.add_argument("--size", default="1024x1024", help="image / video / frames size, WxH")
         g.add_argument("--extra", action="append", default=[], metavar="KEY=JSON",
                        help="extra request field (chat, image, video) or model_kwargs entry (/generate)")
@@ -98,7 +102,10 @@ class E2ESuite(Suite):
     def __init__(self, args: argparse.Namespace):
         super().__init__(args)
         self.extra = parse_extra(args.extra)
-        if args.kind in MEDIA_KINDS and not args.media:
+        needs_media = args.kind in MEDIA_KINDS or (
+            args.kind == "gen_omni" and args.input_modality in ("image", "audio")
+        )
+        if needs_media and not args.media:
             raise SystemExit(f"--kind {args.kind} needs --media (python -m benchmark.eval data e2e)")
         self.media = Path(args.media) if args.media else None
         self._cache: dict[str, bytes] = {}
@@ -115,8 +122,11 @@ class E2ESuite(Suite):
 
     def config(self) -> dict[str, Any]:
         a = self.args
-        return {"kind": a.kind, "max_tokens": a.max_tokens, "audio_out": a.audio_out, "size": a.size,
-                "extra": self.extra, "sample_rate": a.sample_rate}
+        config = {"kind": a.kind, "max_tokens": a.max_tokens, "audio_out": a.audio_out, "size": a.size,
+                  "extra": self.extra, "sample_rate": a.sample_rate}
+        if a.kind == "gen_omni":
+            config["input_modality"] = a.input_modality
+        return config
 
     def _bytes(self, name: str) -> bytes:
         if name not in self._cache:
@@ -154,7 +164,19 @@ class E2ESuite(Suite):
     def _form(self, i: int, item: Item) -> aiohttp.FormData:
         kind = self.args.kind
         form = aiohttp.FormData()
-        if kind == "gen_clone":
+        if kind == "gen_omni":
+            modality = self.args.input_modality
+            if modality in ("image", "audio"):
+                name, mime = ("image.png", "image/png") if modality == "image" else ("audio.wav", "audio/wav")
+                form.add_field("files", self._bytes(name), filename=name, content_type=mime)
+            prompts = AUDIO_PROMPTS if modality == "audio" else TEXT_PROMPTS
+            prompt = prompts[i % len(prompts)]
+            form.add_field("text", prompt)
+            form.add_field("input_modalities", f"{modality},text" if modality != "text" else "text")
+            form.add_field("output_modalities", "text,audio" if self.args.audio_out else "text")
+            kwargs: dict[str, Any] = {"seed": 1000 + i, "temperature": 0.0,
+                                     "max_output_tokens": self.args.max_tokens}
+        elif kind == "gen_clone":
             form.add_field("files", Path(item.ref_audio).read_bytes(), filename="ref.wav", content_type="audio/wav")
             form.add_field("text", item.text)
             form.add_field("input_modalities", "text,audio")
@@ -192,6 +214,7 @@ class E2ESuite(Suite):
         a = self.args
         first: list[float] = []
         text: list[str] = []
+        native_text: list[bytes] = []
         audio = bytearray()
         blob: bytes | None = None
         timeout = aiohttp.ClientTimeout(total=a.timeout)
@@ -257,9 +280,13 @@ class E2ESuite(Suite):
                             data = base64.b64decode(msg["data"])
                             if msg.get("modality") == "audio":
                                 audio.extend(data)
+                            elif msg.get("modality") == "text":
+                                native_text.append(data)
                             else:
                                 chunks.append(data)
                 blob = b"".join(chunks) or None
+                if native_text:
+                    text.append(decode_joined(native_text))
         except Exception as exc:  # noqa: BLE001 - every failure is an error row
             return exception_row(item, exc)
         e2e = time.perf_counter() - t0
@@ -267,7 +294,8 @@ class E2ESuite(Suite):
             return error_row(item, "empty output", e2e_s=e2e)
         out = "".join(text).encode() + bytes(audio) + (blob or b"")
         return {"id": item.id, "ok": True, "error": None, "e2e_s": e2e, "ttft_s": first[0] if first else None,
-                "text": "".join(text), "n_chunks": len(text), "audio_s": len(audio) / 2 / a.sample_rate,
+                "text": "".join(text), "n_chunks": len(native_text) or len(text),
+                "audio_s": len(audio) / 2 / a.sample_rate,
                 "out_sha": hashlib.sha256(out).hexdigest()[:16], "_audio": bytes(audio), "_blob": blob}
 
     def score(self, items: list[Item], rows: list[dict[str, Any]], wall_s: float, audio_dir: Path | None) -> dict:
