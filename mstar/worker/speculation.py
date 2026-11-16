@@ -470,8 +470,8 @@ class SpeculationBuilder:
 class Speculator:
     """Builds step N+1 while N runs, chaining on N's node or yielding to another,
     threads N's outputs in and settles its staged ingests; on a TP follower, it
-    rebuilds the batch the leader's head names. Tracks how many steps in a row the
-    current chain has run: at MSTAR_MAX_CONSECUTIVE_SPEC_STEPS the next step yields."""
+    rebuilds the batch the leader's head names. Tracks the peek's chain steps
+    and the cap's steps since another (node, walk) ran."""
 
     def __init__(
         self, services: WorkerServices, layout: WorkerLayout, scheduler: MicroScheduler,
@@ -499,17 +499,34 @@ class Speculator:
         self._peek = peek
         self._max_consecutive = max_consecutive
         self._consecutive = 0
+        self._since_other = 0
+        # Direct speculation can enter another walk; its mixed batch label is
+        # not the logical key whose consecutive steps the cap bounds.
+        self._cap_key: tuple[str, str] | None = None
+        # A capture-group yield can stay on the same scheduling key.
+        self._built_chain_key: tuple[str, str] | None = None
 
     def note_launched(self, speculation: Speculation) -> None:
-        """A speculated step went to the GPU thread: a step that continues the
-        chain counts toward the cap, and a real yield starts it over."""
+        """Count a launched step for the peek and the consecutive-step cap."""
         if speculation.is_yield_away and not speculation.gave_way:
             self._consecutive = 0
         else:
             self._consecutive += 1
+        launched_key = self._built_chain_key
+        if speculation.is_yield_away:
+            batch = speculation.scheduled_batch
+            launched_key = (batch.node_name, batch.graph_walk)
+        if launched_key == self._cap_key:
+            self._since_other += 1
+        else:
+            self._cap_key = launched_key
+            self._since_other = 1
 
     def chain_ended(self) -> None:
         self._consecutive = 0
+        self._since_other = 0
+        self._cap_key = None
+        self._built_chain_key = None
 
     def _async_schedulable(self, batch: ScheduledBatch) -> bool:
         """Any walk of the batch may speculate; the runtime skips the others."""
@@ -1150,11 +1167,8 @@ class Speculator:
         )
 
         if pending is not None and self.can_speculate(pending.batch):
-            # Fairness check (peek-based, replaces the old iter-
-            # counter cap): only break the spec chain when there's
-            # another (node, walk) actually ready to schedule on
-            # this worker. On single-walk workers (Orpheus LLM,
-            # Orpheus SNAC) this returns False and we always speculate.
+            # The peek breaks a chain when another (node, walk) is ready;
+            # the cap also bounds it when the peek is disabled.
             # Keyed on the walk the chain speculates into, not the step's:
             # after a mixed step that is the combined walk, which no row has,
             # so the chain's own parked rows would count as other work.
@@ -1163,6 +1177,7 @@ class Speculator:
                 (target.info.node_name, target.info.graph_walk) if target is not None
                 else (pending.node_name, pending.graph_walk)
             )
+            self._built_chain_key = chain_key
             # A prompt chain yields from its first step: speculating its next
             # chunk must not keep decode rows waiting a second prompt step. A
             # walk with no token budget runs its prompts whole and keeps
@@ -1171,7 +1186,8 @@ class Speculator:
                 chain_key, self._consecutive,
                 chain_key in self.chunk_loops.speculated and self.scheduler.chunks(*chain_key),
             )
-            must_yield_away = self._consecutive >= self._max_consecutive or other_ready
+            cap_steps = self._since_other if self._cap_key == chain_key else 0
+            must_yield_away = cap_steps >= self._max_consecutive or other_ready
             if target is not None and not must_yield_away and not admit_refused:
                 if self.enable_nvtx:
                     range_push("worker.speculate", synchronize=False)
