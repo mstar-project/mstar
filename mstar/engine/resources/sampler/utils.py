@@ -1198,6 +1198,7 @@ def scalar_fields(
     enable_min_p: bool = False, windowed: bool = False, min_tokens: bool = False,
     enable_top_p_first: bool = False, enable_logprobs: bool = False,
     enable_processed_logprobs: bool = False,
+    enable_ras: bool = False,
 ) -> tuple[ScalarField, ...]:
     """The scalars a sampler's spec enables, in the order its per-step rows
     pack them. Every field defaults to what ``SamplingConfig()`` reads as."""
@@ -1212,6 +1213,8 @@ def scalar_fields(
         fields.append(ScalarField("min_p", torch.float32, 0.0))
     if windowed:
         fields += [ScalarField("window", torch.int32, 0), ScalarField("window_penalty", torch.float32, 1.0)]
+    if enable_ras:
+        fields.append(ScalarField("ras_threshold", torch.float32, 0.0))
     if min_tokens:
         fields.append(ScalarField("min_tokens", torch.int32, 0))
     if enable_top_p_first:
@@ -1227,7 +1230,10 @@ def scalar_values(cfg: "SamplingConfig", windowed: bool) -> dict[str, float | in
     """Each scalar's value for ``cfg``: the eager sampler's canonical values
     (greedy: the prep kernel's one-hot at argmax, filters off), so both paths
     read one meaning. A field the spec doesn't enable is never read."""
-    t, k, p, m = canonical_sampling_values(cfg.temperature, cfg.top_k, cfg.top_p, cfg.min_p)
+    t, k, p, m = (
+        (cfg.temperature, cfg.top_k, cfg.top_p, cfg.min_p)
+        if cfg.ras_mode else canonical_sampling_values(cfg.temperature, cfg.top_k, cfg.top_p, cfg.min_p)
+    )
     return {
         "temperature": t, "top_k": k, "top_p": p, "seed": cfg.seed,
         # a windowed request's penalty is count-based, so the mask is inert for it
@@ -1235,6 +1241,10 @@ def scalar_values(cfg: "SamplingConfig", windowed: bool) -> dict[str, float | in
         "min_p": m,
         "window": int(cfg.repetition_window),
         "window_penalty": float(cfg.window_penalty),
+        # Match the model's former Python product, staged to float32 once.
+        # Multiplying float32 window and tau on the device can move a
+        # threshold just above an integer and change the redraw decision.
+        "ras_threshold": float(cfg.repetition_window) * float(cfg.ras_tau),
         "min_tokens": int(cfg.min_tokens),
         "top_p_first": bool(cfg.top_p_first),
         "top_p_min_keep": int(cfg.top_p_min_keep),
@@ -1258,6 +1268,8 @@ class SamplingConfig:
     min_p: float = 0.0  # 0 = disabled; see ``SamplingReqConfig.min_p``
     # see the fields of the same names on ``SamplingReqConfig``
     repetition_window: int = 0
+    ras_mode: bool = False
+    ras_tau: float = 0.0
     min_tokens: int = 0
     top_p_first: bool = False
     top_p_min_keep: int = 1
@@ -1397,10 +1409,11 @@ class Sampler(BaseSampler):
             if k in curr_config.keys() and arg is not None
         }
         merged = {**curr_config, **kwargs}
-        (merged["temperature"], merged["top_k"], merged["top_p"],
-         merged["min_p"]) = canonical_sampling_values(
-            merged["temperature"], merged["top_k"], merged["top_p"], merged["min_p"],
-        )
+        if not merged["ras_mode"]:
+            (merged["temperature"], merged["top_k"], merged["top_p"],
+             merged["min_p"]) = canonical_sampling_values(
+                merged["temperature"], merged["top_k"], merged["top_p"], merged["min_p"],
+            )
         self._sampling_config[request_id] = SamplingConfig(**merged)
 
         new_vocab_size = self._sampling_config[request_id].vocab_size
@@ -2051,6 +2064,7 @@ class AcceleratorGraphableSampler(BaseSampler):
     top_p_buf: torch.Tensor
     seed_buf: torch.Tensor
     offset_buf: torch.Tensor
+    ras_threshold_buf: torch.Tensor | None = None
     # Repetition-penalty state for the CUDA-graph path. ``None`` for submodules
     # that don't opt into seen-token tracking (then ``apply_penalty`` is a no-op).
     rep_penalty_buf: torch.Tensor | None = None
@@ -2554,6 +2568,7 @@ class SamplerBuffers:
     history: "GenerationHistory | None" = None
     window: "HostBuffer | None" = None
     window_penalty: "HostBuffer | None" = None
+    ras_threshold: "HostBuffer | None" = None
     min_tokens: "HostBuffer | None" = None
     stop_ids: torch.Tensor | None = None
     top_p_first: "HostBuffer | None" = None
@@ -2668,6 +2683,7 @@ class SamplerBuffers:
         enable_logprobs: bool = False,
         enable_processed_logprobs: bool = False,
         fused_draw: bool = True,
+        enable_ras: bool = False,
     ) -> "SamplerBuffers":
         """Allocate sampling buffers for ``max_batch_size``.
 
@@ -2714,7 +2730,7 @@ class SamplerBuffers:
         fields = cls.fields_for(
             enable_min_p=enable_min_p, history=history, stop_ids=stop_ids,
             enable_top_p_first=enable_top_p_first, enable_logprobs=enable_logprobs,
-            enable_processed_logprobs=enable_processed_logprobs,
+            enable_processed_logprobs=enable_processed_logprobs, enable_ras=enable_ras,
         )
         buffers = cls(
             max_batch_size=max_batch_size,
@@ -2755,12 +2771,14 @@ class SamplerBuffers:
         enable_top_p_first: bool = False,
         enable_logprobs: bool = False,
         enable_processed_logprobs: bool = False,
+        enable_ras: bool = False,
     ) -> tuple[ScalarField, ...]:
         """The scalars ``allocate`` gives these options a buffer each."""
         return scalar_fields(
             enable_min_p=enable_min_p, windowed=history is not None and history.window > 0,
             min_tokens=stop_ids is not None, enable_top_p_first=enable_top_p_first,
             enable_logprobs=enable_logprobs, enable_processed_logprobs=enable_processed_logprobs,
+            enable_ras=enable_ras,
         )
 
     def slice_for_bs(
@@ -2787,6 +2805,7 @@ class SamplerBuffers:
             "top_p_buf": scalar("top_p"),
             "seed_buf": scalar("seed"),
             "offset_buf": self.offset.slot_view(cg_slot, bs),
+            "ras_threshold_buf": scalar("ras_threshold"),
             "rep_penalty_buf": scalar("rep_penalty"),
             "seen_tokens_buf": self.seen_tokens.slot_view(cg_slot, bs) if self.seen_tokens is not None else None,
             "min_p_buf": scalar("min_p"),
