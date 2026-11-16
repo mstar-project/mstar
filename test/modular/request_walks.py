@@ -49,7 +49,7 @@ def run_walks(model: Model, step: Step, prompt: torch.Tensor, max_tokens: int,
     plan = model.walk_plan(PARTITION, ["text"], ["text"], {"text_inputs": [prompt]}, {})
     caps = model.get_loop_caps(max_output_tokens=max_tokens)
     rid = runtime.add_request(
-        request_id="r", partition=PARTITION, graph_walk=plan[0].walk,
+        request_id=101, partition=PARTITION, graph_walk=plan[0].walk,
         partition_worker_graph_ids=ids, worker_graph_to_workers=ParallelList(ids, [["w0"]] * len(ids)),
         loop_caps=caps,
     )

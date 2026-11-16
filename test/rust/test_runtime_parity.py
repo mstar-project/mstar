@@ -112,7 +112,7 @@ def _info(uuid):
     )
 
 
-def _admit(rt, rid="r1", loop_caps=None):
+def _admit(rt, rid=101, loop_caps=None):
     return rt.add_request(
         request_id=rid, partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[WG_ID],
@@ -148,8 +148,8 @@ def _ready(rt):
 def test_admit_ingest_schedule(pair):
     rt, _book, _store = pair
     rid = _admit(rt)
-    assert rt.get_rid_handle("r1") == rid
-    assert rt.get_rid_string(rid) == "r1"
+    assert rt.get_rid_handle(101) == rid
+    assert rt.get_rid_string(rid) == 101
     assert _ready(rt) == []
 
     assert rt.ingest_inputs_batch(
@@ -229,7 +229,7 @@ def test_one_handle_per_request_across_partitions(pair):
     rt, _book, _store = pair
     handles = [
         rt.add_request(
-            request_id="r", partition=p, graph_walk=WALK,
+            request_id=100, partition=p, graph_walk=WALK,
             partition_worker_graph_ids=[WG_ID],
             worker_graph_to_workers=ParallelList([WG_ID], [[WORKER]]),
             loop_caps={},
@@ -237,14 +237,14 @@ def test_one_handle_per_request_across_partitions(pair):
         for p in ("Thinker", "Talker", "Code2Wav")
     ]
     assert len(set(handles)) == 1, f"one request, {len(set(handles))} handles"
-    assert rt.get_rid_handle("r") == handles[0]
+    assert rt.get_rid_handle(100) == handles[0]
 
     # And teardown is complete: the handle is reusable, so nothing may be left
     # keyed by it.
     rt.remove_request(handles[0])
-    assert rt.get_rid_handle("r") is None
+    assert rt.get_rid_handle(100) is None
     assert rt.add_request(
-        request_id="r2", partition="Thinker", graph_walk=WALK,
+        request_id=102, partition="Thinker", graph_walk=WALK,
         partition_worker_graph_ids=[WG_ID],
         worker_graph_to_workers=ParallelList([WG_ID], [[WORKER]]),
         loop_caps={},
@@ -253,12 +253,12 @@ def test_one_handle_per_request_across_partitions(pair):
 
 def test_handle_recycling(pair):
     rt, _book, _store = pair
-    rid = _admit(rt, "r1")
+    rid = _admit(rt, 101)
     rt.remove_request(rid)
-    assert rt.get_rid_handle("r1") is None
+    assert rt.get_rid_handle(101) is None
     rt.remove_request(rid)  # idempotent
-    assert _admit(rt, "r2") == rid
-    assert rt.get_rid_string(rid) == "r2"
+    assert _admit(rt, 102) == rid
+    assert rt.get_rid_string(rid) == 102
 
 
 def test_speculation_targets(pair):
@@ -366,8 +366,8 @@ def _run_pass(rt, book, rid, uuids, on_decode=None, declined_decode=None) -> lis
 def test_a_capped_loop_ends_at_its_cap_on_every_pass(decode):
     rt, book = decode
     uuids = iter(range(1, 500))
-    capped = _admit(rt, "r1", loop_caps={"ar_loop": 2})
-    free = _admit(rt, "r2")
+    capped = _admit(rt, 101, loop_caps={"ar_loop": 2})
+    free = _admit(rt, 102)
 
     first = _run_pass(rt, book, capped, uuids)
     second = _run_pass(rt, book, capped, uuids)
@@ -566,7 +566,7 @@ def test_a_recycled_handle_does_not_inherit_a_loop_stop(pair):
     iteration and prep leaves it out of speculation. On main the key was the
     string rid, which never recurs."""
     rt, _book, _store = pair
-    rid = _admit(rt, "r1")
+    rid = _admit(rt, 101)
     rt.stop_loops_batched(
         partition="default", graph_walk=WALK, last_node_run="prefill",
         loop_names=ParallelList([rid], [["ar_loop"]]),
@@ -574,7 +574,7 @@ def test_a_recycled_handle_does_not_inherit_a_loop_stop(pair):
     assert rt.has_pending_loop_stop(rid, WALK, "ar_loop"), "nothing to inherit"
     rt.remove_request(rid)
 
-    assert _admit(rt, "r2") == rid, "the handle was recycled, as intended"
+    assert _admit(rt, 102) == rid, "the handle was recycled, as intended"
     assert not rt.has_pending_loop_stop(rid, WALK, "ar_loop")
     assert rt.pending_loop_stop_rids([WALK], "ar_loop") == set()
 
@@ -744,7 +744,7 @@ def test_removal_purges_routing_parked_for_a_send_that_never_ran(pair):
     """
     rt, _book, store = pair
     for i in range(20):
-        rid = _admit(rt, f"r{i}")
+        rid = _admit(rt, 100 + i)
         rt.ingest_inputs_batch(
             _ingest_block([rid], [_spec("prompt", "prefill")])
         )
@@ -978,7 +978,7 @@ def test_a_tensor_read_by_two_workers_holds_two_references(two_consumers):
     rt, book, store = two_consumers
     # "remote" runs on two workers for this request.
     rid = rt.add_request(
-        request_id="r1", partition="default", graph_walk=WALK,
+        request_id=101, partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[WG_ID, 1],
         worker_graph_to_workers=ParallelList(
             [WG_ID, 1], [[WORKER], ["worker1", "worker2"]],
@@ -1057,7 +1057,7 @@ def test_the_last_iteration_sends_no_loop_back_to_another_worker_graph(split_loo
     rt, book, step_workers = split_loop
     sibling = step_workers == [WORKER]
     rid = rt.add_request(
-        request_id="r1", partition="default", graph_walk=WALK,
+        request_id=101, partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], step_workers]),
         loop_caps={},
@@ -1107,7 +1107,7 @@ def test_a_batch_of_three_routes_and_stays_schedulable(pair):
     ready and that each request can run again.
     """
     rt, book, store = pair
-    rids = [_admit(rt, f"r{i}") for i in range(3)]
+    rids = [_admit(rt, 100 + i) for i in range(3)]
     assert len(set(rids)) == 3, "handles must be distinct"
 
     rt.ingest_inputs_batch(_ingest_block(
@@ -1152,7 +1152,7 @@ def test_a_batch_completes_every_request_not_just_the_first(pair):
     un-reset, so they never become ready again -- the request simply stops.
     """
     rt, book, store = pair
-    rids = [_admit(rt, f"r{i}") for i in range(3)]
+    rids = [_admit(rt, 100 + i) for i in range(3)]
     rt.ingest_inputs_batch(_ingest_block(
         rids, [_spec("prompt", "prefill") for _ in rids],
     ))
@@ -1248,7 +1248,7 @@ def test_the_node_becomes_ready_again_in_the_next_walk(two_walks):
     """
     rt, book, store = two_walks
     rid = rt.add_request(
-        request_id="r1", partition="default", graph_walk="prefill",
+        request_id=101, partition="default", graph_walk="prefill",
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
         loop_caps={},
@@ -1267,7 +1267,7 @@ def test_the_node_becomes_ready_again_in_the_next_walk(two_walks):
 def _one_rid_per_walk(rt):
     return [
         rt.add_request(
-            request_id=f"r{walk}", partition="default", graph_walk=walk,
+            request_id=101 if walk == "prefill" else 102, partition="default", graph_walk=walk,
             partition_worker_graph_ids=[0, 1],
             worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
             loop_caps={},
@@ -1346,7 +1346,7 @@ def test_a_batch_transitions_together(two_walks):
     rt, book, store = two_walks
     rids = [
         rt.add_request(
-            request_id=f"r{i}", partition="default", graph_walk="prefill",
+            request_id=100 + i, partition="default", graph_walk="prefill",
             partition_worker_graph_ids=[0, 1],
             worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
             loop_caps={},
@@ -1428,7 +1428,7 @@ def test_an_edge_into_a_sibling_local_graph_is_ingested_not_only_sent(
     """
     rt, book, store = two_local_graphs
     rid = rt.add_request(
-        request_id="r1", partition="default", graph_walk=WALK,
+        request_id=101, partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
         loop_caps={},
@@ -1500,7 +1500,7 @@ def test_a_stream_to_a_sibling_graph_is_reported_local(streams_to_sibling):
     """
     rt, book, store = streams_to_sibling
     rid = rt.add_request(
-        request_id="r1", partition="default", graph_walk=WALK,
+        request_id=101, partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
         loop_caps={},
@@ -1537,7 +1537,7 @@ def test_a_sibling_graph_chunk_is_held_once_not_twice(streams_to_sibling):
     """
     rt, book, store = streams_to_sibling
     rid = rt.add_request(
-        request_id="r1", partition="default", graph_walk=WALK,
+        request_id=101, partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
         loop_caps={},
@@ -1567,7 +1567,7 @@ def test_a_local_streams_inline_items_go_to_its_buffer_by_value(streams_to_sibli
     rt.set_inline_streams(frozenset({("LLM", "new_token")}))
     rids = [
         rt.add_request(
-            request_id=f"r{i}", partition="default", graph_walk=WALK,
+            request_id=100 + i, partition="default", graph_walk=WALK,
             partition_worker_graph_ids=[0, 1],
             worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
             loop_caps={},
@@ -1602,7 +1602,7 @@ def test_a_withheld_local_inline_item_reaches_no_buffer(streams_to_sibling):
     rt.set_inline_streams(frozenset({("LLM", "new_token")}))
     rids = [
         rt.add_request(
-            request_id=f"r{i}", partition="default", graph_walk=WALK,
+            request_id=100 + i, partition="default", graph_walk=WALK,
             partition_worker_graph_ids=[0, 1],
             worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
             loop_caps={},
@@ -1631,7 +1631,7 @@ def test_a_row_with_no_tensor_on_a_stream_sends_it_no_item(streams_to_sibling):
     rt, book, store = streams_to_sibling
     rids = [
         rt.add_request(
-            request_id=f"r{i}", partition="default", graph_walk=WALK,
+            request_id=100 + i, partition="default", graph_walk=WALK,
             partition_worker_graph_ids=[0, 1],
             worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
             loop_caps={},
@@ -1667,7 +1667,7 @@ def test_a_partition_the_request_does_not_use_takes_the_empty_walk(streams_to_si
 
     def admit(partition, walk, wg_id):
         return rt.add_request(
-            request_id="r1", partition=partition, graph_walk=walk,
+            request_id=101, partition=partition, graph_walk=walk,
             partition_worker_graph_ids=[wg_id],
             worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
             loop_caps={},
@@ -1682,7 +1682,7 @@ def test_a_partition_the_request_does_not_use_takes_the_empty_walk(streams_to_si
         assert _ready(rt) == [("LLM", WALK, [rid])]
         assert rt.is_partition_idle(rid, "SNAC")
     rt.remove_request(rid)
-    assert rt.get_rid_handle("r1") is None
+    assert rt.get_rid_handle(101) is None
 
 
 def test_the_speculation_target_reports_its_output_signals(pair):
@@ -1786,7 +1786,7 @@ def test_a_finished_worker_graph_asks_for_request_info(streams_to_sibling):
     """
     rt, book, store = streams_to_sibling
     rid = rt.add_request(
-        request_id="r1", partition="default", graph_walk=WALK,
+        request_id=101, partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
         loop_caps={},
@@ -2103,7 +2103,7 @@ def tp_pair():
 def _drive_tp(rt, book, store, steps=8):
     """Run whatever is ready until nothing is, logging what each step ate."""
     rid = rt.add_request(
-        request_id="r1", partition="default", graph_walk=TP_WALK,
+        request_id=101, partition="default", graph_walk=TP_WALK,
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER, PEER]]),
         loop_caps={},
@@ -2249,7 +2249,7 @@ def _admit_with_remote(rt, remote):
     if not remote:
         return _admit(rt)
     return rt.add_request(
-        request_id="r1", partition="default", graph_walk=WALK,
+        request_id=101, partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[WG_ID, 1],
         worker_graph_to_workers=ParallelList([WG_ID, 1], [[WORKER], ["worker1"]]),
         loop_caps={},
@@ -2488,7 +2488,7 @@ def _chunk_runtime():
     return rt, book
 
 
-def _enter_chunk_walk(rt, seed_tick=True, request_id="r1"):
+def _enter_chunk_walk(rt, seed_tick=True, request_id=101):
     """What the conductor sends on entering the walk: the prompt, and the
     chunk Loop's loop-back seed."""
     from mstar.model.submodule_base import chunk_tick_name
@@ -2608,7 +2608,7 @@ def _per_chunk_stream_runtime():
     from mstar.model.submodule_base import chunk_tick_name
 
     rid = rt.add_request(
-        request_id="r1", partition="default", graph_walk=CHUNK_WALK,
+        request_id=101, partition="default", graph_walk=CHUNK_WALK,
         partition_worker_graph_ids=[WG_ID, 1],
         worker_graph_to_workers=ParallelList([WG_ID, 1], [[WORKER], [WORKER]]),
         loop_caps={},
@@ -2769,8 +2769,8 @@ def test_speculation_searches_past_a_first_row_on_its_last_chunk():
     """A first row on its last chunk does not end the walk's speculation: the
     target stays for the row that continues, and only that row is prepped."""
     rt, _book = _chunk_runtime()
-    done = _enter_chunk_walk(rt, request_id="r1")
-    going = _enter_chunk_walk(rt, request_id="r2")
+    done = _enter_chunk_walk(rt, request_id=101)
+    going = _enter_chunk_walk(rt, request_id=102)
     for rid in (done, going):
         _cap(rt, rid, 10)
     rt.pop_rids("llm", CHUNK_WALK, [done, going])
