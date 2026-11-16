@@ -114,6 +114,7 @@ class OrpheusModel(Model):
     """Orpheus TTS model: Llama 3.2 3B + SNAC 24kHz decoder."""
 
     DECODE_LOOP = "decode_loop"
+    _llm_weights_dir: str | None = None
 
     def __init__(
         self,
@@ -458,9 +459,26 @@ class OrpheusModel(Model):
         language_model.to_empty(device=device)
 
         load_weights(language_model, local_dir, device=device)
+        self._llm_weights_dir = local_dir
         language_model.eval()
 
         return OrpheusLLMSubmodule(language_model, self.config)
+
+    def reload_weights(
+        self, path: str, submodules: dict[str, torch.nn.Module], *, check_only: bool = False,
+    ) -> None:
+        """Reload the LLM in place; the separately loaded SNAC decoder is unchanged."""
+        from mstar.model.loader import HF_DEFAULT_SKIP_FRAGMENTS, load_weights
+        from mstar.model.loader.reload import WeightReloadRefusedError, check_reload_compatible
+
+        llm = submodules.get("LLM")
+        if llm is None:
+            return
+        if self._llm_weights_dir is None:
+            raise WeightReloadRefusedError("the Orpheus LLM was not loaded from a checkpoint directory")
+        check_reload_compatible(path, self._llm_weights_dir, skip_fragments=HF_DEFAULT_SKIP_FRAGMENTS)
+        if not check_only:
+            load_weights(llm.model, path, device="cpu")
 
     def _create_snac_submodule(self, device: str) -> NodeSubmodule:
         from mstar.model.orpheus.components.snac import SNAC

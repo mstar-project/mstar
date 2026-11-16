@@ -38,6 +38,7 @@ from mstar.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
+from mstar.model.loader.reload import WeightReloadRefusedError
 from mstar.graph.special_destinations import EMPTY_DESTINATION
 from mstar.model.media_limits import VideoBudget, decoding_upload, read_image, video_decode_threads
 from mstar.model.multimodal import TEXT, PromptPart
@@ -870,6 +871,17 @@ class Model(ABC):
         override alone (``names_checkpoint``).
         """
         return None
+
+    def reload_weights(
+        self, path: str, submodules: dict[str, torch.nn.Module], *, check_only: bool = False,
+    ) -> None:
+        """Copy compatible checkpoint weights into existing modules when supported.
+
+        A model opts in by overriding this method. The engine calls the check
+        before any copy and keeps module storage stable for captured graphs.
+        """
+        del path, submodules, check_only
+        raise WeightReloadRefusedError(f"{type(self).__name__} does not support reloading weights in place")
 
     def preprocess_fingerprint(self) -> str:
         """What this model's preprocessing contributes to the cache's root.

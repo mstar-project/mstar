@@ -37,6 +37,7 @@ from mstar.worker.lora_loads import LoraLoads
 from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout, WorkerServices
 from mstar.worker.worker_metrics import WorkerMetrics
+from mstar.worker.weight_ops import WeightOps
 
 if TYPE_CHECKING:
     from mstar.engine.resources import ResourceReqConfig
@@ -70,6 +71,7 @@ class InputIngest:
         lifecycle: RequestLifecycle, lockstep: Lockstep, wakeup_event: EventWakeup,
         *, metrics: WorkerMetrics | None = None, enable_nvtx: bool = False,
         set_rebuildable: Callable[[int, dict[str, ResourceReqConfig]], Collection[str]] | None = None,
+        weight_ops: WeightOps | None = None,
     ):
         self._worker_id = services.worker_id
         self._runtime = services.graph_runtime
@@ -101,6 +103,8 @@ class InputIngest:
             WorkerMessageType.LOAD_LORA_ADAPTER: self.lora_loads.load,
             WorkerMessageType.UNLOAD_LORA_ADAPTER: self.lora_loads.unload,
         }
+        if weight_ops is not None:
+            self._handlers[WorkerMessageType.WEIGHT_CONTROL] = weight_ops.enqueue
         if metrics is not None:
             # sent only with metrics on
             self._handlers[WorkerMessageType.ENABLE_METRICS] = lambda _: metrics.start_counting()
