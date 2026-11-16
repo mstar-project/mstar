@@ -103,6 +103,20 @@ def test_main_returns_failure_for_truncated_full_rollout(monkeypatch, tmp_path):
     assert report["cases"][0]["sample_complete"] is False
 
 
+def test_invalid_case_fails_before_server_start(monkeypatch, tmp_path):
+    def unexpected_start(*_args, **_kwargs):
+        raise AssertionError("server started for an invalid case")
+
+    monkeypatch.setattr(probe.subprocess, "Popen", unexpected_start)
+    monkeypatch.setattr(sys, "argv", ["probe", "--example", str(tmp_path), "--out", str(tmp_path / "out"),
+                                       "--cases", "0:4x4"])
+
+    with pytest.raises(SystemExit) as error:
+        probe.main()
+    assert error.value.code == 2
+    assert not (tmp_path / "out").exists()
+
+
 def test_chunk_cadence_and_playback_stalls():
     result = summarize_chunks([1.0, 2.0, 3.5], [13, 16, 16], [16.0] * 3)
 

@@ -171,8 +171,23 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=18451)
     args = ap.parse_args()
     sys.path.insert(0, str(args.repo))
+    if args.chunks < 1:
+        ap.error("--chunks must be positive")
+    cases = []
+    for case in args.cases:
+        try:
+            count_text, layout = case.split(":")
+            count = int(count_text)
+            if layout not in {"4x4", "3x4"}:
+                raise ValueError("layout must be 4x4 or 3x4")
+            expected_chunk_frame_counts(count)
+        except ValueError as e:
+            ap.error(f"invalid case {case!r}: {e}")
+        cases.append((count, layout))
     from mstar.client import MStarClient, VideoFrameChunk
 
+    poses = np.load(args.example / "poses.npy")
+    intr = np.load(args.example / "intrinsics.npy")[0].tolist()
     args.out.mkdir(parents=True, exist_ok=True)
     workdir = Path(tempfile.mkdtemp(prefix="lingbot-ff-"))
     log = open(args.out / "server.log", "w")
@@ -185,10 +200,6 @@ def main() -> int:
         stdout=log, stderr=subprocess.STDOUT, cwd=args.repo,
     )
     client = MStarClient(f"http://127.0.0.1:{args.port}", timeout=900)
-    poses = np.load(args.example / "poses.npy")
-    intr = np.load(args.example / "intrinsics.npy")[0].tolist()
-    if args.chunks < 1:
-        ap.error("--chunks must be positive")
     report = {"cases": [], "full_rollout": args.full_rollout}
 
     try:
@@ -199,9 +210,8 @@ def main() -> int:
             time.sleep(2)
         report["warmup"] = run_case(client, VideoFrameChunk, poses, intr, args.example, 93, "4x4", None, "warm")
         report["warm_93"] = run_case(client, VideoFrameChunk, poses, intr, args.example, 93, "4x4", None, "warm2")
-        for i, case in enumerate(args.cases):
-            n, layout = case.split(":")
-            report["cases"].append(run_case(client, VideoFrameChunk, poses, intr, args.example, int(n), layout,
+        for i, (n, layout) in enumerate(cases):
+            report["cases"].append(run_case(client, VideoFrameChunk, poses, intr, args.example, n, layout,
                                             None if args.full_rollout else args.chunks, f"case{i}"))
             time.sleep(5)
     finally:
