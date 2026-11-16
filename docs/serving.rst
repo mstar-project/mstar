@@ -1223,8 +1223,8 @@ RDMA-read or SHM file-read time on ``rx``; the registration / serialize-and-writ
 
 .. note::
 
-   Per-node and transfer profiling is gated on ``--log-stats``. The data worker
-   also reports preprocess timing when metrics or tracing is enabled.
+   Per-node and transfer profiling runs with ``--log-stats`` or request tracing.
+   The data worker also reports preprocess timing when metrics or tracing is enabled.
 
 .. _serving-tracing:
 
@@ -1245,9 +1245,20 @@ children when their existing timestamps are available. The current default
 Rust frontend and the deprecated Python frontend both produce these API
 spans. For ``/v1/chat/completions``, either frontend passes an incoming W3C
 ``traceparent`` to the API server. A valid parent is used for the request span;
-a malformed one starts a root trace. Other routes and HTTP server spans remain
+a malformed one starts a root trace. When tracing is enabled, the workers collect
+their existing per-request node timings. Each ``node.activity`` child of ``graph``
+spans the first to last step in the conductor's retained timing for one node
+and walk. Its execution count and CPU-measured phase sums use the same batch-wide
+timing as ``--log-stats``; a missing forward-end stamp folds later work into the
+forward sum. The window does not divide GPU time between requests or show gaps
+between repeated steps. With several ranks, the last report for a node and walk
+may replace an earlier rank's timing. Tracing turns on worker profiling for all
+requests, including ones the sampler drops, so transfer accounting and periodic
+arena logs also run. It does not print a per-request profile unless
+``--log-stats`` is set. The timing conversion assumes the current same-host
+process clocks; worker hosts outside that clock domain need a separate clock
+mapping. Other routes, HTTP server spans, transfer spans and exemplars remain
 in `issue #771 <https://github.com/mstar-project/mstar/issues/771>`_.
-Node, transfer, exemplar and log correlation work also remains in that issue.
 
 .. _serving-metrics:
 

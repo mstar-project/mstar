@@ -560,6 +560,7 @@ class APIServer:
         log_stats_file: str | None = None,
         enable_nvtx: bool = False,
         model_config: dict | None = None,
+        profile_workers: bool = False,
     ):
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
@@ -628,7 +629,7 @@ class APIServer:
             socket_path_prefix=socket_path_prefix,
             tensor_comm_protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
-            enable_prof=self.log_stats,
+            enable_prof=self.log_stats or profile_workers,
             enable_nvtx=self.enable_nvtx,
             is_pending=self.is_pending,
             upload_dir=self.upload_dir,
@@ -3288,6 +3289,7 @@ def main(argv: list[str] | None = None):
 
     global api_server
     log_stats = args.log_stats or args.log_stats_file is not None
+    profile_workers = log_stats or bool(args.otlp_traces_endpoint)
     api_server = APIServer(
         socket_path_prefix=args.socket_path_prefix,
         upload_dir=args.upload_dir,
@@ -3300,6 +3302,7 @@ def main(argv: list[str] | None = None):
         log_stats=log_stats,
         log_stats_file=args.log_stats_file,
         enable_nvtx=args.enable_nvtx,
+        profile_workers=profile_workers,
     )
 
     from mstar.api_server.openai.adapters import get_adapter
@@ -3316,7 +3319,7 @@ def main(argv: list[str] | None = None):
             args.config,
             args.socket_path_prefix,
             args.enable_nvtx,
-            log_stats,
+            profile_workers,
             args.log_level,
             args.cache_dir,
             CommProtocol(args.tensor_comm_protocol),
