@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from benchmark.eval.e2e import checks
+from benchmark.eval.e2e.report import RERUN_TAG
 
 
 def _safe_file(path: Path, root: Path) -> bool:
@@ -64,8 +65,9 @@ def _media(path: Path, root: Path, page: Path) -> str:
     return f'<a href="{url}">download {label}</a>'
 
 
-def write(run_dir: Path, rows: list) -> Path:
+def write(run_dir: Path, rows: list, models: list) -> Path:
     """Write report/review.html using local saved outputs only; no media is fetched here."""
+    min_conc = {(model.name, case.id): min(case.conc) for model in models for case in model.cases}
     page = run_dir / "report" / "review.html"
     _check_output_path(page, run_dir)
     page.parent.mkdir(parents=True, exist_ok=True)
@@ -80,20 +82,26 @@ def write(run_dir: Path, rows: list) -> Path:
     for row in rows:
         if row.correct not in ("changed", "FAIL") and not row.quality_worse:
             continue
-        model = run_dir / row.model
+        model = run_dir / "results" / row.model
         case = row.case
+        conc = min_conc[(row.model, case)]
         pairs: list[tuple[str, Path | None, Path | None]] = []
-        for session in sorted((model / "base").glob("s*")):
-            if not session.is_dir() or not session.name.startswith("s"):
-                continue
-            base = checks.saved_dir(session / case, 1)
-            head = checks.saved_dir(model / "head" / session.name / case, 1)
-            names = set()
-            for directory in (base, head):
-                if directory is not None and directory.is_dir():
-                    names.update(p.name for p in directory.iterdir() if _safe_file(p, run_dir))
-            pairs.extend((f"{session.name}/{name}", base / name if base else None,
-                          head / name if head else None) for name in sorted(names))
+        runs = [("first run", model)]
+        rerun = run_dir / "results" / (row.model + RERUN_TAG)
+        if row.rerun and rerun.is_dir():
+            runs.append(("ABBA rerun", rerun))
+        for run_label, result in runs:
+            for session in sorted((result / "base").glob("s*")):
+                if not session.is_dir() or not session.name.startswith("s"):
+                    continue
+                base = checks.saved_dir(session / case, conc)
+                head = checks.saved_dir(result / "head" / session.name / case, conc)
+                names = set()
+                for directory in (base, head):
+                    if directory is not None and directory.is_dir():
+                        names.update(p.name for p in directory.iterdir() if _safe_file(p, run_dir))
+                pairs.extend((f"{run_label}/{session.name}/{name}", base / name if base else None,
+                              head / name if head else None) for name in sorted(names))
         if not pairs:
             continue
         shown += 1

@@ -118,9 +118,10 @@ def render(run_dir: Path, man: mf.Manifest, calibration: str, chart_url: str | N
             raise SystemExit("--review is for saved compare outputs, not --stress")
         md, verdicts = stress.write(run_dir, run["models"], chart_url)
         return md, 1 if any(v.flagged for v in verdicts) else 2 if any(v.unfinished for v in verdicts) else 0
-    md, rows = report.write(run_dir, run_models(man, run), chart_url, calibrate.load(calibration))
+    models = run_models(man, run)
+    md, rows = report.write(run_dir, models, chart_url, calibrate.load(calibration))
     if with_review:
-        page = review.write(run_dir, rows)
+        page = review.write(run_dir, rows, models)
         with md.open("a") as out:
             out.write(f"\n[Changed output review]({page.name})\n")
     bare = sorted({r.model for r in rows if r.no_baseline})
