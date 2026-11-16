@@ -40,8 +40,8 @@ def _build(speculator, consecutive):
     return speculator.build(_pending())
 
 
-def _chain_step():
-    return SimpleNamespace(node_batch=SimpleNamespace(node_name="LLM"), tp_seq=-1, is_yield_away=False)
+def _chain_step(node_name="LLM"):
+    return SimpleNamespace(node_batch=SimpleNamespace(node_name=node_name), tp_seq=-1, is_yield_away=False)
 
 
 def _pending():
@@ -213,3 +213,24 @@ def test_another_capture_group_keeps_the_default_peek_cadence():
 
     speculator.build(_pending())
     assert peeked == []
+
+
+def test_a_direct_step_on_another_walk_restarts_the_cap():
+    target = [SpeculationTarget(SimpleNamespace(node_name="LLM", graph_walk="decode"), [0])]
+    speculator, _, _ = _speculator(target[0], peek=False)
+    speculator._max_consecutive = 2
+    speculator._choose_spec_target = lambda batch: target[0]
+    speculator._try_speculate_next = lambda pending, picked: _chain_step(picked.info.node_name)
+
+    launched, _ = speculator.build(_pending())
+    assert launched.node_batch.node_name == "LLM"
+    speculator.note_launched(launched)
+
+    target[0] = SpeculationTarget(SimpleNamespace(node_name="audio", graph_walk="emit"), [0])
+    launched, _ = speculator.build(_pending())
+    assert launched.node_batch.node_name == "audio"
+    speculator.note_launched(launched)
+
+    # The first audio step did not continue the LLM chain.
+    launched, yielded_from = speculator.build(_pending())
+    assert launched.node_batch.node_name == "audio" and yielded_from is None

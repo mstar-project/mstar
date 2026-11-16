@@ -500,6 +500,9 @@ class Speculator:
         self._max_consecutive = max_consecutive
         self._consecutive = 0
         self._since_other = 0
+        # Direct speculation can enter another walk; its mixed batch label is
+        # not the logical key whose consecutive steps the cap bounds.
+        self._cap_key: tuple[str, str] | None = None
         # A capture-group yield can stay on the same scheduling key.
         self._built_chain_key: tuple[str, str] | None = None
 
@@ -509,16 +512,20 @@ class Speculator:
             self._consecutive = 0
         else:
             self._consecutive += 1
+        launched_key = self._built_chain_key
         if speculation.is_yield_away:
             batch = speculation.scheduled_batch
-            if (batch.node_name, batch.graph_walk) != self._built_chain_key:
-                self._since_other = 0
-                return
-        self._since_other += 1
+            launched_key = (batch.node_name, batch.graph_walk)
+        if launched_key == self._cap_key:
+            self._since_other += 1
+        else:
+            self._cap_key = launched_key
+            self._since_other = 1
 
     def chain_ended(self) -> None:
         self._consecutive = 0
         self._since_other = 0
+        self._cap_key = None
         self._built_chain_key = None
 
     def _async_schedulable(self, batch: ScheduledBatch) -> bool:
@@ -1179,7 +1186,8 @@ class Speculator:
                 chain_key, self._consecutive,
                 chain_key in self.chunk_loops.speculated and self.scheduler.chunks(*chain_key),
             )
-            must_yield_away = self._since_other >= self._max_consecutive or other_ready
+            cap_steps = self._since_other if self._cap_key == chain_key else 0
+            must_yield_away = cap_steps >= self._max_consecutive or other_ready
             if target is not None and not must_yield_away and not admit_refused:
                 if self.enable_nvtx:
                     range_push("worker.speculate", synchronize=False)
