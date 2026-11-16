@@ -2605,6 +2605,7 @@ async def generate_ws(websocket: WebSocket):
                 request_id=request_id,
                 end_input=end_input,
                 file_streams=file_streams,
+                traceparent=websocket.headers.get("traceparent"),
             )
             key = api_server.submission_key(request_id)
             submitted.add(key)
@@ -2964,6 +2965,7 @@ async def generate(
                 prompt_parts=parts or None,
                 streaming=streaming,
                 request_id=request_id,
+                traceparent=request.headers.get("traceparent"),
             )
         except json.JSONDecodeError:
             raise   # a downstream parse failure, not a bad request (a 500 below)

@@ -123,6 +123,20 @@ def test_json_frame_round_trip(monkeypatch, tmp_path):
     assert saved.startswith(str(tmp_path)) and open(saved, "rb").read() == b"PNG"
 
 
+@pytest.mark.parametrize("parent", [None, "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"])
+def test_generate_ws_uses_handshake_traceparent_for_each_request(monkeypatch, tmp_path, parent):
+    fake = _FakeServer(tmp_path, chunks_per_request=1)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    headers = {"traceparent": parent} if parent else {}
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws", headers=headers) as ws:
+        for rid in ("first", "second"):
+            ws.send_text(json.dumps({"text": "hi", "request_id": rid}))
+        for _ in range(2):
+            assert _recv_until_finish(ws, binary=False)[-1]["finish"] is True
+
+    assert [submission["traceparent"] for submission in fake.submitted] == [parent, parent]
+
+
 def test_msgpack_frames_and_pipelining(monkeypatch, tmp_path):
     fake = _FakeServer(tmp_path, chunks_per_request=1)
     monkeypatch.setattr(entrypoint, "api_server", fake)

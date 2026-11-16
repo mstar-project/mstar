@@ -1689,6 +1689,7 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
     let mut request_id: Option<String> = None;
     let mut uploads = SavedUploads::new(&st.upload_dir);
     let mut parts: Vec<Part> = Vec::new();
+    let traceparent = incoming_traceparent(req.headers());
 
     // The FastAPI endpoint this replaces uses `Form(...)` fields, which
     // Starlette parses from EITHER `multipart/form-data` (with file uploads)
@@ -1751,7 +1752,7 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
         }
         return generate_finish(
             st, text, in_mods_raw, out_mods_raw, streaming, tokenize, mk_raw,
-            request_id, uploads, Vec::new(), binary,
+            request_id, uploads, Vec::new(), binary, traceparent,
         )
         .await;
     }
@@ -1845,7 +1846,7 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
 
     generate_finish(
         st, text, in_mods_raw, out_mods_raw, streaming, tokenize, mk_raw,
-        request_id, uploads, parts, binary,
+        request_id, uploads, parts, binary, traceparent,
     )
     .await
 }
@@ -1890,6 +1891,7 @@ async fn generate_finish(
     uploads: SavedUploads,
     mut parts: Vec<Part>,
     binary: bool,
+    traceparent: Option<String>,
 ) -> Response {
     // An empty field means none, as the Python /generate's form parsing reads
     // its optional fields.
@@ -1966,6 +1968,7 @@ async fn generate_finish(
     let args = SubmitArgs {
         text,
         tokens,
+        traceparent,
         file_paths: uploads.keep(),
         input_modalities,
         output_modalities,
@@ -2335,7 +2338,7 @@ mod tests {
         uploads.paths = file_paths;
         let resp = generate_finish(
             st, Some("hi".into()), input.map(str::to_string), output.into(), streaming,
-            false, None, None, uploads, Vec::new(), false,
+            false, None, None, uploads, Vec::new(), false, None,
         )
         .await;
         let (status, _, data) = body(resp).await;
