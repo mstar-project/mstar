@@ -643,9 +643,10 @@ scaffold, its state declared on the state contract, through the checkpoint's cha
 ``chat_template_kwargs``, reaches it); other sizes aren't registered. Prefill, the
 mixed prefill/decode step and decode are captured. Sampling defaults come from the
 checkpoint's ``generation_config.json``. A request is bounded by the checkpoint's
-context: one that asks no length decodes to the room its prompt leaves, and a prompt
-past it is a 400. Rope scaling, sliding windows and attention biases are refused at
-startup rather than ignored.
+context: one that asks no length decodes at most 2048 tokens (the server's default output
+cap), fewer where its prompt leaves less room, and a prompt past the context is a 400.
+Rope scaling, sliding windows and attention biases are refused at startup rather than
+ignored.
 
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------
