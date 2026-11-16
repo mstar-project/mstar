@@ -1,0 +1,50 @@
+name: Review hint
+
+# One comment on each PR, when it opens ready for review or is marked ready, saying which `/review` commands its
+# author and maintainers can run there (bot.py, hint). Never on a push: a later run finds the comment by its marker
+# and edits it rather than post another. It reviews nothing and runs no model; reviews start only on request
+# (claude-review.yml).
+#
+# pull_request_target so fork PRs get it too. GitHub runs the default branch's copy of this file, and the job checks
+# out only main's .github/review: it runs no PR code and reads only the PR's metadata through the API, and the comment
+# is fixed text chosen by the author's access. It posts with the job's own token, as github-actions: the review app's
+# key is in the review-bot environment, which this job stays out of.
+
+on:
+  pull_request_target:
+    types: [opened, ready_for_review]
+
+permissions: {}
+
+jobs:
+  hint:
+    name: Review hint
+    # A draft gets it when it is marked ready.
+    if: github.event.action == 'ready_for_review' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Queued, not cancelled: two runs at once would each find no hint and both post one.
+    concurrency:
+      group: review-hint-${{ github.event.pull_request.number }}
+    permissions:
+      # Main's copy of the bot's scripts.
+      contents: read
+      # Reads the PR and its comments, and posts or edits the hint.
+      pull-requests: write
+    steps:
+      - name: Check out main's scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/review
+          persist-credentials: false
+
+      # A hint isn't worth a red check on a new PR; a failure stays in the log.
+      - name: Post the hint
+        continue-on-error: true
+        env:
+          PYTHONDONTWRITEBYTECODE: 1
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: python3 .github/review/bot.py hint
