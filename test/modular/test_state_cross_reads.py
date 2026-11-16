@@ -604,6 +604,17 @@ def test_a_step_of_only_an_array_with_no_reads_is_no_step_at_all():
     assert state_steps(step, _handles(_resampler())) is None, "it would plan a resource that nothing reads"
 
 
+def test_a_kept_step_lists_an_array_with_no_reads_at_its_queries_span():
+    """MiniCPM-o's every image request failed here: its queries take no add, and the step keeps by default."""
+    patch_kv, queries = _resampler()
+    step = SubmoduleStep(state={"queries": ArrayStep(segments=(Segment(1, "queries", 2),))})
+    step.set_ctx(_ctx())
+    step.set_state_handles((_handles([patch_kv, queries])["queries"],))
+    step.begin_calls()
+    step.check_calls()
+    step.end_calls()
+
+
 @pytest.mark.parametrize("call, tensors", [("add", ("k", "v")), ("read", ("q",))])
 def test_an_array_with_no_reads_takes_no_add_or_read(call, tensors):
     queries = _handles(_resampler())["queries"]
