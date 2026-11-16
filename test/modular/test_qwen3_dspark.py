@@ -940,8 +940,36 @@ _ADOPTERS = [
     ("mstar.model.command_a_plus.submodules", "CommandAPlusLLMSubmodule"),
     ("mstar.model.canary_qwen.submodules", "CanaryQwenLLMSubmodule"),
     ("mstar.model.canary.submodules", "CanaryDecoderSubmodule"),
+    ("mstar.model.phi4mm.submodules", "Phi4MMLLMSubmodule"),
 ]
 _ROUTED = {"OrpheusLLMSubmodule", "CommandAPlusLLMSubmodule", "CanaryQwenLLMSubmodule"}
+
+
+def test_every_scaffold_adopter_is_listed():
+    """Every node a model package builds on the shared decoder (a `SampledTokenDecoder` outside
+    `mstar.model.components`) is in `_ADOPTERS`, so the two tests below check each one. A package
+    that can't be imported here is passed over, as the two tests skip it."""
+    import importlib
+    import inspect
+    import pkgutil
+
+    import mstar.model
+    from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+
+    found = set()
+    for package in pkgutil.iter_modules(mstar.model.__path__):
+        name = f"mstar.model.{package.name}.submodules"
+        if package.name == "components" or importlib.util.find_spec(f"mstar.model.{package.name}") is None:
+            continue
+        try:
+            module = importlib.import_module(name)
+        except ImportError:
+            # no submodules module, or one that needs an optional dependency (as `_adopter` skips)
+            continue
+        for cls_name, cls in inspect.getmembers(module, inspect.isclass):
+            if cls.__module__ == name and issubclass(cls, SampledTokenDecoder) and not inspect.isabstract(cls):
+                found.add((name, cls_name))
+    assert found <= set(_ADOPTERS), sorted(found - set(_ADOPTERS))
 
 
 def _adopter(module: str, name: str):
