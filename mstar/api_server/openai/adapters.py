@@ -1785,6 +1785,8 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     # chat with images and audio (image_url, audio_url and input_audio parts)
     "phi4mm": Qwen3_5Adapter(),
     "ripple_65b": TextChatAdapter(),
+    # image_url and text parts in, text out, like Qwen3.5's chat
+    "deepseek_ocr": Qwen3_5Adapter(),
 }
 
 # One key per size; every size takes the same adapter.
