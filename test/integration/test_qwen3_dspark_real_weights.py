@@ -142,10 +142,10 @@ def _config(tmp: Path, name: str, drafter: Drafter, *, draft_mode: str | None, v
     if not captured:
         config["model_kwargs"]["accelerator_graph"] = False
     # pages of 16 tokens, so a 23-56-token chat prompt fills whole pages a repeat can hit; as many
-    # tokens as the shipped configs' 128-token pages hold
+    # tokens as the shipped config's own pages hold
     kv = resources.setdefault("kv_cache", {})
+    kv["max_num_pages"] = kv.get("max_num_pages", 1024) * kv.get("page_size", 128) // PAGE
     kv["page_size"] = PAGE
-    kv["max_num_pages"] = kv.get("max_num_pages", 1024) * (128 // PAGE)
     if max_num_pages:
         # pages run out under load: requests are offloaded and reloaded
         kv.update(max_num_pages=max_num_pages, cpu_offload_pages=4 * max_num_pages)
