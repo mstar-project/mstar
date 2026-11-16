@@ -543,7 +543,9 @@ class QuantColumnParallelLinear(ColumnParallelLinear):
 
     def __init__(self, linear: ColumnParallelLinear, fmt: LinearFormat, input_amax: float | None):
         nn.Module.__init__(self)
-        self.local = QuantLinear(linear.weight, linear.bias, fmt, input_amax=input_amax)
+        self.local = QuantLinear(
+            linear.weight, None if linear.skip_bias_add else linear.bias, fmt, input_amax=input_amax,
+        )
         self.tp_rank, self.tp_size = linear.tp_rank, linear.tp_size
         self.input_size_per_partition = linear.input_size_per_partition
         self.output_size_per_partition = linear.output_size_per_partition

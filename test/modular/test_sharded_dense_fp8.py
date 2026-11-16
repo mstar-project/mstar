@@ -70,6 +70,21 @@ def test_column_gather_keeps_rank_shards_and_lora_contract(monkeypatch):
     assert torch.equal(quantized[0](x)[..., :128], out[..., :128] + 1)
 
 
+def test_column_skip_bias_add_stays_bias_free(monkeypatch):
+    monkeypatch.setattr(type(DENSE_FP8), "unavailable_reason", lambda self, device: None)
+    layer = ColumnParallelLinear(
+        _Group(0), 128, 256, bias=True, skip_bias_add=True, dtype=torch.bfloat16,
+    )
+    layer.weight.data.zero_()
+    layer.bias.data.fill_(3)
+    x = torch.ones(2, 128, dtype=torch.bfloat16)
+    assert torch.equal(layer(x), torch.zeros(2, 128, dtype=torch.bfloat16))
+    root = nn.Module()
+    root.proj = layer
+    apply_linear_dtype(root, "dense_fp8", QuantizableLinears(("proj",), ()))
+    assert torch.equal(root.proj(x), torch.zeros(2, 128, dtype=torch.bfloat16))
+
+
 def test_row_reduce_adds_bias_once_and_keeps_lora_contract(monkeypatch):
     monkeypatch.setattr(type(DENSE_FP8), "unavailable_reason", lambda self, device: None)
     weight, bias = _weight((128, 256), 4), _weight((128,), 5)
