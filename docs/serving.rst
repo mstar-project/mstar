@@ -1243,9 +1243,10 @@ Tracing is off by default and starts after warmups. This first API-server slice
 exports a root ``request`` span and ``preprocess``, ``graph`` and ``delivery``
 children when their existing timestamps are available. The current default
 Rust frontend and the deprecated Python frontend both produce these API
-spans. HTTP ``traceparent`` is not yet propagated from either frontend; the
-later frontend work in `issue #771 <https://github.com/mstar-project/mstar/issues/771>`_
-adds that parent and the HTTP server span.
+spans. For ``/v1/chat/completions``, either frontend passes an incoming W3C
+``traceparent`` to the API server. A valid parent is used for the request span;
+a malformed one starts a root trace. Other routes and HTTP server spans remain
+in `issue #771 <https://github.com/mstar-project/mstar/issues/771>`_.
 Node, transfer, exemplar and log correlation work also remains in that issue.
 
 .. _serving-metrics:

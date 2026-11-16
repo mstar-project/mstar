@@ -48,6 +48,7 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
             streaming=bool(req.stream),
             request_id=request_id,
             report_usage=True,
+            traceparent=raw_request.headers.get("traceparent") if raw_request is not None else None,
         )
         if req.stream:
             # a request the engine refuses gets its status, not a 200

@@ -1,5 +1,6 @@
 """CPU checks for the opt-in API request trace."""
 
+import asyncio
 import time
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from mstar.api_server.entrypoint import PendingRequest
+from mstar.api_server.rust_frontend import RustFrontendBridge
 from mstar.observability.tracing import RequestTracing
 from mstar.profile.format import RequestProfile, RequestTiming
 
@@ -90,3 +92,59 @@ def test_request_span_is_root_even_with_ambient_context():
     assert spans["request"].parent is None
     assert spans["request"].context.trace_id != spans["ambient"].context.trace_id
     provider.shutdown()
+
+
+@pytest.mark.parametrize("traceparent,has_parent", [
+    ("00-0123456789abcdef0123456789abcdef-0123456789abcdef-01", True),
+    ("not-a-traceparent", False),
+])
+def test_submit_traceparent_parents_only_a_valid_request(traceparent, has_parent):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    server = make_test_api_server(preprocess_worker=SimpleNamespace(new_request=lambda inp: None))
+    server.tracing = RequestTracing("dummy", provider=provider)
+    rid = server.submit_request(
+        request_id="client", input_modalities=["text"], output_modalities=["text"],
+        traceparent=traceparent,
+    )
+    req = server.pending_requests[server.submission_key(rid)]
+    server._record_end(req, "success")
+    span, = exporter.get_finished_spans()
+    if has_parent:
+        assert span.parent.trace_id == int("0123456789abcdef0123456789abcdef", 16)
+        assert span.parent.span_id == int("0123456789abcdef", 16)
+    else:
+        assert span.parent is None
+    provider.shutdown()
+
+
+def test_rust_bridge_keeps_the_parent_on_the_submission():
+    async def run():
+        provider = TracerProvider()
+        exporter = InMemorySpanExporter()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        server = make_test_api_server(preprocess_worker=SimpleNamespace(new_request=lambda inp: None))
+        server.tracing = RequestTracing("dummy", provider=provider)
+
+        async def empty_result(request_id):
+            if False:
+                yield request_id
+
+        server.iter_result_chunks = empty_result
+
+        bridge = RustFrontendBridge.__new__(RustFrontendBridge)
+        bridge.server = server
+        bridge._keys = {}
+        bridge._send = lambda msg: None
+        header = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+        bridge._submit({"t": "submit", "rid": "chatcmpl-1", "sub": 1, "traceparent": header})
+        key = server.submission_key("chatcmpl-1")
+        assert key is not None
+        server._record_end(server.pending_requests[key], "success")
+        await asyncio.sleep(0)
+        span, = exporter.get_finished_spans()
+        assert span.parent.trace_id == int("0123456789abcdef0123456789abcdef", 16)
+        provider.shutdown()
+
+    asyncio.run(run())

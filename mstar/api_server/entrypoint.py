@@ -858,6 +858,7 @@ class APIServer:
         file_streams: dict[str, list[str | None]] | None = None,
         raw_inputs: dict[str, list[torch.Tensor]] | None = None,
         report_usage: bool = False,
+        traceparent: str | None = None,
     ) -> str:
         """Build a :class:`NewRequestConductor` and send it to the conductor.
 
@@ -959,7 +960,9 @@ class APIServer:
                 report_usage=report_usage,
             )
             if self.tracing is not None:
-                self.pending_requests[key].trace = self.tracing.start(self.pending_requests[key], key)
+                self.pending_requests[key].trace = self.tracing.start(
+                    self.pending_requests[key], key, traceparent,
+                )
         if self.metrics is not None:
             mark_submitted()
 

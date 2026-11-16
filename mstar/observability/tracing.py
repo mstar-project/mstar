@@ -56,6 +56,7 @@ class RequestTracing:
 
     def __init__(self, model_name: str, endpoint: str | None = None, *, provider: Any = None):
         from opentelemetry import context, trace
+        from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
         if provider is None:
             require_tracing()
@@ -76,16 +77,22 @@ class RequestTracing:
         self.tracer = provider.get_tracer("mstar.api_server")
         self._trace = trace
         self._root_context = context.Context()
+        self._propagator = TraceContextTextMapPropagator()
         self.model_name = model_name
 
-    def start(self, req: PendingRequest, key: str) -> RequestSpan:
+    def start(self, req: PendingRequest, key: str, traceparent: str | None = None) -> RequestSpan:
         # A request's wall/perf pair is local to its API server. Do not use
         # another host's raw clock for a reconstructed span.
         wall_ns, perf_ns = time.time_ns(), time.perf_counter_ns()
         timing = req.profile.timing
+        parent = self._root_context
+        if traceparent:
+            parent = self._propagator.extract(
+                {"traceparent": traceparent}, context=self._root_context,
+            )
         span = self.tracer.start_span(
             "request",
-            context=self._root_context,
+            context=parent,
             start_time=wall_ns + int(timing.recv_time * 1_000_000_000) - perf_ns,
             attributes={
                 "mstar.model_name": self.model_name,
