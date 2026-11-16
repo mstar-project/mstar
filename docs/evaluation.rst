@@ -364,7 +364,11 @@ and approved spending limits. The small label selects ``tag:small``; the full la
 selects ``all`` (the manifest's non-optional models). The GPU job gets a read-only token and no secrets, checks the pinned
 PR head, and uploads the report and chart. A separate trusted job posts a bounded
 table and an ``e2e-matrix`` check; a missing report is neutral, not a pass. Re-adding
-the label runs it again and updates the same comment.
+the label runs it again and updates the same comment. This is an advisory check:
+PR code runs on the GPU host and can change files that become the report artifact.
+The trusted reporter checks the artifact's shape and internal verdict consistency,
+but cannot prove that a malicious PR did not alter its measurements. Do not make
+this check a required security gate for untrusted PRs.
 
 The run directory holds every results file and ``report/report.md`` (a table for a PR body, details in toggles),
 ``report/chart.png`` and ``report/summary.json``. ``compare`` exits with 1 when any row is flagged, else with 2

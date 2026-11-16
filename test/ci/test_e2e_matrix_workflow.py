@@ -11,9 +11,11 @@ WORKFLOW = (ROOT / ".github/workflows/e2e-matrix.yml").read_text()
 REPORTER = runpy.run_path(str(ROOT / ".github/e2e/report_pr.py"))
 
 
-def row(*, flagged=False, correct="PASS"):
+def row(*, flagged=False, correct="pass"):
     return {"model": "kokoro", "case": "text", "correct": correct, "flagged": flagged,
-            "latency": {"delta_pct": 2.1}, "throughput": {"delta_pct": -1.3}}
+            "starts": {"base": True, "head": True}, "quality": [],
+            "latency": {"delta_pct": 2.1, "verdict": "regression" if flagged else "same"},
+            "throughput": {"delta_pct": -1.3, "verdict": "same"}}
 
 
 class MatrixWorkflowTests(unittest.TestCase):
@@ -32,6 +34,8 @@ class MatrixWorkflowTests(unittest.TestCase):
     def test_summary_cannot_turn_missing_or_flagged_result_green(self):
         result = REPORTER["conclusion"]
         self.assertEqual(result("0", []), "neutral")
+        self.assertEqual(result("0", [{}]), "neutral")
+        self.assertEqual(result("0", [row(correct="FAIL", flagged=False)]), "neutral")
         self.assertEqual(result("0", [row(flagged=True)]), "neutral")
         self.assertEqual(result("0", [row(correct="incomplete")]), "neutral")
         self.assertEqual(result("1", [row(flagged=True)]), "failure")
@@ -75,6 +79,12 @@ class MatrixWorkflowTests(unittest.TestCase):
                 REPORTER["load_rows"](path)
             path.write_text(json.dumps([row()]))
             self.assertEqual(REPORTER["load_rows"](path), [row()])
+            path.write_text(json.dumps([{}]))
+            with self.assertRaises(ValueError):
+                REPORTER["load_rows"](path)
+            path.write_text(json.dumps([row(correct="FAIL", flagged=False)]))
+            with self.assertRaises(ValueError):
+                REPORTER["load_rows"](path)
 
 
 if __name__ == "__main__":

@@ -19,6 +19,9 @@ from typing import Any
 MARKER = "<!-- mstar-e2e-matrix -->"
 MAX_SUMMARY_BYTES = 2_000_000
 MAX_ROWS = 200
+CORRECT = {"pass", "changed", "FAIL", "incomplete", "base broken"}
+PERF = {"same", "noisy", "better", "regression", "n/a"}
+QUALITY = {"same", "better", "worse"}
 
 
 def _cell(value: object) -> str:
@@ -35,23 +38,59 @@ def _delta(value: object) -> str:
     return f"{delta:+.1f}%"
 
 
+def valid_row(row: object) -> bool:
+    if not isinstance(row, dict):
+        return False
+    if any(not isinstance(row.get(k), str) or not row[k] for k in ("model", "case")):
+        return False
+    if not isinstance(row.get("correct"), str) or row["correct"] not in CORRECT \
+            or type(row.get("flagged")) is not bool:
+        return False
+    starts = row.get("starts")
+    if not isinstance(starts, dict) or any(
+        k not in starts or not (starts[k] is True or starts[k] is False or starts[k] is None)
+        for k in ("base", "head")
+    ):
+        return False
+    perfs = [row.get(k) for k in ("latency", "throughput")]
+    if any(p is not None and (
+        not isinstance(p, dict) or not isinstance(p.get("verdict"), str) or p["verdict"] not in PERF
+    ) for p in perfs):
+        return False
+    quality = row.get("quality")
+    if not isinstance(quality, list) or any(
+        not isinstance(q, dict) or not isinstance(q.get("verdict"), str) or q["verdict"] not in QUALITY
+        for q in quality
+    ):
+        return False
+    expected_flag = (
+        row["correct"] == "FAIL"
+        or (starts["base"] is True and starts["head"] is False)
+        or any(p is not None and p["verdict"] == "regression" for p in perfs)
+        or any(q["verdict"] == "worse" for q in quality)
+    )
+    return row["flagged"] is expected_flag
+
+
 def load_rows(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     if path.stat().st_size > MAX_SUMMARY_BYTES:
         raise ValueError("matrix summary is too large")
     rows = json.loads(path.read_text())
-    if not isinstance(rows, list) or len(rows) > MAX_ROWS or any(not isinstance(row, dict) for row in rows):
-        raise ValueError("matrix summary must be a bounded list of rows")
+    if not isinstance(rows, list) or len(rows) > MAX_ROWS or any(not valid_row(row) for row in rows):
+        raise ValueError("matrix summary has missing or contradictory rows")
     return rows
 
 
 def conclusion(exit_code: str, rows: list[dict[str, Any]]) -> str:
     """No report or a contradictory exit code cannot become a green check."""
-    if not rows:
+    if not rows or any(not valid_row(row) for row in rows):
         return "neutral"
     flagged = any(row.get("flagged") is True for row in rows)
     unfinished = any(row.get("correct") in ("incomplete", "base broken") for row in rows)
+    if any(row["starts"]["base"] is not True or row["starts"]["head"] is not True for row in rows):
+        unfinished = True
     if exit_code == "1":
         return "failure" if flagged else "neutral"
     if exit_code == "2":
