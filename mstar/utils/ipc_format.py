@@ -318,7 +318,7 @@ class ScheduleTPNode(MessageBody):
     walk_idx: list[int] = field(default_factory=list)
     # rank 0's prefix-cache leases, by wire request id and then resource
     prefix_hits: dict[int, dict[str, CachedLease]] = field(default_factory=dict)
-    page_trails: dict[int, tuple[int, ...]] = field(default_factory=dict)
+    page_trails: dict[str, tuple[int, ...]] = field(default_factory=dict)
     # A row of the step takes an input a follower reads from elsewhere: every
     # rank agrees on whose read failed before preparing the step
     read_check: bool = False
