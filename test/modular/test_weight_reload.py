@@ -404,5 +404,9 @@ def test_reload_drops_the_prefix_cache_and_reroots_it(ckpts, monkeypatch):
     assert kv._index.num_pages() == 0 and kv._arena.num_free == free, "cached pages kept"
     assert kv._prefix_root != b"root", "a key from the old weights would still match"
     root_v1 = kv._prefix_root
-    kv.drop_prefix_cache("v1")
+    page = kv._arena.acquire(1)[0]
+    kv._index.insert(fingerprint(root_v1, b"k2"), page)
+    kv._arena.release([page])
+    assert kv.drop_prefix_cache("v1") == 1
+    assert kv._arena.num_free == free
     assert kv._prefix_root != root_v1, "a second reload under the same name reused the root"

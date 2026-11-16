@@ -972,7 +972,7 @@ class KVManager(AttentionResource):
         with self._lock:
             if self._index is None:
                 return 0
-            freed = self._index.evict(self._index.num_pages())
+            freed = len(self._index.evict(self._index.num_pages()))
             self._prefix_root = fingerprint(self._prefix_root, "weights", salt)
         logger.info("KV %s: prefix cache dropped for reloaded weights (%d pages freed)", self.name, freed)
         return freed
