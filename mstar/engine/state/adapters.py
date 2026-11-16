@@ -2496,6 +2496,9 @@ class QueriesOnlyHandle(_MaxLenZeroHandle):
 
     needs_step = False
 
+    def check_step(self, step) -> None:
+        """It takes no add, so a step keeps nothing of it and has nothing to refuse as a whole."""
+
 
 # Storages
 
