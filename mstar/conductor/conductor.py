@@ -1319,7 +1319,7 @@ class Conductor:
                 )
                 return
             self._queued_since_summary += 1
-            trace_id = trace_id_from_parent(body.traceparent)
+            trace_id = trace_id_from_parent(getattr(body, "traceparent", None))
             if trace_id is None:
                 request_log.debug(
                     "Request %s queued (at capacity: %d/%d)",
@@ -1396,7 +1396,8 @@ class Conductor:
         self, body: NewRequestConductor
     ):
         """Actually dispatch a request to workers (no admission check)."""
-        trace_id = trace_id_from_parent(body.traceparent)
+        traceparent = getattr(body, "traceparent", None)
+        trace_id = trace_id_from_parent(traceparent)
         if trace_id is None:
             request_log.debug("Conductor ingesting request %s", body.request_id)
         else:
@@ -1555,7 +1556,7 @@ class Conductor:
             conductor_ingest_time=ingest_time,
             conductor_arrival_time=arrival_time,
             prompt_tokens=body.prompt_tokens,
-            traceparent=body.traceparent,
+            traceparent=traceparent,
         )
         self._register_request(body.request_id, request_data)
 

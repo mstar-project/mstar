@@ -1133,7 +1133,7 @@ class PreprocessWorkerThread:
                 input_open=bool(self._client_edges - input.ends),
                 streaming=input.streaming,
                 prompt_tokens=num_prompt_tokens,
-                traceparent=input.traceparent,
+                traceparent=getattr(input, "traceparent", None),
             ),
         )
         self.communicator.send("conductor", msg)
