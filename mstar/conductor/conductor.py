@@ -23,6 +23,7 @@ from mstar.api_server.request_types import (
     WorkersReady,
 )
 from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.conductor.generation_control import GenerationControl
 from mstar.conductor.lora_ops import LoraAdapterOps
 from mstar.conductor.mps import MpsDaemon
 from mstar.conductor.request_info import (
@@ -416,6 +417,9 @@ class RequestData:
     # when the conductor took it in (queued, or admitted on arrival); None
     # unless metrics are on
     conductor_arrival_time: float | None = None
+    # the committed weight version at admission: no request runs across a
+    # reload, so every output it gets was made by these weights
+    weight_version: str | None = None
     graph_timings: GraphTimings = field(default_factory=dict)
     # Tensor-transport profiling merged across workers. Keyed so repeated
     # WorkerGraphsDone updates (cumulative per worker) replace rather than
@@ -473,6 +477,7 @@ class Conductor:
     # Metrics are off unless __init__ gets an interval; class-level so an
     # object built without __init__ reads them as off too.
     _status_interval_s: float | None = None
+    _generation: GenerationControl | None = None
     # The INFO summary that stands in for the per-request lines, which are
     # DEBUG: every SUMMARY_PERIOD_S while anything ran, waited or finished, so a
     # default log shows a server serving, and one that stopped finishing.
@@ -687,6 +692,13 @@ class Conductor:
             push_ids=self.worker_ids + ["api_server", "api_server_preprocess_worker"],
             ipc_socket_path_prefix=socket_path_prefix,
             nonblocking_send=True,
+        )
+        self._generation = GenerationControl(
+            workers=self.worker_ids,
+            send=lambda peer, message: self.communicator.send(peer, message),  # noqa: PLW0108
+            reject_queued=lambda: self._reject_waiting_queue("generation is paused", status=503),
+            abort_in_flight=self._abort_in_flight_for_pause,
+            timeout_s=float(self.model_config.get("weight_update_timeout_s", 600)),
         )
 
     def _max_output_tokens(self, model_kwargs: dict) -> int:
@@ -1078,6 +1090,7 @@ class Conductor:
                 continue  # completed or aborted, the client has already heard
             pending.append(request_id)
         for request_id in pending:
+            admitted = self.requests.get(request_id)  # None while queued
             self.communicator.send(
                 "api_server",
                 APIServerMessage(
@@ -1086,6 +1099,7 @@ class Conductor:
                         request_id=request_id,
                         error_message=error_message,
                         status=status,
+                        weight_version=None if admitted is None else admitted.weight_version,
                     ),
                 ),
             )
@@ -1269,6 +1283,8 @@ class Conductor:
 
     def _try_admit_waiting(self):
         """Drain the waiting queue up to the concurrency cap."""
+        if self._generation is not None and self._generation.paused:
+            return
         while self.waiting_queue:
             if (self.max_concurrent_requests is not None
                     and len(self.requests) >= self.max_concurrent_requests):
@@ -1299,6 +1315,9 @@ class Conductor:
             logger.info(
                 "Request %s was aborted before ingest; dropping", body.request_id
             )
+            return
+        if self._generation is not None and self._generation.paused:
+            self._reject_request(body.request_id, "generation is paused", status=503)
             return
         try:
             _request_seed(body.model_kwargs or {}, _seed_id(body))
@@ -1382,6 +1401,23 @@ class Conductor:
                 body=RequestFailed(request_id=request_id, error_message=error, status=status),
             ),
         )
+
+    def _reject_waiting_queue(self, error: str, status: int) -> None:
+        queued, self.waiting_queue = self.waiting_queue, []
+        for body in queued:
+            if self._status_interval_s is not None:
+                self._queued_since.pop(body.request_id, None)
+            self._reject_request(body.request_id, error, status=status)
+
+    def _abort_in_flight_for_pause(self) -> None:
+        for request_id, request_data in list(self.requests.items()):
+            if request_id in self.draining:
+                continue
+            self._remove_request(
+                request_id, request_data,
+                failure_error="generation was paused, aborting requests in flight",
+                failure_status=503,
+            )
 
     def _do_ingest_request(
         self, body: NewRequestConductor
@@ -1542,6 +1578,7 @@ class Conductor:
             conductor_ingest_time=ingest_time,
             conductor_arrival_time=arrival_time,
             prompt_tokens=body.prompt_tokens,
+            weight_version=None if self._generation is None else self._generation.weight_version,
         )
         self._register_request(body.request_id, request_data)
 
@@ -1733,6 +1770,7 @@ class Conductor:
                 ),
             )
         if dr.failure_error is not None:
+            admitted = self.requests.get(request_id)
             self._send_for_teardown(
                 request_id, "api_server",
                 APIServerMessage(
@@ -1741,6 +1779,7 @@ class Conductor:
                         request_id=request_id,
                         error_message=dr.failure_error,
                         status=dr.failure_status,
+                        weight_version=None if admitted is None else admitted.weight_version,
                     ),
                 ),
             )
@@ -1860,7 +1899,7 @@ class Conductor:
 
     def _remove_request(
         self, request_id: str, request_data: RequestData,
-        failure_error: str | None = None,
+        failure_error: str | None = None, failure_status: int = 500,
     ):
         """Begin teardown for an abort/fail: drain every participant's reads,
         then (on the barrier's completion) hard-remove. Shared by the abort
@@ -1880,6 +1919,7 @@ class Conductor:
             expected_acks=participants,
             participants=participants,
             failure_error=failure_error,
+            failure_status=failure_status,
         )
 
     def _process_request_done(
@@ -1907,6 +1947,7 @@ class Conductor:
                     conductor_arrival_time=request_data.conductor_arrival_time,
                     prompt_tokens=request_data.prompt_tokens,
                     max_output_tokens=request_data.max_output_tokens,
+                    weight_version=request_data.weight_version,
                 )
             )
         )
@@ -2371,6 +2412,18 @@ class Conductor:
                 self.communicator.send(worker_id, WorkerMessage(
                     message_type=WorkerMessageType.ENABLE_METRICS, body=message.body,
                 ))
+        elif message.message_type == ConductorMessageType.PAUSE_GENERATION:
+            self._generation.pause(message.body)
+        elif message.message_type == ConductorMessageType.CONTINUE_GENERATION:
+            self._generation.resume(message.body)
+        elif message.message_type == ConductorMessageType.UPDATE_WEIGHTS_FROM_DISK:
+            self._generation.update(message.body)
+        elif message.message_type == ConductorMessageType.GET_GENERATION_STATE:
+            self._generation.report(message.body)
+        elif message.message_type == ConductorMessageType.CHECK_WEIGHTS:
+            self._generation.check_weights(message.body)
+        elif message.message_type == ConductorMessageType.WEIGHT_CONTROL_ACK:
+            self._generation.ack(message.body)
         elif message.message_type == ConductorMessageType.LOAD_LORA_ADAPTER:
             self._lora_ops().load(message.body)
         elif message.message_type == ConductorMessageType.UNLOAD_LORA_ADAPTER:
@@ -2564,6 +2617,8 @@ class Conductor:
                             self._fail_after_error(request_id, "completing it", exc)
 
                 self._sweep_expiry()
+                if self._generation is not None:
+                    self._generation.tick(len(self.requests))
                 if self._status_interval_s is not None:
                     self._maybe_send_status()
                 self._maybe_log_summary()

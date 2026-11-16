@@ -30,6 +30,7 @@ mod auth;
 mod bridge;
 mod client_errors;
 mod generation_kwargs;
+mod generation_admin;
 mod media;
 mod protocol;
 mod realtime;
@@ -221,7 +222,7 @@ async fn main() {
     // outside admission, so an unauthenticated request never takes a permit.
     // The refusal counter sits between the two, so it sees the 401 and not
     // the preflights.
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/models", get(list_models))
@@ -234,7 +235,13 @@ async fn main() {
         .route("/healthz", get(ws::openpi::healthz))
         .route("/generate/ws", any(ws::generate::generate_ws))
         .route("/v1/realtime", any(realtime::realtime))
-        .merge(api)
+        .merge(api);
+    // A reload path is client-controlled, so no admin route exists without
+    // both authentication and a deployment-owned checkpoint allowlist.
+    if generation_admin::enabled(key_enabled, std::env::var("MSTAR_WEIGHT_RELOAD_ROOTS").ok().as_deref()) {
+        app = app.merge(generation_admin::router());
+    }
+    let app = app
         .layer(DefaultBodyLimit::max(body_limit_mb << 20))
         .layer(axum::middleware::from_fn_with_state(
             api_key,
@@ -2020,7 +2027,19 @@ async fn generate_finish(
             .or_default()
             .push(json!({"data": media::b64(&c.data), "metadata": c.metadata}));
     }
-    Json(json!({"request_id": request_id, "outputs": outputs})).into_response()
+    let mut body = json!({"request_id": request_id, "outputs": outputs});
+    if let Some(v) = top_level_weight_version(&chunks) {
+        body["weight_version"] = v.clone();
+    }
+    Json(body).into_response()
+}
+
+/// The top-level `weight_version` of a non-streaming `/generate`: the first
+/// chunk that carries one, as the Python frontend reads it. Only once a reload
+/// named a version, which every chunk carries the same; a request that
+/// completed with no output chunks has none on either frontend.
+fn top_level_weight_version(chunks: &[ResultChunk]) -> Option<&Value> {
+    chunks.iter().find_map(|c| c.metadata.get("weight_version"))
 }
 
 /// The Python `/generate`'s refusals for `video_frame`, worded the same: raw
@@ -2129,6 +2148,15 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_top_level_version_is_the_first_chunk_that_carries_one() {
+        let chunk = |metadata: Value| ResultChunk { modality: "text".into(), data: vec![], metadata };
+        assert_eq!(top_level_weight_version(&[]), None);
+        assert_eq!(top_level_weight_version(&[chunk(json!({}))]), None);
+        let chunks = [chunk(json!({})), chunk(json!({"weight_version": "v3"})), chunk(json!({"weight_version": "v3"}))];
+        assert_eq!(top_level_weight_version(&chunks), Some(&json!("v3")));
+    }
     use mstar_rust::communicator::RawZmqCommunicator;
     use std::sync::atomic::{AtomicBool, Ordering};
 

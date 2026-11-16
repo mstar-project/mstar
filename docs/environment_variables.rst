@@ -320,6 +320,24 @@ frontend's (``--python-frontend``); ``mstar-server``'s rows are under
        workers do not inherit it), and
        :class:`mstar.client.MStarClient` sends it when not given
        ``api_key``. See :ref:`api-key`.
+   * - ``MSTAR_WEIGHT_RELOAD_ROOTS``
+     - unset
+     - Path-separated absolute directories from which
+       ``/update_weights_from_disk`` may load checkpoints. Together with an
+       API key, enables ``/pause_generation``, ``/update_weights_from_disk``,
+       ``/continue_generation``, ``/is_paused`` and ``/weight_checker`` on either frontend. An
+       empty value leaves those routes off. A requested checkpoint must be
+       an existing directory whose resolved path stays under one listed root;
+       symlinks outside it are refused. Only the deployment operator should
+       be able to change files in these directories.
+
+       ``POST /weight_checker`` is paused-only. ``{"mode":"checksum"}``
+       returns ``rank_checksums``, one lowercase SHA-256 hex digest per worker
+       rank. ``{"mode":"compare","checksums":{"worker_0":"..."}}`` compares
+       a complete worker-rank map and returns 409 on a mismatch. The digest
+       covers each rank's resident parameters and registered buffers in stable
+       node/name order, including fused and quantized weight buffers. Mutable
+       buffers can change this paused-state fingerprint between requests.
    * - ``MSTAR_SILERO_VAD_PATH``
      - unset
      - Silero VAD ONNX file (``silero_vad.onnx``) for ``/v1/realtime``
@@ -364,6 +382,13 @@ and its bridge (see :doc:`installation`).
        once at startup): every route except ``/health`` and ``/metrics`` needs
        ``Authorization: Bearer <key>``. ``mstar-serve``
        sets it from ``--api-key`` / its own environment.
+   * - ``MSTAR_WEIGHT_RELOAD_ROOTS``
+     - unset
+     - Same checkpoint directory allowlist as the Python API server.
+       ``mstar-server`` registers generation-control routes only when this
+       variable has an entry and ``MSTAR_API_KEY`` is set; the shared API
+       server checks each resolved checkpoint path before sending it to the
+       conductor.
    * - ``MSTAR_REQUEST_TIMEOUT_S``
      - ``600``
      - Per-request budget in the Rust frontend, in seconds; on expiry the

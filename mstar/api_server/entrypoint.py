@@ -44,6 +44,7 @@ from mstar.api_server.auth import (
 )
 from mstar.api_server.body_limit import BodyLimitMiddleware, max_body_bytes
 from mstar.api_server.data_worker import PreprocessWorker, unlink_files
+from mstar.api_server.generation_admin import GenerationAdmin, reload_roots
 from mstar.api_server.lora_admin import LoraAdmin
 from mstar.api_server.openpi import OpenpiPolicy, serve_connection
 from mstar.api_server.request_types import (
@@ -311,6 +312,29 @@ def _client_text(text: str, key: str, request_id: str | None) -> str:
     return text if request_id is None else text.replace(key, request_id)
 
 
+def _request_weight_version(req: "PendingRequest") -> str | None:
+    """The conductor's admitted version, else (no completion or failure came,
+    e.g. the conductor died) the one its chunks carried."""
+    return req.weight_version if req.weight_version is not None else req.chunk_weight_version
+
+
+def _with_weight_version(body: dict, weight_version: str | None) -> dict:
+    """``body`` plus ``weight_version`` once a reload named one; a deployment
+    that never reloads keeps its exact response shape."""
+    if weight_version is not None:
+        body["weight_version"] = weight_version
+    return body
+
+
+def _chunks_weight_version(chunks: list[ResultChunk]) -> str | None:
+    """The top-level ``weight_version`` of a non-streaming ``/generate``: the
+    first chunk that carries one, as the Rust frontend reads it, so a request
+    that completed with no output chunks has none on either frontend."""
+    return next(
+        (c.metadata["weight_version"] for c in chunks if c.metadata and "weight_version" in c.metadata), None,
+    )
+
+
 def _until_error(chunks: list[ResultChunk]) -> tuple[list[ResultChunk], bool]:
     """``chunks`` up to and including the first error chunk, which ends the
     response, and whether there was one."""
@@ -348,6 +372,11 @@ class PendingRequest:
     open_streams: frozenset[str] = frozenset()
     last_input_time: float = 0.0
     input_bytes: int = 0
+    # The weight version the conductor admitted it under, from its
+    # completion or failure; None until a reload names one.
+    weight_version: str | None = None
+    # The version its chunks carried, kept after a stream hands them out
+    chunk_weight_version: str | None = None
     # Set by the streaming handler on its event loop; the message thread wakes
     # it through these when a chunk or the completion lands, so the handler
     # sleeps between chunks instead of polling every millisecond per request.
@@ -416,11 +445,11 @@ def usage_chunk(request_id: str, req: PendingRequest) -> ResultChunk:
     ``text_output`` has its stop tokens seen; any other is ``length`` at the cap."""
     cap = req.max_output_tokens
     at_cap = cap is not None and req.completion_tokens >= cap
-    return ResultChunk(request_id=request_id, modality=USAGE, data=b"", metadata={
+    return ResultChunk(request_id=request_id, modality=USAGE, data=b"", metadata=_with_weight_version({
         "prompt_tokens": req.prompt_tokens or 0,
         "completion_tokens": req.completion_tokens,
         "finish_reason": "length" if at_cap and not req.stopped else "stop",
-    })
+    }, _request_weight_version(req)))
 
 
 def notify_many(reqs) -> None:
@@ -539,6 +568,7 @@ class APIServer:
     _process_cpus: frozenset[int] = frozenset()
     # set in __init__; None until then, which a server built without it (a test's) keeps
     lora_admin: LoraAdmin | None = None
+    generation_admin: GenerationAdmin | None = None
 
     def __init__(
         self,
@@ -633,6 +663,12 @@ class APIServer:
         self.lora_admin = LoraAdmin(
             lora, self.served_models,
             lambda message: self.preprocess_worker.send_to_conductor(message),  # noqa: PLW0108 - late-bound
+            timeout_s=timeout_seconds,
+        )
+        self.generation_admin = GenerationAdmin(
+            self.preprocess_worker.send_to_conductor,
+            key_enabled=api_key_guard.enabled,
+            roots=reload_roots() if api_key_guard.enabled else (),
             timeout_s=timeout_seconds,
         )
 
@@ -1273,13 +1309,19 @@ class APIServer:
                                         )
                             if rids:
                                 self.preprocess_worker.new_result_tokens(
-                                    rids, values, body.signal, body.modality, logprobs or None, loops,
+                                    rids, values, body.signal, body.modality, logprobs or None,
+                                    loops, metadata=body.metadata,
                                 )
                         continue
 
                     if message.message_type == "lora_adapter_result":
                         if self.lora_admin is not None:
                             self.lora_admin.on_result(message.body)
+                        continue
+
+                    if message.message_type == "generation_control_result":
+                        if self.generation_admin is not None:
+                            self.generation_admin.on_result(message.body)
                         continue
 
                     if message.message_type == "conductor_status":
@@ -1316,6 +1358,7 @@ class APIServer:
                                         message.body.error_message, rid, req.request_id,
                                     )
                                     req.error_status = message.body.status
+                                req.weight_version = message.body.weight_version
                                 # Release the waiting client immediately: no
                                 # result is coming, so the alternative is the
                                 # blanket request timeout.
@@ -1345,6 +1388,7 @@ class APIServer:
                                 req.output_chunk_counts = message.body.output_chunk_counts
                                 req.prompt_tokens = message.body.prompt_tokens
                                 req.max_output_tokens = message.body.max_output_tokens
+                                req.weight_version = message.body.weight_version
                                 req.profile.timing.conductor_ingest_time = \
                                     message.body.conductor_ingest_time
                                 req.profile.timing.conductor_finish_time = \
@@ -1427,11 +1471,17 @@ class APIServer:
                             req.first_chunk_times.setdefault(result_chunk.modality, now)
                         if req.request_id is not None:
                             result_chunk.request_id = req.request_id
+                        if (chunk_version := (result_chunk.metadata or {}).get("weight_version")) is not None:
+                            req.chunk_weight_version = chunk_version
                         if result_chunk.modality == "error":
                             result_chunk.data = _client_text(
                                 result_chunk.data.decode("utf-8", "replace"),
                                 rid, req.request_id,
                             ).encode("utf-8")
+                            # e.g. a live call's failed input chunk, which no output names
+                            meta = result_chunk.metadata or {}
+                            if "weight_version" not in meta:
+                                result_chunk.metadata = _with_weight_version(dict(meta), _request_weight_version(req))
                         req.chunks.append(result_chunk)
                         if self.log_stats:
                             info = req.output_totals.get(result_chunk.modality)
@@ -1694,7 +1744,9 @@ class APIServer:
                                 request_id=request_id,
                                 modality="error",
                                 data=str(finished_req.error).encode("utf-8"),
-                                metadata={"status": finished_req.error_status},
+                                metadata=_with_weight_version(
+                                    {"status": finished_req.error_status}, _request_weight_version(finished_req),
+                                ),
                             ))
                         elif finished_req.report_usage:
                             tail.append(usage_chunk(request_id, finished_req))
@@ -2586,11 +2638,11 @@ async def generate_ws(websocket: WebSocket):
                     # iterator's last chunk, so the loop ends here; the error
                     # is the reply and no finish follows.
                     failed = True
-                    await send({
+                    await send(_with_weight_version({
                         "request_id": request_id,
                         "error": bytes(chunk.data).decode("utf-8", "replace"),
                         "status": chunk.metadata.get("status", 500),
-                    }, binary)
+                    }, chunk.metadata.get("weight_version")), binary)
                     continue
                 await send({
                     "request_id": request_id, "modality": chunk.modality,
@@ -2958,10 +3010,9 @@ async def generate(
                 "data": base64.b64encode(chunk.data).decode("ascii"),
                 "metadata": chunk.metadata,
             })
-        return JSONResponse({
-            "request_id": request_id,
-            "outputs": outputs,
-        })
+        return JSONResponse(_with_weight_version(
+            {"request_id": request_id, "outputs": outputs}, _chunks_weight_version(chunks),
+        ))
 
     except HTTPException:
         raise
@@ -3218,6 +3269,12 @@ def main(argv: list[str] | None = None):
     log_off_thread()
     api_key = resolve_api_key(args.api_key)
     api_key_guard.set(api_key)
+    # These routes read deployment checkpoint paths; leave them absent unless
+    # both HTTP authentication and a trusted checkpoint root are configured.
+    if api_key and reload_roots():
+        from mstar.api_server.generation_routes import router as generation_router
+
+        app.include_router(generation_router)
     # The Rust frontend gets the key explicitly.
     keep_api_key_from_children(api_key)
 
