@@ -130,3 +130,115 @@ def test_a_forced_tool_call_gets_its_grammar_from_the_data_worker(tmp_path):
     assert "</think>" in forced[GRAMMAR_TOOLS_KWARG], "the call format lets the reasoning finish first"
     free = _prepared_kwargs(model, None, tools=tools, tool_choice="auto", **{GRAMMAR_TOOLS_KWARG: "x"})
     assert GRAMMAR_TOOLS_KWARG not in free
+
+
+# the released checkpoints' generation prompt: a thinking block opened only when enable_thinking is true
+FLAG_TEMPLATE = CHAT_TEMPLATE.replace(
+    "{%- if add_generation_prompt -%}{{ '<|im_start|>assistant\n<think>\n' }}{%- endif -%}",
+    "{%- if add_generation_prompt -%}{{ '<|im_start|>assistant\n' }}"
+    "{%- if enable_thinking is defined and enable_thinking is true -%}{{ '<think>\n' }}"
+    "{%- else -%}{{ '<think>\n\n</think>\n\n' }}{%- endif -%}{%- endif -%}")
+assert FLAG_TEMPLATE != CHAT_TEMPLATE
+
+
+def _worker(model):
+    from mstar.api_server.data_worker import PreprocessWorkerThread
+
+    worker = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
+    worker.model, worker.device, worker._keyed_labels = model, "cpu", None
+    return worker
+
+
+def _starts_in_reasoning(worker, **client) -> bool:
+    """What the data worker tells a chat's reply parser: does the reply start inside its reasoning."""
+    from mstar.api_server.request_types import PreprocessInput
+
+    return worker._prepare_input(PreprocessInput(
+        request_id="r", text="Hello.", file_paths=None, input_modalities=["text"], output_modalities=["text"],
+        model_kwargs={"prefix_cache": False, **client}, parse_reply=True,
+    )).reply_in_reasoning
+
+
+def _counting_scans(monkeypatch) -> list:
+    from mstar.api_server import data_worker
+
+    calls = []
+    real = data_worker.after_reasoning
+
+    def counted(text_output, prompt_ids):
+        calls.append(1)
+        return real(text_output, prompt_ids)
+    monkeypatch.setattr(data_worker, "after_reasoning", counted)
+    return calls
+
+
+def test_qwen3_5_says_whether_a_reply_starts_in_its_reasoning_and_the_prompt_agrees(tmp_path, monkeypatch):
+    """Qwen3.5 answers from enable_thinking, for a dict lookup; the data worker reads the prompt for
+    the first answer of each kind, and after both agree reads it no more."""
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    repo = _repo(tmp_path / "repo", None)
+    (repo / "chat_template.jinja").write_text(FLAG_TEMPLATE)
+    worker = _worker(Qwen3_5DenseModel(str(repo)))
+    scans = _counting_scans(monkeypatch)
+    for _ in range(3):
+        assert _starts_in_reasoning(worker) is True  # thinking on, the default
+        assert _starts_in_reasoning(worker, enable_thinking=True) is True
+        assert _starts_in_reasoning(worker, enable_thinking=False) is False
+    assert len(scans) == 2, "one read of the prompt per kind of answer, then the model's answer alone"
+
+
+@pytest.mark.parametrize("template, client, prompt_says", [
+    (CHAT_TEMPLATE, {"enable_thinking": False}, True),  # a template that always opens the block
+    (OTHER_TEMPLATE, {}, False),  # one that always closes it
+], ids=["always-opens", "always-closes"])
+def test_a_template_that_ignores_enable_thinking_is_read_from_the_prompt(tmp_path, monkeypatch, caplog,
+                                                                       template, client, prompt_says):
+    """The model's answer disagrees with its prompt: the prompt wins, a warning says so, and the data
+    worker reads the prompt on every request from then on."""
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    repo = _repo(tmp_path / "repo", None)
+    (repo / "chat_template.jinja").write_text(template)
+    worker = _worker(Qwen3_5DenseModel(str(repo)))
+    scans = _counting_scans(monkeypatch)
+    with caplog.at_level("WARNING", logger="mstar.api_server.data_worker"):
+        assert _starts_in_reasoning(worker, **client) is prompt_says
+    assert "reading the prompt from now on" in caplog.text
+    for flag in (True, False, None):
+        kwargs = {} if flag is None else {"enable_thinking": flag}
+        assert _starts_in_reasoning(worker, **kwargs) is prompt_says
+    assert len(scans) == 4, "after a disagreement, every request reads its prompt"
+
+
+CHATS = [
+    [{"role": "user", "content": "What's 2 + 2?"}],
+    [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi."}],
+    [{"role": "user", "content": "Hi."}, {"role": "assistant", "content": "Hello!", "reasoning_content": "Greet."},
+     {"role": "user", "content": "How are you?"}],
+]
+
+
+@pytest.mark.parametrize("thinking", [True, False])
+@pytest.mark.parametrize("chat", range(len(CHATS)))
+def test_on_the_released_template_qwen3_5s_answer_is_the_prompts(chat, thinking):
+    """On the checkpoint's own template (tools included), the answer Qwen3.5 gives from its settings
+    is the one reading the rendered prompt gives."""
+    import os
+
+    import torch
+
+    from mstar.engine.resources.sampler.grammar import after_reasoning
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    path = os.environ.get("QWEN3_5_CKPT")
+    if not path:
+        pytest.skip("set QWEN3_5_CKPT to the checkpoint's directory")
+    model = Qwen3_5DenseModel(path)
+    tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}]
+    for with_tools in (None, tools):
+        text = model.tokenizer.apply_chat_template(CHATS[chat], tools=with_tools, tokenize=False,
+                                                   add_generation_prompt=True, enable_thinking=thinking)
+        ids = torch.tensor(model.tokenizer.encode(text, add_special_tokens=False))
+        from_prompt = after_reasoning(model.text_output(), ids) is not None
+        assert model.reply_starts_in_reasoning({"enable_thinking": thinking}) is from_prompt is thinking

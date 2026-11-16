@@ -614,6 +614,41 @@ def warm_up_model(model) -> None:
         logger.exception("model.warmup_preprocess failed; the first request will do the work")
 
 
+class ReasoningStart:
+    """Whether a reply starts inside the reasoning block its prompt opened, as `after_reasoning`
+    reads it from the prompt's tail, asked of the model first (`Model.reply_starts_in_reasoning`):
+    a model that knows answers from its settings for a dict lookup, where the read costs about
+    20 µs a request on the data worker, which prepares requests one at a time. The first answer of
+    each kind is checked against the read, and an answer that disagrees stops the model being
+    asked. One lock, held briefly, so the prepare pool may call it too."""
+
+    def __init__(self, model: Model):
+        self._model = model
+        self._lock = threading.Lock()
+        self._checked: set[bool] = set()
+        self._asking = True
+
+    def after(self, model_kwargs: dict, prompt_ids: torch.Tensor) -> str | None:
+        """The model's ``reasoning_end`` when the reply starts inside its reasoning, else None."""
+        text_output = self._model.text_output()
+        answer = self._model.reply_starts_in_reasoning(model_kwargs) if self._asking else None
+        if answer is not None and answer in self._checked:
+            return text_output.reasoning_end if answer and text_output is not None else None
+        after = after_reasoning(text_output, prompt_ids)
+        if answer is not None:
+            with self._lock:
+                if (after is not None) == answer:
+                    self._checked.add(answer)
+                elif self._asking:
+                    self._asking = False
+                    logger.warning(
+                        "%s says a reply %s inside its reasoning, but its prompt says otherwise; "
+                        "reading the prompt from now on", type(self._model).__name__,
+                        "starts" if answer else "doesn't start",
+                    )
+        return after
+
+
 @dataclass
 class RequestOutputState:
     """One request's output ordering, held by the data worker.
@@ -981,6 +1016,10 @@ class PreprocessWorkerThread:
         self._live_requests[input.request_id] = self._live_requests.get(input.request_id, 0) + 1
         self.in_flight_requests.add(input.request_id)
 
+    @cached_property
+    def _reasoning_start(self) -> ReasoningStart:
+        return ReasoningStart(self.model)
+
     def _prepare_input(self, input: PreprocessInput) -> PreparedInput:
         """Decode the request's media and run the model's prompt processing.
         Runs on the prepare pool when there is one, so it reads only what
@@ -1049,7 +1088,7 @@ class PreprocessWorkerThread:
             if (input.parse_reply or tools or model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None) \
                     and tensors.get("text_inputs"):
                 # one answer for the grammars and the reply's parser
-                after = after_reasoning(self.model.text_output(), tensors["text_inputs"][0])
+                after = self._reasoning_start.after(model_kwargs, tensors["text_inputs"][0])
                 if input.parse_reply:
                     reply_in_reasoning = after is not None
                 if after is not None and model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None:

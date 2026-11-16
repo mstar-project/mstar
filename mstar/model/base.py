@@ -1221,6 +1221,14 @@ class Model(ABC):
         ``postprocess_inline`` derive their text paths from it."""
         return None
 
+    def reply_starts_in_reasoning(self, model_kwargs: dict) -> bool | None:
+        """Whether a reply to a prompt built with ``model_kwargs`` starts inside the reasoning block
+        the prompt opened (`TextOutput.reasoning_start`), for a model that knows it from its own
+        settings; None (the default) to have the data worker read the prompt's tail instead
+        (`after_reasoning`). The data worker checks the first answer of each kind against that read,
+        and stops asking a model whose answer disagreed."""
+        return None
+
     _text_detokenizer: TextChunkDetokenizer | None = None
 
     def _chunk_detokenizer(self) -> TextChunkDetokenizer:

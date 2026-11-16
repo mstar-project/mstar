@@ -416,6 +416,12 @@ class Qwen3_5DenseModel(DeclaredDecoderModel):
     def request_kwargs(self) -> frozenset[str]:
         return super().request_kwargs() | {"enable_thinking", *self.PREPROCESS_ONLY_KWARGS}
 
+    def reply_starts_in_reasoning(self, model_kwargs: dict) -> bool | None:
+        # the template opens a `<think>` block for the reply exactly when enable_thinking is true,
+        # the default `_prompt_ids` renders with (and a non-boolean is refused there first)
+        thinking = model_kwargs.get("enable_thinking", True)
+        return thinking if isinstance(thinking, bool) else None
+
     def process_prompt(self, *args: Any, **kwargs: Any) -> ProcessPromptOutput:
         out = super().process_prompt(*args, **kwargs)
         out.metadata["state_layout"][GDN_STATE] = {"main": Layout()}
