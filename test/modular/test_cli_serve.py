@@ -35,6 +35,7 @@ def test_an_explicit_socket_prefix_is_kept(launched):
 
 @pytest.mark.parametrize("flags", [
     ["--enable-metrics"], ["--enable-nvtx"], ["--timeout", "1800.0"], ["--tcp-transfer-device", "eth1"],
+    ["--otlp-traces-endpoint", "http://localhost:4318/v1/traces"],
 ])
 def test_serve_passes_its_flags_to_the_server(launched, flags):
     cli._serve(cli.build_parser().parse_args(["serve", "kokoro", *flags]))
@@ -44,4 +45,5 @@ def test_serve_passes_its_flags_to_the_server(launched, flags):
 
 def test_serve_leaves_the_server_defaults_alone(launched):
     cli._serve(cli.build_parser().parse_args(["serve", "kokoro"]))
-    assert not {"--enable-nvtx", "--timeout", "--tcp-transfer-device"} & set(launched[0])
+    assert not {"--enable-nvtx", "--timeout", "--tcp-transfer-device",
+                "--otlp-traces-endpoint"} & set(launched[0])

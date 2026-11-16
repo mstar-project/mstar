@@ -82,6 +82,10 @@ mstar serve
      - off
      - Serve Prometheus metrics at ``/metrics`` (see :ref:`serving-metrics`).
        Needs ``.[metrics]``.
+   * - ``--otlp-traces-endpoint``
+     - off
+     - Export API request traces to this OTLP traces URL (see
+       :ref:`serving-tracing`). Needs ``.[tracing]``.
    * - ``--enable-nvtx``
      - off
      - Emit NVTX markers for CUDA profiling. Disabled on XPU and CPU.
@@ -185,6 +189,10 @@ mstar-serve
      - off
      - Serve Prometheus metrics at ``/metrics`` (see :ref:`serving-metrics`).
        Needs ``.[metrics]``.
+   * - ``--otlp-traces-endpoint``
+     - off
+     - Export API request traces to this OTLP traces URL (see
+       :ref:`serving-tracing`). Needs ``.[tracing]``.
    * - ``--log-level``
      - ``INFO``
      - ``DEBUG`` / ``INFO`` / ``WARNING`` / ``ERROR``.
@@ -1215,8 +1223,49 @@ RDMA-read or SHM file-read time on ``rx``; the registration / serialize-and-writ
 
 .. note::
 
-   Profiling is gated end-to-end on ``--log-stats``: when it is off, the workers,
-   conductor, and data worker skip the timing/transfer bookkeeping entirely.
+   Per-node and transfer profiling runs with ``--log-stats`` or request tracing.
+   The data worker also reports preprocess timing when metrics or tracing is enabled.
+
+.. _serving-tracing:
+
+Request tracing
+---------------
+
+Pass ``--otlp-traces-endpoint http://localhost:4318/v1/traces`` to either
+``mstar serve`` or ``mstar-serve`` to export sampled request traces from the API
+server. Install ``mstar-ai[tracing]`` first. The endpoint is the full OTLP
+traces URL. The default wire format is HTTP/protobuf; set
+``OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=grpc`` for gRPC. Standard OpenTelemetry
+service-name, header and sampler environment variables apply. An unsupported
+protocol or missing tracing extra fails before model loading.
+
+Tracing is off by default and starts after warmups. This first API-server slice
+exports a root ``request`` span and ``preprocess``, ``graph`` and ``delivery``
+children when their existing timestamps are available. The current default
+Rust frontend and the deprecated Python frontend both produce these API
+spans. For ``/v1/chat/completions``, either frontend passes an incoming W3C
+``traceparent`` to the API server. A valid parent is used for the request span;
+a malformed one starts a root trace. When tracing is enabled, the workers collect
+their existing per-request node timings. Each ``node.activity`` child of ``graph``
+spans the first to last step in the conductor's retained timing for one node
+and walk. Its execution count and CPU-measured phase sums use the same batch-wide
+timing as ``--log-stats``; a missing forward-end stamp folds later work into the
+forward sum. The window does not divide GPU time between requests or show gaps
+between repeated steps. With several ranks, the last report for a node and walk
+may replace an earlier rank's timing. Tracing turns on worker profiling for all
+requests, including ones the sampler drops, so transfer accounting and periodic
+arena logs also run. It does not print a per-request profile unless
+``--log-stats`` is set. The timing conversion assumes the current same-host
+process clocks; worker hosts outside that clock domain need a separate clock
+mapping. At DEBUG log level, API submission, conductor queue, intake and
+completion, and worker intake log the same ``trace_id`` with the request ID.
+One worker may log intake for several partitions of that request.
+``MSTAR_LOG_REQUESTS=1`` enables these request lines in all three processes
+without enabling other DEBUG logs. A trace ID can appear in logs when the
+sampler drops its span. Later worker step logs still use their request
+IDs and are not automatically tagged. Other
+routes, HTTP server spans, transfer spans and exemplars remain
+in `issue #771 <https://github.com/mstar-project/mstar/issues/771>`_.
 
 .. _serving-metrics:
 

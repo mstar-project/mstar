@@ -689,8 +689,13 @@ async fn audio_voices(State(st): State<AppState>) -> Response {
 
 // ---- POST /v1/chat/completions -------------------------------------------
 
+fn incoming_traceparent(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers.get("traceparent").and_then(|value| value.to_str().ok()).map(str::to_owned)
+}
+
 async fn chat_completions(
     State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
     payload: Result<Json<ChatCompletionRequest>, JsonRejection>,
 ) -> Response {
     let Json(req) = match payload {
@@ -731,6 +736,7 @@ async fn chat_completions(
         }
     }
     args.report_usage = true;
+    args.traceparent = incoming_traceparent(&headers);
     schedule_upload_cleanup(&st.upload_dir, &args);
     let request_id = rid("chatcmpl");
 
@@ -2080,6 +2086,15 @@ fn ndjson_line(c: &ResultChunk) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chat_reads_traceparent_from_its_own_headers() {
+        let mut headers = axum::http::HeaderMap::new();
+        let value = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
+        headers.insert("traceparent", value.parse().unwrap());
+        assert_eq!(super::incoming_traceparent(&headers).as_deref(), Some(value));
+        assert_eq!(super::incoming_traceparent(&axum::http::HeaderMap::new()), None);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_speech_clip_is_removed_once_the_last_piece_is_done_with_it() {
         let dir = std::env::temp_dir().join(format!("mstar_cleanup_{}", uuid::Uuid::new_v4().simple()));
@@ -2559,7 +2574,9 @@ mod tests {
             st.python_adapter = adapter.into();
             let req: ChatCompletionRequest = serde_json::from_value(request).unwrap();
 
-            let (status, _, data) = body(chat_completions(State(st.clone()), Ok(Json(req))).await).await;
+            let (status, _, data) = body(chat_completions(
+                State(st.clone()), axum::http::HeaderMap::new(), Ok(Json(req)),
+            ).await).await;
 
             let body: Value = serde_json::from_slice(&data).unwrap();
             assert_eq!((status, body["error"]["message"].as_str()), (StatusCode::BAD_REQUEST, Some(detail)), "{adapter}");
