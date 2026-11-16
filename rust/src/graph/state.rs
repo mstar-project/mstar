@@ -309,8 +309,10 @@ impl RequestState {
     // -- ingest --------------------------------------------------------------
 
     /// Python's `GraphNode.ingest_input` + the registry chain's
-    /// `register_ingested_input`. Returns false when the edge is rejected
-    /// (both slots already hold this input), i.e. "try the next destination".
+    /// `register_ingested_input`. Returns where the input went, `Some(false)`
+    /// for the current iteration and `Some(true)` for the next, or `None` when
+    /// the edge is rejected (both slots already hold this input), i.e. "try
+    /// the next destination".
     /// A SLICE, not an owned vec: the caller offers the same tensors to each
     /// live worker graph in turn and only one claims them, so taking ownership
     /// meant an allocation per attempt -- and then another, because the slot
@@ -318,25 +320,31 @@ impl RequestState {
     pub fn ingest(
         &mut self, g: &CompiledGraph, node: NodeId, slot: u8,
         tensors: &[TensorRef], can_buffer: bool, final_chunk: bool,
-    ) -> bool {
+    ) -> Option<bool> {
         let name = g.node(node).inputs[slot as usize];
-        {
+        // What reaches a loop member after it ran this iteration is for the next one. Its
+        // current slot looks free once the worker clears the consumed inputs, but the loop
+        // drops that slot when it advances.
+        let ran = g.node(node).loop_id.is_some() && self.nodes[node as usize].completed;
+        let in_next = {
             let st = &mut self.nodes[node as usize];
-            if !st.cur.has(slot) {
+            if !st.cur.has(slot) && !ran {
                 st.cur.set(slot, tensors.to_vec(), final_chunk);
+                false
             } else if can_buffer && !st.next.has(slot) {
                 st.next.set(slot, tensors.to_vec(), final_chunk);
+                true
             } else {
-                return false;
+                return None;
             }
-        }
+        };
         // An ingest bubbles through every enclosing loop, each recording it if
         // it is external at that level (Loop.ingest_external_input recursing
         // via _managing_registry), then reaches the root's ready sets.
         self.record_external(g, node, name, tensors);
         self.refresh_ready(node);
         self.note_ingested_for_streaming(node);
-        true
+        Some(in_next)
     }
 
     fn record_external(
@@ -721,6 +729,8 @@ impl RequestState {
             }
             self.refresh_ready(n);
             self.reseed_streaming_ready(n);
+            // what it took while the last iteration ran may leave only its stream missing
+            self.note_ingested_for_streaming(n);
         }
         for &c in &lspec.child_loops {
             self.reset_subtree_for_iter(g, c);
@@ -948,7 +958,7 @@ mod tests {
         let (_, g) = decode_loop();
         let enc = 0;
         let mut st = RequestState::new(g.clone());
-        assert!(st.ingest(&g, enc, 0, &[t(1)], false, false));
+        assert!(st.ingest(&g, enc, 0, &[t(1)], false, false).is_some());
         assert!(st.is_ready(enc));
         // No cleanup ran first, so the completion itself releases `x`.
         let done = st.complete(&g, enc, &[vec![t(2)], vec![t(3)]]);
@@ -1024,9 +1034,9 @@ mod tests {
         st.ingest(&g, dec, 0, &[t(2)], true, false);
         st.ingest(&g, dec, 1, &[t(3)], true, false);
         // A loop-back arrival while the current slot is full is buffered.
-        assert!(st.ingest(&g, dec, 1, &[t(4)], true, false));
+        assert!(st.ingest(&g, dec, 1, &[t(4)], true, false).is_some());
         assert!(st.has_input(dec, 1, true));
-        assert!(!st.ingest(&g, dec, 1, &[t(5)], true, false), "both slots full");
+        assert!(st.ingest(&g, dec, 1, &[t(5)], true, false).is_none(), "both slots full");
 
         // No cleanup: the reset releases `tok` (not the held `h`), then
         // promotes the buffered arrival.
@@ -1098,7 +1108,7 @@ mod tests {
         let mut st = RequestState::new(g.clone());
 
         assert!(st.is_ready_for_streaming(snac), "seeded: all inputs streamed");
-        assert!(st.ingest(&g, snac, 0, &[t(1)], false, false));
+        assert!(st.ingest(&g, snac, 0, &[t(1)], false, false).is_some());
         assert!(st.is_ready(snac));
         assert!(!st.is_ready_for_streaming(snac), "full, so plainly ready");
 
@@ -1112,7 +1122,7 @@ mod tests {
             st.is_ready_for_streaming(snac),
             "an only-streaming node must accept its next chunk after completing",
         );
-        assert!(st.ingest(&g, snac, 0, &[t(2)], false, false));
+        assert!(st.ingest(&g, snac, 0, &[t(2)], false, false).is_some());
     }
 
     #[test]
@@ -1186,7 +1196,7 @@ mod tests {
         st.clear_speculative_inputs();
 
         // The loop-back `tok` goes into the next-iter slot; `h` stays put.
-        assert!(st.ingest(&g, dec, 1, &[t(30)], true, false));
+        assert!(st.ingest(&g, dec, 1, &[t(30)], true, false).is_some());
         assert!(st.ready_for_speculation(dec, true, false));
         let mut inputs: Vec<(Sym, Vec<u64>)> = st.input_tensors(dec, true)
             .into_iter().map(|(n, ts, _)| (n, ts.iter().map(|x| x.uuid).collect()))
@@ -1213,8 +1223,83 @@ mod tests {
         let mut st = RequestState::new(g.clone());
         st.ingest(&g, top, 0, &[t(1)], true, false);
         st.ingest(&g, top, 1, &[t(2)], true, false);
-        assert!(st.ingest(&g, top, 1, &[t(3)], true, false));
+        assert!(st.ingest(&g, top, 1, &[t(3)], true, false).is_some());
         assert!(!st.ready_for_speculation(top, true, false));
         assert_eq!(st.input_tensors(top, true).len(), 1);
+    }
+
+    /// [loop T: flow -> hift], a loop over the `tokens` stream: `flow` takes a
+    /// chunk and loops `voice` back to itself, `hift` loops `stream` back.
+    fn token2wav_loop() -> GraphRef {
+        let mut it = StrToId::default();
+        let nodes = vec![
+            node("flow", &["tokens", "voice"], &["tokens"], vec![edge("voice", "flow"), edge("mel", "hift")]),
+            node("hift", &["mel", "stream"], &[], vec![edge("stream", "hift"), edge("audio", "")]),
+        ];
+        let loops = vec![LoopArg {
+            name: "T".into(), max_iters: 8, parent: None,
+            member_nodes: vec!["flow".into(), "hift".into()],
+            outputs: vec![], accumulated: vec![],
+            loop_back: vec![("voice".into(), "flow".into()), ("stream".into(), "hift".into())],
+            external_inputs: vec![],
+        }];
+        compile_one(&mut it, &nodes, &loops).unwrap()
+    }
+
+    /// `flow`'s first iteration as the worker runs it: its consumed inputs
+    /// are released before its outputs are routed.
+    fn run_flow_once(g: &GraphRef) -> RequestState {
+        let (flow, hift) = (0, 1);
+        let mut st = RequestState::new(g.clone());
+        st.ingest(g, flow, 1, &[t(1)], true, false);
+        st.ingest(g, hift, 1, &[t(2)], true, false);
+        assert!(st.ingest(g, flow, 0, &[t(3)], false, false).is_some());
+        assert!(st.is_ready(flow));
+        assert_eq!(st.clear_consumed_inputs(g, flow), vec![3, 1]);
+        st.complete(g, flow, &[vec![t(10)], vec![t(11)]]);
+        st
+    }
+
+    #[test]
+    fn a_loop_back_to_a_member_that_ran_is_kept_for_the_next_iteration() {
+        let g = token2wav_loop();
+        let (flow, hift) = (0, 1);
+        let mut st = run_flow_once(&g);
+        // `flow` is not the loop's last member, so its loop-back arrives
+        // before the loop advances, and its current slot is empty by now.
+        assert_eq!(
+            st.ingest(&g, flow, 1, &[t(10)], true, false), Some(true),
+            "a speculative step's undo would take it from the current slot",
+        );
+        assert!(st.has_input(flow, 1, true));
+        assert!(!st.has_input(flow, 1, false), "the iteration that ran would drop it on advance");
+
+        st.ingest(&g, hift, 0, &[t(11)], true, false);
+        st.clear_consumed_inputs(&g, hift);
+        st.complete(&g, hift, &[vec![t(12)], vec![t(13)]]);
+        assert_eq!(st.loop_iter(0), 1);
+        let voice: Vec<Vec<u64>> = st.input_tensors(flow, false).into_iter()
+            .map(|(_, ts, _)| ts.iter().map(|t| t.uuid).collect()).collect();
+        assert_eq!(voice, vec![vec![10]], "the next chunk reads the voice the last one wrote");
+    }
+
+    #[test]
+    fn a_consumer_takes_its_next_chunk_only_once_its_loop_advances() {
+        let g = token2wav_loop();
+        let (flow, hift) = (0, 1);
+        let mut st = run_flow_once(&g);
+        st.ingest(&g, flow, 1, &[t(10)], true, false);
+        // A chunk is offered with nothing to buffer it in: refused, it stays
+        // in the stream buffer for the next iteration.
+        assert!(st.ingest(&g, flow, 0, &[t(4)], false, false).is_none(), "taken into the iteration that ran");
+
+        st.ingest(&g, hift, 0, &[t(11)], true, false);
+        st.clear_consumed_inputs(&g, hift);
+        st.complete(&g, hift, &[vec![t(12)], vec![t(13)]]);
+        // `flow` reads nothing from outside its loop, so only the voice it
+        // was given while the last iteration ran makes it open to a chunk.
+        assert!(st.is_ready_for_streaming(flow), "the stream would never be polled again");
+        assert!(st.ingest(&g, flow, 0, &[t(4)], false, false).is_some());
+        assert!(st.is_ready(flow));
     }
 }
