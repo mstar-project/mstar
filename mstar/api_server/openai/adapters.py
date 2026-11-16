@@ -199,11 +199,17 @@ def _field(msg, name: str):
     return msg.get(name) if isinstance(msg, dict) else getattr(msg, name, None)
 
 
+_TEXT_ONLY = "a tool message, or an assistant message with tool_calls or reasoning, takes text content only"
+
+
 def _message_text(content) -> str:
-    """A tool or tool-call message's text: its string, or its text parts joined."""
+    """A tool or tool-call message's text: its string, or its text parts joined. Anything else in
+    it (an image, audio) is the client's 400, not dropped: the turn renders as text only."""
     if content is None or isinstance(content, str):
         return content or ""
-    return "\n".join(p["text"] for p in content if isinstance(p, dict) and p.get("type") == "text" and p.get("text"))
+    if not isinstance(content, list) or any(not isinstance(p, dict) or p.get("type") != "text" for p in content):
+        raise ValueError(_TEXT_ONLY)
+    return "\n".join(p["text"] for p in content if p.get("text"))
 
 
 def _strict_json(constant: str):

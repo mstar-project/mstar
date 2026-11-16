@@ -594,6 +594,7 @@ _LOOP = [
     {"role": "tool", "tool_call_id": "c0", "content": "sunny"},
     {"role": "tool", "tool_call_id": "c1", "content": [{"type": "text", "text": "rainy"}]},
 ]
+_IMAGE_PART = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
 TOOL_CASES = {
     "auto": {"tools": [_TOOL], "tool_choice": "auto"},
     "required": {"tools": [_TOOL], "tool_choice": "required", "parallel_tool_calls": False},
@@ -613,6 +614,10 @@ TOOL_CASES = {
         {"type": "function", "function": {"name": "get_weather", "arguments": "[1]"}}]}]},
     "reasoning-only-turn": {"messages": [_LOOP[0], {"role": "assistant", "content": "Hi", "reasoning_content": "r"},
                                          {"role": "user", "content": "and Rome?"}]},
+    "tool-message-image": {"tools": [_TOOL], "messages": [
+        _LOOP[0], _LOOP[1], {"role": "tool", "tool_call_id": "c0", "content": [_IMAGE_PART]}]},
+    "tool-call-turn-image": {"tools": [_TOOL], "messages": [
+        _LOOP[0], {"role": "assistant", "content": [_IMAGE_PART], "tool_calls": _LOOP[1]["tool_calls"]}]},
 }
 
 

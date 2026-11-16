@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import random
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -107,6 +108,17 @@ def test_an_audio_chunk_with_completion_tokens_zero_keeps_the_text_count():
     req = RequestInput(req_type=RequestType.T2T, prompt="hi")
     m = asyncio.run(SGLangOmni().send_request(_Session(lines + [b"data: [DONE]"]), req, "http://x", 0, _TextModel()))
     assert m.output_text_tokens == 7
+
+
+@pytest.mark.parametrize("key", ["reasoning", "reasoning_content"])
+def test_a_reasoning_delta_counts_as_text(key):
+    """A reasoning model's thinking streams under ``reasoning`` (M*, vLLM) or ``reasoning_content``
+    (SGLang): text the model generated, so it times the first token and counts."""
+    m = RequestMetrics(request_id=0, type=RequestType.T2T)
+    m.start_time = time.monotonic()
+    _record_vllm_omni_chunk({"choices": [{"delta": {"role": "assistant", key: "Let me think"}}]}, m)
+    _record_vllm_omni_chunk({"choices": [{"delta": {"content": "Paris."}}]}, m)
+    assert len(m._text_chunks) == 2
 
 
 @pytest.mark.parametrize(

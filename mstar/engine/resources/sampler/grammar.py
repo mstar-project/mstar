@@ -176,10 +176,13 @@ def tool_call_grammar(tool_format: str | None, model_kwargs: dict, reasoning: bo
     ``reasoning``: the reply starts inside a reasoning block, which the tag lets it finish first.
     A call's arguments are held to its tool's schema only when the tool is strict, as vLLM holds them
     (xgrammar holds every tool's unless told otherwise)."""
+    if tool_format is None:
+        # a model that calls no tools: its tool kwargs are unread, and unchecked (`/generate`)
+        return None
     tools = model_kwargs.get("tools") or []
     choice = model_kwargs.get("tool_choice") or "auto"
     strict = [bool(tool["function"].get("strict")) for tool in tools]
-    if tool_format is None or not tools or choice == "none" or (choice == "auto" and not any(strict)):
+    if not tools or choice == "none" or (choice == "auto" and not any(strict)):
         return None
     shaped = [{"type": "function", "function": {**tool["function"], "strict": s}}
               for tool, s in zip(tools, strict, strict=True)]

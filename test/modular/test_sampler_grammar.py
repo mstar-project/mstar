@@ -662,6 +662,13 @@ def test_a_forced_tool_call_gets_a_grammar_and_a_free_one_none(kwargs, forced):
     assert tool_call_grammar(None, kwargs, True) is None, "a model with no tool format gets no grammar"
 
 
+@pytest.mark.parametrize("tools", [[{"name": "f"}], "x", [3]], ids=["no-function", "a-string", "a-number"])
+def test_a_model_with_no_tool_format_never_reads_its_tools(tools):
+    """``/generate`` on such a model leaves ``tools`` unchecked and unread, as before tools were
+    served: a malformed list is no error there."""
+    assert tool_call_grammar(None, {"tools": tools, "tool_choice": "required"}, False) is None
+
+
 def test_a_forced_call_holds_the_reply_to_qwen3_5s_call_format():
     """``required``: after the reasoning the reply is a call, typed by its schema only for a strict
     tool (vLLM's rule; xgrammar would type every tool's); one call when parallel_tool_calls is false;

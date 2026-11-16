@@ -31,7 +31,7 @@ pub fn flatten_messages(
             "tool" if tool_turns => {
                 parts.push(Part {
                     modality: "text".to_string(),
-                    text: Some(message_text(&msg.content)),
+                    text: Some(message_text(&msg.content)?),
                     index: 0,
                     role: Some("tool".to_string()),
                     extras: None,
@@ -57,7 +57,7 @@ pub fn flatten_messages(
             if let Some(extras) = turn_extras(msg.tool_calls.as_ref(), reasoning)? {
                 parts.push(Part {
                     modality: "text".to_string(),
-                    text: Some(message_text(&msg.content)),
+                    text: Some(message_text(&msg.content)?),
                     index: 0,
                     role: Some(role.to_string()),
                     extras: Some(extras),
@@ -163,19 +163,28 @@ pub(super) fn add_text(parts: &mut Vec<Part>, text: &str, role: &str) {
     });
 }
 
-/// A tool or tool-call message's text: its string, or its text parts joined.
-fn message_text(content: &Option<Content>) -> String {
+/// A tool or tool-call message's text: its string, or its text parts joined; anything else in it
+/// is refused, as `_message_text` in `api_server/openai/adapters.py` refuses it.
+fn message_text(content: &Option<Content>) -> Result<String, String> {
     match content {
-        None => String::new(),
-        Some(Content::Text(s)) => s.clone(),
-        Some(Content::Parts(parts)) => parts
-            .iter()
-            .filter_map(Value::as_object)
-            .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|p| p.get("text").and_then(Value::as_str))
-            .filter(|t| !t.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
+        None => Ok(String::new()),
+        Some(Content::Text(s)) => Ok(s.clone()),
+        Some(Content::Parts(parts)) => {
+            let mut texts = Vec::new();
+            for p in parts {
+                let p = p.as_object().filter(|p| p.get("type").and_then(Value::as_str) == Some("text"));
+                let Some(p) = p else {
+                    return Err(
+                        "a tool message, or an assistant message with tool_calls or reasoning, takes text content only"
+                            .to_string(),
+                    );
+                };
+                if let Some(t) = p.get("text").and_then(Value::as_str).filter(|t| !t.is_empty()) {
+                    texts.push(t);
+                }
+            }
+            Ok(texts.join("\n"))
+        }
     }
 }
 
