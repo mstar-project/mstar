@@ -70,6 +70,30 @@ def test_submit_request_starts_span_on_the_api_server_path():
     provider.shutdown()
 
 
+def test_submit_sends_its_own_span_context_to_preprocess_worker():
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    inputs = []
+    server = make_test_api_server(preprocess_worker=SimpleNamespace(new_request=inputs.append))
+    server.tracing = RequestTracing("dummy", provider=provider)
+    parent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+    rid = server.submit_request(
+        request_id="client", input_modalities=["text"], output_modalities=["text"],
+        traceparent=parent,
+    )
+    child = inputs[0].traceparent
+    assert child is not None and child != parent
+    _, trace_id, span_id, flags = child.split("-")
+    req = server.pending_requests[server.submission_key(rid)]
+    context = req.trace.span.get_span_context()
+    assert int(trace_id, 16) == context.trace_id
+    assert int(span_id, 16) == context.span_id
+    assert flags == "01"
+    server._record_end(req, "success")
+    provider.shutdown()
+
+
 def test_request_span_is_root_even_with_ambient_context():
     provider = TracerProvider()
     exporter = InMemorySpanExporter()
@@ -124,7 +148,8 @@ def test_rust_bridge_keeps_the_parent_on_the_submission():
         provider = TracerProvider()
         exporter = InMemorySpanExporter()
         provider.add_span_processor(SimpleSpanProcessor(exporter))
-        server = make_test_api_server(preprocess_worker=SimpleNamespace(new_request=lambda inp: None))
+        inputs = []
+        server = make_test_api_server(preprocess_worker=SimpleNamespace(new_request=inputs.append))
         server.tracing = RequestTracing("dummy", provider=provider)
 
         async def empty_result(request_id):
@@ -141,6 +166,9 @@ def test_rust_bridge_keeps_the_parent_on_the_submission():
         bridge._submit({"t": "submit", "rid": "chatcmpl-1", "sub": 1, "traceparent": header})
         key = server.submission_key("chatcmpl-1")
         assert key is not None
+        assert inputs[0].traceparent is not None
+        assert inputs[0].traceparent != header
+        assert inputs[0].traceparent.split("-")[1] == header.split("-")[1]
         server._record_end(server.pending_requests[key], "success")
         await asyncio.sleep(0)
         span, = exporter.get_finished_spans()

@@ -7,6 +7,7 @@ OpenTelemetry, and this module loads it only when tracing is enabled.
 from __future__ import annotations
 
 import os
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -16,6 +17,13 @@ if TYPE_CHECKING:
     from mstar.api_server.entrypoint import PendingRequest
 
 INSTALL_HINT = "--otlp-traces-endpoint needs OpenTelemetry: pip install 'mstar-ai[tracing]'"
+_TRACEPARENT = re.compile(r"[0-9a-f]{2}-([0-9a-f]{32})-[0-9a-f]{16}-[0-9a-f]{2}\Z")
+
+
+def trace_id_from_parent(traceparent: str | None) -> str | None:
+    """A log-safe trace ID from an internal W3C parent header."""
+    match = _TRACEPARENT.fullmatch(traceparent) if traceparent is not None else None
+    return match.group(1) if match is not None else None
 
 
 def otlp_protocol() -> str:
@@ -46,6 +54,7 @@ class RequestSpan:
     span: Any
     wall_ns: int
     perf_ns: int
+    traceparent: str | None
 
     def epoch_ns(self, perf_seconds: float) -> int:
         return self.wall_ns + int(perf_seconds * 1_000_000_000) - self.perf_ns
@@ -100,7 +109,9 @@ class RequestTracing:
                 "mstar.submission_key": key,
             },
         )
-        return RequestSpan(span, wall_ns, perf_ns)
+        carrier: dict[str, str] = {}
+        self._propagator.inject(carrier, context=self._trace.set_span_in_context(span))
+        return RequestSpan(span, wall_ns, perf_ns, carrier.get("traceparent"))
 
     def finish(self, req: PendingRequest, outcome: str) -> None:
         state = req.trace
