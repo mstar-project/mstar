@@ -280,6 +280,10 @@ def test_bad_events_report_errors_but_keep_the_session(client_and_stub):
         ws.receive_text()
         ws.send_text("not json")
         assert json.loads(ws.receive_text())["type"] == "error"
+        ws.send_text('{"type":"transcription_session.update","session":{"prompt":"\\ud800"}}')
+        assert json.loads(ws.receive_text())["error"]["message"] == (
+            "text is not valid UTF-8 (contains a lone surrogate)"
+        )
         ws.send_text(json.dumps({"type": "nope"}))
         assert "unknown event" in json.loads(ws.receive_text())["error"]["message"]
         ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": "%%%"}))

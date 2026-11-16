@@ -165,6 +165,19 @@ class _UploadServer(_RecordingServer):
         self.upload_dir = upload_dir
 
 
+def test_generate_refuses_surrogate_in_json_kwargs_and_cleans_upload(monkeypatch, tmp_path):
+    server = _UploadServer(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", server)
+    response = TestClient(entrypoint.app).post(
+        "/generate", data={"text": "hi", "model_kwargs": '{"ref_text":"\\ud800"}'},
+        files={"files": ("clip.wav", b"RIFF")},
+    )
+    assert response.status_code == 400
+    assert response.json() == {"detail": "text is not valid UTF-8 (contains a lone surrogate)"}
+    assert server.streaming is None
+    assert list(tmp_path.iterdir()) == []
+
+
 @pytest.mark.parametrize("files,fields,detail", [
     ([("clip.wav", b"RIFF"), ("notes.xyz", b"?")], {}, "Cannot determine modality for file: notes.xyz"),
     ([("clip.wav", b"RIFF")], {"input_modalities": "video_frame"}, "'video_frame' is an output-only modality"),

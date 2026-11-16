@@ -123,6 +123,43 @@ def _pcm(vals):
     return np.array(vals, dtype="<i2").tobytes()  # int16 PCM, as the models emit
 
 
+@pytest.mark.parametrize("model,path,body", [
+    ("bagel", "/v1/chat/completions", {"messages": [{"role": "user", "content": "\ud800"}]}),
+    ("bagel", "/v1/chat/completions", {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "\ud800"}
+    ]}]}),
+    ("orpheus", "/v1/audio/speech", {"input": "\ud800"}),
+    ("orpheus", "/v1/audio/speech", {"input": "hi", "instructions": "\ud800"}),
+    ("orpheus", "/v1/audio/speech", {"input": "hi", "ref_text": "\ud800"}),
+    ("bagel", "/v1/images/generations", {"prompt": "\ud800"}),
+    ("wan22", "/v1/videos/generations", {"prompt": "\ud800"}),
+])
+def test_json_routes_refuse_lone_surrogates_before_submit(client_and_stub, model, path, body):
+    client, stub = client_and_stub
+    stub.model_name = model
+    # httpx encodes json= with ensure_ascii=False, so send the escaped JSON
+    # explicitly: this is the actual wire shape the Python decoder accepts.
+    response = client.post(
+        path, content=json.dumps(body).encode(), headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "text is not valid UTF-8 (contains a lone surrogate)"
+    assert stub.last_submit is None
+
+
+@pytest.mark.parametrize("model,path,files", [
+    ("whisper_large", "/v1/audio/transcriptions", {"file": ("clip.wav", b"RIFF")}),
+    ("bagel", "/v1/images/edits", {"image": ("image.png", b"PNG")}),
+])
+def test_multipart_routes_refuse_a_decoded_lone_surrogate(client_and_stub, model, path, files):
+    client, stub = client_and_stub
+    stub.model_name = model
+    response = client.post(path, files=files, data={"instructions": '"\\ud800"'})
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "text is not valid UTF-8 (contains a lone surrogate)"
+    assert stub.last_submit is None
+
+
 def test_models(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "bagel"

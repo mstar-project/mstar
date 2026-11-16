@@ -123,6 +123,21 @@ def test_json_frame_round_trip(monkeypatch, tmp_path):
     assert saved.startswith(str(tmp_path)) and open(saved, "rb").read() == b"PNG"
 
 
+def test_json_frame_refuses_lone_surrogate_before_saving_files(monkeypatch, tmp_path, off_loop):
+    fake = _FakeServer(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text('{"text":"\\ud800","files":[{"name":"obs.png","data":"UE5H"}]}')
+        (error,) = _recv_until_finish(ws, binary=False)
+        assert error["request_id"] is None
+        assert "text is not valid UTF-8 (contains a lone surrogate)" in error["error"]
+        assert fake.submitted == []
+        assert list(tmp_path.iterdir()) == []
+        ws.send_text(json.dumps({"text": "fine", "request_id": "ok"}))
+        messages = _recv_until_finish(ws, binary=False)
+    assert messages[-1] == {"request_id": "ok", "finish": True}
+
+
 def test_msgpack_frames_and_pipelining(monkeypatch, tmp_path):
     fake = _FakeServer(tmp_path, chunks_per_request=1)
     monkeypatch.setattr(entrypoint, "api_server", fake)

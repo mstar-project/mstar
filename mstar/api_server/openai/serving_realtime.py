@@ -97,6 +97,7 @@ from mstar.api_server import media_io
 from mstar.api_server.openai import realtime_vad
 from mstar.api_server.openai._util import error_type, now, rid
 from mstar.api_server.openai.protocol import TranscriptionRequest
+from mstar.api_server.unicode_input import reject_lone_surrogates
 from mstar.utils.utf8_stream import Utf8Stream, decode_joined
 
 if TYPE_CHECKING:
@@ -619,6 +620,11 @@ async def _events(ws: WebSocket, send):
             continue
         if not isinstance(event, dict):
             await send(error_event("an event must be a JSON object"))
+            continue
+        try:
+            reject_lone_surrogates(event)
+        except ValueError as exc:
+            await send(error_event(str(exc)))
             continue
         yield event
 
