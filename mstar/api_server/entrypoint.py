@@ -444,11 +444,11 @@ def usage_chunk(request_id: str, req: PendingRequest) -> ResultChunk:
     ``text_output`` has its stop tokens seen; any other is ``length`` at the cap."""
     cap = req.max_output_tokens
     at_cap = cap is not None and req.completion_tokens >= cap
-    return ResultChunk(request_id=request_id, modality=USAGE, data=b"", metadata={
+    return ResultChunk(request_id=request_id, modality=USAGE, data=b"", metadata=_with_weight_version({
         "prompt_tokens": req.prompt_tokens or 0,
         "completion_tokens": req.completion_tokens,
         "finish_reason": "length" if at_cap and not req.stopped else "stop",
-    })
+    }, _request_weight_version(req)))
 
 
 def notify_many(reqs) -> None:
