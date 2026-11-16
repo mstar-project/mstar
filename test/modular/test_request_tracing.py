@@ -148,3 +148,30 @@ def test_rust_bridge_keeps_the_parent_on_the_submission():
         provider.shutdown()
 
     asyncio.run(run())
+
+
+def test_rust_bridge_leaves_other_routes_without_a_traceparent_kwarg():
+    async def run():
+        server = make_test_api_server(preprocess_worker=SimpleNamespace(new_request=lambda inp: None))
+        submit = server.submit_request
+
+        def without_parent(**kwargs):
+            assert "traceparent" not in kwargs
+            return submit(**kwargs)
+
+        server.submit_request = without_parent
+
+        async def empty_result(request_id):
+            if False:
+                yield request_id
+
+        server.iter_result_chunks = empty_result
+        bridge = RustFrontendBridge.__new__(RustFrontendBridge)
+        bridge.server = server
+        bridge._keys = {}
+        bridge._send = lambda msg: None
+        bridge._submit({"t": "submit", "rid": "other-route-1", "sub": 1})
+        assert server.submission_key("other-route-1") is not None
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
