@@ -1,6 +1,7 @@
 """CPU checks for the opt-in API request trace."""
 
 import asyncio
+import logging
 import time
 from types import SimpleNamespace
 
@@ -18,6 +19,7 @@ from mstar.api_server.entrypoint import PendingRequest
 from mstar.api_server.rust_frontend import RustFrontendBridge
 from mstar.observability.tracing import RequestTracing
 from mstar.profile.format import GraphTiming, RequestProfile, RequestTiming
+from mstar.utils.logging_config import REQUEST_LOGGER
 
 
 def test_request_trace_reuses_existing_timing_and_records_outcome():
@@ -107,7 +109,7 @@ def test_submit_request_starts_span_on_the_api_server_path():
     provider.shutdown()
 
 
-def test_submit_sends_its_own_span_context_to_preprocess_worker():
+def test_submit_sends_its_own_span_context_to_preprocess_worker(caplog):
     provider = TracerProvider()
     exporter = InMemorySpanExporter()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
@@ -115,10 +117,11 @@ def test_submit_sends_its_own_span_context_to_preprocess_worker():
     server = make_test_api_server(preprocess_worker=SimpleNamespace(new_request=inputs.append))
     server.tracing = RequestTracing("dummy", provider=provider)
     parent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
-    rid = server.submit_request(
-        request_id="client", input_modalities=["text"], output_modalities=["text"],
-        traceparent=parent,
-    )
+    with caplog.at_level(logging.DEBUG, logger=REQUEST_LOGGER):
+        rid = server.submit_request(
+            request_id="client", input_modalities=["text"], output_modalities=["text"],
+            traceparent=parent,
+        )
     child = inputs[0].traceparent
     assert child is not None and child != parent
     _, trace_id, span_id, flags = child.split("-")
@@ -127,8 +130,21 @@ def test_submit_sends_its_own_span_context_to_preprocess_worker():
     assert int(trace_id, 16) == context.trace_id
     assert int(span_id, 16) == context.span_id
     assert flags == "01"
+    assert f"Request client submitted as {server.submission_key(rid)}" in caplog.text
+    assert f"trace_id={trace_id}" in caplog.text
     server._record_end(req, "success")
     provider.shutdown()
+
+
+def test_untraced_submit_log_has_no_trace_id(caplog):
+    worker = SimpleNamespace(new_request=lambda inp: None)
+    server = make_test_api_server(preprocess_worker=worker)
+    with caplog.at_level(logging.DEBUG, logger=REQUEST_LOGGER):
+        server.submit_request(
+            request_id="client", input_modalities=["text"], output_modalities=["text"],
+        )
+    assert "Request client submitted as client#1" in caplog.text
+    assert "trace_id=" not in caplog.text
 
 
 def test_request_span_is_root_even_with_ambient_context():
