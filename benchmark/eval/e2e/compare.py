@@ -156,9 +156,9 @@ def public_command(args) -> str:
         parts.append(f"--sessions {args.sessions}")
     if args.repeats:
         parts.append(f"--repeats {args.repeats}")
-    if args.review:
+    if getattr(args, "review", False):
         parts.append("--review")
-    if args.review_fetch:
+    if getattr(args, "review_fetch", False):
         parts.append("--review-fetch")
     if getattr(args, "stress", False):
         parts += ["--stress", f"--stress-runs {args.stress_runs}", f"--stress-seconds {args.stress_seconds:g}",
@@ -475,7 +475,7 @@ def make_slots(args, provider: hosts.HostProvider | None) -> list[hosts.Slot]:
 
 
 def cmd_compare(args) -> int:
-    if args.review_fetch and not args.review:
+    if getattr(args, "review_fetch", False) and not getattr(args, "review", False):
         raise SystemExit("--review-fetch requires --review")
     man = mf.load(args.cases)
     if args.list:
@@ -488,10 +488,11 @@ def cmd_compare(args) -> int:
         print("* request path or served invariants (--rp); + optional model: name it or use its own tag")
         return 0
     if args.render:
-        md, code = render(Path(args.render), man, args.calibration, args.chart_url, args.review)
+        md, code = render(Path(args.render), man, args.calibration, args.chart_url,
+                          getattr(args, "review", False))
         print(md)
         return code
-    if args.review and args.stress:
+    if getattr(args, "review", False) and args.stress:
         raise SystemExit("--review is for saved compare outputs, not --stress")
     if not args.head:
         raise SystemExit("compare needs --head (or --render / --list)")
@@ -592,7 +593,7 @@ def _run(args, man, models, base, head, slots) -> int:
         run["gpu_hours"] = round(sum(s.get("gpu_s", 0) for s in st.values()) / 3600, 2)
         run["model_status"] = {n: {k: v for k, v in s.items() if k in ("status", "reason")} for n, s in st.items()}
         (run_dir / "run.json").write_text(json.dumps(run, indent=1))
-    md, code = render(run_dir, man, args.calibration, args.chart_url, args.review)
+    md, code = render(run_dir, man, args.calibration, args.chart_url, getattr(args, "review", False))
     print(f"report: {md}\nGPU-hours: {run['gpu_hours']}", file=sys.stderr)
     print(md.read_text())
     return code
