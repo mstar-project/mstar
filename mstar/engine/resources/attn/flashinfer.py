@@ -238,6 +238,10 @@ class FlashInferManager(PlacedAttention):
             # a verifying node's mixed step: the host plans its prompt rows, and FA3's ragged wrapper reads its
             # verify rows' pages and lengths off the tables in the graph
             mixed = self._mixed_cg.get((step.bucket, step.slot))
+            if mixed is None and self._verify_fa3 and not stream.reads:
+                # every attention on a mixed walk runs on the verify kernels (`drafter_step`), so its ragged
+                # wrapper exists: without it the verify rows would attend over their reserved lengths
+                raise RuntimeError(f"a mixed capture {step.bucket} planned no FA3 ragged wrapper on {pool!r}")
             if mixed is not None and not stream.reads:
                 table = step.block_tables[pool]
                 mixed.gather_resident(step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col)
@@ -543,9 +547,12 @@ class FlashInferManager(PlacedAttention):
         # FlashInfer's own plans them where FA3 doesn't run
         fa3 = step.verify and self._verify_fa3 and ctx.graph_walk == self._verify_walk
         mixed_fa3 = step.verify and self._verify_fa3 and not fa3
-        if fa3 and len(plan_outputs) > 1:
-            # one FA3 wrapper per (bucket, slot), whichever label: a second label's plan would overwrite the first's
-            raise RuntimeError(f"a verify step plans one KV label on FA3, not {sorted(plan_outputs)}")
+        if (fa3 or mixed_fa3) and len(plan_outputs) > 1:
+            # one FA3 wrapper per (bucket, slot), whichever label: a second label's plan would overwrite the first's,
+            # and a mixed step's resident gather fills one wrapper over every row of the bucket
+            raise RuntimeError(
+                f"a {'verify' if fa3 else 'mixed'} step plans one KV label on FA3, not {sorted(plan_outputs)}"
+            )
         for label, kv_out in plan_outputs.items():
             indptrs = kv_out.cpu_indptrs
             r = None if shard_plan is None else shard_plan.ranges.get(label)

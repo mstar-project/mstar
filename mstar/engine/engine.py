@@ -60,7 +60,7 @@ from mstar.engine.resources.base import (
     head_shards,
 )
 from mstar.engine.resources.context_parallel import position_pools
-from mstar.engine.resources.draft.startup import model_combined_walks, node_chunks_prompts
+from mstar.engine.resources.draft.startup import model_combined_walks, model_kv_labels, node_chunks_prompts
 from mstar.engine.resources.kv import manager as kv_manager
 from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
 from mstar.engine.resources.kv.keys import fingerprint
@@ -1012,6 +1012,7 @@ class Engine:
                 decl, specs_by_key, (async_scheduling or {}).get(decl.node, (True, "")),
                 chunks=node_chunks_prompts(model, decl.node),
                 combined=model_combined_walks(model) if model is not None else {},
+                kv_labels=model_kv_labels(model),
             )
             for decl in _verify_nodes(model) if decl.node in self._submodules
         }
@@ -1086,6 +1087,7 @@ class Engine:
     def _set_up_draft(
         self, decl: "VerifyNode", specs_by_key: Mapping[str, NodeResourceSpec], async_scheduling: tuple[bool, str],
         chunks: bool = False, combined: Mapping[tuple[str, str], str] | None = None,
+        kv_labels: Mapping[str, Collection[str]] | None = None,
     ) -> "NodeDraft":
         """Check a verifying node again against what was built, pick its mode,
         and bind what its verify steps read: the sampler's ``k``, the ledger, and
@@ -1106,7 +1108,7 @@ class Engine:
         # the submodule's own, which is what runs
         decl = decl._replace(device_loopback=getattr(submodule, "device_loopback", None))
         # from config and the built submodule: the same on every rank, so a raise here is every rank's
-        problems = node_problems(decl, stop, specs_by_key, chunks, combined)
+        problems = node_problems(decl, stop, specs_by_key, chunks, combined, kv_labels=kv_labels)
         if problems:
             raise RuntimeError("speculative decoding: " + "; ".join(problems))
         mode, reason = self._agreed_mode(decl, mgmt, specs_by_key, async_scheduling)

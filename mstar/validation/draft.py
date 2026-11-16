@@ -91,13 +91,13 @@ def check_draft(model, config: Mapping[str, Any], specs: list[NodeResourceSpec] 
         node for group in config.get("node_groups") or [] if group.get("side_stream")
         for node in group.get("node_names") or []
     ]
-    from mstar.engine.resources.draft.startup import model_combined_walks
+    from mstar.engine.resources.draft.startup import model_combined_walks, model_kv_labels
 
     problems = check_deployment(
         decls, {spec.resource_key: spec for spec in specs or ()}, streaming_out, side_lane,
         async_scheduling_of(model, config), knobs.resident_planning() != "off",
         chunked=[decl.node for decl in decls if node_chunks_prompts(model, decl.node)],
-        combined_walk_of=model_combined_walks(model),
+        combined_walk_of=model_combined_walks(model), kv_labels=model_kv_labels(model),
         max_seq_len=max_seq_len if isinstance(max_seq_len := config.get("max_seq_len"), int) else None,
     )
     return problems

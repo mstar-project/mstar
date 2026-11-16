@@ -400,3 +400,39 @@ def test_a_replay_at_qwen3_8b_buckets_zeroes_its_padding_in_place(block, hide, m
         eager.plan(dtype=torch.bfloat16, **build_paged_indptrs(step_views, page).to_kwargs_dict())
         assert torch.equal(out[: step_q.shape[0]], eager.run(step_q, cache))
         assert out[step_q.shape[0]:].eq(0).all()
+
+
+def test_a_mixed_step_over_two_kv_labels_is_refused_where_its_attention_plans():
+    """FA3's ragged wrapper of a mixed capture holds one label's rows, and its resident gather covers every
+    row of the bucket: a mixed step that plans two KV labels on one attention is refused, as a verify step's
+    is, and a mixed capture that registered no wrapper refuses its gather rather than reading host lengths."""
+    from mstar.engine.resources.attn.flashinfer import FlashInferManager
+    from mstar.engine.resources.kv.plan import KVPlanOutputs
+    from mstar.engine.resources.resident import ResidentStream
+    from mstar.engine.resources.step import BucketKey
+
+    manager = _stub_manager(verify_fa3=False)
+    manager._verify_backend, manager._fa3_reason = FlashInferManager.__init__.__defaults__ and None, None
+    from mstar.engine.resources.attn.config import VerifyBackend
+
+    manager._verify_backend = VerifyBackend.AUTO
+    manager.bind_verify_walk("decode", BLOCK, 2 * BLOCK)
+    assert manager._verify_fa3
+    views = _mixed_views([5], [(2, 3)], {0: [3, 4, 5], 1: [6, 7]})
+    kv_out = SimpleNamespace(views=views, cpu_indptrs=build_paged_indptrs(views, PAGE))
+    ctx = SimpleNamespace(
+        resident=None, slot_lease=None, is_preplan=False, plan_phase="plan", graph_walk="mixed", slot=0,
+        request_ids=(0, 1), walk_of={0: "decode", 1: "prefill"}.get, force_prefill=False,
+        plan_results={"kv": KVPlanOutputs({"main": kv_out, "cfg": kv_out})},
+    )
+    with pytest.raises(RuntimeError, match=r"a mixed step plans one KV label on FA3, not \['cfg', 'main'\]"):
+        manager.plan(AttentionStep(verify=True, causal=True), ctx)
+
+    manager._lagged_cg = {}
+    bucket = BucketKey(graph_walk="mixed", bs=2, num_tokens=2 * BLOCK + 32)
+    step = SimpleNamespace(
+        bucket=bucket, slot=0, streams={"kv": ResidentStream("main", reads=False, span=BLOCK)},
+        buffers=SimpleNamespace(mixed=True), host_planned=False,
+    )
+    with pytest.raises(RuntimeError, match="planned no FA3 ragged wrapper"):
+        manager.resident_gather(step)

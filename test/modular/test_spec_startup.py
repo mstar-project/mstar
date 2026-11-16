@@ -603,3 +603,22 @@ def test_a_max_seq_len_override_on_a_verifying_pool_is_the_clients_limit():
     plain = KVSpec("kv_cache", {NODE}, PagedKVConfig(num_layers=2, num_kv_heads=2, head_dim=8, max_seq_len=64))
     apply_yaml_overrides([plain], {"resources": {"kv_cache": {"max_seq_len": 48}}})
     assert plain.config.max_seq_len == 48
+
+
+def test_a_mixed_walk_over_a_pool_the_model_writes_under_two_labels_is_refused():
+    """A mixed step plans one KV label on FA3, so a node whose model writes its pool under two labels
+    (`Model.kv_labels`) runs no mixed walk, refused before workers spawn (and at load, test_spec_engine).
+    One label passes."""
+    from spec_toy import ToyModel
+    from spec_toy import specs as toy_specs
+
+    from mstar.engine.resources.draft.startup import mixed_label_problem
+
+    one = ToyModel(3, mixed=True).kv_labels()
+    two = {"kv": {**one["kv"], "cfg": one["kv"]["main"]}}
+    (decl,) = ToyModel(3, mixed=True).verify_nodes()
+    specs = {spec.resource_key: spec for spec in toy_specs(3)}
+    assert mixed_label_problem(decl, specs, {"kv": set(one["kv"])}) is None
+    assert "under ['cfg', 'main']" in mixed_label_problem(decl, specs, {"kv": set(two["kv"])})
+    (plain,) = ToyModel(3).verify_nodes()
+    assert mixed_label_problem(plain, specs, {"kv": set(two["kv"])}) is None

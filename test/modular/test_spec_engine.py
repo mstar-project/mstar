@@ -1106,3 +1106,14 @@ def test_a_verifying_node_on_a_pool_with_no_host_pool_is_warned_about(caplog):
     with caplog.at_level(logging.WARNING, logger="mstar.engine.engine"):
         engine_mod._warn_hostless(NODE, {"kv": hosted})
     assert not any("no host pool" in r.getMessage() for r in caplog.records)
+
+
+def test_a_mixed_walk_over_a_pool_written_under_two_labels_is_refused_at_load(monkeypatch):
+    """`mixed_label_problem` at load, from what the model says it writes (test_spec_startup). The toy writes one
+    label; only the labels the check reads are swapped, since a pool of two labels builds its own transfer."""
+    import mstar.engine.engine as engine_mod
+
+    monkeypatch.setattr(engine_mod, "model_kv_labels", lambda model: {"kv": {"main", "cfg"}})
+    with pytest.raises(RuntimeError, match="plans one KV label"):
+        engine(3, mixed=True)
+    engine(3)  # no mixed walk

@@ -245,6 +245,32 @@ def combined_problem(decl: VerifyNode, combined_walk_of: Mapping[tuple[str, str]
     return None
 
 
+def mixed_label_problem(
+    decl: VerifyNode, specs: Mapping[str, NodeResourceSpec], kv_labels: Mapping[str, Iterable[str]],
+) -> str | None:
+    """A mixed prompt-plus-verify step plans each KV label apart, and FA3's ragged wrapper that reads its verify
+    rows off the resident tables holds one label's rows: a mixed walk over a pool the model writes under more
+    than one label (`Model.kv_labels`) is refused."""
+    from mstar.engine.resources.kv.config import KVSpec
+
+    if decl.mixed_walk is None:
+        return None
+    for key, spec in specs.items():
+        labels = sorted(kv_labels.get(key, ()))
+        if isinstance(spec, KVSpec) and decl.node in spec.nodes and len(labels) > 1:
+            return (
+                f"node {decl.node!r}: a mixed prompt-plus-verify step ({decl.mixed_walk!r}) plans one KV label, "
+                f"and the model writes {key!r} under {labels}; run the node's prompts in steps of their own"
+            )
+    return None
+
+
+def model_kv_labels(model) -> Mapping[str, frozenset[str]]:
+    """The KV labels the model writes, by resource (`Model.kv_labels`)."""
+    of = getattr(model, "kv_labels", None)
+    return {} if of is None else {key: frozenset(labels) for key, labels in of().items()}
+
+
 def model_combined_walks(model) -> Mapping[tuple[str, str], str]:
     of = getattr(model, "combined_walk_of", None)
     return of() if of is not None else {}
@@ -288,13 +314,17 @@ def chunking_problem(decl: VerifyNode, chunks_prompts: bool) -> str | None:
 def node_problems(
     decl: VerifyNode, token_stop, specs: Mapping[str, NodeResourceSpec], chunks_prompts: bool,
     combined_walk_of: Mapping[tuple[str, str], str] | None = None, max_seq_len: int | None = None,
+    kv_labels: Mapping[str, Iterable[str]] | None = None,
 ) -> list[str]:
     """Every problem with one verifying node that its declaration and its resources show: the one list both
     `check_deployment` (before workers spawn, ``max_seq_len`` the serving config's) and the engine at load (with
     the built submodule's ``token_stop``) run, so the two can't disagree."""
     problems = shape_problems(decl, token_stop, specs) + geometry_problems(decl, specs)
     problems += resource_problems(decl, specs)
-    for problem in (chunking_problem(decl, chunks_prompts), combined_problem(decl, combined_walk_of or {})):
+    for problem in (
+        chunking_problem(decl, chunks_prompts), combined_problem(decl, combined_walk_of or {}),
+        mixed_label_problem(decl, specs, kv_labels or {}),
+    ):
         if problem is not None:
             problems.append(problem)
     return problems + slack_problems([decl], specs.values(), max_seq_len)
@@ -312,6 +342,7 @@ def check_deployment(
     streaming_out: Mapping[str, bool], side_lane: Iterable[str], async_scheduling: Mapping[str, tuple[bool, str]],
     resident_planning: bool, chunked: Iterable[str] = (),
     combined_walk_of: Mapping[tuple[str, str], str] | None = None, max_seq_len: int | None = None,
+    kv_labels: Mapping[str, Iterable[str]] | None = None,
 ) -> list[str]:
     """`validate_deployment`'s share: every problem with every verifying node,
     and each node's mode logged."""
@@ -319,7 +350,7 @@ def check_deployment(
     side = set(side_lane)
     for decl in decls:
         problems += node_problems(decl, decl.token_stop, specs, decl.node in set(chunked), combined_walk_of,
-                                  max_seq_len)
+                                  max_seq_len, kv_labels)
         if streaming_out.get(decl.node):
             problems.append(f"node {decl.node!r}: an outgoing streaming edge expects one item a step")
         if decl.node in side:
