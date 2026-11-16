@@ -53,6 +53,10 @@ def test_the_speculators_and_llama_formats_parse_to_one_config():
     ({"norm_output": True}, "norm_output"),
     ({"parallel_drafting": True}, "parallel_drafting"),
     ({"attention_bias": True}, "biases"),
+    # the drafter rotates with plain RoPE
+    ({"rope_scaling": {"rope_type": "llama3", "factor": 8.0}}, "RoPE scaling"),
+    ({"rope_scaling": {"type": "yarn", "factor": 4.0}}, "RoPE scaling"),
+    ({"rope_parameters": {"rope_type": "dynamic", "factor": 2.0}}, "RoPE scaling"),
 ])
 def test_the_variants_no_reference_pair_uses_are_refused(change, why):
     hf = {**SPECULATORS, "transformer_layer_config": {**SPECULATORS["transformer_layer_config"], **change}}
@@ -375,3 +379,46 @@ def test_the_drafters_dtype_comes_from_one_config_level(tmp_path, top, inner, wa
     path.write_text(json.dumps(hf))
     target, _ = qwen3_cpu.write_checkpoints(tmp_path)
     assert qwen3_cpu.make_model(target, draft, max_seq_len=512).drafter_decl.dtype == want
+
+
+def test_a_default_rope_parses_and_the_drafter_declares_plain_rope():
+    for scaling in (None, {"rope_type": "default"}, {"type": "default"}):
+        layer = {**SPECULATORS["transformer_layer_config"], "rope_scaling": scaling}
+        config = Eagle3Config.from_hf({**SPECULATORS, "transformer_layer_config": layer})
+        assert config.rope_theta == 1e6
+    decl = Eagle3(Eagle3Config.from_hf(SPECULATORS), 3, "bfloat16", taps=(2, 18, 33), kv_key="kv_cache",
+                  pos_key="rope", attn_key="attn")
+    assert decl.needs.geometry.plain_rope
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("tokens", [64, 256, 384, 640, 8192])
+def test_plain_rope_rotates_as_the_neutral_llama31_kernel_did(tokens):
+    """The drafter's RoPE on FlashInfer's plain launcher (with its head-parallel grid for few tokens) against the
+    Llama 3.1 launcher at the neutral factors it took before: the same q and k, bit for bit, eager and in a graph."""
+    pytest.importorskip("flashinfer")
+    from mstar.engine.resources.position.rope import rope_apply_qk_inplace
+
+    torch.manual_seed(tokens)
+    q = torch.randn(tokens, 32, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(tokens, 8, 128, device="cuda", dtype=torch.bfloat16)
+    pos = torch.randint(0, 40960, (tokens,), device="cuda", dtype=torch.int32)
+    neutral = dict(low_freq_factor=1.0, high_freq_factor=1.0, old_context_len=8192)
+
+    def rotate(q, k, **llama31):
+        rope_apply_qk_inplace(q, k, pos, None, None, False, 1.0, 1e6, **llama31)
+        return q, k
+
+    want = rotate(q.clone(), k.clone(), **neutral)
+    got = rotate(q.clone(), k.clone())
+    assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
+    qs, ks = q.clone(), k.clone()
+    rotate(qs, ks)  # warm-up
+    qs.copy_(q), ks.copy_(k)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        rotate(qs, ks)
+    qs.copy_(q), ks.copy_(k)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(qs, want[0]) and torch.equal(ks, want[1])

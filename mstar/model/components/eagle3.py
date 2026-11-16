@@ -95,6 +95,11 @@ class Eagle3Config:
         problems += [f"{flag}" for flag in _REFUSED_FLAGS if flags.get(flag)]
         if layer.get("attention_bias") or layer.get("mlp_bias"):
             problems.append("attention or MLP biases")
+        # the drafter rotates with plain RoPE (`Eagle3Drafter`)
+        for key in ("rope_scaling", "rope_parameters"):
+            scaling = layer.get(key) or {}
+            if (scaling.get("rope_type") or scaling.get("type") or "default") != "default":
+                problems.append(f"RoPE scaling ({key} {scaling})")
         if problems:
             raise ValueError("unsupported EAGLE-3 variant: " + ", ".join(problems))
         hidden = layer["hidden_size"]
@@ -146,7 +151,7 @@ class Eagle3(HostedDrafterDecl):
             num_layers=1, num_kv_heads=cfg.num_key_value_heads, head_dim=cfg.head_dim,
             hidden_size=cfg.target_hidden_size, vocab_size=cfg.vocab_size, dtype=self.dtype,
             # it attends through the target's attention and rotates through its positions
-            num_qo_heads=cfg.num_attention_heads, rope_theta=cfg.rope_theta,
+            num_qo_heads=cfg.num_attention_heads, rope_theta=cfg.rope_theta, plain_rope=True,
         )
         return DrafterNeeds(
             taps=self.taps, tap_key=self.tap_key,
@@ -225,6 +230,10 @@ class Eagle3Drafter(nn.Module, HostedDrafter):
             attn_key=decl.attn_key, kv_key=decl.kv_key, pos_key=decl.pos_key,
             # its one layer, the set's layer 0, which the pool places
             kv_layer_set=LAYER_SET,
+            # plain RoPE (the config refuses scaling, startup a scaled position resource): the attention's neutral
+            # Llama 3.1 factors would launch FlashInfer's Llama 3.1 kernel, which has no head-parallel grid for a
+            # step's few tokens
+            rope_low_freq_factor=None, rope_high_freq_factor=None, rope_old_context_len=None,
         )
         self.post_attention_layernorm = RMSNorm(hidden, eps=cfg.rms_norm_eps)
         self.mlp = ParallelGatedMLP(comm_group=comm_group, hidden_size=hidden,
