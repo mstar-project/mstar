@@ -498,7 +498,7 @@ def _upload_dirs(monkeypatch, tmp_path) -> dict:
         # and so would handing pytest's log handlers to a writer thread, which repeats every later record
         m.setattr(entrypoint, "log_off_thread", lambda: None)
         with pytest.raises(_StopError):
-            entrypoint.main(["--config", str(cfg)])
+            entrypoint.main(["--config", str(cfg), "--python-frontend"])
 
     def fake_ensure(path):
         seen["APIServer"] = path
