@@ -8,7 +8,7 @@ step without pulling them in behind it.
 import hashlib
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
@@ -29,12 +29,11 @@ REAL_KNOB_RULES = {
     "top_p": ("in (0, 1] (1 is off; greedy is temperature 0)", lambda v: 0 < v <= 1),
     "min_p": ("in [0, 1] (0 is off)", lambda v: 0 <= v <= 1),
     "repetition_penalty": ("> 0 (1 is off)", lambda v: v > 0),
-    "ras_tau": ("in [0, 1]", lambda v: 0 <= v <= 1),
 }
 INT_KNOB_RULES = {
     "top_k": (">= 0 (0 is off)", lambda v: v >= 0),
 }
-BOOL_KNOBS = ("ignore_eos", "penalize_prompt", "return_logprobs", "ras_mode")
+BOOL_KNOBS = ("ignore_eos", "penalize_prompt", "return_logprobs")
 
 
 def check_real_knob(key: str, value, rule: str, ok) -> None:
@@ -157,8 +156,10 @@ class SamplingReqConfig(ResourceReqConfig):
     # the last ``repetition_window`` generated tokens; 0: presence over prompt
     # and output.
     repetition_window: int = 0
-    ras_mode: bool = False
-    ras_tau: float = 0.0
+    # Internal sampler modes are supplied by a model-specific request config,
+    # not exposed as generation knobs to every model and frontend.
+    ras_mode: ClassVar[bool] = False
+    ras_tau: ClassVar[float] = 0.0
     # The spec's stop ids get no probability until this many tokens exist
     # (applied after top-k/top-p).
     min_tokens: int = 0
@@ -232,6 +233,21 @@ class SamplingReqConfig(ResourceReqConfig):
             raise ValueError(
                 "this model does not support repetition_penalty; send 1 or leave it unset"
             )
+
+
+@dataclass
+class RASSamplingReqConfig(SamplingReqConfig):
+    """Opt-in RAS settings supplied by a model, outside the public knob set."""
+
+    ras_mode: bool = True
+    ras_tau: float = 0.1
+
+    def validate(self, spec: "SamplerSpec | None" = None) -> None:
+        check_bool_knob("ras_mode", self.ras_mode)
+        if not self.ras_mode:
+            raise ValueError("RASSamplingReqConfig requires ras_mode=True")
+        check_real_knob("ras_tau", self.ras_tau, "in [0, 1]", lambda v: 0 <= v <= 1)
+        super().validate(spec)
 
 
 def derive_seed(seed: int, stream: str) -> int:

@@ -28,7 +28,7 @@ import yaml
 
 from mstar.api_server.openai import adapters
 from mstar.api_server.openai.protocol import SpeechRequest
-from mstar.engine.resources.sampler.config import SamplingReqConfig
+from mstar.engine.resources.sampler.config import RASSamplingReqConfig
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.base import TensorAndMetadata
 from mstar.model.chatterbox.chatterbox_model import voice_key_for
@@ -851,7 +851,7 @@ def _lm_sampler(sub, infos):
     )
     for rid, info in infos.items():
         meta = info.step_metadata
-        cfg = SamplingReqConfig(
+        cfg = RASSamplingReqConfig(
             temperature=meta["temperature"], top_p=meta["top_p"], top_k=meta["top_k"],
             repetition_window=meta["ras_window"], ras_mode=True, ras_tau=meta["ras_tau"],
             ignore_eos=meta["ignore_eos"],

@@ -55,13 +55,13 @@ from mstar.engine.resources import (
     PositionSpec,
     ResourceReqConfig,
     SamplerSpec,
-    SamplingReqConfig,
 )
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
     RecurrentStateConfig,
     RecurrentStateSpec,
 )
+from mstar.engine.resources.sampler.config import RASSamplingReqConfig
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import (
@@ -451,7 +451,7 @@ class CosyVoice3Model(Model):
         del input_modalities, output_modalities
         knobs = self.resolve_generation_kwargs(model_kwargs)
         configs: dict[str, ResourceReqConfig] = {LM_KV: KVReqConfig(needed_labels=[LM_LABEL])}
-        configs[LM_SAMPLER] = SamplingReqConfig(
+        configs[LM_SAMPLER] = RASSamplingReqConfig(
             temperature=knobs["temperature"], top_p=knobs["top_p"], top_k=knobs["top_k"],
             repetition_window=knobs["ras_window"], ras_mode=True, ras_tau=knobs["ras_tau"],
             ignore_eos=knobs["ignore_eos"],

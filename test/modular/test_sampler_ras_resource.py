@@ -1,8 +1,11 @@
 """The shared sampler's ring gives the model's RAS tokens across steps."""
 
+from dataclasses import fields
+
 import torch
 
-from mstar.engine.resources.sampler.config import SamplingReqConfig
+from mstar.communication.wire import decode, encode
+from mstar.engine.resources.sampler.config import RASSamplingReqConfig, SamplingReqConfig
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.cosyvoice3.components.sampling import ras_sample_plain as old_ras_sample
 
@@ -14,13 +17,22 @@ def _resource(window: int) -> SamplerResource:
     )
 
 
-def _config(seed: int, window: int, tau: float, temperature: float, top_p: float) -> SamplingReqConfig:
-    cfg = SamplingReqConfig(
+def _config(seed: int, window: int, tau: float, temperature: float, top_p: float) -> RASSamplingReqConfig:
+    cfg = RASSamplingReqConfig(
         temperature=temperature, top_k=7, top_p=top_p,
         repetition_window=window, ras_mode=True, ras_tau=tau,
     )
     cfg.apply_conductor_config(seed=seed, resource_key="lm_sampler")
     return cfg
+
+
+def test_ras_request_settings_are_model_scoped_and_cross_typed_wire():
+    public_fields = {field.name for field in fields(SamplingReqConfig)}
+    assert "ras_mode" not in public_fields and "ras_tau" not in public_fields
+    cfg = _config(7, 25, 0.6, 1.0, 0.0)
+    decoded = decode(encode(cfg))
+    assert isinstance(decoded, RASSamplingReqConfig)
+    assert decoded == cfg and decoded.ras_mode and decoded.ras_tau == 0.6
 
 
 def test_ras_resource_matches_model_draws_across_mixed_batch_steps():
