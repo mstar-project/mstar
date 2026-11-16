@@ -352,6 +352,23 @@ def test_a_drafter_that_doesnt_fit_its_target_is_refused(fit, message):
     assert any(message in p for p in geometry_problems(decl, specs)), geometry_problems(decl, specs)
 
 
+@pytest.mark.parametrize("scaled", [
+    dict(rope_scale=2.0), dict(low_freq_factor=1.0, high_freq_factor=4.0, old_context_len=8192),
+], ids=["rope_scale", "llama31"])
+def test_a_drafter_on_plain_rope_refuses_positions_that_scale(scaled):
+    """EAGLE-3's drafter rotates with plain RoPE through the node's positions: a scaled position resource would
+    rotate the target one way and the drafter another."""
+    from mstar.engine.resources.draft.startup import geometry_problems
+
+    decl, specs = _fit(target="default", plain_rope=True)
+    assert geometry_problems(decl, specs) == []
+    specs["rope"] = PositionSpec("rope", {NODE}, PositionConfig(kv_cache="kv_cache", rope_theta=1e4, **scaled))
+    assert any("rotates with plain RoPE" in p for p in geometry_problems(decl, specs)), geometry_problems(decl, specs)
+    # a drafter that doesn't claim plain RoPE is checked on its base alone
+    decl, _ = _fit(target="default")
+    assert geometry_problems(decl, specs) == []
+
+
 def test_a_drafter_that_fits_has_no_geometry_problems_and_a_pool_short_of_its_layers_does():
     from mstar.engine.resources.draft.startup import geometry_problems
 

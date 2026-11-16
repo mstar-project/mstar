@@ -62,6 +62,8 @@ class ModelGeometry(NamedTuple):
     # the node's position resource; None checks nothing
     num_qo_heads: int | None = None
     rope_theta: float | None = None
+    # it rotates with plain RoPE, so the node's positions must carry no scaling
+    plain_rope: bool = False
 
     def layer_set(self, kv_cache: str, name: str) -> KVLayerSet:
         """The layer set of these layers in KV pool ``kv_cache``."""

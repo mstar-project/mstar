@@ -157,6 +157,11 @@ def geometry_problems(decl: VerifyNode, specs: Mapping[str, NodeResourceSpec]) -
                         and spec.config.rope_theta != drafter.rope_theta:
                     problems.append(f"{where}: the drafter's rope_theta is {drafter.rope_theta}; positions "
                                     f"{spec.resource_key!r} rotate with {spec.config.rope_theta}")
+                if isinstance(spec, PositionSpec) and spec.config.kv_cache == pool_key and drafter.plain_rope and (
+                        spec.config.llama31_params or spec.config.rope_scale != 1.0
+                        or spec.config.longrope is not None):
+                    problems.append(f"{where}: the drafter rotates with plain RoPE; positions "
+                                    f"{spec.resource_key!r} scale theirs")
         for field, what in (
             ("hidden_size", "residual width"), ("vocab_size", "vocabulary"), ("dtype", "dtype"),
         ):
