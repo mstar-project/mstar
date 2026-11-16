@@ -1,8 +1,106 @@
 """CPU checks for the served LingBot-World chunk timing report."""
 
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
 import pytest
 
-from test.lingbot_world.serve_first_chunk import summarize_chunks
+from mstar.client import VideoFrameChunk
+from test.lingbot_world import serve_first_chunk as probe
+
+summarize_chunks = probe.summarize_chunks
+
+
+def _chunk(index: int, count: int) -> VideoFrameChunk:
+    return VideoFrameChunk(
+        b"\0" * (count * 3),
+        {"width": 1, "height": 1, "fps": 16, "pixel_format": "rgb24",
+         "frame_index": index, "frame_count": count},
+    )
+
+
+class _Client:
+    def __init__(self, events):
+        self.events = events
+
+    def stream(self, **_kwargs):
+        return iter(self.events)
+
+
+def _run(events, *, num_frames=29, max_chunks=None):
+    poses = np.tile(np.eye(4), (num_frames, 1, 1))
+    return probe.run_case(_Client(events), VideoFrameChunk, poses, [1, 1, 1, 1], Path("/tmp/example"),
+                          num_frames, "4x4", max_chunks, "cpu")
+
+
+def test_model_rounds_requested_frames_to_whole_chunks():
+    assert probe.expected_chunk_frame_counts(93) == [13] + [16] * 5
+    assert len(probe.expected_chunk_frame_counts(3001)) == 187
+    assert sum(probe.expected_chunk_frame_counts(3001)) == 2989
+
+
+def test_full_rollout_requires_expected_frame_coverage():
+    complete = _run([_chunk(0, 13), _chunk(13, 16)])
+    short = _run([_chunk(0, 13)])
+
+    assert complete["sample_complete"] is True
+    assert complete["expected_frames"] == 29
+    assert short["sample_complete"] is False
+    assert "expected 29 frames" in short["error"]
+
+
+def test_noncontiguous_frame_indices_fail_even_with_expected_count():
+    result = _run([_chunk(0, 13), _chunk(14, 16)])
+
+    assert result["sample_complete"] is False
+    assert "frame_index" in result["error"]
+
+
+def test_capped_sample_is_explicitly_incomplete_without_error():
+    result = _run([_chunk(0, 13), _chunk(13, 16)], max_chunks=1)
+
+    assert result["sample_complete"] is False
+    assert "error" not in result
+
+
+def test_main_returns_failure_for_truncated_full_rollout(monkeypatch, tmp_path):
+    from mstar import client as client_module
+
+    class FakeProcess:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout):
+            pass
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def health(self):
+            return True
+
+        def stream(self, **kwargs):
+            if kwargs["request_id"] == "case0":
+                return iter([_chunk(0, 13)])
+            return iter([_chunk(0, 13)] + [_chunk(13 + i * 16, 16) for i in range(5)])
+
+    monkeypatch.setattr(probe.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
+    monkeypatch.setattr(client_module, "MStarClient", FakeClient)
+    monkeypatch.setattr(probe.np, "load", lambda path: np.tile(np.eye(4), (29, 1, 1))
+                        if str(path).endswith("poses.npy") else np.array([[1, 1, 1, 1]]))
+    monkeypatch.setattr(probe.time, "sleep", lambda *_args: None)
+    monkeypatch.setattr(sys, "argv", ["probe", "--example", str(tmp_path), "--out", str(tmp_path / "out"),
+                                       "--full-rollout", "--cases", "29:4x4"])
+
+    assert probe.main() == 1
+    report = json.loads((tmp_path / "out" / "first_frame.json").read_text())
+    assert report["cases"][0]["sample_complete"] is False
 
 
 def test_chunk_cadence_and_playback_stalls():
