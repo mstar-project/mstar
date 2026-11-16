@@ -82,6 +82,10 @@ mstar serve
      - off
      - Serve Prometheus metrics at ``/metrics`` (see :ref:`serving-metrics`).
        Needs ``.[metrics]``.
+   * - ``--otlp-traces-endpoint``
+     - off
+     - Export API request traces to this OTLP traces URL (see
+       :ref:`serving-tracing`). Needs ``.[tracing]``.
    * - ``--enable-nvtx``
      - off
      - Emit NVTX markers for CUDA profiling. Disabled on XPU and CPU.
@@ -185,6 +189,10 @@ mstar-serve
      - off
      - Serve Prometheus metrics at ``/metrics`` (see :ref:`serving-metrics`).
        Needs ``.[metrics]``.
+   * - ``--otlp-traces-endpoint``
+     - off
+     - Export API request traces to this OTLP traces URL (see
+       :ref:`serving-tracing`). Needs ``.[tracing]``.
    * - ``--log-level``
      - ``INFO``
      - ``DEBUG`` / ``INFO`` / ``WARNING`` / ``ERROR``.
@@ -1215,8 +1223,31 @@ RDMA-read or SHM file-read time on ``rx``; the registration / serialize-and-writ
 
 .. note::
 
-   Profiling is gated end-to-end on ``--log-stats``: when it is off, the workers,
-   conductor, and data worker skip the timing/transfer bookkeeping entirely.
+   Per-node and transfer profiling is gated on ``--log-stats``. The data worker
+   also reports preprocess timing when metrics or tracing is enabled.
+
+.. _serving-tracing:
+
+Request tracing
+---------------
+
+Pass ``--otlp-traces-endpoint http://localhost:4318/v1/traces`` to either
+``mstar serve`` or ``mstar-serve`` to export sampled request traces from the API
+server. Install ``mstar-ai[tracing]`` first. The endpoint is the full OTLP
+traces URL. The default wire format is HTTP/protobuf; set
+``OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=grpc`` for gRPC. Standard OpenTelemetry
+service-name, header and sampler environment variables apply. An unsupported
+protocol or missing tracing extra fails before model loading.
+
+Tracing is off by default and starts after warmups. This first API-server slice
+exports a root ``request`` span and ``preprocess``, ``graph`` and ``delivery``
+children when their existing timestamps are available. The current default
+Rust frontend and the deprecated Python frontend both produce these API
+spans. For ``/v1/chat/completions``, either frontend passes an incoming W3C
+``traceparent`` to the API server. A valid parent is used for the request span;
+a malformed one starts a root trace. Other routes and HTTP server spans remain
+in `issue #771 <https://github.com/mstar-project/mstar/issues/771>`_.
+Node, transfer, exemplar and log correlation work also remains in that issue.
 
 .. _serving-metrics:
 
