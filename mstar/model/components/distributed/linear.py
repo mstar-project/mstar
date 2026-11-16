@@ -5,7 +5,7 @@ from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide, kv_head_replicas, split_tensor_along_last_dim
 from mstar.engine.resources.lora.config import LoraTarget
 from mstar.model.components.lora.capable import LoraBound, LoraCapable, apply_lora
-from mstar.model.components.quant_linear import QuantCapability
+from mstar.model.components.quant_linear import LinearFormat, QuantCapability, QuantLinear
 
 
 class _ColumnLora(LoraBound):
@@ -152,10 +152,12 @@ class ColumnParallelLinear(nn.Module, LoraCapable):
         return output_parallel
 
     def quant_capability(self) -> QuantCapability:
-        return QuantCapability(False, (
-            "a tensor-parallel linear gathers or splits around its own GEMM; a format would apply per shard "
-            "([N / tp, K] here) inside that forward, which takes no format yet"
-        ))
+        if type(self) in (ColumnParallelLinear, MergedColumnParallelLinear, QKVParallelLinear):
+            return QuantCapability(True)
+        return QuantCapability(False, f"{type(self).__name__} has a custom sharded forward")
+
+    def quantize_linear(self, fmt: LinearFormat, input_amax: float | None = None) -> nn.Module:
+        return QuantColumnParallelLinear(self, fmt, input_amax)
 
     def lora_target(self) -> LoraTarget:
         return LoraTarget(
@@ -520,10 +522,12 @@ class RowParallelLinear(nn.Module, LoraCapable):
         return output
 
     def quant_capability(self) -> QuantCapability:
-        return QuantCapability(False, (
-            "a tensor-parallel linear all-reduces its partial GEMM; a format would apply per shard ([N, K / tp] "
-            "here, K / tp meeting the format's K alignment) inside that forward, which takes no format yet"
-        ))
+        return QuantCapability(type(self) is RowParallelLinear,
+                               None if type(self) is RowParallelLinear else
+                               f"{type(self).__name__} has a custom sharded forward")
+
+    def quantize_linear(self, fmt: LinearFormat, input_amax: float | None = None) -> nn.Module:
+        return QuantRowParallelLinear(self, fmt, input_amax)
 
     def lora_target(self) -> LoraTarget:
         return LoraTarget(
@@ -531,6 +535,83 @@ class RowParallelLinear(nn.Module, LoraCapable):
             out_slices=(self.output_size_per_partition,),
             parallel="row",
         )
+
+class QuantColumnParallelLinear(ColumnParallelLinear):
+    """The same column-parallel contract with a quantized rank-local GEMM."""
+
+    lora_twin = _ColumnLora
+
+    def __init__(self, linear: ColumnParallelLinear, fmt: LinearFormat, input_amax: float | None):
+        nn.Module.__init__(self)
+        self.local = QuantLinear(linear.weight, linear.bias, fmt, input_amax=input_amax)
+        self.tp_rank, self.tp_size = linear.tp_rank, linear.tp_size
+        self.input_size_per_partition = linear.input_size_per_partition
+        self.output_size_per_partition = linear.output_size_per_partition
+        self.output_partition_sizes = linear.output_partition_sizes
+        self._local_output_start = linear._local_output_start
+        self.gather_output = linear.gather_output
+        self.skip_bias_add = linear.skip_bias_add
+        self.comm_group = linear.comm_group
+        self._lora_target = linear.lora_target()
+
+    def _apply(self, fn, recurse=True):
+        return nn.Module._apply(self, fn, recurse=recurse)
+
+    def _local(self, input_):
+        out = self.local(input_)
+        if self._local_output_start:
+            out = torch.nn.functional.pad(out[..., self._local_output_start:],
+                                         (self._local_output_start, 0), value=float("-inf"))
+        return out
+
+    def lora_target(self) -> LoraTarget:
+        return self._lora_target
+
+    def lora_local_shape(self) -> tuple[int, int]:
+        return self.local.in_features, self.local.out_features
+
+    def quant_capability(self) -> QuantCapability:
+        return QuantCapability(False, f"already {self.local.fmt.name}")
+
+
+class QuantRowParallelLinear(RowParallelLinear):
+    """The same row-parallel contract with a quantized rank-local GEMM."""
+
+    lora_twin = _RowLora
+
+    def __init__(self, linear: RowParallelLinear, fmt: LinearFormat, input_amax: float | None):
+        nn.Module.__init__(self)
+        bias = None if linear.tp_rank > 0 or linear.skip_bias_add else linear.bias
+        self.local = QuantLinear(linear.weight, bias, fmt, input_amax=input_amax)
+        self.tp_rank, self.tp_size = linear.tp_rank, linear.tp_size
+        self.input_size_per_partition = linear.input_size_per_partition
+        self.output_size_per_partition = linear.output_size_per_partition
+        self.output_partition_sizes = linear.output_partition_sizes
+        self.input_is_parallel = linear.input_is_parallel
+        self.reduce_results = linear.reduce_results
+        self.skip_bias_add = linear.skip_bias_add
+        self.comm_group = linear.comm_group
+        self._lora_target = linear.lora_target()
+
+    def _apply(self, fn, recurse=True):
+        return nn.Module._apply(self, fn, recurse=recurse)
+
+    def _local(self, input_):
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            input_parallel = split_tensor_along_last_dim(input_, num_partitions=self.tp_size)[self.tp_rank].contiguous()
+        return input_parallel, self.local(input_parallel)
+
+    def lora_target(self) -> LoraTarget:
+        return self._lora_target
+
+    def lora_local_shape(self) -> tuple[int, int]:
+        return self.local.in_features, self.local.out_features
+
+    def quant_capability(self) -> QuantCapability:
+        return QuantCapability(False, f"already {self.local.fmt.name}")
+
 
 class KVColumnParallelLinear(ColumnParallelLinear):
     """One K or V projection, sharded by head, replicated when heads run out.

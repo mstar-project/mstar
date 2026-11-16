@@ -26,6 +26,7 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.norm import rms_norm_no_weight
+from mstar.model.components.quant_linear import QuantizableLinears
 from mstar.model.ltx2_5.components.layers import (
     GatedAttention,
     GeluFeedForward,
@@ -40,6 +41,23 @@ from mstar.model.ltx2_5.config import (
     VIDEO,
     VIDEO_FOR_AUDIO,
     LTX2TransformerConfig,
+)
+
+# Only block attention and FF projections take load-time FP8. Gate logits,
+# conditioning and output heads keep their checkpoint precision.
+QUANTIZABLE_LINEARS = QuantizableLinears(
+    candidates=(
+        "transformer_blocks.*.*.to_qkv",
+        "transformer_blocks.*.*.to_q",
+        "transformer_blocks.*.*.to_kv",
+        "transformer_blocks.*.*.to_out",
+        "transformer_blocks.*.ff.*",
+        "transformer_blocks.*.audio_ff.*",
+    ),
+    keep_bf16=(
+        "proj_in", "audio_proj_in", "proj_out", "audio_proj_out",
+        "*.linear", "*.emb.timestep_embedder.*", "transformer_blocks.*.*.to_gate_logits",
+    ),
 )
 
 
