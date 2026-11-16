@@ -36,6 +36,7 @@ from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout, WorkerServices
 from mstar.worker.speculation import Speculation, Speculator
 from mstar.worker.step_executor import PendingBatch, StepExecutor
+from mstar.worker.weight_ops import WeightOps
 from mstar.worker.worker_metrics import WorkerMetrics
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,7 @@ class StepPipeline:
         speculator: Speculator, preemption: Preemption, *, metrics: WorkerMetrics | None = None,
         profile_info: WorkerProfileInfo | None = None, launch_wait_s: float = 0.0,
         enable_nvtx: bool = False,
+        weight_ops: WeightOps | None = None,
     ):
         self.worker_id = services.worker_id
         self._services = services
@@ -104,6 +106,7 @@ class StepPipeline:
         self.profile_info = profile_info if profile_info is not None else WorkerProfileInfo()
         self._launch_wait_s = launch_wait_s
         self.enable_nvtx = enable_nvtx
+        self.weight_ops = weight_ops
         self._has_side_lane = bool(layout.side_keys)
 
         # step N, on the chain, and the side lane's step
@@ -197,7 +200,14 @@ class StepPipeline:
 
         # 2. Speculatively schedule + build N+1, overlapping GPU(N). Falls through
         # to the fresh path below for a step that can't (not AR, loop ended).
-        speculation, yield_away_from_target = self.speculator.build(self.pending)
+        if self.weight_ops is not None and self.weight_ops.pending is not None:
+            # End a speculative chain at the control boundary. A follower of
+            # an async TP step still needs rank 0's explicit no-head marker.
+            if self.pending is not None:
+                self.lockstep.maybe_broadcast_nospec(self.pending, None)
+            speculation, yield_away_from_target = None, None
+        else:
+            speculation, yield_away_from_target = self.speculator.build(self.pending)
         self._speculation = speculation
         self._decided = self.pending
         if speculation is not None and speculation.tp_seq >= 0 and not self.is_tp_follower:
@@ -222,6 +232,13 @@ class StepPipeline:
             self._set_pending(spec_pending)
             return
         self.speculator.chain_ended()
+
+        if self.weight_ops is not None and self.weight_ops.pending is not None:
+            # The GPU thread and any side step are settled before a check or
+            # copy. A blocked quiesce leaves the admitted work schedulable.
+            self._finish_side(block=True)
+            if self.weight_ops.process(self.in_flight_rids):
+                return
 
         if finished_node in self._stream_consumer_nodes:
             # The preamble polled while N ran, and refused the next chunk of each
