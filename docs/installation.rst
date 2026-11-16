@@ -191,6 +191,10 @@ Model families and some output formats need extra packages, exposed as pip *extr
      - ``prometheus-client`` for ``--enable-metrics`` (Prometheus metrics at
        ``/metrics``, see :ref:`serving-metrics`). A serving feature rather than a
        model's runtime, so not part of ``.[all]``.
+   * - ``.[tracing]``
+     - OpenTelemetry SDK and OTLP exporters for ``--otlp-traces-endpoint``
+       (request traces, see :ref:`serving-tracing`). Off by default and not part
+       of ``.[all]``.
    * - ``.[dev]``
      - ``ruff`` + ``pytest`` for linting and the test suite.
    * - ``.[all]``

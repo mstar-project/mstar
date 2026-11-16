@@ -546,6 +546,7 @@ class RustFrontendBridge:
                 streaming=bool(msg.get("streaming", True)),
                 request_id=rid,
                 report_usage=bool(msg.get("report_usage")),
+                **({"traceparent": msg["traceparent"]} if msg.get("traceparent") is not None else {}),
                 **_stream_and_raw_inputs(msg),
             )
         except (ValueError, TypeError) as e:
