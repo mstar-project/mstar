@@ -180,6 +180,10 @@ class DraftInputs(NamedTuple):
     # rows' blocks at ``mixed.at``; a prompt row's drafts are unread, and its writes are rewritten after
     # the target (`ObserveInputs.mixed`)
     mixed: MixedRows | None = None
+    # a lagged drafter's pass (`DrafterNeeds.lag`): ``select_pass(p)`` points its KV writes, positions and
+    # attention extent at pass ``p``, and ``select_pass(None)`` ends the passes. The engine binds it from where
+    # the lag goes (`DraftLag`), so the drafter names none of those resources; None without a lag
+    select_pass: Callable[[int | None], None] | None = None
 
 
 class DrafterDecl(Protocol):
@@ -332,6 +336,18 @@ def _sink_first_rows(kv, keep: torch.Tensor) -> None:
     kv.sink_lagged_rows(keep)
 
 
+def _pass_selector(resources: dict[str, Any], lag) -> Callable[[int | None], None]:
+    """`DraftInputs.select_pass` over the resources a `DraftLag` names."""
+    chosen = [resources[lag.kv_key], resources[lag.pos_key], resources[lag.attn_key]]
+
+    @torch.compiler.disable
+    def select_pass(p: int | None) -> None:
+        for resource in chosen:
+            resource.select_pass(p)
+
+    return select_pass
+
+
 def draft_verify_step(
     sampler,
     request_ids: Sequence[int],
@@ -341,13 +357,15 @@ def draft_verify_step(
     resources: dict[str, Any],
     resident: CapturedResidentStep | None = None,
     correcting_keys: Sequence[str] = (),
+    lag=None,
 ) -> VerifyResult:
     """One verify step, in the engine's order. ``target`` maps the block's ids
     ``[n * (k + 1)]`` to a `TargetOutput`: logits ``[n * (k + 1), V]``, and with
     the drafter's ``needs.target_hidden`` the hidden states; ``sampler`` is the node's
     verifying `SamplerResource`, which also keeps a carrying drafter's
     `DRAFT_CARRY`; ``correcting_keys`` the resources that correct the block's state
-    (`DrafterShare.correcting_keys`). Capturable: nothing here reads the device on the host."""
+    (`DrafterShare.correcting_keys`); ``lag`` where a lagged drafter's lag goes (`DrafterShare.lag`).
+    Capturable: nothing here reads the device on the host."""
     k = sampler.verify_draft_tokens
     n = input_ids.shape[0]
     needs = drafter.needs
@@ -357,7 +375,8 @@ def draft_verify_step(
         # the target accepted every draft: in the graph, before any of the drafter's writes
         keep = _read_carry(sampler, request_ids, n, DRAFT_KEEP_FIRST).reshape(n) != 0
         _sink_first_rows(resources[needs.kv.kv_cache], keep)
-    drafts = drafter.propose(DraftInputs(request_ids, input_ids, resources, k, carry))
+    select_pass = _pass_selector(resources, lag) if lag is not None else None
+    drafts = drafter.propose(DraftInputs(request_ids, input_ids, resources, k, carry, select_pass=select_pass))
     if drafts.shape != (n, k):
         raise ValueError(f"drafter proposed {tuple(drafts.shape)} drafts for {n} rows of {k}")
     # every rank writes KV for rank 0's drafts

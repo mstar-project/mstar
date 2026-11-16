@@ -291,3 +291,27 @@ def test_each_pass_attends_as_dense_causal_attention_over_the_lagged_history():
                 scores = q[i * queries + r] @ keys[: at + 1].T
                 want.append(scores.softmax(-1) @ values[: at + 1])
         torch.testing.assert_close(got, torch.stack(want))
+
+
+def test_a_lagged_drafter_selects_its_passes_through_the_engines_binding():
+    """`DraftInputs.select_pass` selects a pass on the KV, positions and attention the lag's binding names
+    (`DraftLag`), so a lagged drafter names none of them."""
+    from mstar.engine.resources.step import Lag
+
+    selected = {key: [] for key in ("kv", "rope", "attn")}
+    resources = {key: SimpleNamespace(select_pass=selected[key].append) for key in selected}
+    resources["kv"].sunk = None
+    resources["kv"].sink_lagged_rows = lambda keep: None
+
+    class _Lagged(_Drafter):
+        def propose(self, inputs):
+            inputs.select_pass(0)
+            inputs.select_pass(None)
+            return torch.zeros(inputs.input_ids.shape[0], K, dtype=torch.long)
+
+    lag = DraftLag("decode", Lag(1, (2,) + (1,) * (K - 1)), "kv", "draft", "rope", "attn")
+    sampler = _Sampler(keep=[1, 1], accepted=[K, K])
+    draft_verify_step(sampler, [1, 2], torch.zeros(2, dtype=torch.long),
+                      lambda block: TargetOutput(torch.zeros(block.shape[0], 5)), _Lagged(resources["kv"]),
+                      resources, lag=lag)
+    assert selected == {key: [0, None] for key in selected}
