@@ -86,6 +86,9 @@ class RequestComplete:
     # (the model's default, or what fits its resources, when the client set none).
     prompt_tokens: int | None = None
     max_output_tokens: int | None = None
+    # The weight version the request was admitted under; None until a reload
+    # names one.
+    weight_version: str | None = None
 
 
 @dataclass
@@ -98,6 +101,8 @@ class RequestFailed:
     request_id: str
     error_message: str
     status: int = 500
+    # As on RequestComplete; None also for a request never admitted.
+    weight_version: str | None = None
 
 
 @dataclass

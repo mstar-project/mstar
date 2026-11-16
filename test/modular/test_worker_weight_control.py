@@ -28,13 +28,18 @@ WORKERS = ["worker_0", "worker_1"]
 
 
 class _Runtime:
-    """``idle_counts`` only: requests held, routes parked, ingests staged."""
+    """``idle_counts`` (requests held, routes parked, ingests staged) and the
+    version the worker hands it for result frames."""
 
     def __init__(self):
         self.counts = (0, 0, 0)
+        self.weight_version = None
 
     def idle_counts(self):
         return self.counts
+
+    def set_weight_version(self, version):
+        self.weight_version = version
 
 
 class _Lifecycle:
@@ -215,6 +220,7 @@ def test_both_ranks_reload_their_shards_in_one_epoch_and_commit(ckpts):
     answer = d.answer("u")
     assert (answer.status, answer.weight_version) == (200, "v1")
     assert answer.rank_versions == dict.fromkeys(WORKERS, "v1")
+    assert {w: d.workers[w].runtime.weight_version for w in WORKERS} == dict.fromkeys(WORKERS, "v1")
     for rank, lm in enumerate(lms):
         assert {n: p.data_ptr() for n, p in lm.named_parameters()} == pointers[rank]
         assert torch.equal(lm.model.layers[0].self_attn.qkv_proj.weight, _shard(ckpts.b, rank))
@@ -239,6 +245,12 @@ def test_a_follower_that_fails_mid_copy_keeps_the_deployment_paused(ckpts):
     assert answer.ranks["worker_1"].startswith("OSError: read error partway")
     assert answer.rank_versions == {"worker_0": "v1", "worker_1": None}
     assert d.workers["worker_1"].ops.dirty
+    # a failed copy changes no stamp: here, the first reload, the follower still
+    # stamps nothing (after an earlier reload it would keep that one's version,
+    # harmless since a dirty rank never serves); the rank that copied stamps
+    # the new one, but stays paused
+    assert d.workers["worker_1"].runtime.weight_version is None
+    assert d.workers["worker_0"].runtime.weight_version == "v1"
     assert d.control.weight_version is None
 
     d.control.resume(ContinueGeneration(op_id="c1"))

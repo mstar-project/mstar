@@ -101,6 +101,7 @@ class WeightOps:
                 self.weight_version = op.weight_version
                 self.weight_epoch = op.epoch
                 self.dirty = False
+                self._runtime.set_weight_version(op.weight_version)
         else:
             error = f"unknown weight control step {op.op!r}"
         self._communicator.send("conductor", ConductorMessage(
