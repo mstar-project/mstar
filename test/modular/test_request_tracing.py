@@ -17,7 +17,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from mstar.api_server.entrypoint import PendingRequest
 from mstar.api_server.rust_frontend import RustFrontendBridge
 from mstar.observability.tracing import RequestTracing
-from mstar.profile.format import RequestProfile, RequestTiming
+from mstar.profile.format import GraphTiming, RequestProfile, RequestTiming
 
 
 def test_request_trace_reuses_existing_timing_and_records_outcome():
@@ -48,6 +48,43 @@ def test_request_trace_reuses_existing_timing_and_records_outcome():
     for name in ("preprocess", "graph", "delivery"):
         assert spans[name].parent.span_id == root.context.span_id
         assert spans[name].start_time <= spans[name].end_time
+    provider.shutdown()
+
+
+def test_node_activity_windows_are_children_of_graph_span():
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracing = RequestTracing("dummy", provider=provider)
+    now = time.perf_counter() - .04
+    req = PendingRequest(
+        streaming=False, input_modalities=["text"], output_modalities=["text"],
+        profile=RequestProfile("client", timing=RequestTiming(recv_time=now)),
+    )
+    req.trace = tracing.start(req, "client#1")
+    req.profile.timing.conductor_ingest_time = now + .01
+    req.profile.timing.conductor_finish_time = now + .03
+    req.profile.graph_timings = [
+        GraphTiming("decoder", "decode", 2, .012, .006, .004, .002,
+                    first_start=now + .012, last_end=now + .028),
+        GraphTiming("outside", "decode", 1, .001, .001, 0, 0,
+                    first_start=now - .1, last_end=now - .09),
+        GraphTiming("missing", "decode", 1, .001, .001, 0, 0),
+    ]
+    tracing.finish(req, "success")
+
+    spans = exporter.get_finished_spans()
+    root, graph, node = (next(s for s in spans if s.name == name)
+                         for name in ("request", "graph", "node.activity"))
+    assert len([s for s in spans if s.name == "node.activity"]) == 1
+    assert graph.parent.span_id == root.context.span_id
+    assert node.parent.span_id == graph.context.span_id
+    assert graph.start_time <= node.start_time <= node.end_time <= graph.end_time
+    assert node.attributes == {
+        "mstar.node": "decoder", "mstar.graph_walk": "decode", "mstar.exec_count": 2,
+        "mstar.forward_sum_s": .006, "mstar.preprocess_sum_s": .004,
+        "mstar.postprocess_sum_s": .002,
+    }
     provider.shutdown()
 
 

@@ -131,7 +131,10 @@ class RequestTracing:
                 self._stage("preprocess", timing.recv_time, timing.preprocess_finish_time,
                             state.epoch_ns, parent, end_ns)
                 self._stage("graph", timing.conductor_ingest_time, timing.conductor_finish_time,
-                            state.epoch_ns, parent, end_ns)
+                            state.epoch_ns, parent, end_ns,
+                            children=lambda graph, start, end: self._node_activity(
+                                req, state, graph, start, end,
+                            ))
                 self._stage("delivery", timing.conductor_finish_time,
                             time.perf_counter(), state.epoch_ns, parent, end_ns)
         finally:
@@ -145,6 +148,7 @@ class RequestTracing:
     def _stage(
         self, name: str, start: float | None, end: float | None,
         epoch_ns: Callable[[float], int], parent: Any, request_end_ns: int,
+        children: Callable[[Any, int, int], None] | None = None,
     ) -> None:
         if start is None or end is None or start <= 0 or end < start:
             return
@@ -152,4 +156,34 @@ class RequestTracing:
         if end_ns < start_ns:
             return
         span = self.tracer.start_span(name, context=parent, start_time=start_ns)
-        span.end(end_time=end_ns)
+        try:
+            if children is not None:
+                children(span, start_ns, end_ns)
+        finally:
+            span.end(end_time=end_ns)
+
+    def _node_activity(
+        self, req: PendingRequest, state: RequestSpan, graph: Any,
+        graph_start_ns: int, graph_end_ns: int,
+    ) -> None:
+        """Show each node's first-to-last activity window, not each batched step."""
+        parent = self._trace.set_span_in_context(graph)
+        for timing in req.profile.graph_timings:
+            if timing.first_start is None or timing.last_end is None:
+                continue
+            start_ns = max(state.epoch_ns(timing.first_start), graph_start_ns)
+            end_ns = min(state.epoch_ns(timing.last_end), graph_end_ns)
+            if end_ns < start_ns:
+                continue
+            span = self.tracer.start_span(
+                "node.activity", context=parent, start_time=start_ns,
+                attributes={
+                    "mstar.node": timing.node,
+                    "mstar.graph_walk": timing.graph_walk,
+                    "mstar.exec_count": timing.exec_count,
+                    "mstar.forward_sum_s": timing.forward_time,
+                    "mstar.preprocess_sum_s": timing.preprocess_time,
+                    "mstar.postprocess_sum_s": timing.postprocess_time,
+                },
+            )
+            span.end(end_time=end_ns)
