@@ -50,7 +50,7 @@ class _ScriptedEngine:
         # What the message thread does once a request completes and drains.
         with self.api.request_lock:
             req = self.api.pending_requests[input.request_id]
-            req.chunks.append(ResultChunk(input.request_id, "image", input.request_id.encode()))
+            req.chunks.append(ResultChunk(input.request_id, "image", str(input.request_id).encode()))
             if outcome == FAIL:
                 req.error = "injected image failure"
             req.event.set()
@@ -141,7 +141,9 @@ def test_all_images_succeed_unchanged():
     api.release_request = lambda rid: (released.append(rid), real_release(rid))
     out = asyncio.run(_create(api, n=4))
     # images in submit order, seeds follow the seed + i contract, nothing released
-    assert [base64.b64decode(d["b64_json"]).decode() for d in out["data"]] == engine.submitted
+    assert [base64.b64decode(d["b64_json"]).decode() for d in out["data"]] == [
+        str(rid) for rid in engine.submitted
+    ]
     assert engine.seeds == [7, 8, 9, 10]
     assert released == []
     _assert_nothing_left(api, engine, aborted=[], reads_done=sorted(engine.submitted))

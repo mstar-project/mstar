@@ -325,7 +325,7 @@ class RustGraphRuntime(GraphRuntime):
         )
 
     def add_request(
-        self, request_id: str, partition: str, graph_walk: str,
+        self, request_id: int, partition: str, graph_walk: str,
         partition_worker_graph_ids: list[int],
         worker_graph_to_workers: ParallelList[int, list[str]],
         loop_caps: dict[str, int],
@@ -365,10 +365,10 @@ class RustGraphRuntime(GraphRuntime):
         callers can legitimately race a removal."""
         return self._sharding.get(rid)
 
-    def get_rid_string(self, handle: int) -> str:
+    def get_rid_string(self, handle: int) -> int:
         return self._rust.get_rid_string(handle)
 
-    def get_rid_handle(self, rid: str) -> int | None:
+    def get_rid_handle(self, rid: int) -> int | None:
         return self._rust.get_rid_handle(rid)
 
     def set_walk(self, rid: int, partition: str, walk: str):

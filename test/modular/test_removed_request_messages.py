@@ -102,7 +102,7 @@ def _worker(is_tp_follower=False) -> Worker:
     return w
 
 
-def _new(rid: str) -> WorkerMessage:
+def _new(rid: int) -> WorkerMessage:
     return WorkerMessage(WorkerMessageType.NEW_REQUEST, NewRequest(
         request_id=rid,
         request_info=CurrentForwardPassInfo(
@@ -116,17 +116,17 @@ def _new(rid: str) -> WorkerMessage:
     ))
 
 
-def _remove(rid: str, source=MessageSource.CONDUCTOR) -> WorkerMessage:
+def _remove(rid: int, source=MessageSource.CONDUCTOR) -> WorkerMessage:
     return WorkerMessage(
         WorkerMessageType.REMOVE_REQUEST, RemoveRequest(request_id=rid, source=source),
     )
 
 
-def _drain(rid: str) -> WorkerMessage:
+def _drain(rid: int) -> WorkerMessage:
     return WorkerMessage(WorkerMessageType.DRAIN_REQUEST, DrainRequest(request_id=rid))
 
 
-def _signals(rid: str, uuid: int, streaming=False) -> WorkerMessage:
+def _signals(rid: int, uuid: int, streaming=False) -> WorkerMessage:
     """A peer's output for ``rid``: one tensor it holds until this worker ACKs."""
     info = TensorPointerInfo(
         dims=[1], dtype=torch.int64, nbytes=8, address=0, stride=[1],
@@ -143,13 +143,13 @@ def _signals(rid: str, uuid: int, streaming=False) -> WorkerMessage:
     ))
 
 
-def _stop_loops(rid: str) -> WorkerMessage:
+def _stop_loops(rid: int) -> WorkerMessage:
     return WorkerMessage(WorkerMessageType.STOP_LOOPS, StopLoops(
         request_id=rid, loop_names={"ar"}, partition_name="default",
     ))
 
 
-def _follow(rid: str) -> ScheduleTPNode:
+def _follow(rid: int) -> ScheduleTPNode:
     return ScheduleTPNode(node_name=NODE, graph_walk=WALK, request_ids=[rid])
 
 
@@ -159,9 +159,9 @@ def _parked(w: Worker) -> int:
 
 def test_late_messages_for_a_removed_request_are_dropped_and_acked():
     w = _worker()
-    deliver(w, _new("A#1"), _remove("A#1"))
+    deliver(w, _new(11), _remove(11))
     # landed after the teardown, over the peer's socket
-    deliver(w, _signals("A#1", 1, streaming=True), _stop_loops("A#1"))
+    deliver(w, _signals(11, 1, streaming=True), _stop_loops(11))
     assert _parked(w) == 0
     # the peer can free its source buffer instead of waiting on its own teardown
     assert w.tensor_manager.acked == [1]
@@ -174,14 +174,14 @@ def test_leader_remove_then_conductor_remove_goes_through_remove_request():
     takes ``InputIngest._remove_request``'s no-handle branch, which clears the
     wire-keyed TP-follow count, instead of being parked."""
     w = _worker(is_tp_follower=True)
-    deliver(w, _new("tp#1"))
-    deliver(w, _remove("tp#1", source=MessageSource.TP_RANK_0))
-    w.lockstep.enqueue_follow(_follow("tp#1"))
-    assert w.lockstep.pending_follow_count("tp#1") == 1
-    deliver(w, _remove("tp#1", source=MessageSource.CONDUCTOR))
-    assert w._graph_runtime.get_rid_handle("tp#1") is None
+    deliver(w, _new(12))
+    deliver(w, _remove(12, source=MessageSource.TP_RANK_0))
+    w.lockstep.enqueue_follow(_follow(12))
+    assert w.lockstep.pending_follow_count(12) == 1
+    deliver(w, _remove(12, source=MessageSource.CONDUCTOR))
+    assert w._graph_runtime.get_rid_handle(12) is None
     assert not w.lifecycle._parked
-    assert w.lockstep.pending_follow_count("tp#1") == 0
+    assert w.lockstep.pending_follow_count(12) == 0
 
 
 def test_a_request_drained_before_its_new_request_acks_what_was_parked():
@@ -189,17 +189,17 @@ def test_a_request_drained_before_its_new_request_acks_what_was_parked():
     a TP follower can apply rank 0's moves for it. Its parked inputs are never read, so they are ACKed unread, and the
     conductor's REMOVE tears it down and clears its drain state."""
     w = _worker()
-    deliver(w, _drain("D#1"))
-    deliver(w, _signals("D#1", 3), _new("D#1"))
-    assert w._graph_runtime.get_rid_handle("D#1") is not None and _parked(w) == 0
+    deliver(w, _drain(13))
+    deliver(w, _signals(13, 3), _new(13))
+    assert w._graph_runtime.get_rid_handle(13) is not None and _parked(w) == 0
     assert w.tensor_manager.acked == [3] and w.tensor_manager.reads == []
-    w.lockstep.enqueue_follow(_follow("D#1"))
-    assert w.lockstep.pending_follow_count("D#1") == 1
+    w.lockstep.enqueue_follow(_follow(13))
+    assert w.lockstep.pending_follow_count(13) == 1
 
-    deliver(w, _remove("D#1"))
-    assert not w.lifecycle._parked and w._graph_runtime.get_rid_handle("D#1") is None
-    assert "D#1" not in w.lifecycle.draining and "D#1" not in w.lifecycle._reads_done_sent
-    assert w.lockstep.pending_follow_count("D#1") == 0
+    deliver(w, _remove(13))
+    assert not w.lifecycle._parked and w._graph_runtime.get_rid_handle(13) is None
+    assert 13 not in w.lifecycle.draining and 13 not in w.lifecycle._reads_done_sent
+    assert w.lockstep.pending_follow_count(13) == 0
 
 
 def test_a_remove_replayed_from_the_parking_lot_acks_what_trailed_it_once():
@@ -207,13 +207,13 @@ def test_a_remove_replayed_from_the_parking_lot_acks_what_trailed_it_once():
     NEW_REQUEST; the replay tears the request down and the chunk is acked once."""
     w = _worker(is_tp_follower=True)
     deliver(w,
-        _remove("R#1", source=MessageSource.TP_RANK_0),
-        _signals("R#1", 5),
+        _remove(14, source=MessageSource.TP_RANK_0),
+        _signals(14, 5),
     )
     assert _parked(w) == 2
 
-    deliver(w, _new("R#1"))
-    assert w._graph_runtime.get_rid_handle("R#1") is None, "the replayed REMOVE tears the request down"
+    deliver(w, _new(14))
+    assert w._graph_runtime.get_rid_handle(14) is None, "the replayed REMOVE tears the request down"
     assert not w.lifecycle._parked
     assert w.tensor_manager.acked == [5]
     assert w.tensor_manager.reads == []
@@ -222,11 +222,11 @@ def test_a_remove_replayed_from_the_parking_lot_acks_what_trailed_it_once():
 def test_messages_that_outrun_their_new_request_are_still_replayed():
     w = _worker(is_tp_follower=True)
     deliver(w,
-        _signals("E#1", 4), _remove("E#1", source=MessageSource.TP_RANK_0),
+        _signals(15, 4), _remove(15, source=MessageSource.TP_RANK_0),
     )
     assert _parked(w) == 2, "an id never seen here may still be on its way"
 
-    deliver(w, _new("E#1"))
+    deliver(w, _new(15))
     assert w.tensor_manager.reads == [("prompt", 4)]
-    assert w._graph_runtime.get_rid_handle("E#1") is None
+    assert w._graph_runtime.get_rid_handle(15) is None
     assert w.tensor_manager.acked == []

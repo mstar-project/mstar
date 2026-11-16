@@ -51,6 +51,10 @@ def _one_signal(rid, signal, next_node) -> ColumnarEdgeSpecs:
     block.add(rid, signal, [], False, next_node=next_node)
     return block
 
+# Python msgpack encodes this as an unsigned 64-bit value, while the Rust
+# runtime accepts a positive signed i64. Exercise the boundary directly.
+RID = (1 << 63) - 8
+RID2 = RID + 1
 WALK = "decode"
 WG_ID = 0
 ME = "worker_0"
@@ -95,7 +99,7 @@ class _Mesh:
         return self.rt.add_request(
             # Single partition, so the partition's worker graphs and the
             # request's are the same list.
-            "r1", "default", WALK, list(wgs), list(wgs), list(workers),
+            RID, "default", WALK, list(wgs), list(wgs), list(workers),
             [1] * len(wgs),
             [], [],
         )
@@ -196,7 +200,7 @@ def test_a_completion_sends_the_conductor_a_worker_graphs_done(tmp_path):
     assert got["conductor"] == [_sent(ConductorMessage(
         message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
         body=WorkerGraphsDone(
-            request_id="r1", worker_graph_ids=[WG_ID], is_first_tp_rank=True,
+            request_id=RID, worker_graph_ids=[WG_ID], is_first_tp_rank=True,
             partition_name="default", graph_walk=WALK,
         ),
     ))]
@@ -222,7 +226,7 @@ def test_an_emitted_signal_reaches_the_api_server(tmp_path):
     assert got["api_server"] == [_sent(APIServerMessage(
         message_type="result_tensors",
         body=ResultTensors(
-            request_id="r1", modality="", graph_edge=GraphEdge(
+            request_id=RID, modality="", graph_edge=GraphEdge(
                 name="out", next_node="emit_to_client", output_modality="",
                 tensor_info=[info],
             ),
@@ -258,7 +262,7 @@ def test_a_remote_destination_gets_input_signals(tmp_path):
     rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
     info = _put(mesh, 1)
     fwd = CurrentForwardPassInfo(
-        request_id="r1", graph_walk=WALK, fwd_index=2, random_seed=0,
+        request_id=RID, graph_walk=WALK, fwd_index=2, random_seed=0,
         max_tokens=8, partition_name="default",
     )
     got = mesh.run(rid, uuids=[1], request_infos=[
@@ -268,7 +272,7 @@ def test_a_remote_destination_gets_input_signals(tmp_path):
     assert got[PEER] == [_sent(WorkerMessage(
         message_type=WorkerMessageType.INPUT_SIGNALS,
         body=InputSignals(
-            request_id="r1",
+            request_id=RID,
             inputs=[GraphEdge(name="out", next_node="remote",
                               tensor_info=[info])],
             request_info=fwd, partition_name="default",
@@ -289,7 +293,7 @@ def test_data_extensions_survive_rust_frame_splicing(tmp_path):
     rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
     _put(mesh, 1)
     fwd = CurrentForwardPassInfo(
-        request_id="r1", graph_walk=WALK, fwd_index=0, random_seed=0,
+        request_id=RID, graph_walk=WALK, fwd_index=0, random_seed=0,
         max_tokens=8, partition_name="default",
         step_metadata={
             "shape": (2, 3), "size": torch.Size([2, 3]), "dtype": torch.float16,
@@ -389,7 +393,7 @@ def test_resource_publish_info_keeps_its_subclass(tmp_path):
     cls = next(c for c in _TYPE_TO_TAG
                if isinstance(c, type) and issubclass(c, PublishedInfo))
     fwd = CurrentForwardPassInfo(
-        request_id="r1", graph_walk=WALK, fwd_index=0, random_seed=0,
+        request_id=RID, graph_walk=WALK, fwd_index=0, random_seed=0,
         max_tokens=1, partition_name="default",
         resource_publish_info={"kv": cls()},
     )
@@ -483,7 +487,7 @@ def _loop_mesh(tmp_path):
                   "tp_enabled_nodes": []},
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
-    rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [WG_ID, 1],
+    rid = rt.add_request(RID, "default", WALK, [WG_ID, 1], [WG_ID, 1],
                          [ME, PEER], [1, 1], [], [])
     return rt, rid, inboxes
 
@@ -496,7 +500,7 @@ def test_stopping_a_loop_tells_the_peers_that_run_it(tmp_path):
     assert len(got) == 1
     msg = got[0]
     assert msg.message_type is WorkerMessageType.STOP_LOOPS
-    assert msg.body.request_id == "r1"
+    assert msg.body.request_id == RID
     assert msg.body.loop_names == {"ar_loop"}
     assert msg.body.partition_name == "default"
     # The observation the peer needs to tell a newer stop from a duplicate.
@@ -533,7 +537,7 @@ def _emit_mesh(tmp_path, tp_rank, shard_dim=None):
         },
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
-    rid = rt.add_request("r1", "default", WALK, [WG_ID], [WG_ID], [ME, PEER], [2], [], [])
+    rid = rt.add_request(RID, "default", WALK, [WG_ID], [WG_ID], [ME, PEER], [2], [], [])
     info = TensorPointerInfo(
         dims=[2, 3], dtype=torch.bfloat16, nbytes=12, address=1,
         stride=[3, 1], uuid=1, source_session_id="h:1", source_entity=ME,
@@ -578,7 +582,7 @@ def _persist_mesh(tmp_path, tp_rank):
         },
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
-    rid = rt.add_request("r1", "default", WALK, [WG_ID], [WG_ID], [ME, PEER], [2], [], [])
+    rid = rt.add_request(RID, "default", WALK, [WG_ID], [WG_ID], [ME, PEER], [2], [], [])
     info = TensorPointerInfo(
         dims=[2, 3], dtype=torch.bfloat16, nbytes=12, address=1,
         stride=[3, 1], uuid=1, source_session_id="h:1", source_entity=ME,
@@ -677,7 +681,7 @@ def _fanout_mesh(tmp_path, shard_dim=None, dims=(4, 3), nbytes=24, stride=None):
         },
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
-    rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [WG_ID, 1],
+    rid = rt.add_request(RID, "default", WALK, [WG_ID, 1], [WG_ID, 1],
                          [ME, PEER, P2], [1, 2], [], [])
     # By default 4 rows of 6 bytes.
     book.put_tensor(1, _info(
@@ -811,7 +815,7 @@ def _gather_mesh(tmp_path, src_tp, dest_tp, my_rank=0, shard_dim=0,
     )
     srcs = [ME, PEER][:src_tp]
     dests = [PEER, P2][:dest_tp]
-    rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [WG_ID, 1],
+    rid = rt.add_request(RID, "default", WALK, [WG_ID, 1], [WG_ID, 1],
                          srcs + dests, [src_tp, dest_tp], [], [])
     book.put_tensor(1, _info(1, dims=[4, 3], nbytes=24))
     book.increment_ref(1, 1)
@@ -909,7 +913,7 @@ def _looping_emit_mesh(tmp_path):
                   "tp_enabled_nodes": []},
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
-    rid = rt.add_request("r1", "default", WALK, [WG_ID], [WG_ID], [ME], [1], [], [])
+    rid = rt.add_request(RID, "default", WALK, [WG_ID], [WG_ID], [ME], [1], [], [])
     return rt, book, rid, inboxes
 
 
@@ -1012,7 +1016,7 @@ def test_a_removed_rid_leaves_no_persist_signal_for_the_next_handle(tmp_path):
     mesh = _Mesh(tmp_path, [("kv", "", True)])
     keep = mesh.admit()
     doomed = mesh.rt.add_request(
-        "doomed", "default", WALK, [WG_ID], [WG_ID], [ME], [1],
+        RID2, "default", WALK, [WG_ID], [WG_ID], [ME], [1],
         [], [],
     )
     _put(mesh, 1)
@@ -1030,7 +1034,7 @@ def test_a_removed_rid_leaves_no_persist_signal_for_the_next_handle(tmp_path):
     # all it takes -- and the handle goes straight back out.
     mesh.rt.remove_request(doomed)
     reused = mesh.rt.add_request(
-        "fresh", "default", WALK, [WG_ID], [WG_ID], [ME], [1],
+            RID2 + 1, "default", WALK, [WG_ID], [WG_ID], [ME], [1],
         [], [],
     )
     assert reused == doomed, "the handle must be recycled for this to bite"
@@ -1046,7 +1050,7 @@ def test_a_removed_rid_leaves_no_persist_signal_for_the_next_handle(tmp_path):
         m.body for m in _collect(mesh.inboxes["conductor"])
         if isinstance(m.body, WorkerGraphsDone)
     ]
-    assert [w.request_id for w in wgds] == ["r1"], (
+    assert [w.request_id for w in wgds] == [RID], (
         "only the surviving request reports done"
     )
     assert [i.uuid for i in wgds[0].persist_signals["kv"]] == [1]
@@ -1072,7 +1076,7 @@ def test_one_route_reports_each_row_in_its_own_walks_graph(tmp_path):
     )
     rids = [
         rt.add_request(name, "default", walk, [0, 1], [0, 1], [ME, ME], [1, 1], [], [])
-        for name, walk in (("r_prefill", "prefill"), ("r_decode", "decode"))
+        for name, walk in ((RID, "prefill"), (RID2, "decode"))
     ]
     for rid in rids:
         rt.ingest_inputs_batch(_one_signal(rid, "prompt", "only"))
@@ -1090,7 +1094,7 @@ def test_one_route_reports_each_row_in_its_own_walks_graph(tmp_path):
         m.body.request_id: (m.body.worker_graph_ids, m.body.graph_walk)
         for m in _collect(conductor)
     }
-    assert done == {"r_prefill": ([0], "prefill"), "r_decode": ([1], "decode")}
+    assert done == {RID: ([0], "prefill"), RID2: ([1], "decode")}
 
 
 def test_a_streamed_edge_goes_as_the_edge_items_python_builds(tmp_path):
@@ -1107,7 +1111,7 @@ def test_a_streamed_edge_goes_as_the_edge_items_python_builds(tmp_path):
     ]
     (frame,) = mesh.run(rid, uuids=[1, 2])[PEER]
     builder = EdgeItemsBuilder("default")
-    assert builder.try_add("r1", GraphEdge(
+    assert builder.try_add(RID, GraphEdge(
         next_node="remote", name="out", tensor_info=infos, is_streaming=True,
     ))
     assert frame == _sent(WorkerMessage(
@@ -1129,7 +1133,7 @@ def test_a_streamed_value_goes_as_the_value_frame_python_builds(tmp_path, with_t
     got = mesh.run(rid, uuids=[1] if with_tensor else [], route={"inline_signals": ["out"], "inline_values": [7]})
     (frame,) = got[PEER]
     builder = EdgeItemsBuilder("default")
-    assert builder.add_values("r1", "out", "remote", None, [7], ("", ME, "only", 1, 0))
+    assert builder.add_values(RID, "out", "remote", None, [7], ("", ME, "only", 1, 0))
     assert frame == _sent(WorkerMessage(message_type=WorkerMessageType.EDGE_ITEMS, body=builder.build()))
     assert got["conductor"][0].body.stream_items_sent == {"out": {PEER: 1}}
 
@@ -1191,7 +1195,7 @@ def test_only_a_non_streamed_edge_to_a_peer_asks_for_request_info(tmp_path, edge
     )
     if edge == "walk_driven":
         rt.set_walk_driven_signals(["out"])
-    rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [WG_ID, 1],
+    rid = rt.add_request(RID, "default", WALK, [WG_ID, 1], [WG_ID, 1],
                          [ME, PEER], [1, 1], [], [])
     rt.ingest_inputs_batch(_one_signal(rid, "token", "ar_decode"))
     rt.pop_rids("ar_decode", WALK, [rid])
@@ -1229,7 +1233,7 @@ def _spoken_mesh(tmp_path):
     )
     rt.set_inline_streams([("talker", "speech")])
     rids = [
-        rt.add_request(f"r{i}", "default", WALK, [WG_ID, 1], [WG_ID, 1], [ME, PEER], [1, 1], [], [])
+        rt.add_request(RID + i - 1, "default", WALK, [WG_ID, 1], [WG_ID, 1], [ME, PEER], [1, 1], [], [])
         for i in (1, 2)
     ]
 
@@ -1263,10 +1267,10 @@ def test_signals_on_one_column_ride_to_the_client_and_down_the_stream(tmp_path):
     each counted as one item sent."""
     got = _spoken_mesh(tmp_path)(inline_signals=["text", "speech"])
     [tokens] = got["api_server"]
-    assert tokens.body.request_ids == ["r1", "r2"] and tokens.body.values == [7, 8]
-    assert got[PEER] == [_speech_frame([7, 8], ["r1", "r2"])]
+    assert tokens.body.request_ids == [RID, RID2] and tokens.body.values == [7, 8]
+    assert got[PEER] == [_speech_frame([7, 8], [RID, RID2])]
     assert {m.body.request_id: m.body.stream_items_sent for m in got["conductor"]} == {
-        "r1": {"speech": {PEER: 1}}, "r2": {"speech": {PEER: 1}},
+        RID: {"speech": {PEER: 1}}, RID2: {"speech": {PEER: 1}},
     }
 
 
@@ -1278,10 +1282,10 @@ def test_a_withheld_inline_item_goes_nowhere_and_counts_no_item(tmp_path):
         inline_signals=["text", "speech"], withheld_signals=["speech"], withheld_rids=[[1]],
     )
     [tokens] = got["api_server"]
-    assert tokens.body.request_ids == ["r1", "r2"] and tokens.body.values == [7, 8]
-    assert got[PEER] == [_speech_frame([7], ["r1"])]
+    assert tokens.body.request_ids == [RID, RID2] and tokens.body.values == [7, 8]
+    assert got[PEER] == [_speech_frame([7], [RID])]
     assert {m.body.request_id: m.body.stream_items_sent for m in got["conductor"]} == {
-        "r1": {"speech": {PEER: 1}}, "r2": {},
+        RID: {"speech": {PEER: 1}}, RID2: {},
     }
 
 
@@ -1292,4 +1296,4 @@ def test_a_withheld_signal_that_does_not_ride_inline_changes_nothing(tmp_path):
     named = _spoken_mesh(tmp_path / "named")(
         inline_signals=["speech"], withheld_signals=["text"], withheld_rids=[[0, 1]],
     )
-    assert plain == named and plain[PEER] == [_speech_frame([7, 8], ["r1", "r2"])]
+    assert plain == named and plain[PEER] == [_speech_frame([7, 8], [RID, RID2])]

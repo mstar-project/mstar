@@ -408,7 +408,7 @@ def _runtime(model: Qwen3OmniModel, walk: str):
         sharding_config=_sharding_config(),
     )
     rid = runtime.add_request(
-        request_id="r", partition="Thinker", graph_walk=walk, partition_worker_graph_ids=ids,
+        request_id=101, partition="Thinker", graph_walk=walk, partition_worker_graph_ids=ids,
         worker_graph_to_workers=ParallelList(ids, [["w0"]] * len(ids)),
         loop_caps=model.get_loop_caps(max_output_tokens=16),
     )

@@ -12,7 +12,7 @@ from collections import deque
 import pytest
 import torch
 
-from mstar.conductor.conductor import Conductor, RequestData, _req_id_to_seed, _request_seed
+from mstar.conductor.conductor import Conductor, RequestData, _request_seed
 from mstar.graph.base import TensorPointerInfo
 from mstar.utils.ipc_format import (
     FailRequests,
@@ -21,6 +21,7 @@ from mstar.utils.ipc_format import (
     UnpersistTensors,
     WorkerMessageType,
 )
+from mstar.utils.request_ids import client_id_seed
 
 PREPROCESS = "api_server_preprocess_worker"
 
@@ -260,9 +261,10 @@ def _failures(c, rid):
 
 
 def test_request_seed_takes_an_int64_or_derives_one():
-    assert _request_seed({"seed": 7}, "r1") == 7
-    assert _request_seed({"seed": -(2**63)}, "r1") == -(2**63)
-    assert _request_seed({}, "r1") == _req_id_to_seed("r1")
+    fallback = client_id_seed("r1")
+    assert _request_seed({"seed": 7}, fallback) == 7
+    assert _request_seed({"seed": -(2**63)}, fallback) == -(2**63)
+    assert _request_seed({}, fallback) == fallback
 
 
 @pytest.mark.parametrize("seed", ["abc", "7", 1.5, True, 2**63, -(2**63) - 1, [1]])

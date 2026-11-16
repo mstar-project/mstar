@@ -906,7 +906,7 @@ class GraphRuntime(PhasedPostprocess, ABC):
 
     @abstractmethod
     def add_request(
-        self, request_id: str,
+        self, request_id: int,
         partition: str,
         graph_walk: str,
         partition_worker_graph_ids: list[int],
@@ -939,20 +939,20 @@ class GraphRuntime(PhasedPostprocess, ABC):
 
     # --------- rid <-> handle, at the process boundary ----------
     #
-    # Handles are worker-internal. Messages carry the string, so the only
+    # Handles are worker-internal. Messages carry the deployment-local integer, so the only
     # translations are: de-intern at each send site, intern at each receive
     # handler. In the worker the receive handlers are InputIngest's and
-    # Lockstep's; sends take the string from get_rid_string, or from
+    # Lockstep's; sends take the integer from get_rid_string, or from
     # RequestLifecycle's wire-keyed drain sets; step outputs leave through the
     # runtime.
 
     @abstractmethod
-    def get_rid_string(self, handle: int) -> str:
+    def get_rid_string(self, handle: int) -> int:
         """For a message about to leave this process."""
         pass
 
     @abstractmethod
-    def get_rid_handle(self, rid: str) -> int | None:
+    def get_rid_handle(self, rid: int) -> int | None:
         """For a message that just arrived.
 
         None when the rid is unknown -- a message can legitimately arrive for a

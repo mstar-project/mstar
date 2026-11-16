@@ -37,8 +37,9 @@ struct ReferenceInfo {
     teardown: bool,
 }
 
-/// A request id as the store keys ownership: the worker's integer handle, or
-/// the string id the api server's data worker still passes.
+/// A request id as the store keys ownership. Production uses a worker-local
+/// integer handle or the API data worker's global integer submission ID. The
+/// string variant remains for existing direct bookkeeper callers and tests.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum RidKey {
     Int(i64),
@@ -47,8 +48,8 @@ pub enum RidKey {
 
 impl<'py> FromPyObject<'py> for RidKey {
     fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
-        // Type check first: a failed int extraction would build a PyErr per
-        // string rid.
+        // Type check first: a failed int extraction would build a PyErr for
+        // legacy direct callers passing strings.
         if let Ok(s) = ob.downcast::<PyString>() {
             return Ok(RidKey::Str(s.to_str()?.to_owned()));
         }

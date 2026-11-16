@@ -177,7 +177,7 @@ def _admit(w: Worker, n: int, start: int = 0, walk: str = WALK) -> list[int]:
     wg = WG_PRE if walk == PRE else WG
     rids = []
     for i in range(start, start + n):
-        wire = f"req-{i}"
+        wire = 100 + i
         rid = w._graph_runtime.add_request(
             request_id=wire, partition=PART, graph_walk=walk,
             partition_worker_graph_ids=[wg],

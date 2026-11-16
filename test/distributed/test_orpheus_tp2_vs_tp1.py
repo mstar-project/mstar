@@ -73,7 +73,7 @@ def run_one(url: str) -> dict:
             "model_kwargs": json.dumps({"voice": VOICE}),
             # request_id propagates into the conductor seed (md5-based),
             # so pinning it gives the sampler a deterministic seed across
-            # runs. See conductor.py:_req_id_to_seed.
+            # runs. See mstar.utils.request_ids.client_id_seed.
             "request_id": REQUEST_ID_HINT,
         },
         stream=True,

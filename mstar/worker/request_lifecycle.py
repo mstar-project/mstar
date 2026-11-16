@@ -76,7 +76,7 @@ class RequestLifecycle:
 
     # -- arrival ------------------------------------------------------------
 
-    def add(self, rid: int, wire_rid: str) -> list[WorkerMessage]:
+    def add(self, rid: int, wire_rid: int) -> list[WorkerMessage]:
         """A NEW_REQUEST, of which a request with several partitions here sends
         one per partition: it keeps its first arrival. Its parked messages
         stay parked until ``take_parked``."""
@@ -87,7 +87,7 @@ class RequestLifecycle:
             # Drained before admission: no new work, while committed TP steps still run.
             self.failed_rids.add(rid)
 
-    def take_parked(self, wire_rid: str) -> list[WorkerMessage]:
+    def take_parked(self, wire_rid: int) -> list[WorkerMessage]:
         """The messages parked for a request, for the caller to replay now. Taken
         only at the replay, so a setup that raises leaves them for the request's
         teardown to drop."""
@@ -102,7 +102,7 @@ class RequestLifecycle:
         self._parked.setdefault(wire_rid, []).append(message)
         return True
 
-    def takes_input(self, wire_rid: str) -> bool:
+    def takes_input(self, wire_rid: int) -> bool:
         """Whether this rank still reads the inputs of NEW_REQUEST and INPUT_SIGNALS
         for a request: until it sends READS_DONE, draining or not, since a step
         rank 0 committed may wait on one that arrives behind the forwarded drain.
@@ -164,7 +164,7 @@ class RequestLifecycle:
                 break
         return ready
 
-    def removed(self, rid: int | None, wire_rid: str) -> Iterable[WorkerMessage]:
+    def removed(self, rid: int | None, wire_rid: int) -> Iterable[WorkerMessage]:
         """Forget a request that was torn down, or never admitted (``rid`` None).
         Returns the messages that were parked for it, for the caller to drop."""
         if rid is not None:
@@ -212,7 +212,7 @@ class RequestLifecycle:
         handle = self._handle
         return [wire for wire in self.pending_drains if handle(wire) not in in_flight]
 
-    def begin_drain(self, wire_rid: str) -> int | None:
+    def begin_drain(self, wire_rid: int) -> int | None:
         """Take no new work for the request. Its handle, if it has been admitted."""
         self.pending_drains.discard(wire_rid)
         rid = self._handle(wire_rid)
@@ -229,11 +229,11 @@ class RequestLifecycle:
         handle = self._handle
         return [(w, handle(w)) for w in self.draining if w not in self._reads_done_sent]
 
-    def reads_done(self, wire_rid: str) -> None:
+    def reads_done(self, wire_rid: int) -> None:
         """READS_DONE went out. The rid stays draining until its remove."""
         self._reads_done_sent.add(wire_rid)
 
-    def _handle(self, wire_rid: str) -> int | None:
+    def _handle(self, wire_rid: int) -> int | None:
         """``wire_rid``'s handle while it is admitted here, else None."""
         rid = self._runtime.get_rid_handle(wire_rid)
         return rid if rid in self.arrivals else None
@@ -256,7 +256,7 @@ class RequestLifecycle:
             return _NONE
         return self.failed_rids.union(self.pending_removes, *also)
 
-    def closing(self, rid: int, wire_rid: str | None) -> bool:
+    def closing(self, rid: int, wire_rid: int | None) -> bool:
         """Whether ``rid`` (``wire_rid`` on the wire) is on its way out:
         `no_new_work`'s, or with a drain pending or begun."""
         return (

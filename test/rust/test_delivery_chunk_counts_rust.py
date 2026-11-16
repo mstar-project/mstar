@@ -116,7 +116,7 @@ def _script(runtime, put) -> list[list[int]]:
     step that stores no tensors, values that miss a row, and a failed
     request. ``a`` asks for log-probs, ``b`` does not, ``c`` only at its
     prefill. Returns each step's staged uuids."""
-    a, b, c = (_admit(runtime, f"r{i}") for i in range(3))
+    a, b, c = (_admit(runtime, 100 + i) for i in range(3))
     step = _stepper(runtime, put)
     _ingest(runtime, [a, b, c])
     outs = [step([(a, PREFILL), (b, PREFILL)], [1, 2], logprobs=[-1.0, None])]
@@ -173,15 +173,15 @@ def test_the_script_sends_these_frames(tmp_path):
 
     assert staged == [[101, 102], [], [107], [], [112, 114], []]
     assert _frames(chunks) == [
-        ("tensors", "r0", "new_token", "text", (101,), _prefill_step(), {"logprobs": [-1.0]}),
-        ("tensors", "r0", "new_token", "text", (112,), _decode_step(3), {"logprobs": [-3.5]}),
-        ("tensors", "r1", "new_token", "text", (102,), _prefill_step(), {}),
-        ("tensors", "r1", "new_token", "text", (114,), _decode_step(3), {}),
-        ("tensors", "r2", "new_token", "text", (107,), _prefill_step(), {"logprobs": [-2.0]}),
-        ("tokens", "new_token", "text", (("r0", 11, _decode_step(0), -1.5), ("r1", 21, _decode_step(0), None))),
-        ("tokens", "new_token", "text", (("r0", 12, _decode_step(1), -2.5), ("r1", 22, _decode_step(1), None))),
-        ("tokens", "new_token", "text", (("r0", 13, _decode_step(2), -3.0), ("r1", 23, _decode_step(2), None))),
-        ("tokens", "new_token", "text", (("r0", 15, _decode_step(4), None),)),
+        ("tensors", 100, "new_token", "text", (101,), _prefill_step(), {"logprobs": [-1.0]}),
+        ("tensors", 100, "new_token", "text", (112,), _decode_step(3), {"logprobs": [-3.5]}),
+        ("tensors", 101, "new_token", "text", (102,), _prefill_step(), {}),
+        ("tensors", 101, "new_token", "text", (114,), _decode_step(3), {}),
+        ("tensors", 102, "new_token", "text", (107,), _prefill_step(), {"logprobs": [-2.0]}),
+        ("tokens", "new_token", "text", ((100, 11, _decode_step(0), -1.5), (101, 21, _decode_step(0), None))),
+        ("tokens", "new_token", "text", ((100, 12, _decode_step(1), -2.5), (101, 22, _decode_step(1), None))),
+        ("tokens", "new_token", "text", ((100, 13, _decode_step(2), -3.0), (101, 23, _decode_step(2), None))),
+        ("tokens", "new_token", "text", ((100, 15, _decode_step(4), None),)),
     ]
     # a step's tensor chunks go out before its tokens
     assert [type(c).__name__ for c in chunks] == [
@@ -189,8 +189,8 @@ def test_the_script_sends_these_frames(tmp_path):
         "ResultTokens", "ResultTensors", "ResultTensors", "ResultTokens",
     ]
     assert _reports(reports) == [
-        ("r0", (0,), ("new_token",)), ("r0", (1,), ("new_token",) * 5),
-        ("r1", (0,), ("new_token",)), ("r2", (0,), ("new_token",)),
+        (100, (0,), ("new_token",)), (100, (1,), ("new_token",) * 5),
+        (101, (0,), ("new_token",)), (102, (0,), ("new_token",)),
     ]
     tokens = sorted(sorted(c.values) for c in chunks if isinstance(c, ResultTokens))
     assert tokens == [[11, 21], [12, 22], [13, 23], [15]]
@@ -198,13 +198,13 @@ def test_the_script_sends_these_frames(tmp_path):
         (rid, lp) for c in chunks if isinstance(c, ResultTokens) and c.logprobs
         for rid, lp in zip(c.request_ids, c.logprobs, strict=True) if lp is not None
     )
-    assert logprobs == [("r0", -3.0), ("r0", -2.5), ("r0", -1.5)]
+    assert logprobs == [(100, -3.0), (100, -2.5), (100, -1.5)]
     metadata = sorted(
         (c.request_id, *c.metadata["logprobs"]) for c in chunks
         if not isinstance(c, ResultTokens) and c.metadata
     )
     # the prefills, and the step whose values missed a row
-    assert metadata == [("r0", -3.5), ("r0", -1.0), ("r2", -2.0)]
+    assert metadata == [(100, -3.5), (100, -1.0), (102, -2.0)]
 
 
 def _tp_rank(rank):
@@ -218,7 +218,7 @@ def _tp_rank(rank):
 
 
 def _tp_step(runtime, put):
-    rid = _admit(runtime, "r1", workers=(WORKER, PEER))
+    rid = _admit(runtime, 101, workers=(WORKER, PEER))
     runtime.set_walk(rid, "default", DECODE)
     _ingest(runtime, [rid])
     _stepper(runtime, put)([(rid, DECODE)], [7])
@@ -233,4 +233,4 @@ def test_only_the_tp_leader_emits(tmp_path):
         chunks, reports = sent()
 
         assert [type(c) for c in chunks] == ([ResultTokens] if rank == 0 else [])
-        assert _reports(reports) == [("r1", (1,), emitted)]
+        assert _reports(reports) == [(101, (1,), emitted)]

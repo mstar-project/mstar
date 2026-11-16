@@ -186,8 +186,10 @@ def test_rank_0s_moves_round_trip_typed():
 
 
 def test_rank_0s_leases_and_page_trails_round_trip_typed():
+    request_id = (1 << 62) + 17
     body = ScheduleTPNode(
-        "llm", "decode", ["r"], prefix_hits={"r": {"kv": CachedLease([4, 5, 6], [4])}},
+        "llm", "decode", [request_id],
+        prefix_hits={request_id: {"kv": CachedLease([4, 5, 6], [4])}},
         page_trails={"kv": (3, 17, 2, 0, 1)},
     )
 
@@ -195,6 +197,7 @@ def test_rank_0s_leases_and_page_trails_round_trip_typed():
 
     assert got.prefix_hits == body.prefix_hits, "a follower would take another lease than rank 0's"
     assert got.page_trails == body.page_trails, "a follower would check another trail than rank 0's"
+    assert list(got.page_trails) == ["kv"], "page trails are keyed by pool name, not request id"
 
 
 def test_unregistered_payloads_still_round_trip():

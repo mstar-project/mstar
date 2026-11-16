@@ -104,7 +104,7 @@ def _remove(w, request_id):
     deliver(w, WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest(request_id=request_id)))
 
 
-def _new_request(request_id="r1", graph=(WG_ID, NODE, WALK, "default"), worker_graph_ids=(WG_ID,)):
+def _new_request(request_id=101, graph=(WG_ID, NODE, WALK, "default"), worker_graph_ids=(WG_ID,)):
     wg_id, _, walk, partition = graph
     return NewRequest(
         request_id=request_id,
@@ -124,9 +124,9 @@ def test_admit_mints_a_handle_and_sets_up_both_sides():
     body = _new_request()
     _admit(w, body)
 
-    rid = w._graph_runtime.get_rid_handle("r1")
+    rid = w._graph_runtime.get_rid_handle(101)
     assert rid is not None, "the handle must be interned"
-    assert w._graph_runtime.get_rid_string(rid) == "r1"
+    assert w._graph_runtime.get_rid_string(rid) == 101
     # The handle is stamped onto the fwd_info so submodules can key on it.
     assert body.request_info.rid_handle == rid
 
@@ -143,12 +143,12 @@ def test_admit_mints_a_handle_and_sets_up_both_sides():
 
 def test_remove_tears_down_both_sides_and_frees_the_handle():
     w = _worker()
-    _admit(w, _new_request("r1"))
-    rid = w._graph_runtime.get_rid_handle("r1")
+    _admit(w, _new_request(101))
+    rid = w._graph_runtime.get_rid_handle(101)
 
-    _remove(w, "r1")
+    _remove(w, 101)
 
-    assert w._graph_runtime.get_rid_handle("r1") is None
+    assert w._graph_runtime.get_rid_handle(101) is None
     assert w._graph_runtime.get_sharding_config(rid) is None, \
         "the runtime must drop the request's state on removal"
     assert w._graph_runtime.get_sharding_config(rid) is None
@@ -157,9 +157,9 @@ def test_remove_tears_down_both_sides_and_frees_the_handle():
 
     # Freed handles are reused, which is why teardown has to be complete: the
     # next request gets this exact integer back.
-    _admit(w, _new_request("r2"))
-    assert w._graph_runtime.get_rid_handle("r2") == rid
-    assert w._graph_runtime.get_rid_string(rid) == "r2"
+    _admit(w, _new_request(102))
+    assert w._graph_runtime.get_rid_handle(102) == rid
+    assert w._graph_runtime.get_rid_string(rid) == 102
 
 
 THINKER = (0, "thinker", "thinker", "Thinker")
@@ -175,10 +175,10 @@ def test_a_second_partition_opens_nothing_twice():
     opened = []
     w.engine_manager.add_request = lambda rid, cfgs, info: opened.append((rid, info.partition_name))
 
-    _admit(w, _new_request("r1", THINKER, (0, 1)))
-    _admit(w, _new_request("r1", TALKER, (0, 1)))
+    _admit(w, _new_request(101, THINKER, (0, 1)))
+    _admit(w, _new_request(101, TALKER, (0, 1)))
 
-    rid = w._graph_runtime.get_rid_handle("r1")
+    rid = w._graph_runtime.get_rid_handle(101)
     assert w.tensor_manager.registered == [rid]
     assert opened == [(rid, "Thinker")]
     # each partition still gets its own forward-pass info and worker graph
@@ -187,8 +187,8 @@ def test_a_second_partition_opens_nothing_twice():
     assert all(w._graph_runtime.is_partition_idle(rid, p) for p in ("Thinker", "Talker"))
 
     # the next request to get the handle opens it again
-    _remove(w, "r1")
-    _admit(w, _new_request("r2", TALKER, (0, 1)))
-    assert w._graph_runtime.get_rid_handle("r2") == rid
+    _remove(w, 101)
+    _admit(w, _new_request(102, TALKER, (0, 1)))
+    assert w._graph_runtime.get_rid_handle(102) == rid
     assert w.tensor_manager.registered == [rid, rid]
     assert opened == [(rid, "Thinker"), (rid, "Talker")]

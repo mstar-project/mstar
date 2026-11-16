@@ -37,7 +37,7 @@ class EdgeItemsBuilder:
             self._msg.names.append(name)
         return i
 
-    def try_add(self, request_id: str, edge: GraphEdge) -> bool:
+    def try_add(self, request_id: int, edge: GraphEdge) -> bool:
         """Add the edge's row; False, adding nothing, when its descriptors
         don't share the frame's fields (or one walk)."""
         infos = edge.tensor_info
@@ -87,7 +87,7 @@ class EdgeItemsBuilder:
         return True
 
     def add_values(
-        self, request_id: str, signal: str, next_node: str, walk: str | None, values: list[int],
+        self, request_id: int, signal: str, next_node: str, walk: str | None, values: list[int],
         source: tuple[str, str, str | None, int, int],
     ) -> bool:
         """Add a row of inline items, ``source`` the producer's (session, entity,
@@ -121,7 +121,7 @@ class StreamRow(NamedTuple):
     items are ``frame.uuids[start:start + count]`` (and likewise every item
     column), and their dims and strides ``frame.dims_flat[dim_start:...]``."""
     index: int
-    request_id: str
+    request_id: int
     signal: str
     next_node: str
     start: int

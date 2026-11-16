@@ -18,7 +18,7 @@ class CurrentForwardPassInfo:
     Information that is passed into the worker / engines about this request
     at the current forward pass
     """
-    request_id: str
+    request_id: int
     graph_walk: str
     fwd_index: int
     random_seed: int

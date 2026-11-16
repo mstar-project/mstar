@@ -63,7 +63,7 @@ STEPS = [("P", "produce", 0, "p", "x"), ("C", "consume", 1, "c", "y")]
 def add_both_partitions(rt):
     for part, walk, wg in [("P", "produce", 0), ("C", "consume", 1)]:
         rid = rt.add_request(
-            request_id="rid", partition=part, graph_walk=walk, partition_worker_graph_ids=[wg],
+            request_id=101, partition=part, graph_walk=walk, partition_worker_graph_ids=[wg],
             worker_graph_to_workers=ParallelList([0, 1], [["worker_0"], ["worker_0"]]),
             loop_caps={},
         )
@@ -158,7 +158,7 @@ def _two_stream_conductor(tmp_path, monkeypatch, model=None):
     monkeypatch.setattr(conductor_mod, "make_communicator", lambda **kw: SimpleNamespace(send=lambda *a: None))
     c = Conductor(model, str(cfg), socket_path_prefix=str(tmp_path / "s"))
     c._ingest_request(NewRequestConductor(
-        request_id="rid", initial_signals={}, initial_input_modalities=["text"],
+        request_id=101, initial_signals={}, initial_input_modalities=["text"],
         initial_output_modalities=["text"], input_metadata={}, model_kwargs={}))
     return c
 
@@ -168,10 +168,10 @@ def test_producer_done_goes_once_per_consumer_partition(tmp_path, monkeypatch):
     sent = []
     monkeypatch.setattr(c, "_send_producer_done", lambda rid, src, dst: sent.append((src, dst)))
 
-    c._process_done_forward("rid", "P")
+    c._process_done_forward(101, "P")
 
     assert sent == [("P", "C")]
-    done = sorted(x.edge_name for x in c.requests["rid"].streaming_connections.values() if x.producer_done)
+    done = sorted(x.edge_name for x in c.requests[101].streaming_connections.values() if x.producer_done)
     assert done == ["first", "second"], f"conductor ends only {done}"
 
 
@@ -179,5 +179,5 @@ def test_connections_whose_names_join_alike_are_both_tracked(tmp_path, monkeypat
     c = _two_stream_conductor(tmp_path, monkeypatch, _ColonNamesModel())
     sent = []
     monkeypatch.setattr(c, "_send_producer_done", lambda rid, src, dst: sent.append((src, dst)))
-    c._process_done_forward("rid", "P")
+    c._process_done_forward(101, "P")
     assert sorted(sent) == [("P", "C"), ("P", "C:x")]

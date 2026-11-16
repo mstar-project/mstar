@@ -482,7 +482,7 @@ class InputIngest:
         text, _ = client_error_text(err, f"Worker {self._worker_id}: {what}", log=logger)
         self._lifecycle.fail({rid: f"Error in worker: {text}" for rid in rids})
 
-    def _ack_unbuffered(self, rid: int, request_id: str, edges: list[GraphEdge]) -> None:
+    def _ack_unbuffered(self, rid: int, request_id: int, edges: list[GraphEdge]) -> None:
         """Streamed edges of a known request with no stream buffer here:
         nothing will consume them, so ack them unread for the producer to
         free. Expected when the request's ingest failed on this worker."""

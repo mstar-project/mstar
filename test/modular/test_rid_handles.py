@@ -1,7 +1,7 @@
-"""Worker-local rid handles: strings on the wire, recycled ints inside.
+"""Worker-local rid handles: integer IDs on the wire, recycled handles inside.
 
 The failure mode these guard is silent: a handle that outlives its request
-attaches to whichever request is given that handle next, and a string that
+attaches to whichever request is given that handle next, and a global ID that
 reaches a handle-keyed map just misses.
 """
 from types import SimpleNamespace
@@ -33,36 +33,36 @@ from mstar.worker.worker import Worker
 def test_intern_is_idempotent_across_partitions():
     """One NEW_REQUEST per partition on this worker; all share one handle."""
     t = RidTable()
-    h = t.intern("req-a")
-    assert t.intern("req-a") == h
+    h = t.intern(1001)
+    assert t.intern(1001) == h
     assert len(t) == 1
 
 
 def test_first_handle_is_zero_and_round_trips():
     """0 is a real handle, so nothing may treat a handle as a truth value."""
     t = RidTable()
-    assert t.intern("req-a") == 0
-    assert t.handle("req-a") == 0
-    assert t.name(0) == "req-a"
+    assert t.intern(1001) == 0
+    assert t.handle(1001) == 0
+    assert t.name(0) == 1001
 
 
 def test_unknown_request_has_no_handle():
-    assert RidTable().handle("never-seen") is None
+    assert RidTable().handle(9999) is None
 
 
 def test_released_handle_is_recycled_for_the_next_request():
     t = RidTable()
-    a = t.intern("req-a")
-    t.intern("req-b")
+    a = t.intern(1001)
+    t.intern(1002)
     t.release(a)
-    assert t.handle("req-a") is None
-    assert t.intern("req-c") == a
-    assert t.name(a) == "req-c"
+    assert t.handle(1001) is None
+    assert t.intern(1003) == a
+    assert t.name(a) == 1003
 
 
 def test_name_of_a_released_handle_raises():
     t = RidTable()
-    h = t.intern("req-a")
+    h = t.intern(1001)
     t.release(h)
     with pytest.raises(KeyError):
         t.name(h)
@@ -70,56 +70,56 @@ def test_name_of_a_released_handle_raises():
 
 def test_release_is_idempotent():
     t = RidTable()
-    h = t.intern("req-a")
+    h = t.intern(1001)
     t.release(h)
     t.release(h)
     # A double release must not put the handle on the free list twice, or two
     # later requests would share it.
-    assert t.intern("req-b") != t.intern("req-c")
+    assert t.intern(1002) != t.intern(1003)
 
 
-# ── TP-follow messages carry strings ───────────────────────────────────────
+# ── TP-follow messages carry global integer IDs ───────────────────────────────────────
 
 
 def _lockstep(table: RidTable) -> Lockstep:
     return make_scheduler(graph_runtime=SimpleNamespace(get_rid_handle=table.handle)).lockstep
 
 
-def _follow(*rids: str) -> ScheduleTPNode:
+def _follow(*rids: int) -> ScheduleTPNode:
     return ScheduleTPNode(node_name="n", graph_walk="w", request_ids=list(rids))
 
 
 def test_tp_rids_resolve_to_this_ranks_handles_in_wire_order():
     t = RidTable()
-    t.intern("pad")  # so this rank's handles differ from the leader's order
-    b, a = t.intern("b"), t.intern("a")
-    assert _lockstep(t).tp_rids(_follow("a", "b")) == [a, b]
+    t.intern(1000)  # so this rank's handles differ from the leader's order
+    b, a = t.intern(102), t.intern(101)
+    assert _lockstep(t).tp_rids(_follow(101, 102)) == [a, b]
 
 
 def test_tp_rid_this_rank_does_not_know_is_the_removed_sentinel():
     t = RidTable()
-    a = t.intern("a")
-    assert _lockstep(t).tp_rids(_follow("a", "gone")) == [a, REMOVED_RID]
+    a = t.intern(101)
+    assert _lockstep(t).tp_rids(_follow(101, 999)) == [a, REMOVED_RID]
 
 
 def test_follow_refcount_counts_rids_this_rank_cannot_resolve():
-    """Counted by WIRE STRING, so a rid whose NEW_REQUEST has not landed yet
+    """Counted by GLOBAL ID, so a rid whose NEW_REQUEST has not landed yet
     still gates the drain. Resolving to handles here would drop it, and the
     drain would ACK while its batch sat at the head of the TP FIFO."""
     t = RidTable()
-    t.intern("a")
+    t.intern(101)
     s = _lockstep(t)
-    s.enqueue_follow(_follow("a", "gone"))
-    assert (s.pending_follow_count("a"), s.pending_follow_count("gone")) == (1, 1)
+    s.enqueue_follow(_follow(101, 999))
+    assert (s.pending_follow_count(101), s.pending_follow_count(999)) == (1, 1)
     s.pop_follow_head()
-    assert (s.pending_follow_count("a"), s.pending_follow_count("gone")) == (0, 0)
+    assert (s.pending_follow_count(101), s.pending_follow_count(999)) == (0, 0)
 
 
 # ── the worker's boundary ──────────────────────────────────────────────────
 
 
 def _worker(
-    *rids: str, tensor_manager=None, engine_manager=None, connections=(),
+    *rids: int, tensor_manager=None, engine_manager=None, connections=(),
 ) -> tuple[Worker, RidTable]:
     """A worker whose graph runtime is only the rid table: the boundary is
     what these tests are about, and the runtime owns the table."""
@@ -160,23 +160,23 @@ def _worker(
     return w, t
 
 
-def test_failures_leave_the_worker_as_wire_strings():
-    w, t = _worker("req-a", "req-b")
-    w.pipeline._fail_requests({t.handle("req-a"): "boom"})
+def test_failures_leave_the_worker_as_global_ids():
+    w, t = _worker(1001, 1002)
+    w.pipeline._fail_requests({t.handle(1001): "boom"})
     [(entity, msg)] = w.sent
     assert entity == "conductor"
     assert msg.message_type == ConductorMessageType.FAIL_REQUESTS
-    assert msg.body.errors == {"req-a": "boom"}
+    assert msg.body.errors == {1001: "boom"}
     # ...while the scheduler gate stays on the handle.
-    assert w.lifecycle.failed_rids == {t.handle("req-a")}
+    assert w.lifecycle.failed_rids == {t.handle(1001)}
 
 
 def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     w, t = _worker(
-        "req-a", "req-b", engine_manager=SimpleNamespace(remove_request=lambda h: None),
+        1001, 1002, engine_manager=SimpleNamespace(remove_request=lambda h: None),
         tensor_manager=SimpleNamespace(force_cleanup_request=lambda h: None),
     )
-    a, b = t.handle("req-a"), t.handle("req-b")
+    a, b = t.handle(1001), t.handle(1002)
     w._rebuilds._pool = HostPool(16, torch.device("cpu"))
     pieces = {rid: w._rebuilds._pool.take(8) for rid in (a, b)}
     w._rebuilds._kept, w._rebuilds._keeps_ids = {"n": {a: None, b: None}}, {"n": dict(pieces)}
@@ -188,7 +188,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     w.scheduler.admission.held_until[a] = float("inf")
 
     deliver(w, WorkerMessage(
-        WorkerMessageType.REMOVE_REQUEST, RemoveRequest(request_id="req-a", source=MessageSource.SELF),
+        WorkerMessageType.REMOVE_REQUEST, RemoveRequest(request_id=1001, source=MessageSource.SELF),
     ))
 
     assert not w.streams.possible(), "the stream manager forgets the handle"
@@ -204,8 +204,8 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
         "the next request would run this one's rebuild, or be counted as preempted"
     )
     # Freed last, and reused by the next request: nothing of req-a's may remain.
-    assert t.handle("req-a") is None
-    assert t.intern("req-c") == a
+    assert t.handle(1001) is None
+    assert t.intern(1003) == a
 
 
 def test_a_request_whose_engine_teardown_raises_stays_out_of_the_schedule():
@@ -213,24 +213,24 @@ def test_a_request_whose_engine_teardown_raises_stays_out_of_the_schedule():
         raise RuntimeError("engine teardown failed")
 
     w, t = _worker(
-        "req-a", "req-b", engine_manager=SimpleNamespace(remove_request=remove_request),
+        1001, 1002, engine_manager=SimpleNamespace(remove_request=remove_request),
         tensor_manager=SimpleNamespace(force_cleanup_request=lambda h: None),
     )
-    a = t.handle("req-a")
+    a = t.handle(1001)
 
     with pytest.raises(RuntimeError, match="engine teardown failed"):
         deliver(w, WorkerMessage(
-            WorkerMessageType.REMOVE_REQUEST, RemoveRequest(request_id="req-a", source=MessageSource.SELF),
+            WorkerMessageType.REMOVE_REQUEST, RemoveRequest(request_id=1001, source=MessageSource.SELF),
         ))
 
     assert a in w.lifecycle.failed_rids, "next_batch could hand out a request whose state is half gone"
     assert not w.lifecycle.removes_ready(set(), -1), "the teardown would be retried every pass"
-    assert t.handle("req-a") == a, "the handle was freed, so a later request would inherit the exclusion"
+    assert t.handle(1001) == a, "the handle was freed, so a later request would inherit the exclusion"
 
 
 def test_remove_for_an_unknown_request_is_a_no_op():
-    w, _ = _worker("req-a")
-    w.ingest._remove_request(RemoveRequest(request_id="gone", source=MessageSource.SELF))
+    w, _ = _worker(1001)
+    w.ingest._remove_request(RemoveRequest(request_id=999, source=MessageSource.SELF))
     w.pipeline._teardown(set())
     assert len(w.request_state.per_request_info) == 1
 
@@ -251,7 +251,7 @@ def test_tensor_ack_is_keyed_by_uuid_alone():
 
 def test_add_new_request_hands_the_handle_to_every_subsystem():
     """The one place a handle is minted. Nothing below NEW_REQUEST sees the
-    wire string, so a subsystem handed ``body.request_id`` instead would key
+    global ID, so a subsystem handed ``body.request_id`` instead would key
     its state under something no later message resolves to."""
     got: dict[str, object] = {}
     w, t = _worker(
@@ -276,13 +276,13 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
         partition_name="p",
     )
     body = SimpleNamespace(
-        request_id="wire-1", request_info=info,
+        request_id=2001, request_info=info,
         partition_worker_graph_ids={}, worker_graph_to_workers={},
         initial_inputs=[], loop_caps={},
     )
     w.ingest._add_new_request(body)
 
-    handle = t.handle("wire-1")
+    handle = t.handle(2001)
     assert handle is not None
     assert got == {"state": handle, "engine": handle, "tensors": handle}
     assert info.rid_handle == handle
@@ -322,7 +322,7 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
             stream_lead_items=lead,
         )
         body = SimpleNamespace(
-            request_id="wire-1", request_info=info, partition_worker_graph_ids={},
+            request_id=2001, request_info=info, partition_worker_graph_ids={},
             worker_graph_to_workers={}, initial_inputs=[], loop_caps={},
         )
         w.ingest._add_new_request(body)

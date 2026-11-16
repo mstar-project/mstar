@@ -1,13 +1,13 @@
 """Worker-local integer handles for request ids.
 
-Messages carry the request id string; everything inside a worker keys on a
+Messages carry the deployment-local request id; everything inside a worker keys on a
 small int instead. The only translations are at the process boundary: a handle
 is minted on NEW_REQUEST and looked up on every other inbound message, and the
-string goes back on the wire at each send site.
+global integer goes back on the wire at each send site.
 
 Handles are RECYCLED once a request is removed, so anything keyed by one must
-be purged on the same REMOVE_REQUEST that releases it. A leaked string key was
-harmless -- the string never recurred -- but a leaked handle silently attaches
+be purged on the same REMOVE_REQUEST that releases it. A leaked global ID was
+harmless -- the ID never recurred -- but a leaked handle silently attaches
 to whichever request gets that handle next. Known handle-keyed state:
 RequestLifecycle.{failed_rids, arrivals, pending_removes, _removes_awaiting_step,
 _unreported} (purged by removed), MicroScheduler.{backlog, last_ran, chunk_started,
@@ -30,7 +30,7 @@ remove_request), and WorkerProfileInfo.
 
 Lockstep's follow count is the one deliberate exception: a
 ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it
-stays keyed by the wire string and is purged by clear_wire_rid.
+stays keyed by the global wire ID and is purged by clear_wire_rid.
 """
 
 
@@ -38,11 +38,11 @@ class RidTable:
     __slots__ = ("_names", "_handles", "_free")
 
     def __init__(self):
-        self._names: list[str | None] = []
-        self._handles: dict[str, int] = {}
+        self._names: list[int | None] = []
+        self._handles: dict[int, int] = {}
         self._free: list[int] = []
 
-    def intern(self, request_id: str) -> int:
+    def intern(self, request_id: int) -> int:
         """Handle for ``request_id``, minting one if it has none.
 
         A request spanning several partitions on this worker gets one
@@ -60,13 +60,13 @@ class RidTable:
         self._handles[request_id] = handle
         return handle
 
-    def handle(self, request_id: str) -> int | None:
+    def handle(self, request_id: int) -> int | None:
         """Handle for an inbound message's request id, or None if this worker
         does not know it (never admitted, or already removed -- a benign race,
         not an error)."""
         return self._handles.get(request_id)
 
-    def name(self, handle: int) -> str:
+    def name(self, handle: int) -> int:
         """The wire identity, for a message about to leave this process."""
         name = self._names[handle] if 0 <= handle < len(self._names) else None
         if name is None:

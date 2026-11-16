@@ -740,7 +740,7 @@ def test_the_data_worker_reports_preprocess_finish_once_asked(tmp_path):
     def preprocess(key):
         before = time.perf_counter()
         worker.in_queue.put(PreprocessInput(
-            request_id=key, client_request_id=key, text="hi", file_paths=None,
+            request_id=key, fallback_seed=0, text="hi", file_paths=None,
             model_kwargs={}, **TEXT))
         _wait(lambda: len(sent) == int(key[-1]))
         return before
