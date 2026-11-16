@@ -53,7 +53,7 @@ from mstar.model.wan22.config import DIT_TOKENS, Wan22Config
 # 3D RoPE base frequency (reference WanRotaryPosEmbed default `theta`).
 ROPE_THETA = 10000.0
 
-# Only the block GEMMs are eligible for load-time MXFP8. Keep the condition
+# Only the block GEMMs are eligible for load-time dense FP8. Keep the condition
 # projections and output head in their checkpoint dtypes. QuantizableLinears
 # requires every linear to be classified, including ones added in future.
 QUANTIZABLE_LINEARS = QuantizableLinears(

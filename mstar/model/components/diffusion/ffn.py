@@ -15,15 +15,15 @@ does a ``linear_in`` bound to a LoRA delta, which its forward adds.
 from __future__ import annotations
 
 import torch
+from torch import nn
 
-from mstar.model.components.lora.capable import LoraBound
 from mstar.model.components.mlp import MLP
 
 
 def gelu_tanh_ffn(x: torch.Tensor, mlp: MLP) -> torch.Tensor:
     """``mlp(x)`` for an ``MLP`` built with ``activation="gelu_tanh"`` and a
     biased ``linear_in``."""
-    if x.is_cuda and torch.compiler.is_compiling() and not isinstance(mlp.linear_in, LoraBound):
+    if x.is_cuda and torch.compiler.is_compiling() and isinstance(mlp.linear_in, nn.Linear):
         lin = mlp.linear_in
         hidden = torch._addmm_activation(lin.bias, x.flatten(0, -2), lin.weight.t(), use_gelu=True)
         return mlp.linear_out(hidden.unflatten(0, x.shape[:-1]))

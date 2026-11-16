@@ -5,6 +5,9 @@ import torch
 from torch import nn
 
 from mstar.model.components.dense_fp8_format import DENSE_FP8, DenseFp8Format
+from mstar.model.components.diffusion.ffn import gelu_tanh_ffn
+from mstar.model.components.fp8_linear import reference as fp8_reference
+from mstar.model.components.mlp import MLP
 from mstar.model.components.quant_linear import QuantLinear, quant_capability
 from mstar.model.wan22.components.dit import QUANTIZABLE_LINEARS, Wan22DiT
 from mstar.model.wan22.config import Wan22Config
@@ -121,3 +124,25 @@ def test_dense_fp8_refuses_misaligned_or_non_bf16_weights():
         DENSE_FP8.check(127, 128, torch.bfloat16)
     with pytest.raises(ValueError, match="bf16 GEMM"):
         DENSE_FP8.check(128, 128, torch.float32)
+
+
+def test_compiled_ffn_dispatches_quant_linear_through_its_forward(monkeypatch):
+    """Exercise the CUDA/compile condition on CPU without claiming a GPU run."""
+    class PretendCuda(torch.Tensor):
+        @property
+        def is_cuda(self) -> bool:
+            return True
+
+    torch.manual_seed(7)
+    mlp = MLP(128, 256, 128, activation="gelu_tanh", bias=True).bfloat16()
+    mlp.linear_in = QuantLinear.from_linear(mlp.linear_in, DENSE_FP8)
+    x = torch.randn(2, 128, dtype=torch.bfloat16)
+    monkeypatch.setattr(
+        DenseFp8Format, "linear",
+        lambda self, rows, weight, scale: fp8_reference(rows, weight, scale, self.block_size),
+    )
+    expected = mlp(x)
+    pretend_cuda = torch.Tensor._make_subclass(PretendCuda, x, False)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    actual = gelu_tanh_ffn(pretend_cuda, mlp)
+    torch.testing.assert_close(actual.as_subclass(torch.Tensor), expected, rtol=0, atol=0)
