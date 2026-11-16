@@ -80,6 +80,7 @@ class WeightOps:
             return False
         self.pending = None
         error = None
+        checksum = None
         if op.op in (WeightOp.QUIESCE, WeightOp.VERIFY):
             pass
         elif blockers:
@@ -102,6 +103,15 @@ class WeightOps:
                 self.weight_epoch = op.epoch
                 self.dirty = False
                 self._runtime.set_weight_version(op.weight_version)
+        elif op.op == WeightOp.CHECKSUM:
+            if self.dirty:
+                error = "rank weights may be partially copied"
+            else:
+                try:
+                    checksum = self._engine.weight_checksum()
+                except Exception as exc:  # noqa: BLE001 - return a per-rank error to conductor
+                    logger.exception("Worker %s: loaded weight checksum failed", self.worker_id)
+                    error = f"{type(exc).__name__}: {exc}"
         else:
             error = f"unknown weight control step {op.op!r}"
         self._communicator.send("conductor", ConductorMessage(
@@ -110,6 +120,7 @@ class WeightOps:
                 epoch=op.epoch, worker_id=self.worker_id, op=op.op, error=error,
                 weight_version=self.weight_version, weight_epoch=self.weight_epoch,
                 dirty=self.dirty,
+                checksum=checksum,
             ),
         ))
         return True

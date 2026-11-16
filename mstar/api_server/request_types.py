@@ -134,6 +134,7 @@ class GenerationControlResult:
     error_message: str | None = None
     ranks: dict[str, str] = field(default_factory=dict)
     rank_versions: dict[str, str | None] = field(default_factory=dict)
+    rank_checksums: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

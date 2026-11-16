@@ -19,6 +19,7 @@ from fastapi import HTTPException
 
 from mstar.api_server.request_types import GenerationControlResult
 from mstar.utils.ipc_format import (
+    CheckWeights,
     ConductorMessage,
     ConductorMessageType,
     ContinueGeneration,
@@ -94,6 +95,18 @@ class GenerationAdmin:
             payload = UpdateWeightsFromDisk(op_id, path, version)
         elif op == "is_paused":
             message_type, payload = ConductorMessageType.GET_GENERATION_STATE, GetGenerationState(op_id)
+        elif op == "weight_checker":
+            mode = body.get("mode", "checksum")
+            if mode not in ("checksum", "compare"):
+                raise ValueError("mode must be 'checksum' or 'compare'")
+            checksums = body.get("checksums", {})
+            if not isinstance(checksums, dict) or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in checksums.items()
+            ):
+                raise ValueError("checksums must map rank names to SHA-256 hex digests")
+            message_type = ConductorMessageType.CHECK_WEIGHTS
+            payload = CheckWeights(op_id=op_id, mode=mode, checksums=checksums)
         else:
             raise ValueError("unknown generation operation")
 

@@ -2420,6 +2420,8 @@ class Conductor:
             self._generation.update(message.body)
         elif message.message_type == ConductorMessageType.GET_GENERATION_STATE:
             self._generation.report(message.body)
+        elif message.message_type == ConductorMessageType.CHECK_WEIGHTS:
+            self._generation.check_weights(message.body)
         elif message.message_type == ConductorMessageType.WEIGHT_CONTROL_ACK:
             self._generation.ack(message.body)
         elif message.message_type == ConductorMessageType.LOAD_LORA_ADAPTER:

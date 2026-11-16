@@ -29,6 +29,7 @@ pub fn router() -> Router<AppState> {
         .route("/update_weights_from_disk", post(update))
         .route("/continue_generation", post(resume))
         .route("/is_paused", get(state))
+        .route("/weight_checker", post(checker))
 }
 
 fn body(bytes: &Bytes) -> Result<Map<String, Value>, Response> {
@@ -105,6 +106,13 @@ async fn resume(State(st): State<AppState>, bytes: Bytes) -> Response {
 
 async fn state(State(st): State<AppState>) -> Response {
     call(st, "is_paused", Map::new()).await
+}
+
+async fn checker(State(st): State<AppState>, bytes: Bytes) -> Response {
+    match body(&bytes) {
+        Ok(fields) => call(st, "weight_checker", fields).await,
+        Err(error) => error,
+    }
 }
 
 #[cfg(test)]

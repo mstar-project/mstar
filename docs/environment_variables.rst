@@ -325,11 +325,19 @@ frontend's (``--python-frontend``); ``mstar-server``'s rows are under
      - Path-separated absolute directories from which
        ``/update_weights_from_disk`` may load checkpoints. Together with an
        API key, enables ``/pause_generation``, ``/update_weights_from_disk``,
-       ``/continue_generation`` and ``/is_paused`` on either frontend. An
+       ``/continue_generation``, ``/is_paused`` and ``/weight_checker`` on either frontend. An
        empty value leaves those routes off. A requested checkpoint must be
        an existing directory whose resolved path stays under one listed root;
        symlinks outside it are refused. Only the deployment operator should
        be able to change files in these directories.
+
+       ``POST /weight_checker`` is paused-only. ``{"mode":"checksum"}``
+       returns ``rank_checksums``, one lowercase SHA-256 hex digest per worker
+       rank. ``{"mode":"compare","checksums":{"worker_0":"..."}}`` compares
+       a complete worker-rank map and returns 409 on a mismatch. The digest
+       covers each rank's resident parameters and registered buffers in stable
+       node/name order, including fused and quantized weight buffers. Mutable
+       buffers can change this paused-state fingerprint between requests.
    * - ``MSTAR_SILERO_VAD_PATH``
      - unset
      - Silero VAD ONNX file (``silero_vad.onnx``) for ``/v1/realtime``

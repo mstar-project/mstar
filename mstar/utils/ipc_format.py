@@ -346,6 +346,7 @@ class WeightOp(str, Enum):
     PREPARE = "prepare"
     APPLY = "apply"
     VERIFY = "verify"
+    CHECKSUM = "checksum"
 
 
 @dataclass
@@ -381,6 +382,7 @@ class ConductorMessageType(Enum):
     CONTINUE_GENERATION = "continue_generation"
     UPDATE_WEIGHTS_FROM_DISK = "update_weights_from_disk"
     GET_GENERATION_STATE = "get_generation_state"
+    CHECK_WEIGHTS = "check_weights"
     WEIGHT_CONTROL_ACK = "weight_control_ack"
 
 
@@ -527,6 +529,13 @@ class GetGenerationState(MessageBody):
 
 
 @dataclass
+class CheckWeights(MessageBody):
+    op_id: str
+    mode: str
+    checksums: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class WeightControlAck(MessageBody):
     epoch: int
     worker_id: str
@@ -535,6 +544,7 @@ class WeightControlAck(MessageBody):
     weight_version: str | None = None
     weight_epoch: int = 0
     dirty: bool = False
+    checksum: str | None = None
 
 
 @dataclass
