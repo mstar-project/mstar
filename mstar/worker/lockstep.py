@@ -580,7 +580,7 @@ class Lockstep:
         self._discharge(head.request_ids)
         self._follow_fifo[0] = moves_alone(head)
 
-    def _discharge(self, rids: list[str]) -> None:
+    def _discharge(self, rids: list[int]) -> None:
         for rid in rids:
             if rid not in self._follow_count:
                 continue

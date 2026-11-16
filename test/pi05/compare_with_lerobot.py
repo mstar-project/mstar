@@ -8,7 +8,7 @@ What it does
    path runs end-to-end), a fixed prompt, and a fixed robot state.
 2. POSTs them to the running mstar server with a pinned ``request_id`` so the
    conductor's per-request RNG seed is reproducible (md5 hash, see
-   ``mstar/conductor/conductor.py::_req_id_to_seed``).
+   ``mstar/utils/request_ids.py::client_id_seed``).
 3. Recomputes the exact noise tensor the server's Pi05 submodule will sample
    (same seed, same shape, same device).
 4. Loads ``lerobot.policies.pi05.PI05Policy.from_pretrained("lerobot/pi05_base")``
@@ -60,7 +60,7 @@ DEFAULT_REQUEST_ID = "pi05_compare_fixed_seed_v1"
 # ----------------------------------------------------------------------------
 
 def server_seed_for(request_id: str) -> int:
-    """Reproduce ``mstar.conductor.conductor._req_id_to_seed`` exactly."""
+    """Reproduce ``mstar.utils.request_ids.client_id_seed`` exactly."""
     import hashlib
 
     digest = hashlib.md5(request_id.encode("utf-8")).digest()

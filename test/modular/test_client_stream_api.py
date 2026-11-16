@@ -1494,8 +1494,9 @@ def test_a_new_request_under_a_live_calls_id_is_refused_and_the_call_goes_on(mon
     retried, one_shot, stray_end = sorted(ws.sent, key=lambda r: r["request_id"])
     assert retried["status"] == 409 and one_shot["status"] == 409
     assert "not taking input on this socket" in stray_end["error"]
-    assert [i.request_id for i in server.preprocess_worker.items] == ["call#1"]
-    assert server.preprocess_worker.aborted == ["call#1"]  # by the close, not before
+    (key,) = (i.request_id for i in server.preprocess_worker.items)
+    assert isinstance(key, int) and key > 0
+    assert server.preprocess_worker.aborted == [key]  # by the close, not before
 
 
 def test_an_end_of_input_with_settings_or_null_fields_ends_the_call_s_input(monkeypatch, tmp_path):
@@ -1527,13 +1528,14 @@ def test_a_failed_request_cannot_take_over_the_next_calls_entry(monkeypatch, tmp
     ])
 
     def streaming():
-        req = server.pending_requests.get("A#1")
+        req = server.pending_requests.get(server.submission_key("A"))
         return bool(ws.sent) and req is not None and req.loop is not None
 
     asyncio.run(_serve(ws, until=streaming))
     (failed,) = ws.sent
     assert failed["request_id"] == "A" and "Expecting" in failed["error"]  # the JSON error
-    assert server.preprocess_worker.aborted == ["A#1"]
+    (key,) = (i.request_id for i in server.preprocess_worker.items)
+    assert server.preprocess_worker.aborted == [key]
 
 
 def test_an_opening_is_one_shot_unless_it_sends_end_input_false(monkeypatch, tmp_path):

@@ -405,7 +405,7 @@ class _SinkBatch(NamedTuple):
 
     sink: ChunkSink
     # by key, so a request with several chunks in the pass is relayed once
-    reqs: dict[str, PendingRequest]
+    reqs: dict[int, PendingRequest]
 
 
 def _set_events(wakes: list) -> None:
@@ -1536,12 +1536,12 @@ class APIServer:
             if req is not None:
                 req.sink, req.sink_tag = sink, tag
 
-    def _relay_chunks(self, sink: ChunkSink, reqs: dict[str, PendingRequest]) -> None:
+    def _relay_chunks(self, sink: ChunkSink, reqs: dict[int, PendingRequest]) -> None:
         """On ``sink``'s loop: drain its requests' chunks into it, up to an
         error chunk, which stays for the handler with what follows it."""
         tags: list = []
         chunks: list[ResultChunk] = []
-        relayed: list[str] = []
+        relayed: list[int] = []
         with self.request_lock:
             for key, req in reqs.items():
                 pending = req.chunks
@@ -1601,7 +1601,7 @@ class APIServer:
         finally:
             await batches.aclose()
 
-    def _bind(self, request_id: str) -> tuple[str | None, PendingRequest | None]:
+    def _bind(self, request_id: str) -> tuple[int | None, PendingRequest | None]:
         """The newest submission under ``request_id``: its key and request.
         Called when a handler is created, right after ``submit_request`` and
         before the event loop runs anything else, so a later submission under
@@ -2536,7 +2536,7 @@ async def generate_ws(websocket: WebSocket):
         or refused; ``turn`` is this message's, for the one after it."""
         request_id = message.get("request_id")
         file_paths: dict[str, list[str]] | None = None
-        key: str | None = None
+        key: int | None = None
 
         def release_turn() -> None:
             """Let the next message submit, once the one before this one has."""

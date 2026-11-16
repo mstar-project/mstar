@@ -321,7 +321,7 @@ class PreprocessWorker:
 
         self.per_request_reading_tensors = {}
         # request id -> output name -> chunks received, for received_final_chunks
-        self.received_chunk_counts: dict[str, dict[str, int]] = {}
+        self.received_chunk_counts: dict[int, dict[str, int]] = {}
 
         # Build the communicator + tensor manager here (main thread) and hand
         # them to the worker thread, rather than constructing them inside it.
@@ -775,7 +775,7 @@ class PreprocessWorkerThread:
         self._client_edges = frozenset(self._client_connections)
         self._model_config = model_config
         # per request of a model with client streams, those streams' state
-        self._client_calls: dict[str, ClientCall] = {}
+        self._client_calls: dict[int, ClientCall] = {}
         self.in_queue = in_queue
         # Whether the API server still waits on a submission (see
         # _process_waiting_input); None (tests) takes everything.
@@ -790,15 +790,15 @@ class PreprocessWorkerThread:
 
         # Teardown drain: rids we've stopped reading for (until REMOVE_REQUEST),
         # and those we've already ACKed READS_DONE for (avoid double-ACK).
-        self._draining_rids: set[str] = set()
-        self._reads_done_sent: set[str] = set()
+        self._draining_rids: set[int] = set()
+        self._reads_done_sent: set[int] = set()
         # Requests under each rid that started here and are not removed yet
         # (by REMOVE_REQUEST, or by failing before they reached the conductor).
         # A release (finished_reading or an abort) for a rid with none must not
         # enter the sets above: its request is gone and no REMOVE_REQUEST
         # follows. A count, since a client can reuse a rid before the last
         # request under it is removed.
-        self._live_requests: dict[str, int] = {}
+        self._live_requests: dict[int, int] = {}
 
         self.stop_event = stop_event
         self.device = device
@@ -819,8 +819,8 @@ class PreprocessWorkerThread:
         self.tensor_uuid_to_metadata_per_request = {}
         # The request's model_kwargs, kept so output postprocessing can
         # honor per-request parameters (e.g. the video container fps).
-        self.request_model_kwargs: dict[str, dict] = {}
-        self.request_output_state: dict[str, RequestOutputState] = {}
+        self.request_model_kwargs: dict[int, dict] = {}
+        self.request_output_state: dict[int, RequestOutputState] = {}
 
         # Owned by PreprocessWorker (main thread); used only from this thread.
         self.communicator = communicator

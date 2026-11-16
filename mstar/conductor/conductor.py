@@ -477,11 +477,11 @@ class Conductor:
         adapters' digests pinned, say), which the workers are spawned with; None reads
         ``model_config_file``, which the model's placement methods read in any case. A
         LoRA adapter without its digest is refused either way."""
-        self.requests: dict[str, RequestData] = {}
+        self.requests: dict[int, RequestData] = {}
         self._arrivals = itertools.count()
         # Requests in teardown: kept in self.requests (so they still count toward
         # concurrency until their GPU state is freed) with barrier state here.
-        self.draining: dict[str, DrainingRequest] = {}
+        self.draining: dict[int, DrainingRequest] = {}
         # Backstop for a participant that never ACKs (crashed, hung, OOMed): the
         # barrier is force-finalized so one faulty worker can't hold a
         # concurrency slot — or the client's failure notification — forever.
@@ -489,17 +489,17 @@ class Conductor:
 
         # READS_DONE that arrived before the barrier was registered (the
         # preprocess worker self-drains on abort before we process ABORT_REQUEST).
-        self._early_reads_done: dict[str, set[str]] = {}
+        self._early_reads_done: dict[int, set[str]] = {}
         # Aborts for requests we haven't ingested yet: the preprocess worker
         # forwards ABORT_REQUEST from its abort queue before it finishes
         # preprocessing, so it can outrun the NEW_REQUEST it aborts.
-        self._early_abort_requests: set[str] = set()
+        self._early_abort_requests: set[int] = set()
         # (deadline, rid) FIFOs — expiry sweeps for the three above, so an entry
         # whose awaited message never arrives can't pile up. Deadlines are all
         # the same TTL from insertion, so each deque stays sorted.
-        self._draining_deadlines: deque[tuple[float, str]] = deque()
-        self._early_reads_done_deadlines: deque[tuple[float, str]] = deque()
-        self._early_abort_deadlines: deque[tuple[float, str]] = deque()
+        self._draining_deadlines: deque[tuple[float, int]] = deque()
+        self._early_reads_done_deadlines: deque[tuple[float, int]] = deque()
+        self._early_abort_deadlines: deque[tuple[float, int]] = deque()
 
         self.model = model
         self.hostname = hostname
@@ -637,7 +637,7 @@ class Conductor:
         self._status_interval_s = status_interval_s
         self._next_status = 0.0
         # request id -> when it was queued at capacity
-        self._queued_since: dict[str, float] = {}
+        self._queued_since: dict[int, float] = {}
         self._wg_nodes = {
             wg_id: tuple(wg.section.get_nodes()) for wg_id, wg in self.worker_graphs.items()
         }
