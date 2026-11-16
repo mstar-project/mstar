@@ -19,12 +19,12 @@ def spatial_tile_count(vae, z: torch.Tensor) -> int:
     return len(range(0, z.shape[-2], stride_h)) * len(range(0, z.shape[-1], stride_w))
 
 
-def distributed_tiled_decode(vae, z: torch.Tensor, group: CommGroup) -> torch.Tensor:
+def distributed_tiled_decode(vae, z: torch.Tensor, group: CommGroup) -> torch.Tensor | None:
     """Decode each tile once and assemble it in diffusers' row-major blend order.
 
-    All ranks receive the same decoded tiles and return the same full sample.
-    The decoded tile sizes can differ at the right and bottom edges, so one
-    all-gather carries their shapes and a second carries padded pixel data.
+    Only rank zero receives the decoded tiles and assembles the sample. The
+    edge tiles can differ in shape, so an all-gather shares their sizes before
+    one variable-size all-to-all moves their pixels to rank zero.
     """
     ratio = vae.spatial_compression_ratio
     tile_h = vae.tile_sample_min_height // ratio
@@ -54,20 +54,22 @@ def distributed_tiled_decode(vae, z: torch.Tensor, group: CommGroup) -> torch.Te
         sum(math.prod(entry[1:]) for entry in rank_shapes if entry[0] >= 0)
         for rank_shapes in all_shapes
     ]
-    max_elements = max(rank_sizes)
     local_data = torch.cat([tile.reshape(-1) for _, tile in local_tiles])
-    padded = torch.zeros(max_elements, dtype=local_data.dtype, device=z.device)
-    padded[:local_data.numel()] = local_data
-    all_data = group.all_gather(padded, dim=0).reshape(group.world_size, max_elements)
+    send_rows = [0] * group.world_size
+    send_rows[0] = local_data.numel()
+    recv_rows = rank_sizes if group.rank == 0 else [0] * group.world_size
+    gathered = group.all_to_all_rows(local_data, send_rows, recv_rows)
+    if group.rank != 0:
+        return None
 
     tiles = [None] * len(positions)
-    for rank, rank_shapes in enumerate(all_shapes):
-        offset = 0
+    offset = 0
+    for rank_shapes in all_shapes:
         for idx, *shape in rank_shapes:
             if idx < 0:
                 continue
             size = math.prod(shape)
-            tiles[idx] = all_data[rank, offset:offset + size].view(*shape)
+            tiles[idx] = gathered[offset:offset + size].view(*shape)
             offset += size
     assert all(tile is not None for tile in tiles)
 

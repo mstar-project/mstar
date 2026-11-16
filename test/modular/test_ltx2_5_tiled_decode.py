@@ -5,17 +5,21 @@ from __future__ import annotations
 import math
 import multiprocessing as mp
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 
 from mstar.distributed.communication import CommGroup
-from mstar.graph.base import NodeAndGraphWalk
+from mstar.graph.base import GraphEdge, GraphNode, NodeAndGraphWalk
+from mstar.graph.runtime.base import RouteInput
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.ltx2_5.config import LTX25Config
 from mstar.model.ltx2_5.ltx2_5_model import GENERATE_VIDEO_WALK, LTX25Model
+from mstar.model.ltx2_5.submodules import VIDEO_OUTPUT, LTXVideoDecoderSubmodule
 from mstar.model.ltx2_5.tiled_decode import distributed_tiled_decode, spatial_tile_count
+from mstar.utils.containers import ParallelList
 
 
 class _ToyDecoder(torch.nn.Module):
@@ -71,7 +75,8 @@ def _rank_check(rank: int, world_size: int, init_file: str, results, real_decode
         with torch.inference_mode():
             reference = vae.tiled_decode(z, None, return_dict=False)[0]
             got = distributed_tiled_decode(vae, z, group)
-        results.put((rank, torch.equal(got, reference), tuple(got.shape)))
+        results.put((rank, torch.equal(got, reference) if got is not None else False,
+                     tuple(got.shape) if got is not None else None))
     finally:
         dist.destroy_process_group()
 
@@ -89,7 +94,9 @@ def test_split_spatial_tiles_match_stock_diffusers_assembler(world_size: int, re
     try:
         observed = [results.get(timeout=60) for _ in procs]
         shape = (1, 3, 2, 18, 18) if real_decoder else (1, 2, 3, 14, 14)
-        assert sorted(observed) == [(rank, True, shape) for rank in range(world_size)]
+        assert sorted(observed) == [(0, True, shape)] + [
+            (rank, False, None) for rank in range(1, world_size)
+        ]
     finally:
         for proc in procs:
             proc.join(timeout=20)
@@ -138,3 +145,72 @@ def test_opt_in_graph_replicates_latents_but_only_rank_zero_emits():
     )
     assert len(rank_zero) == 1 and rank_zero[0].worker == ""
     assert rank_one == []
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_follower_completes_worker_route_without_a_video_tensor(rank: int, tmp_path: Path):
+    pytest.importorskip("mstar_rust")
+    from rust_runtime import build_runtime
+
+    from mstar.communication.tensors import SharedMemoryCommunicationManager
+    from mstar.distributed.base import ShardingConfig, ShardingGroup
+    from mstar.model.base import WorkerGraph
+
+    worker = f"worker_{rank}"
+    manager = SharedMemoryCommunicationManager(
+        my_entity_id=worker, hostname="localhost", device="cpu",
+        communicator=SimpleNamespace(send=lambda *args, **kwargs: None),
+        shm_dir=str(tmp_path),
+    )
+    graph = GraphNode(name="vae_decoder", input_names=[], outputs=[
+        GraphEdge(name=VIDEO_OUTPUT, next_node=EMIT_TO_CLIENT, output_modality="video"),
+    ])
+    sharding_group = ShardingGroup(nodes={"vae_decoder"}, tp_size=2)
+    sharding_group._tp_rank = rank
+    runtime = build_runtime(
+        bookkeeping=manager.tensor_store.bookkeeping, my_worker_id=worker,
+        my_worker_graphs=[WorkerGraph(
+            section=graph, graph_walks={GENERATE_VIDEO_WALK}, ranks=[0, 1],
+            tp_size=2, worker_graph_id=0,
+        )],
+        all_wg_ids_to_graph_walks={0: {GENERATE_VIDEO_WALK}},
+        all_wg_ids_to_dyn_loops={0: set()},
+        all_wg_ids_to_nodes={0: {"vae_decoder"}},
+        node_to_partition={"vae_decoder": "default"},
+        sharding_config=ShardingConfig(
+            groups=[sharding_group],
+            tp_enabled_nodes={"vae_decoder"}, shard_dim={},
+        ),
+    )
+    rid = runtime.add_request(
+        "tile", "default", GENERATE_VIDEO_WALK, [0],
+        ParallelList([0], [["worker_0", "worker_1"]]), {},
+    )
+    manager.register_request(rid, runtime.get_sharding_config(rid))
+
+    decoder = LTXVideoDecoderSubmodule.__new__(LTXVideoDecoderSubmodule)
+    torch.nn.Module.__init__(decoder)
+    decoder.run_batch = lambda **kwargs: (
+        {VIDEO_OUTPUT: torch.ones(1, 2, 4, 4, 3, dtype=torch.uint8)} if rank == 0 else {}
+    )
+    one = decoder.forward(GENERATE_VIDEO_WALK, SimpleNamespace(request_ids=[rid]))
+    assert set(one) == ({VIDEO_OUTPUT} if rank == 0 else set())
+    outputs = decoder.forward_batched(
+        GENERATE_VIDEO_WALK, SimpleNamespace(request_ids=[rid]),
+    )
+    assert set(outputs) == {rid}
+    if rank == 0:
+        assert torch.equal(outputs[rid][VIDEO_OUTPUT][0], torch.ones(2, 4, 4, 3, dtype=torch.uint8))
+    else:
+        assert outputs[rid] == {}
+    stored = manager.store_and_return_tensor_info_batch(
+        [rid], outputs, [VIDEO_OUTPUT], node_name="vae_decoder", graph_walk=GENERATE_VIDEO_WALK,
+    )
+    manager.increment_ref_batch_uniform(stored.flat_uuids, 1)
+    route = runtime.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=GENERATE_VIDEO_WALK, node_name="vae_decoder",
+        output_signals=[VIDEO_OUTPUT], wg_ids=ParallelList([rid], [0]),
+        tensors=stored.flat_uuids, num_tensors=stored.num_tensors,
+    ))
+    assert stored.num_tensors == ([1] if rank == 0 else [0])
+    assert route.register_uuids == (stored.flat_uuids if rank == 0 else [])

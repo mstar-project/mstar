@@ -506,6 +506,21 @@ class LTXVideoDecoderSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):
         return {LATENTS: torch.stack([inp.tensor_inputs[LATENTS] for inp in inputs]),
                 "shape": inputs[0].resource_step_info}
 
+    def forward(self, graph_walk, engine_inputs, **kwargs):
+        out = self.run_batch(**kwargs)
+        return {VIDEO_OUTPUT: [out[VIDEO_OUTPUT][0]]} if out else {}
+
+    def forward_batched(self, graph_walk, engine_inputs, **kwargs):
+        out = self.run_batch(**kwargs)
+        if not out:
+            # This follower joined the decode's TP collective, but only rank
+            # zero owns the assembled frames and emits them to the client.
+            return {rid: {} for rid in engine_inputs.request_ids}
+        return {
+            rid: {VIDEO_OUTPUT: [self._row(out[VIDEO_OUTPUT], i)]}
+            for i, rid in enumerate(engine_inputs.request_ids)
+        }
+
     def run_batch(self, latents: torch.Tensor, shape: LTXShape, **kwargs):
         dtype = self.vae.dtype
         x = unpack_video(latents.to(device=self.get_device(), dtype=dtype), shape)
@@ -534,6 +549,8 @@ class LTXVideoDecoderSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):
                 video = self.vae.decode(x, None, return_dict=False)[0]
         else:
             video = self.vae.decode(x, None, return_dict=False)[0]
+        if video is None:
+            return {}
         frames = ((video / 2 + 0.5).clamp(0, 1).float() * 255).round().to(torch.uint8)
         return {VIDEO_OUTPUT: frames.permute(0, 2, 3, 4, 1).contiguous()}
 
