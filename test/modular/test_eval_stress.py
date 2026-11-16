@@ -72,6 +72,19 @@ def test_verdict_outright_classes_fisher_and_incomplete():
     assert not v.flagged and not v.outright                                          # no base to compare with
 
 
+@pytest.mark.parametrize("classes", [["crash"], ["crosstalk"]])
+def test_incomplete_stress_job_cannot_flag_an_outright_regression(classes):
+    base = arm([])
+    head = arm(classes)
+    v = stress.judge_model("m", base, head, expected=20)
+    assert v.unfinished and not v.flagged and not v.outright
+    assert v.text() == "incomplete (1 of 20 runs)"
+
+    v = stress.judge_model("m", base, head, status="error", reason="job died", expected=1)
+    assert v.unfinished and not v.flagged and not v.outright
+    assert v.text() == "incomplete (job died)"
+
+
 def test_request_outcomes():
     refs = Refs({0: "1 2 3 4 5 6 7 8 9 10 11 12 13 14", 1: "Here is the list: A B C D E F G", 2: "banana " * 8,
                  3: "Monday, Tuesday, and a banana"})

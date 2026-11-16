@@ -625,28 +625,27 @@ class Verdict:
 
     @property
     def flagged(self) -> bool:
-        return bool(self.outright) or (self.p is not None and self.p < ALPHA)
+        return not self.unfinished and (bool(self.outright) or (self.p is not None and self.p < ALPHA))
 
     def text(self) -> str:
-        if self.outright:
-            return f"**FAIL** ({' and '.join(self.outright)} only on head)"
-        if self.p is not None and self.p < ALPHA:
-            return f"**FAIL** (more failed runs, p = {self.p:.3f})"
         if self.unfinished:
             if self.status != "done":
                 return f"incomplete ({self.reason or self.status})"
             if any(r.get("no_server") for r in self.base.runs):
                 return "incomplete (base did not start)"
             return f"incomplete ({min(self.base.n, self.head.n)} of {self.expected} runs)"
+        if self.outright:
+            return f"**FAIL** ({' and '.join(self.outright)} only on head)"
+        if self.p is not None and self.p < ALPHA:
+            return f"**FAIL** (more failed runs, p = {self.p:.3f})"
         return "same"
 
 
 def judge_model(model: str, base: Arm, head: Arm, status: str = "done", reason: str = "",
                 expected: int = 0) -> Verdict:
     v = Verdict(model, base, head, status, reason, expected=expected)
-    if base.n and head.n and not any(r.get("no_server") for r in base.runs):   # an unseen base: no outright
-        v.outright = [c for c in OUTRIGHT if head.with_class(c) and not base.with_class(c)]
     if not v.unfinished:
+        v.outright = [c for c in OUTRIGHT if head.with_class(c) and not base.with_class(c)]
         v.p = fisher_one_sided(head.failed, head.n, base.failed, base.n)
     return v
 
