@@ -461,6 +461,20 @@ A prompt on a walk the keys don't name sets 0, because the data worker refuses a
 from any other walk. This key is temporary, with ``kv_labels``.
 A name either key doesn't declare fails the request.
 
+Within-step chunk attention uses an ``Array(max_len=0)`` with one
+``Read(mask=ChunkCausal(chunk_len), op=Attend(...))``. The request gives that
+read's ``ChunkCausalLayout(global_len=, noised_len=, clean_len=)`` under
+``Layout(chunk_causal={read_key: ...})``. Those lengths describe the global,
+noised and clean parts of one step; they must sum to its segment length.
+When the lengths depend on an episode or another admission result, ``walk_plan``
+can set ``step_metadata["__state_chunk_causal_layout__"]`` instead, as
+``{array: {label: {read: [global_len, noised_len, clean_len]}}}``. The model may
+still return paged KV or sized Value layouts from ``process_prompt``. A walk's
+value wins for a read it also names at prompt intake. Every planned walk
+containing a node that declares this mask must receive lengths, even if that
+node skips the read on one walk: ``Array.nodes`` does not identify which walks
+use it. The conductor refuses missing or malformed lengths before dispatch.
+
 The footprint adds the spans, the growth at each loop's iterations (up to the layout's
 ``max_growth``) and the scratch, and rounds up to whole pages per label. A span's own scratch counts only with the spans before
 it, so a window's denoise steps and its commit count once. Under a ``RetentionPolicy`` it

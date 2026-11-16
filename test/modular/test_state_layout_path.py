@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import fields, replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, ".")
@@ -17,11 +18,29 @@ import pytest
 import torch
 from test_kv_prefix_request_keys import PROMPT, _deployment, _Model, _run, _worker
 
-from mstar.conductor.conductor import Conductor
+from mstar.conductor.conductor import (
+    Conductor,
+    _check_chunk_layouts,
+    _required_chunk_layouts,
+    _with_chunk_causal_layout,
+)
+from mstar.conductor.request_info import WalkStep
 from mstar.engine.resources.kv.config import RetentionPolicy
 from mstar.engine.resources.sampler.config import SamplingReqConfig
-from mstar.engine.state import Array, Attend, Causal, KVEntry, Layout, Read, Sampler, SampleSettings, Span
-from mstar.engine.state.adapters import kv_layouts
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Causal,
+    ChunkCausal,
+    ChunkCausalLayout,
+    KVEntry,
+    Layout,
+    Read,
+    Sampler,
+    SampleSettings,
+    Span,
+)
+from mstar.engine.state.adapters import CHUNK_CAUSAL_LAYOUT_KWARG, kv_layouts
 from mstar.graph.base import GraphNode
 from mstar.model.base import LabelLayout, ProcessPromptOutput, state_layouts
 
@@ -77,6 +96,21 @@ class _HandWritten(_Model):
         return ProcessPromptOutput(tensors, {"kv_layout": {"kv": {"main": layout}}})
 
 
+class _ChunkDeclaring(_Declaring):
+    def declare_state(self):
+        return [*_Declaring.declare_state(self), Array(
+            "chunk", nodes={"LLM"}, layers={0}, entry=KVEntry(heads=1, head_dim=8), max_len=0,
+            reads={"chunk_attn": Read(mask=ChunkCausal(8), op=Attend(q_heads=1))},
+        )]
+
+    def process_prompt(self, *args, **kwargs):
+        output = super().process_prompt(*args, **kwargs)
+        output.metadata["state_layout"]["chunk"] = {
+            "main": Layout(chunk_causal={"chunk_attn": ChunkCausalLayout(global_len=4, noised_len=16, clean_len=8)})
+        }
+        return output
+
+
 @pytest.mark.parametrize("keyed, extra", [(None, {}), (0, {"keyed_spans": {"kv": {"main": 0}}})],
                          ids=["every_span_keyed", "no_keyed_spans"])
 def test_a_declared_layout_gives_the_keys_and_rows_of_a_hand_written_one(keyed, extra):
@@ -97,13 +131,128 @@ def test_a_data_worker_builds_the_declarations_once():
     declare_state.assert_called_once()
 
 
+def test_chunk_lengths_cross_the_data_worker_as_wire_safe_rows():
+    model = _ChunkDeclaring()
+    kwargs = _run(_worker(model, _deployment()), {CHUNK_CAUSAL_LAYOUT_KWARG: {"chunk": {"main": "client"}}})
+    assert CHUNK_CAUSAL_LAYOUT_KWARG not in model.handed
+    assert kwargs[CHUNK_CAUSAL_LAYOUT_KWARG] == {"chunk": {"main": {"chunk_attn": [4, 16, 8]}}}
+    assert "state_layout" not in kwargs
+
+
+def test_missing_chunk_lengths_fail_at_data_worker_intake():
+    class MissingChunk(_ChunkDeclaring):
+        def process_prompt(self, *args, **kwargs):
+            output = super().process_prompt(*args, **kwargs)
+            output.metadata["state_layout"]["chunk"]["main"] = Layout()
+            return output
+
+    with pytest.raises(RuntimeError, match="chunk_causal is missing reads \\['chunk_attn'\\]"):
+        _run(_worker(MissingChunk(), _deployment()))
+
+
+def test_missing_chunk_array_can_be_planned_after_data_worker_intake():
+    class MissingChunk(_ChunkDeclaring):
+        def process_prompt(self, *args, **kwargs):
+            output = super().process_prompt(*args, **kwargs)
+            del output.metadata["state_layout"]["chunk"]
+            return output
+
+    kwargs = _run(_worker(MissingChunk(), _deployment()))
+    assert "kv" in kwargs["kv_layout"]
+    assert CHUNK_CAUSAL_LAYOUT_KWARG not in kwargs
+
+
+def test_chunk_layout_can_be_supplied_by_walk_plan_after_intake():
+    class PlannedChunk(_ChunkDeclaring):
+        def process_prompt(self, *args, **kwargs):
+            output = super().process_prompt(*args, **kwargs)
+            del output.metadata["state_layout"]
+            return output
+
+        def walk_plan(self, *args, **kwargs):
+            return [WalkStep("prefill", step_metadata={
+                CHUNK_CAUSAL_LAYOUT_KWARG: {"chunk": {"main": {"chunk_attn": [12, 8, 8]}}},
+            })]
+
+    kwargs = _run(_worker(PlannedChunk(), _deployment()))
+    assert CHUNK_CAUSAL_LAYOUT_KWARG not in kwargs
+
+    model = PlannedChunk()
+    required = _required_chunk_layouts(model, model.declare_state())
+    with pytest.raises(RuntimeError, match="has no chunk-causal layout"):
+        _check_chunk_layouts([WalkStep("prefill")], required, model.declare_state())
+
+    request_layout = {"chunk": {"main": {"chunk_attn": [4, 16, 8]}}}
+    planned_layout = model.walk_plan("main", [], [], {}, kwargs)[0].step_metadata[CHUNK_CAUSAL_LAYOUT_KWARG]
+    plan = _with_chunk_causal_layout(
+        model.walk_plan("main", [], [], {}, kwargs), request_layout,
+    )
+    _check_chunk_layouts(plan, required, model.declare_state())
+    assert plan[0].step_metadata[CHUNK_CAUSAL_LAYOUT_KWARG] == planned_layout
+
+
+@pytest.mark.parametrize("planned, error", [
+    ({"chunk": {"main": {"chunk_attn": [4, 16]}}}, "invalid chunk lengths"),
+    ({"chunk": {"main": {"chunk_attn": [-4, 24, 8]}}}, "global_len must be an int"),
+    ({"chunk": {"main": {"chunk_atn": [4, 16, 8]}}}, "names no ChunkCausal read"),
+    ({"chunk": {"other": {"chunk_attn": [4, 16, 8]}}}, "has no label"),
+    ({"chun": {"main": {"chunk_attn": [4, 16, 8]}}}, "names no declared array"),
+])
+def test_bad_walk_mask_is_refused_at_conductor_ingest(planned, error):
+    class BadWalk(_ChunkDeclaring):
+        def walk_plan(self, *args, **kwargs):
+            return [WalkStep("prefill", step_metadata={CHUNK_CAUSAL_LAYOUT_KWARG: planned})]
+
+    conductor = object.__new__(Conductor)
+    conductor.model = BadWalk()
+    conductor._status_interval_s = None
+    conductor._max_output_tokens = lambda kwargs: 1
+    conductor._loop_caps = lambda kwargs: {}
+    request_layout = {"chunk": {"main": {"chunk_attn": [12, 8, 8]}}}
+    body = SimpleNamespace(
+        request_id="bad-mask", client_request_id=None, model_kwargs={CHUNK_CAUSAL_LAYOUT_KWARG: request_layout},
+        initial_input_modalities=[], initial_output_modalities=[], initial_signals={},
+    )
+    with pytest.raises((RuntimeError, ValueError), match=error):
+        conductor._do_ingest_request(body)
+
+
+def test_shared_mask_node_requires_layout_on_each_planned_walk():
+    class TwoWalks(_ChunkDeclaring):
+        def get_graph_walk_graphs(self):
+            return {
+                walk: GraphNode(name="LLM", input_names=[], outputs=[])
+                for walk in ("prefill", "decode")
+            }
+
+        def walk_plan(self, *args, **kwargs):
+            return [
+                WalkStep("prefill", step_metadata={CHUNK_CAUSAL_LAYOUT_KWARG: {
+                    "chunk": {"main": {"chunk_attn": [4, 16, 8]}},
+                }}),
+                WalkStep("decode"),
+            ]
+
+    conductor = object.__new__(Conductor)
+    conductor.model = TwoWalks()
+    conductor._status_interval_s = None
+    conductor._max_output_tokens = lambda kwargs: 1
+    conductor._loop_caps = lambda kwargs: {}
+    body = SimpleNamespace(
+        request_id="second-walk", client_request_id=None, model_kwargs={},
+        initial_input_modalities=[], initial_output_modalities=[], initial_signals={},
+    )
+    with pytest.raises(RuntimeError, match="walk 'decode' has no chunk-causal layout"):
+        conductor._do_ingest_request(body)
+
+
 def test_a_prompt_with_no_keyed_spans_keys_no_page():
     kwargs = _run(_worker(_Declaring({"keyed_spans": {"kv": {"main": 0}}}), _deployment()))
     assert kwargs["kv_layout"]["kv"]["main"][4] == 0
     assert not (kwargs.get("prefix_keys") or {}).get("kv", {}).get("main"), "a vision prompt keys nothing"
 
 
-@pytest.mark.parametrize("name", ["state_layout", "keyed_spans", "state_sizes"])
+@pytest.mark.parametrize("name", ["state_layout", "keyed_spans", "state_sizes", CHUNK_CAUSAL_LAYOUT_KWARG])
 def test_a_client_cannot_plant_a_layout_key(name):
     model = _Declaring()
     kwargs = _run(_worker(model, _deployment()), {name: {"kv": {"main": 99}}})
@@ -137,8 +286,9 @@ def test_a_kv_layout_translates_to_the_state_layout_that_converts_back_to_it():
 
 
 def test_every_label_layout_field_is_carried_or_refused():
-    # Kept windows reach a LabelLayout as its retention, and sizes go to the sized store.
-    carried = {field.name for field in fields(Layout)} - {"kept_windows", "sizes"} | {"keyed_spans"}
+    # Kept windows reach a LabelLayout as its retention, sizes go to the sized store,
+    # and chunk-causal lengths are declared through Layout rather than paged KV labels.
+    carried = {field.name for field in fields(Layout)} - {"kept_windows", "sizes", "chunk_causal"} | {"keyed_spans"}
     assert set(LabelLayout._fields) == carried | {"retention", "max_growth"}, (
         "a LabelLayout field that state_layouts neither carries nor refuses would be dropped"
     )
