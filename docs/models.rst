@@ -639,7 +639,7 @@ Qwen3-8B (``qwen3_8b``)
 -----------------------
 
 Text-only chat on ``Qwen/Qwen3-8B`` (``Qwen3ForCausalLM``) on the shared decoder
-scaffold, through the checkpoint's chat template (``enable_thinking``, flat or in
+scaffold, its state declared on the state contract, through the checkpoint's chat template (``enable_thinking``, flat or in
 ``chat_template_kwargs``, reaches it); other sizes aren't registered. Prefill, the
 mixed prefill/decode step and decode are captured. Sampling defaults come from the
 checkpoint's ``generation_config.json``. A request is bounded by the checkpoint's

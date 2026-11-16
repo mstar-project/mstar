@@ -1,22 +1,21 @@
 """Dense Qwen3 (Qwen3-8B and its siblings): text in, text out on one ``LLM``
-node of the shared decoder scaffold, on the shared Qwen3 decoder."""
+node of the shared decoder scaffold, on the shared Qwen3 decoder, its state
+declared on the state contract."""
 from __future__ import annotations
 
 import functools
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import torch
 from jinja2 import TemplateError
 
-from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
-from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
-from mstar.engine.resources.position.config import PositionConfig, PositionSpec
-from mstar.engine.resources.spec import NodeResourceSpec
-from mstar.model.keys import KV_CACHE, ROPE
+from mstar.engine.state import Array, Attend, Causal, KVEntry, Positions, Read, Rope, Sampler
+from mstar.model.keys import KV_CACHE, SAMPLER
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns
-from mstar.model.multimodal_decoder import MIXED_SPLIT, MultimodalDecoderModel
+from mstar.model.multimodal_decoder import MIXED_SPLIT, DeclaredDecoderModel
 from mstar.model.qwen3.config import ATTN, LLM_NODE, qwen3_lm_config
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.fast_tokenize import encode_ids
@@ -24,7 +23,7 @@ from mstar.utils.fast_tokenize import encode_ids
 logger = logging.getLogger(__name__)
 
 
-class Qwen3Model(MultimodalDecoderModel):
+class Qwen3Model(DeclaredDecoderModel):
     NAME = "Qwen3"
     # the tokenizer prefers chat_template.jinja to tokenizer_config.json's template,
     # and some repos keep theirs nowhere else
@@ -64,26 +63,23 @@ class Qwen3Model(MultimodalDecoderModel):
         # /generate may nest enable_thinking as OpenAI clients send it
         return super().request_kwargs() | {"chat_template_kwargs"}
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
+    def declare_state(self) -> list[Array | Sampler]:
         cfg, nodes = self.config, {LLM_NODE}
         return [
-            KVSpec(
-                resource_key=KV_CACHE, nodes=nodes,
-                config=PagedKVConfig(
-                    num_layers=cfg.num_hidden_layers,
-                    num_kv_heads=cfg.num_key_value_heads, num_qo_heads=cfg.num_attention_heads,
-                    head_dim=cfg.head_dim,
-                    max_seq_len=cfg.max_position_embeddings,
-                ),
+            Array(
+                KV_CACHE, nodes=nodes, layers=frozenset(range(cfg.num_hidden_layers)),
+                entry=KVEntry(heads=cfg.num_key_value_heads, head_dim=cfg.head_dim),
+                max_len=cfg.max_position_embeddings, positions=Positions(rope=Rope(theta=cfg.rope_theta)),
+                reads={ATTN: Read(mask=Causal(), op=Attend(q_heads=cfg.num_attention_heads))},
             ),
-            AttentionSpec(
-                resource_key=ATTN, nodes=nodes, config=AttentionConfig(kv_cache=KV_CACHE, splits=(MIXED_SPLIT,)),
+            Sampler(
+                SAMPLER, nodes=nodes, vocab_size=cfg.vocab_size, penalty=True,
+                min_p=self._sampler_spec(cfg.vocab_size).enable_min_p,
             ),
-            PositionSpec(
-                resource_key=ROPE, nodes=nodes, config=PositionConfig(kv_cache=KV_CACHE, rope_theta=cfg.rope_theta),
-            ),
-            self._sampler_spec(cfg.vocab_size),
         ]
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        return {ATTN: {"splits": (MIXED_SPLIT,)}}
 
     def _prompt_ids(
         self, parts: list[PromptPart], raw: dict[str, list[torch.Tensor]], **kwargs,
@@ -139,5 +135,5 @@ class Qwen3Model(MultimodalDecoderModel):
         from mstar.model.components.qwen3_lm import Qwen3DenseLM
 
         with torch.device("meta"):
-            lm = Qwen3DenseLM(self.config, attn_key=ATTN, kv_key=KV_CACHE, pos_key=ROPE, comm_group=tp_group)
+            lm = Qwen3DenseLM(self.config, array=KV_CACHE, comm_group=tp_group)
         return lm.to(dtype).to_empty(device=device)

@@ -30,22 +30,29 @@ def _model(tmp_path, config: dict | None = None, generation: dict | None = None)
     return Qwen3Model(model_path_hf=str(tmp_path))
 
 
+def _specs(model) -> list:
+    """The specs the model's declarations build."""
+    from mstar.engine.state.adapters import node_resources
+
+    return node_resources(model)
+
+
 def _sampler_spec(model):
     from mstar.engine.resources.sampler.config import SamplerSpec
 
-    (spec,) = [s for s in model.get_node_resources() if isinstance(s, SamplerSpec)]
+    (spec,) = [s for s in _specs(model) if isinstance(s, SamplerSpec)]
     return spec
 
 
 def test_a_node_declares_kv_attention_positions_and_a_sampler(tmp_path):
-    keys = {spec.resource_key for spec in _model(tmp_path).get_node_resources()}
+    keys = {spec.resource_key for spec in _specs(_model(tmp_path))}
     assert keys == {"kv_cache", "attn", "rope", "sampler"}
 
 
 def test_the_kv_pool_holds_the_checkpoints_context(tmp_path):
     from mstar.engine.resources.kv.config import KVSpec
 
-    (kv,) = [s for s in _model(tmp_path).get_node_resources() if isinstance(s, KVSpec)]
+    (kv,) = [s for s in _specs(_model(tmp_path)) if isinstance(s, KVSpec)]
     assert kv.config.max_seq_len == CONFIG["max_position_embeddings"]
 
 
