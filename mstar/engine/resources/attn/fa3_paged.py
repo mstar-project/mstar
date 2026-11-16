@@ -179,6 +179,14 @@ class FA3PagedWrapper:
         )
 
 
+# Pages of this many tokens or fewer keep FA3's paged kernel inside each row's length. On larger pages, flash_attn_3
+# 3.0.1 (an observed property of the wheel, not a documented contract) reads a row's last page past its length once
+# the step's longest row has about 64 queries, and masks those scores to zero probability: 0 times a stale NaN or Inf
+# left there by an earlier owner's broken forward still poisons the row. Decode and verify rows (8 queries at most)
+# never take that path; a mixed step's prompt row can.
+FA3_TAIL_SAFE_PAGE_SIZE = 32
+
+
 class FA3RaggedWrapper:
     """Paged FA3 over rows of any span, each bottom-right causal or, with ``causal`` False, attending all its
     keys: a mixed step's verify rows of ``k + 1`` queries and its prompt rows (`MixedRows`), from the KV plan's

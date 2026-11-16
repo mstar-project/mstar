@@ -284,3 +284,52 @@ def test_a_captured_ragged_replay_is_the_eager_plans_and_zeroes_its_padding(
         diff = (got.float() - want.float()).abs().max().item()
         assert torch.equal(got, want), f"max |diff| {diff} at queries {rows[:16]}{'...' if len(rows) > 16 else ''}"
         assert out[step_q.shape[0]:].eq(0).all()
+
+
+@pytest.mark.parametrize("page,warns", [(128, True), (64, True), (32, False), (16, False)])
+def test_mixed_steps_on_fa3_over_large_pages_warn_once(caplog, page, warns):
+    """FA3's paged kernel reads a long prompt row's last page past its length on pages over 32 tokens (the CUDA
+    test below documents it): the manager says so once, when it first builds a mixed step's wrapper."""
+    import logging
+
+    manager = _stub_manager(True)
+    manager._group = SimpleNamespace(page_size=page)
+    with caplog.at_level(logging.WARNING, logger="mstar.engine.resources.attn.flashinfer"):
+        manager._mixed_wrapper("main", 2, None, 0, causal=True)
+        manager._mixed_wrapper("main", 2, None, 1, causal=True)
+    said = [r for r in caplog.records if "past its length" in r.getMessage()]
+    assert len(said) == (1 if warns else 0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("page", [128, 32, 16])
+@pytest.mark.parametrize("prompt", [25, 64, 127], ids=lambda n: f"prompt{n}")
+def test_fa3_reads_a_long_rows_last_page_past_its_length_only_on_large_pages(page, prompt):
+    """What `FA3_TAIL_SAFE_PAGE_SIZE` rests on, for this FA3 wheel: with NaN in every slot past each row's length, a
+    mixed step whose prompt row has 64 or more queries comes out NaN on 128-token pages, and finite on pages of 32
+    or fewer, or with a shorter prompt row. A wheel that changes either side fails here."""
+    reason = fa3_paged_unavailable_reason(torch.device("cuda"), 128, torch.bfloat16)
+    if reason is not None:
+        pytest.skip(reason)
+    from mstar.engine.resources.attn.fa3_paged import FA3_TAIL_SAFE_PAGE_SIZE
+
+    heads, kv_heads, dim = 32, 8, 128
+    torch.manual_seed(0)
+    verify = [37, 300, 5, 1021]
+    totals = [n + BLOCK for n in verify] + [700 + prompt]
+    pages_per = [-(-t // page) for t in totals]
+    total = sum(pages_per) + 1
+    cache = torch.randn(total, 2, page, kv_heads, dim, device="cuda", dtype=torch.bfloat16)
+    perm = torch.randperm(total - 1).tolist()
+    pages_of, at = {}, 0
+    for i, (t, count) in enumerate(zip(totals, pages_per, strict=True)):
+        pages_of[i] = [p + 1 for p in perm[at: at + count]]
+        at += count
+        if t % page:
+            cache[pages_of[i][-1], :, t % page:] = float("nan")
+    views = _mixed_views(verify, [(700, prompt)], pages_of)
+    q = torch.randn(len(verify) * BLOCK + prompt, heads, dim, device="cuda", dtype=torch.bfloat16)
+    wrapper = FA3RaggedWrapper(page_size=page, table_width=4096 // page, device=torch.device("cuda"), causal=True)
+    wrapper.plan(dtype=torch.bfloat16, **build_paged_indptrs(views, page).to_kwargs_dict())
+    finite = bool(torch.isfinite(wrapper.run(q, cache)).all())
+    assert finite == (page <= FA3_TAIL_SAFE_PAGE_SIZE or prompt < 64)

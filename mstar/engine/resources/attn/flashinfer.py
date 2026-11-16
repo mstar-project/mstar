@@ -289,9 +289,17 @@ class FlashInferManager(PlacedAttention):
         )
         wrapper = self._verify_wrappers.get(key)
         if wrapper is None:
-            from mstar.engine.resources.attn.fa3_paged import FA3RaggedWrapper
+            from mstar.engine.resources.attn.fa3_paged import FA3_TAIL_SAFE_PAGE_SIZE, FA3RaggedWrapper
 
             page_size = self._group.page_size
+            if page_size > FA3_TAIL_SAFE_PAGE_SIZE and not getattr(self, "_warned_mixed_tail", False):
+                self._warned_mixed_tail = True
+                logger.warning(
+                    "mixed steps run on FA3 over %d-token pages: on pages of more than %d tokens FA3's paged kernel "
+                    "reads a long prompt row's last page past its length, so a NaN or Inf an earlier request left "
+                    "in a reused page would reach the row. Pages of %d tokens or fewer avoid it "
+                    "(resources.kv_cache.page_size).", page_size, FA3_TAIL_SAFE_PAGE_SIZE, FA3_TAIL_SAFE_PAGE_SIZE,
+                )
             wrapper = self._verify_wrappers[key] = FA3RaggedWrapper(
                 page_size=page_size, table_width=self._kv_config.block_table_width(page_size), device=self._device,
                 batch_size=num_rows if lease is not None else None,
