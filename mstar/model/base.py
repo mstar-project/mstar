@@ -39,10 +39,10 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMPTY_DESTINATION
-from mstar.model.loader.reload import WeightReloadRefusedError
 from mstar.model.media_limits import VideoBudget, decoding_upload, read_image, video_decode_threads
 from mstar.model.multimodal import TEXT, PromptPart
 from mstar.model.rebuild import RebuildPolicy
+from mstar.model.reload_errors import WeightReloadRefusedError
 from mstar.model.submodule_base import (
     CHUNK_LOOP_END,
     ChunkingPolicy,
