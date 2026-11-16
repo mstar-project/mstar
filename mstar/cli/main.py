@@ -286,6 +286,8 @@ def _serve(args: argparse.Namespace) -> None:
         argv += ["--log-stats-file", args.log_stats_file]
     if args.enable_metrics:
         argv += ["--enable-metrics"]
+    if getattr(args, "otlp_traces_endpoint", None):
+        argv += ["--otlp-traces-endpoint", args.otlp_traces_endpoint]
     if args.enable_nvtx:
         argv += ["--enable-nvtx"]
     if args.timeout is not None:
@@ -352,6 +354,10 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--enable-metrics", action="store_true",
         help="serve Prometheus metrics at /metrics (needs mstar-ai[metrics])",
+    )
+    serve.add_argument(
+        "--otlp-traces-endpoint", default=None,
+        help="export request traces to this OTLP traces endpoint (needs mstar-ai[tracing])",
     )
     serve.add_argument(
         "--enable-nvtx", action="store_true",
