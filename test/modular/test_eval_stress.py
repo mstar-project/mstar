@@ -98,6 +98,17 @@ def test_request_outcomes():
     assert stress.judge(Reply(0, status=200, hang=True), refs) == "hang"
 
 
+def test_overlap_needs_interleaved_text_not_just_delayed_eof():
+    first = Reply(0, status=200, text="1 2 3", first_text_at=1.0, last_text_at=2.0, result="ok")
+    second = Reply(1, status=200, text="A B C D", first_text_at=3.0, last_text_at=4.0, result="ok")
+    stress.classify_overlap(first, second)
+    assert second.result == "ok"
+
+    second.first_text_at = 1.5
+    stress.classify_overlap(first, second)
+    assert second.result == "accepted_twice"
+
+
 def test_a_stream_of_blank_lines_or_no_headers_is_a_hang_not_progress():
     import asyncio
     import time
@@ -182,7 +193,11 @@ async def health(request):
 async def generate(request):
     form = await request.post()
     rid, text = form["request_id"], form["text"]
-    if rid in live:            # a newer submission supersedes the live one, which ends with an in-band 409
+    if MODE == "sequential":
+        while rid in live:
+            await asyncio.sleep(0.001)
+    if rid in live and MODE != "accept_twice":
+        # a newer submission supersedes the live one, which ends with an in-band 409
         live[rid]["superseded"] = True
     me = live[rid] = {{"superseded": False}}
     retried = rid in aborted
@@ -212,6 +227,9 @@ async def generate(request):
                 await resp.write(line("request superseded", "error", status=409))
                 break
             await resp.write(line(w + " "))
+        if MODE == "sequential" and live.get(rid) is me:
+            del live[rid]
+            await asyncio.sleep(0.05)  # client still awaits EOF after the server frees the id
         await resp.write_eof()
         finished = True
     finally:
@@ -323,6 +341,19 @@ def test_identical_servers_are_not_flagged_and_every_pattern_ran(tmp_path, monke
     assert patterns == set(stress.PATTERNS)
     assert "Nothing flagged on 1 model" in md and "cannot reach p < 0.05 even at 0 vs 2" in md
     assert "--stress --stress-runs 2 --stress-seconds 0.5 --stress-clients 4 --stress-hang-s 1" in md
+
+
+def test_two_live_requests_with_one_id_are_a_failed_run(tmp_path, monkeypatch):
+    v, md, code = run_pair(tmp_path, monkeypatch, "accept_twice", runs=4)
+    assert code == 1 and v.flagged, (v.head.runs, md)
+    assert v.base.failed == 0 and v.head.with_class("accepted_twice") == 4
+    assert v.head.results()["accepted_twice"] > 0
+
+
+def test_sequential_reuse_is_not_a_failed_overlap(tmp_path, monkeypatch):
+    v, md, code = run_pair(tmp_path, monkeypatch, "sequential", runs=2)
+    assert code == 0 and not v.flagged, (v.head.runs, md)
+    assert v.head.with_class("accepted_twice") == 0
 
 
 @pytest.mark.parametrize("mode, runs, outright, cls", [

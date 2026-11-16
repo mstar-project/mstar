@@ -405,7 +405,8 @@ Each run has ``--stress-clients`` clients (32), each holding one pinned ``reques
 and mixing five patterns: close at a random chunk, close before reading, close then retry at once under the same
 id, reuse after a full read, and a second request while the first streams (one of the pair should get a 409).
 A run fails on a hang (no progress for ``--stress-hang-s``, 30 s), a 5xx, unexpected 4xx, empty reply or
-in-band error, cross-talk (a reply holding another prompt's answer), the server's own M\* tensor files left in
+in-band error, overlapping text replies under one id, cross-talk (a reply holding another prompt's answer),
+the server's own M\* tensor files left in
 ``/dev/shm`` 30 s after the run (other servers on the host use another deployment token or pid, so theirs are not
 counted), or a server process that exits. Every 5 runs get a fresh server, arms alternated. Head is flagged
 when it crashes or shows cross-talk and base never does, or when its failed-run count beats base's at one-sided
