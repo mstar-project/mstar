@@ -789,6 +789,9 @@ class Engine:
         self._graph_runtime = graph_runtime
         # chunked prefill: per-walk policies and budgets, and rows mid-prefill
         self._chunking = ChunkingManagement(self._submodules)
+        # an asynchronous verifying node -> the widest mixed bucket capture kept that holds its
+        # worst mixed step (`_fit_mixed_steps_to_captures`); empty on every other node
+        self._mixed_envelope: dict[str, BucketKey] = {}
 
         # The moves on the nodes this rank leads since the last ``take_resident_delta``,
         # or None when it leads none. One for the lockstep instance, which a worker's
@@ -1178,6 +1181,61 @@ class Engine:
                     "AttentionStep(verify=True), or set model_kwargs.draft.mode: synchronous"
                 )
 
+    def _fit_mixed_steps_to_captures(self, ag_runners: Mapping[str, AcceleratorGraphRunner]) -> None:
+        """An asynchronous verifying node runs a mixed prompt-plus-verify step only on a capture,
+        whose verify rows read the resident tables; one that finds none raises and fails its rows.
+        Capture may leave the widest mixed buckets out, so cap the mixed walk's rows and token
+        budget at the widest kept bucket that holds the worst step the scheduler builds under those
+        caps: its verify rows of a block each, and a prompt row at the budget's `min_chunk_tokens`
+        floor. The captured buckets are agreed across the instance, so every rank fits alike.
+
+        Refused: a mixed walk with no token budget (a prompt would run whole, past any capture),
+        and one where no kept bucket holds that worst step."""
+        for node_name, draft in self._drafts.items():
+            mixed = draft.mixed_walk
+            if not draft.asynchronous or mixed is None:
+                continue
+            budget = self._chunking.max_batch_tokens(node_name, mixed)
+            if budget is None or self._chunking.max_step_tokens(node_name, mixed, 1) is None:
+                raise RuntimeError(
+                    f"speculative decoding on {node_name}: an asynchronous mixed step ({mixed!r}) runs only on "
+                    "a capture, and with no token budget on that walk, or its prompts' chunking turned off, a "
+                    "prompt runs whole past every capture; give the walk a max_batch_tokens, or set "
+                    "model_kwargs.draft.mode: synchronous"
+                )
+            runner = ag_runners.get(node_name)
+            block, align = draft.decl.config.block, self.chunk_alignment(node_name)
+            fits = []
+            for key in runner.captured_buckets(mixed) if runner is not None else ():
+                if key.lean:
+                    continue
+                tokens = runner.token_capacity(key)
+                if tokens >= (key.bs - 1) * block + self._chunking.min_chunk_tokens(min(budget, tokens), align):
+                    fits.append((key.bs, tokens, key))
+            dropped = [] if runner is None else [str(key) for key in runner.dropped_buckets if key.graph_walk == mixed]
+            if not fits:
+                raise RuntimeError(
+                    f"speculative decoding on {node_name}: no captured {mixed!r} bucket holds a mixed step's "
+                    f"verify rows and a prompt chunk (dropped: {dropped}); set model_kwargs.draft.mode: "
+                    "synchronous, free memory for the mixed buckets (or lower max_num_pages), or turn the "
+                    "node's mixed steps off"
+                )
+            rows, tokens, envelope = max(fits)
+            self._mixed_envelope[node_name] = envelope
+            if tokens < budget:
+                self._chunking.cap_budget(node_name, mixed, tokens)
+                self._check_chunk_alignment()
+            mgmt = self._submodules[node_name]
+            ladder = mgmt.capture_runner.max_batch_size_for(mixed) if mgmt.capture_runner is not None else None
+            lowered = tokens < budget or (ladder is not None and rows < ladder)
+            if lowered and (mgmt.joint_comm_group is None or mgmt.joint_comm_group.rank == 0):
+                # the instance's leader, once: every rank caps alike
+                logger.warning(
+                    "speculative decoding on %s: mixed steps capped at %d rows (configured %s) and %d tokens "
+                    "(budget %d), the widest captured bucket that holds one (%s); capture left out %s",
+                    node_name, rows, ladder, min(tokens, budget), budget, envelope, dropped or "none",
+                )
+
     def _agreed_mode(
         self, decl: "VerifyNode", mgmt: SubmoduleManagement, specs_by_key: Mapping[str, NodeResourceSpec],
         async_scheduling: tuple[bool, str],
@@ -1492,6 +1550,7 @@ class Engine:
             for bs, tokens in runner.dropped_shapes
         ])
         self._refuse_uncaptured_verify(ag_runners)
+        self._fit_mixed_steps_to_captures(ag_runners)
 
         fail_if_graphs_required([
             f"{node_name} {key}"
@@ -3480,7 +3539,9 @@ class Engine:
         step runs eager at a size the capture budget never measured, so the
         scheduler splits instead. Splitting is the scheduler's job, not the
         engine's: the pieces then pipeline like any other batch instead of
-        running back to back.
+        running back to back. On an asynchronous verifying node, two more: its
+        verify walk at the widest bucket captured, and its mixed walk at the
+        widest that holds a mixed step (`_fit_mixed_steps_to_captures`).
         """
         submodule_mgmt = self._submodules[node_name]
         caps = [submodule_mgmt.submodule.max_batch_size(graph_walk)]
@@ -3494,6 +3555,11 @@ class Engine:
             # largest bucket captured, which the ranks agreed on, caps the step
             runner = submodule_mgmt.accelerator_graph_runner
             caps.append(runner.max_captured_bs(graph_walk) if runner is not None else 0)
+        elif draft is not None and draft.asynchronous and graph_walk == draft.mixed_walk:
+            # nor may a mixed step outgrow the capture that holds it (`_fit_mixed_steps_to_captures`)
+            envelope = self._mixed_envelope.get(node_name)
+            if envelope is not None:
+                caps.append(envelope.bs)
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
 

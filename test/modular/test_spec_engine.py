@@ -649,9 +649,69 @@ def _captured(*buckets):
     from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
-    runner._buckets = {bucket: SimpleNamespace(slots=[object()]) for bucket in buckets}
+    runner._buckets = {
+        bucket: SimpleNamespace(slots=[object()], config=SimpleNamespace(total_tokens_multiplier=1))
+        for bucket in buckets
+    }
     runner.dropped_buckets = []
     return runner
+
+
+def _mixed_budget(eng, budget):
+    from mstar.model.submodule_base import ChunkingPolicy
+
+    eng.set_chunking_policies({(NODE, "mixed"): ChunkingPolicy(walks=("mixed",), max_batch_tokens=budget)})
+
+
+def test_an_async_mixed_walk_is_capped_at_its_widest_captured_envelope(caplog):
+    """A mixed step that finds no capture raises on an asynchronous node, so its rows and tokens are capped at
+    the widest kept bucket that holds the worst step: verify rows of a block each, and a prompt at the
+    `min_chunk_tokens` floor (128 here). bs 128 with a +32 rung doesn't hold 127 blocks and a 128-token floor;
+    a lean twin is never the envelope; a serving override over the envelope is capped too."""
+    from mstar.engine.resources.step import BucketKey
+
+    block, budget = 4, 128 * 4 + 512
+    eng = engine(3, oracle, mode="asynchronous", mixed=True)
+    _mixed_budget(eng, budget)
+    eng.set_token_budgets({NODE: 4096}, {"mixed"})
+    assert eng.get_max_batch_tokens(NODE, "mixed") == 4096
+    wide, narrow = BucketKey("mixed", 64, 64 * block + 512), BucketKey("mixed", 128, 128 * block + 32)
+    lean = BucketKey("mixed", 128, 128 * block + 512, lean=frozenset({"sampler"}))
+    with caplog.at_level("WARNING"):
+        eng._fit_mixed_steps_to_captures({NODE: _captured(wide, narrow, lean)})
+    # a lowered cap is said, the serving override's included, with nothing left out of capture
+    assert any("capped at 64 rows" in r.getMessage() and "budget 4096" in r.getMessage() for r in caplog.records)
+    assert eng._mixed_envelope[NODE] == wide
+    assert eng.get_max_batch_size(NODE, "mixed") == 64
+    assert eng.get_max_batch_tokens(NODE, "mixed") == 64 * block + 512
+    assert eng.get_max_batch_tokens(NODE, eng._drafts[NODE].walk) is None  # the verify walk's untouched
+
+    # every bucket kept: nothing lowered
+    whole = engine(3, oracle, mode="asynchronous", mixed=True)
+    _mixed_budget(whole, budget)
+    top = BucketKey("mixed", 128, budget)
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        whole._fit_mixed_steps_to_captures({NODE: _captured(wide, narrow, top)})
+    assert not [r for r in caplog.records if "capped at" in r.getMessage()]
+    assert whole._mixed_envelope[NODE] == top and whole.get_max_batch_tokens(NODE, "mixed") == budget
+
+    # only buckets too narrow for a prompt chunk beside their verify rows: refused
+    short = engine(3, oracle, mode="asynchronous", mixed=True)
+    _mixed_budget(short, budget)
+    with pytest.raises(RuntimeError, match="mode: synchronous"):
+        short._fit_mixed_steps_to_captures({NODE: _captured(narrow, lean)})
+
+    # no budget on the mixed walk: a prompt would run whole
+    unbudgeted = engine(3, oracle, mode="asynchronous", mixed=True)
+    with pytest.raises(RuntimeError, match="max_batch_tokens"):
+        unbudgeted._fit_mixed_steps_to_captures({NODE: _captured(wide)})
+
+    # a synchronous node runs a mixed step eagerly where no capture holds it
+    sync = engine(3, oracle, mixed=True)
+    _mixed_budget(sync, budget)
+    sync._fit_mixed_steps_to_captures({NODE: _captured(narrow)})
+    assert not sync._mixed_envelope and sync.get_max_batch_tokens(NODE, "mixed") == budget
 
 
 def test_an_async_verify_walk_capture_left_empty_fails_startup():

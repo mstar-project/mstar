@@ -1584,6 +1584,11 @@ class AcceleratorGraphRunner:
         (`_buckets_captured_everywhere`), so every rank answers alike."""
         return [key for key, bucket in self._buckets.items() if key.graph_walk == graph_walk and bucket.slots]
 
+    def token_capacity(self, key: BucketKey) -> int:
+        """The most input tokens a step replaying ``key`` may carry: `select_bucket` scales a
+        step's tokens by its config's multiplier."""
+        return key.num_tokens // self._buckets[key].config.total_tokens_multiplier
+
     def max_captured_bs(self, graph_walk: str) -> int:
         """The widest of `captured_buckets`, 0 when none was captured."""
         return max((key.bs for key in self.captured_buckets(graph_walk)), default=0)
