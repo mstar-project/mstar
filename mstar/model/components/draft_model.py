@@ -148,16 +148,6 @@ class DraftModelDrafter(nn.Module, HostedDrafter):
             # its layers in the target's pool, placed there by the pool's layer set
             kv_layer_set=LAYER_SET,
         )
-        self._passes: list = []
-
-    def bind_resources(self, resources: dict) -> None:
-        # what a pass selects: its KV writes, its positions and its attention's extent (`select_pass`)
-        self._passes = [resources[self.decl.kv_key], resources[self.decl.pos_key], resources[self.decl.attn_key]]
-
-    @torch.compiler.disable
-    def _select(self, p: int | None) -> None:
-        for resource in self._passes:
-            resource.select_pass(p)
 
     def _run(self, ids: torch.Tensor) -> torch.Tensor:
         return self.lm(self.lm.embed(ids), label=LABEL)
@@ -180,15 +170,16 @@ class DraftModelDrafter(nn.Module, HostedDrafter):
         # k, and startup refuses a lag that doesn't split the verify block (`draft_lag`)
         n, k = inputs.input_ids.shape[0], inputs.num_draft_tokens
         prev, bonus = inputs.carry.view(n).long(), inputs.input_ids.view(n).long()
-        self._select(0)
+        select = inputs.select_pass
+        select(0)
         hidden = self._run(torch.stack([prev, bonus], dim=1).view(-1))
         draft = self.lm.logits(hidden.view(n, 2, -1)[:, 1]).argmax(-1)
         drafts = [draft]
         for p in range(1, k):
-            self._select(p)
+            select(p)
             draft = self.lm.logits(self._run(draft)).argmax(-1)
             drafts.append(draft)
-        self._select(None)
+        select(None)
         return torch.stack(drafts, dim=1)
 
     def observe(self, inputs: ObserveInputs) -> torch.Tensor:

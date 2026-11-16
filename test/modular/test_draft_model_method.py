@@ -116,3 +116,23 @@ def test_the_built_node_drafts_with_its_draft_model_module(tmp_path):
     assert isinstance(sub.drafter, DraftModelDrafter) and sub.drafter is sub._modules["drafter"]
     # k is the engine's to bind at load
     assert bind_share(sub, 3)._block == 4
+
+
+def test_the_draft_model_selects_each_pass_through_the_engines_selector_before_it_runs():
+    """The draft model names none of the resources its passes select: it calls `DraftInputs.select_pass`,
+    which the engine binds from the lag's resources, before each pass and ends the passes after the last."""
+    from mstar.engine.resources.draft.drafter import DraftInputs
+    from mstar.model.components.draft_model import DraftModelDrafter
+
+    tiny = Qwen3LMConfig(hidden_size=32, num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=1,
+                         head_dim=16, intermediate_size=64, vocab_size=16, tie_word_embeddings=True)
+    k, n = 3, 2
+    drafter = DraftModelDrafter(DraftModel(tiny, k, dtype="float32", kv_key="kv_cache", pos_key="rope"))
+    events = []
+    drafter._run = lambda ids: events.append(("run", ids.numel())) or torch.zeros(ids.numel(), 32)
+    drafter.lm.logits = lambda hidden: torch.zeros(*hidden.shape[:-1], 16)
+    inputs = DraftInputs([1, 2], torch.zeros(n, dtype=torch.long), {}, k, torch.zeros(n, 1, dtype=torch.long),
+                         select_pass=lambda p: events.append(("select", p)))
+    assert drafter.propose(inputs).shape == (n, k)
+    assert events == [("select", 0), ("run", 2 * n), ("select", 1), ("run", n), ("select", 2), ("run", n),
+                      ("select", None)]
