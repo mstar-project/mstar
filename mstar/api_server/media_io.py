@@ -742,7 +742,10 @@ def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> 
             output = np.full((size, f.channels), np.nan, dtype=np.float32) if unknown_flac else None
             terminal = False
             try:
-                data = f.read(size, dtype="float32", always_2d=True, out=output)
+                if unknown_flac:
+                    data = f.read(size, dtype="float32", always_2d=True, out=output)
+                else:
+                    data = f.read(size, dtype="float32", always_2d=True)
             except RuntimeError as exc:
                 if not (unknown_flac and "psf_fseek() failed" in str(exc)):
                     raise
