@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.model.deepseek_v41.moe import DeepSeekV41MoE, DeepSeekV41MoeConfig
+from mstar.model.components.deepseek_v41.moe import DeepSeekV41MoE, DeepSeekV41MoeConfig
 from mstar.utils.deepseek_v41_expert_weights import dequantize_expert_fp4
 from mstar.utils.fp8_block import dequantize_fp8_block_weight
 

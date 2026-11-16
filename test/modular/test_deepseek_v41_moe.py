@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from mstar.model.deepseek_v41.moe import DeepSeekV41MoE, DeepSeekV41MoeConfig
+from mstar.model.components.deepseek_v41.moe import DeepSeekV41MoE, DeepSeekV41MoeConfig
 
 GOLDEN = [
     [
