@@ -128,13 +128,6 @@ class KVConfig(ABC):
         return None
 
 
-def rank_kv_heads(total: int, num_shards: int) -> int:
-    """One rank's KV heads of ``total``: a slice, or with fewer heads than ranks one replicated head."""
-    from mstar.distributed.utils import divide
-
-    return 1 if num_shards >= total else divide(total, num_shards)
-
-
 DEFAULT_PAGE_SIZE = 128
 # The fewest tokens a page of either group holds when the page size is derived: a window
 # keeps up to a page past it, and a smaller page adds page-table entries and plan work a token.
@@ -312,9 +305,20 @@ class PagedKVConfig(KVConfig):
         )
 
     def storage_kv_heads(self, storage: int) -> int:
-        """One rank's KV heads of extra storage ``storage`` (1-based, as `layer_set_storage`), sharded as the
-        pool is: a slice of its own heads, or one replicated head when it has fewer than ranks."""
-        return rank_kv_heads(self.extra_storages[storage - 1].num_kv_heads, self.num_shards)
+        """One rank's KV heads of extra storage ``storage`` (1-based, as `layer_set_storage`), sharded by the
+        pool's own rule (`kv_head_replicas`): a slice of its heads, or one head replicated over a block of
+        ranks when it has fewer than ranks. Heads that split neither way are refused, naming the layer set."""
+        from mstar.distributed.utils import kv_head_replicas
+
+        heads = self.extra_storages[storage - 1].num_kv_heads
+        try:
+            return kv_head_replicas(heads, self.num_shards)[0]
+        except ValueError:
+            name = next(name for name, _, index in self.joined if index == storage)
+            raise ValueError(
+                f"layer set {name!r}: its {heads} KV heads don't split over {self.num_shards} ranks, as its pool's "
+                "must (each rank a slice, or a head replicated over a block of ranks)"
+            ) from None
 
     @property
     def total_layers(self) -> int:

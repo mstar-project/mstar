@@ -368,6 +368,22 @@ def test_each_storage_shards_its_own_heads_replicating_past_its_count(shards, ta
     assert (view.num_kv_heads, view.num_qo_heads) == (draft_heads, 16 // shards)
 
 
+@pytest.mark.parametrize("heads, shards", [(3, 4), (3, 2)])
+def test_a_storage_whose_heads_dont_split_over_the_ranks_is_refused(heads, shards):
+    """An extra storage shards by its pool's rule (`kv_head_replicas`), so heads that neither divide the ranks
+    nor are divided by them are refused, naming the layer set, before a storage of the wrong width is built."""
+    from mstar.engine.resources.kv.config import KVLayerSet
+
+    config = PagedKVConfig(num_layers=2, num_kv_heads=2, head_dim=8, num_qo_heads=8, max_seq_len=512,
+                           max_num_pages=32, page_size=PAGE)
+    config.join(KVLayerSet("kv", "draft", 2, heads, 8))
+    config.shard(shards)
+    with pytest.raises(ValueError, match="layer set 'draft'"):
+        config.storage_kv_heads(1)
+    with pytest.raises(ValueError, match="layer set 'draft'"):
+        KVCache(config, torch.device("cpu"), torch.float32)
+
+
 def test_a_layer_of_an_extra_storage_writes_and_reads_through_the_manager():
     """The pool's writes and a layer's view (`write_tokens` / `layer_view`) reach an extra storage's layers too."""
     kv = _manager(DRAFT)
