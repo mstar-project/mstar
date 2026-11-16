@@ -714,7 +714,8 @@ def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> 
     ``max_seconds`` it raises :class:`AudioTooLongError`. A rate outside
     ``1..MAX_SAMPLE_RATE`` is refused (:class:`AudioRefusedError`) before
     any read. A headerless FLAC ends when libsndfile raises its terminal seek
-    error, losing at most one 4096-frame block. Other read errors propagate.
+    error; samples written before that error are retained. Other read errors
+    propagate.
     """
     import soundfile as sf
 
@@ -737,14 +738,22 @@ def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> 
             block = min(block, _COUNT_BLOCK_FRAMES)
         parts, frames = [], 0
         while True:
+            size = min(block, limit + 1 - frames)
+            output = np.full((size, f.channels), np.nan, dtype=np.float32) if unknown_flac else None
+            terminal = False
             try:
-                data = f.read(min(block, limit + 1 - frames), dtype="float32", always_2d=True)
+                data = f.read(size, dtype="float32", always_2d=True, out=output)
             except RuntimeError as exc:
                 if not (unknown_flac and "psf_fseek() failed" in str(exc)):
                     raise
-                # libsndfile raises on the last read of a FLAC with no sample count;
-                # like the reference clip reader, this loses at most one 4096-frame block.
-                break
+                # libsndfile filled part of `output` before reporting the final
+                # seek failure. FLAC PCM samples are finite; NaNs mark unwritten rows.
+                valid = np.isfinite(output).all(axis=1)
+                written = int(valid.sum())
+                if not valid[:written].all() or valid[written:].any():
+                    raise
+                data = output[:written]
+                terminal = True
             if not len(data):
                 break
             frames += len(data)
@@ -753,6 +762,8 @@ def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> 
             # a mono block is its own mean, and numpy's reduction over the
             # length-1 axis costs ~10x the copy
             parts.append(data[:, 0] if data.shape[1] == 1 else data.mean(axis=1))
+            if terminal:
+                break
     return (np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)), rate
 
 

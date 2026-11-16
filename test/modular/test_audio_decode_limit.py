@@ -500,8 +500,12 @@ def test_headerless_flac_decodes_without_torchcodec(tmp_path, monkeypatch):
     from mstar.model.components.audio_features import load_speech_file
 
     audio = load_speech_file(str(path), 16000, max_seconds=5)
-    assert 5 * 16000 - 4096 <= len(audio) <= 5 * 16000
-    assert torch.count_nonzero(audio)
+    assert len(audio) == 5 * 16000
+    reference = tmp_path / "reference.flac"
+    tone = (0.1 * np.sin(np.arange(5 * 16000) * 2 * np.pi * 440 / 16000)).astype(np.float32)
+    sf.write(reference, tone, 16000)
+    expected, _ = sf.read(reference, dtype="float32")
+    np.testing.assert_array_equal(audio.numpy(), expected)
 
 
 def test_headerless_flac_still_obeys_the_decoded_limit(tmp_path):
