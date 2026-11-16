@@ -342,6 +342,12 @@ class CpuSelectionTests(unittest.TestCase):
         self.assertIn(f"--ignore={TP_SIM}", workflow)
         self.assertIn(f"args: -n 3 {TP_SIM}", workflow)
 
+    def test_request_tracing_sdk_tests_are_selected_by_cpu_core(self):
+        path = "test/modular/test_request_tracing.py"
+        self.assertTrue((REPO_ROOT / path).is_file())
+        self.assertTrue(IS_COLLECTED(path, EXPANDED_PATHS))
+        self.assertNotEqual(path, TP_SIM)
+
     def test_real_manifest_excludes_only_documented_incompatible_modules(self):
         excluded = manifest_lines("test/cpu-mac-exclude.txt")
         self.assertEqual(set(excluded), {

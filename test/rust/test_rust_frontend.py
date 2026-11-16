@@ -67,7 +67,7 @@ class _StubAPIServer:
     def submit_request(self, *, text=None, file_paths=None,
                        input_modalities, output_modalities,
                        model_kwargs=None, prompt_parts=None, streaming=True,
-                       request_id=None, report_usage=False):
+                       request_id=None, report_usage=False, traceparent=None):
         if text and "boom" in text:
             raise ValueError("scripted ingest failure")
         self.texts[request_id] = text
@@ -76,6 +76,7 @@ class _StubAPIServer:
             "in": input_modalities, "out": output_modalities,
             "mk": model_kwargs, "files": file_paths, "parts": prompt_parts,
             "streaming": streaming, "report_usage": report_usage,
+            "traceparent": traceparent,
         })
         return request_id
 
@@ -352,6 +353,40 @@ def test_generate_submits_the_layout_python_does(fields, files, tmp_path, monkey
     parts = lambda ps: None if ps is None else [dataclasses.asdict(p) for p in ps]  # noqa: E731
     assert parts(sub["parts"]) == parts(want["prompt_parts"])
     assert got_files == want_files
+
+
+@pytest.mark.parametrize("multipart", [False, True], ids=["urlencoded", "multipart"])
+@pytest.mark.parametrize("parent", [None, "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"])
+def test_generate_forwards_traceparent_on_both_frontends(multipart, parent, tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from mstar.api_server import entrypoint
+
+    fields = {"text": "hi", "streaming": "false"}
+    headers = {"traceparent": parent} if parent else {}
+    python = _GeneratePython(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", python)
+    if multipart:
+        reply = TestClient(entrypoint.app).post(
+            "/generate", files={"text": (None, "hi"), "streaming": (None, "false")},
+            headers=headers)
+    else:
+        reply = TestClient(entrypoint.app).post("/generate", data=fields, headers=headers)
+    assert reply.status_code == 200
+    assert python.submitted[0]["traceparent"] == parent
+
+    stub = _StubAPIServer()
+    with _model_stack("qwen3_omni", stub) as (port, _upload):
+        if multipart:
+            body, ctype = _multipart(fields, [])
+        else:
+            body, ctype = urllib.parse.urlencode(fields).encode(), "application/x-www-form-urlencoded"
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/generate", data=body,
+            headers={"Content-Type": ctype, **headers})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            assert response.status == 200
+    assert stub.submitted[0]["traceparent"] == parent
 
 
 def _post_raw(port, path, raw_bytes, content_type="application/json", timeout=15):

@@ -1452,6 +1452,7 @@ class _QueuedFramesSocket:
 
     def __init__(self, frames):
         self.frames = [json.dumps(f) for f in frames]
+        self.headers = {}
         self.sent: list[dict] = []
         self.closed = asyncio.Event()
 

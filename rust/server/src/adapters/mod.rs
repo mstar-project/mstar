@@ -78,6 +78,8 @@ pub struct SubmitArgs {
     pub parts: Vec<Part>,
     /// End the result stream with a `usage` chunk (set by the chat handler).
     pub report_usage: bool,
+    /// W3C parent passed from an HTTP route to the API-server trace; never a model kwarg.
+    pub traceparent: Option<String>,
     /// Decoded inputs that go to the model without a file (`submit_request`'s
     /// `raw_inputs`): openpi's camera images.
     pub raw_inputs: BTreeMap<String, Vec<RawArray>>,
@@ -102,6 +104,7 @@ impl Default for SubmitArgs {
             text: None,
             tokens: None,
             report_usage: false,
+            traceparent: None,
             file_paths: BTreeMap::new(),
             input_modalities: Vec::new(),
             output_modalities: vec!["text".to_string()],

@@ -74,6 +74,12 @@ from mstar.observability.metrics import (
     ServingMetrics,
     mark_submitted,
 )
+from mstar.observability.tracing import (
+    RequestSpan,
+    RequestTracing,
+    require_tracing,
+    trace_id_from_parent,
+)
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
 from mstar.utils import cpus, knobs, profiler
@@ -334,6 +340,7 @@ class PendingRequest:
     input_modalities: list[str]
     output_modalities: list[str]
     profile: RequestProfile
+    trace: RequestSpan | None = None
     event: threading.Event = field(default_factory=threading.Event)
     # Unread outputs; a streaming consumer takes ownership of each drained list.
     chunks: list[ResultChunk] = field(default_factory=list)
@@ -554,6 +561,7 @@ class APIServer:
         log_stats_file: str | None = None,
         enable_nvtx: bool = False,
         model_config: dict | None = None,
+        profile_workers: bool = False,
     ):
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
@@ -572,6 +580,7 @@ class APIServer:
         self.log_stats_file = log_stats_file
         # Prometheus metrics; None until enable_metrics().
         self.metrics: ServingMetrics | None = None
+        self.tracing: RequestTracing | None = None
 
         # Kept so the OpenAI-compatible layer can look up the per-model adapter
         # (``model_name``) and query model-level metadata such as the audio
@@ -621,7 +630,7 @@ class APIServer:
             socket_path_prefix=socket_path_prefix,
             tensor_comm_protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
-            enable_prof=self.log_stats,
+            enable_prof=self.log_stats or profile_workers,
             enable_nvtx=self.enable_nvtx,
             is_pending=self.is_pending,
             upload_dir=self.upload_dir,
@@ -813,6 +822,11 @@ class APIServer:
         self.preprocess_worker.report_preprocess_finish()
         self.preprocess_worker.enable_worker_metrics()
 
+    def enable_tracing(self, endpoint: str) -> None:
+        """Trace requests after warmup, using the existing timing reports."""
+        self.tracing = RequestTracing(self.model_name, endpoint)
+        self.preprocess_worker.report_preprocess_finish()
+
     # ----------------------------------------------------------
     # Submitting a request
     # ----------------------------------------------------------
@@ -846,6 +860,7 @@ class APIServer:
         file_streams: dict[str, list[str | None]] | None = None,
         raw_inputs: dict[str, list[torch.Tensor]] | None = None,
         report_usage: bool = False,
+        traceparent: str | None = None,
     ) -> str:
         """Build a :class:`NewRequestConductor` and send it to the conductor.
 
@@ -925,6 +940,7 @@ class APIServer:
             self._check_call_input(input_bytes)
 
         # Register pending request
+        child_traceparent = None
         with self.request_lock:
             if self.fatal_error is not None:
                 raise HTTPException(status_code=503, detail=self.fatal_error)
@@ -946,6 +962,11 @@ class APIServer:
                 input_bytes=input_bytes,
                 report_usage=report_usage,
             )
+            if self.tracing is not None:
+                self.pending_requests[key].trace = self.tracing.start(
+                    self.pending_requests[key], key, traceparent,
+                )
+                child_traceparent = self.pending_requests[key].trace.traceparent
         if self.metrics is not None:
             mark_submitted()
 
@@ -962,12 +983,21 @@ class APIServer:
             ends=ending,
             streaming=streaming,
             raw_inputs=raw_inputs,
+            traceparent=child_traceparent,
         ))
 
-        request_log.debug(
-            "Request %s submitted as %s  in=%s  out=%s",
-            request_id, key, input_modalities, output_modalities,
-        )
+        if request_log.isEnabledFor(logging.DEBUG):
+            trace_id = trace_id_from_parent(child_traceparent)
+            if trace_id is None:
+                request_log.debug(
+                    "Request %s submitted as %s  in=%s  out=%s",
+                    request_id, key, input_modalities, output_modalities,
+                )
+            else:
+                request_log.debug(
+                    "Request %s submitted as %s  in=%s  out=%s trace_id=%s",
+                    request_id, key, input_modalities, output_modalities, trace_id,
+                )
         return request_id
 
     def lora_kwargs(self, model: str | None, model_kwargs: dict | None) -> Selected:
@@ -1908,11 +1938,15 @@ class APIServer:
         """Count a request that just left ``pending_requests``. Only the
         caller whose ``pop`` returned it calls this, so each request counts
         once; callers must NOT hold ``request_lock``."""
-        if self.metrics is None:
-            return
         if req.error is not None:
             outcome = "error"
-        self.metrics.record(req, outcome)
+        if self.tracing is not None:
+            try:
+                self.tracing.finish(req, outcome)
+            except Exception:
+                logger.exception("Could not finish request trace")
+        if self.metrics is not None:
+            self.metrics.record(req, outcome)
 
     def _finalize_profile(self, req: PendingRequest) -> None:
         """Stamp the finish time, attach output totals, and emit the report.
@@ -2571,6 +2605,7 @@ async def generate_ws(websocket: WebSocket):
                 request_id=request_id,
                 end_input=end_input,
                 file_streams=file_streams,
+                traceparent=websocket.headers.get("traceparent"),
             )
             key = api_server.submission_key(request_id)
             submitted.add(key)
@@ -2930,6 +2965,7 @@ async def generate(
                 prompt_parts=parts or None,
                 streaming=streaming,
                 request_id=request_id,
+                traceparent=request.headers.get("traceparent"),
             )
         except json.JSONDecodeError:
             raise   # a downstream parse failure, not a bad request (a 500 below)
@@ -3189,6 +3225,10 @@ def main(argv: list[str] | None = None):
         help="Serve Prometheus metrics at /metrics (needs mstar-ai[metrics])",
     )
     parser.add_argument(
+        "--otlp-traces-endpoint", type=str, default=None,
+        help="Export request traces to this OTLP traces endpoint (needs mstar-ai[tracing])",
+    )
+    parser.add_argument(
         "--python-frontend", action="store_true",
         help="Serve HTTP from the deprecated uvicorn/FastAPI frontend instead "
              "of mstar-server, the default",
@@ -3206,6 +3246,11 @@ def main(argv: list[str] | None = None):
         parser.error("--python-frontend serves without mstar-server, so it takes no --rust-frontend(-bin)")
     if args.enable_metrics and MISSING_DEPENDENCY is not None:
         parser.error(INSTALL_HINT)
+    if args.otlp_traces_endpoint:
+        try:
+            require_tracing()
+        except (RuntimeError, ValueError) as exc:
+            parser.error(str(exc))
     if args.socket_path_prefix is None:
         args.socket_path_prefix = per_port_socket_prefix(args.port)
 
@@ -3255,6 +3300,7 @@ def main(argv: list[str] | None = None):
 
     global api_server
     log_stats = args.log_stats or args.log_stats_file is not None
+    profile_workers = log_stats or bool(args.otlp_traces_endpoint)
     api_server = APIServer(
         socket_path_prefix=args.socket_path_prefix,
         upload_dir=args.upload_dir,
@@ -3267,6 +3313,7 @@ def main(argv: list[str] | None = None):
         log_stats=log_stats,
         log_stats_file=args.log_stats_file,
         enable_nvtx=args.enable_nvtx,
+        profile_workers=profile_workers,
     )
 
     from mstar.api_server.openai.adapters import get_adapter
@@ -3283,7 +3330,7 @@ def main(argv: list[str] | None = None):
             args.config,
             args.socket_path_prefix,
             args.enable_nvtx,
-            log_stats,
+            profile_workers,
             args.log_level,
             args.cache_dir,
             CommProtocol(args.tensor_comm_protocol),
@@ -3327,6 +3374,8 @@ def main(argv: list[str] | None = None):
             _run_warmup_requests(api_server, warmups, replicas, cache_dir=args.cache_dir)
         if args.enable_metrics:
             api_server.enable_metrics()
+        if args.otlp_traces_endpoint:
+            api_server.enable_tracing(args.otlp_traces_endpoint)
         if not args.python_frontend:
             import tempfile
 
@@ -3404,6 +3453,8 @@ def main(argv: list[str] | None = None):
             shutil.rmtree(bridge_dir, ignore_errors=True)
         if api_server is not None:
             api_server.cleanup()
+            if tracing := getattr(api_server, "tracing", None):
+                tracing.shutdown()
         ws_frames.stop()
         _shutdown_conductor_process(conductor_proc)
     # A worker or conductor death is a failed run. A SIGINT stop still exits 0.
