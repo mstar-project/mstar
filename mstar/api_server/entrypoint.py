@@ -420,7 +420,7 @@ _REPLY_PARSE_FAILED = "the reply could not be parsed"
 def _split_chunk(chunk: ResultChunk, reasoning: str, answer: str, calls: list[dict]) -> None:
     """A parsed reply's text chunk as the parser split it: its answer as the text, its reasoning and
     finished calls in its metadata."""
-    chunk.data = answer.encode()
+    chunk.data = answer.encode() if answer else b""
     if reasoning:
         chunk.metadata[REASONING] = reasoning
     if calls:
@@ -874,15 +874,25 @@ class APIServer:
         message thread, in the request's chunk order. The thread carries every request's chunks, so
         a parser error fails only its own request: the chunk becomes the error that ends it."""
         try:
-            if req.parser is None:
+            parser = req.parser
+            if parser is None:
                 starts = bool(chunk.metadata.pop(REPLY_IN_REASONING, False))
                 tool_format = TOOL_FORMATS.get(getattr(self.model, "TOOL_FORMAT", None)) if req.reply_tools else None
                 if not starts and tool_format is None:
                     # all answer (thinking off, no tools): its chunks pass through unparsed
                     req.parse_reply = False
                     return chunk
-                req.parser = ReplyParser(self._reply_reasoning_end(), starts, tool_format, req.reply_tools)
-            _split_chunk(chunk, *req.parser.feed(chunk.data))
+                parser = req.parser = ReplyParser(self._reply_reasoning_end(), starts, tool_format, req.reply_tools)
+            # `_split_chunk`, inline: this runs for every token of every parsed reply
+            reasoning, answer, calls = parser.feed(chunk.data)
+            chunk.data = answer.encode() if answer else b""
+            if reasoning:
+                chunk.metadata[REASONING] = reasoning
+            if calls:
+                chunk.metadata[TOOL_CALLS] = calls
+            if parser.passes_through:
+                # the rest is answer text as it comes: no more parsing
+                req.parse_reply = False
             return chunk
         except Exception:  # noqa: BLE001 - one request's reply, never the thread
             logger.exception("Parsing the reply of %s failed", chunk.request_id)

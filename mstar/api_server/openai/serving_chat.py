@@ -180,7 +180,7 @@ async def _stream_events(batches, model_name, request_id, sample_rate, include_u
                     delta = {}
                     if REASONING in c.metadata:
                         delta[REASONING] = c.metadata[REASONING]
-                    content = text.feed(c.data)
+                    content = text.feed(c.data) if c.data else ""
                     if content:
                         delta["content"] = content
                     if TOOL_CALLS in c.metadata:

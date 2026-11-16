@@ -487,6 +487,21 @@ def test_a_parser_error_fails_only_its_own_request(monkeypatch):
     assert failed.value.status_code == 500
 
 
+@pytest.mark.parametrize("read", [_collected, _streamed])
+def test_a_reply_past_its_reasoning_stops_being_parsed_once_nothing_is_held(read):
+    """With no tools, the answer after the reasoning is text as it comes, so parsing stops; not
+    while the parser holds a character's first bytes, which would otherwise be lost."""
+    cafe = "café".encode()
+    chunks = [ResultChunk(request_id="r", modality="text", data=d, num_tokens=1)
+              for d in [b"hmm</think>\n\n", cafe[:4], cafe[4:] + b" ok", "</think> é".encode()]]
+    chunks[0].metadata[REPLY_IN_REASONING] = True
+    server = _served(None, cap=64, chunks=chunks, model=_ReasoningModel(), parse_reply=True)
+    got = [c for c in read(server) if c.modality == "text"]
+    assert "".join(c.metadata.get(REASONING, "") for c in got) == "hmm"
+    assert b"".join(c.data for c in got).decode() == "café ok</think> é"
+    assert got[-1].data == "</think> é".encode(), "the last chunk passed through as it came"
+
+
 def test_a_reply_with_nothing_to_split_passes_through_unparsed():
     """Thinking off and no tools: the chunks are the data worker's, bytes split mid-character included."""
     texts = ["caf\xe9 </think>".encode()[:4], "caf\xe9 </think>".encode()[4:]]

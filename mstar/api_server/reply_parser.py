@@ -95,9 +95,21 @@ class ReplyParser:
 
     def feed(self, data: bytes) -> tuple[str, str, list[dict]]:
         text = self._utf8.feed(data)
-        if not self._in_reasoning and not self._opening and self._format is None:
+        if self._in_reasoning:
+            # most of a reasoning block: text that can't hold or begin its end marker, and doesn't
+            # end on a newline that may come before one, is reasoning as it is
+            if not self._held and not self._thinking and self._end[0] not in text and text[-1:] != "\n":
+                return text, "", []
+        elif not self._opening and self._format is None:
             return "", text, []
         return self._split(text)
+
+    @property
+    def passes_through(self) -> bool:
+        """Whether every chunk from here on is answer text as it came: past the reasoning and the
+        newlines that open the answer, with no tools, and holding nothing (a marker's start, or a
+        character's first bytes). The caller can stop feeding the parser then."""
+        return not (self._in_reasoning or self._opening or self._format or self._held or self._utf8.pending)
 
     def finish(self) -> tuple[str, str, list[dict]]:
         text = self._utf8.flush()
