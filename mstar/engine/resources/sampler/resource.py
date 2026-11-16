@@ -62,12 +62,14 @@ class SamplerResource(Resource):
         enable_logprobs: bool = False,
         enable_processed_logprobs: bool = False,
         greedy_capture: bool | None = None,
+        enable_blocked_tokens: bool = False,
     ):
         self._track_seen_tokens = enable_repetition_penalty
         self._loopback_state = dict(loopback_state or {})
         self._enable_min_p = enable_min_p
         self._enable_logprobs = enable_logprobs
         self._enable_processed_logprobs = enable_processed_logprobs
+        self._enable_blocked_tokens = enable_blocked_tokens
         self._vocab_size = vocab_size if self._track_seen_tokens else None
         # A step whose rows all sample greedily runs lean, taking each row's argmax
         # (`lean_for`). By default only where the full sampler is the multi-kernel
@@ -206,6 +208,7 @@ class SamplerResource(Resource):
             enable_logprobs=spec.enable_logprobs,
             enable_processed_logprobs=spec.enable_processed_logprobs,
             greedy_capture=spec.greedy_capture,
+            enable_blocked_tokens=spec.enable_blocked_tokens,
         )
 
     def build_accelerator_graph_buffers(
@@ -748,7 +751,8 @@ class SamplerResource(Resource):
     # Out of the caller's compiled frame: dynamo would guard on the ids it passes on.
     @torch.compiler.disable
     def sample(
-        self, request_ids: list[str], logits: torch.Tensor, **kwargs
+        self, request_ids: list[str], logits: torch.Tensor,
+        blocked_tokens: torch.Tensor | None = None,
     ):
         """One token per row of ``logits``, in ``request_ids`` order.
 
@@ -756,7 +760,16 @@ class SamplerResource(Resource):
         here: under capture that is the slot's padded rows and its dummy ids,
         which is what the graph sampler's per-row params were gathered for.
         The eager sampler keys off request ids and sees the real batch only.
+        ``blocked_tokens`` is a bool [B, V] tensor computed by the node for
+        this step. The node must leave at least one token unblocked per row.
         """
+        if blocked_tokens is not None:
+            if not self._enable_blocked_tokens:
+                raise ValueError("this sampler does not declare blocked-token support")
+            if blocked_tokens.shape != logits.shape or blocked_tokens.dtype != torch.bool \
+                    or blocked_tokens.device != logits.device:
+                raise ValueError("blocked_tokens must be a bool tensor with the logits' shape and device")
+            logits = logits.masked_fill(blocked_tokens, float("-inf"))
         if self._enable_logprobs:
             # under capture this fires once, at capture; a replay never calls in
             if self._sampled_this_step:

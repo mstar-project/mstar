@@ -104,6 +104,9 @@ class SamplerSpec(NodeResourceSpec):
     # Allows ``logprobs_mode: "processed"``; the captured sampler then also
     # renorms every step's distribution again (CUDA only).
     enable_processed_logprobs: bool = False
+    # A node may pass a per-row boolean token mask to ``sample``. The mask is
+    # applied to logits before any penalty, temperature or filter.
+    enable_blocked_tokens: bool = False
     # Whether a step whose rows all sample greedily may take each row's argmax
     # (`SamplerResource.lean_for`), in a twin of each batched capture: None
     # decides by the vocabulary (past the one-kernel draw), False never, True

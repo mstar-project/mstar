@@ -1150,6 +1150,11 @@ The spec types are:
        ``enable_min_p``, ``max_repetition_window``, ``min_tokens_stop_ids`` and
        ``enable_top_p_first`` are capabilities of the same kind. See
        ``SampleSettings`` above.
+       With ``enable_blocked_tokens=True``, a node can pass a per-step bool
+       ``blocked_tokens`` tensor of the same shape as its logits to
+       ``sampler.sample``. The resource masks those logits before sampling on
+       eager and captured paths. Leave at least one token available in every
+       row; the default sampler path has no mask cost.
    * - ``RecurrentStateSpec(config=RecurrentStateConfig(...))``
      - Fixed-size per-request state that carries between steps (an LSTM's ``h`` and
        ``c``, a cursor, a conv tail, a Mamba or gated-DeltaNet layer's conv window and SSM
