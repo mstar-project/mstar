@@ -1064,13 +1064,13 @@ class KVManager(AttentionResource):
                 return False
             chain.looked_up = True
             self._note_looked_up(rid)
-            rooted, ends = chain.rooted, chain.rooted_ends
+            names, ends = self._names(chain.rooted), chain.rooted_ends
             total = sum(span.length for span in chain.spans)
             # The lock was dropped to hash, so another thread's probe may have taken the lease already.
             if stream.lease is None:
                 # Matching the whole prompt would leave the walk an empty input, since it skips every matched page.
                 walk = self._index.lookup if self._world_size == 1 else self._index.pages_for
-                matched = self._retain_cached(rid, stream, walk(rooted)[:len(rooted) - 1])
+                matched = self._retain_cached(rid, stream, walk(names)[:self._lease_cap(len(names))])
                 held = len(matched) * self.config.tokens_per_page
                 # If an image ends inside the next page, look up its cached partial page.
                 image_end = self._image_end(ends, held, total)
@@ -1103,6 +1103,18 @@ class KVManager(AttentionResource):
             if held < end < min(held + self.config.tokens_per_page, total):
                 return end, key
         return None
+
+    def _names(self, keys: list[bytes]) -> list[bytes]:
+        """The keys that name the pages of ``keys``' prompt in the prefix index: page ``i`` by key
+        ``i + names_ahead`` (`PagedKVConfig.names_ahead`). On a pool whose pages hold bytes that read
+        the next page's first token, the next page's key is the one that covers it."""
+        ahead = self.config.names_ahead
+        return keys[ahead:] if ahead else keys
+
+    def _lease_cap(self, names: int) -> int:
+        """How many of a prompt's ``names`` page names a lease may take: all but the prompt's last page,
+        so its walk keeps input. Names running a page ahead already leave that page unnamed."""
+        return names - 1 + self.config.names_ahead
 
     def _root(
         self, keys: list[bytes], spans: list[PrefixSpan],
@@ -1180,7 +1192,7 @@ class KVManager(AttentionResource):
         with self._lock:
             if self._streams.get(rid, {}).get(label) is not stream:
                 return True
-            matched = self._index.pages_for(chain.rooted[:len(pages)])
+            matched = self._index.pages_for(self._names(chain.rooted)[:len(pages)])
             if len(matched) < len(pages) and not caught_up:
                 return False
             if matched != pages:
@@ -1378,7 +1390,9 @@ class KVManager(AttentionResource):
                 return
             if end <= stream.stored_len and span.end_key is not None:
                 ended = end, span.end_key
-        filled = chain.pages_filled(stream.stored_len, self.config.tokens_per_page)
+        ahead = self.config.names_ahead
+        # a page is named by the key ``ahead`` pages on, so it is filed once that key covers a whole page
+        filled = min(chain.pages_filled(stream.stored_len, self.config.tokens_per_page), chain.keyed_pages - ahead)
         if stream.retention is not None:
             filled = min(
                 filled, stream.retention.protected_prefix // self.config.tokens_per_page
@@ -1386,12 +1400,12 @@ class KVManager(AttentionResource):
         # the parent by key: after a lost race or a reload this stream holds a copy
         parent = (
             self._index.page_for(
-                fingerprint(self._prefix_root, chain.keys[chain.cursor - 1])
+                fingerprint(self._prefix_root, chain.keys[chain.cursor - 1 + ahead])
             )
             if 0 < chain.cursor < filled else None
         )
         while chain.cursor < filled:
-            key = fingerprint(self._prefix_root, chain.keys[chain.cursor])
+            key = fingerprint(self._prefix_root, chain.keys[chain.cursor + ahead])
             page = stream.page_indices[chain.cursor]
             # The index files a page under a parent only something else holds. Above one rank the owner counts can
             # differ between ranks, so only a parent this stream holds is offered there.
@@ -1985,9 +1999,9 @@ class KVManager(AttentionResource):
             # hashed here, as `resolve_cached_prefix` hashes outside its lock
             for label, keys in (overrides.prefix_keys or {}).items():
                 if label in needed_labels and keys:
-                    rooted[label] = [
+                    rooted[label] = self._names([
                         fingerprint(self._prefix_root, key) for key in keys
-                    ]
+                    ])
         # one critical section: reading stored_len, comparing to published, and
         # firing the retrieve must be atomic against a concurrent commit/reset
         # (both non-blocking inside, so holding the lock is safe)
@@ -2128,10 +2142,10 @@ class KVManager(AttentionResource):
                 or chain.looked_up or stream.lease is not None
             ):
                 return None
-            rooted = chain.rooted
+            rooted = self._names(chain.rooted)
             chain.looked_up = True
             # one page short of the whole prompt, as the probe matches
-            cap = len(rooted) - 1
+            cap = self._lease_cap(len(rooted))
             run = self._index.pages_for(rooted[:cap])
             at = len(run)
             if at < cap and rooted[at] in self._arriving:
@@ -4025,7 +4039,8 @@ class KVManager(AttentionResource):
         chain = stream.chain
         if self._index is None or chain is None or stream.released:
             return []
-        return chain.keys[:chain.cursor]
+        ahead = self.config.names_ahead
+        return chain.keys[ahead:chain.cursor + ahead]
 
     def can_reload(self, rid: str) -> bool:
         """Whether `_reload_room` covers the pages ``rid``'s reload takes. A request that asks again after
@@ -5082,7 +5097,9 @@ class KVManager(AttentionResource):
         return sum(
             page not in evictable
             for stream in self._streams[rid].values() if stream.chain is not None
-            for page in self._index.pages_for(stream.chain.rooted[:min(stream.chain.keyed_pages, pages)])
+            for page in self._index.pages_for(
+                self._names(stream.chain.rooted)[:min(stream.chain.keyed_pages - self.config.names_ahead, pages)]
+            )
         )
 
     def _index_counts(self) -> tuple[int, int]:
@@ -5337,7 +5354,7 @@ class KVManager(AttentionResource):
         for stream in streams:
             chain = stream.chain
             rooted = [] if self._index is None or chain is None or chain.rooted is None or stream.released else (
-                chain.rooted[:chain.cursor]
+                self._names(chain.rooted)[:chain.cursor]
             )
             pages += self._cpu_pool.takes(len(stream.pages()), rooted[:self._filed(rooted, stream.page_indices)])
         return max(0, pages - self._cpu_pool.reserved.get(rid, 0))
@@ -5515,14 +5532,15 @@ class KVManager(AttentionResource):
             if chain is None or stream.stored_len or stream.offloaded or stream.lease is not None:
                 continue
             if label in reading and label in needed:
-                pages = self._index.pages_for(chain.rooted)[:reading[label].seq_len // page_size]
+                pages = self._index.pages_for(self._names(chain.rooted))[:reading[label].seq_len // page_size]
                 whole += len(pages)
             elif (
                 cursor.done < len(chain.spans) and not stream.read_pending
                 and overrides.get_labels(node_name, chain.spans[cursor.done].walk) == [label]
                 and self._keyed_label(rid, node_name, chain.spans[cursor.done].walk) == label
             ):
-                pages = self._index.pages_for(chain.rooted)[:len(chain.rooted) - 1]
+                names = self._names(chain.rooted)
+                pages = self._index.pages_for(names)[:self._lease_cap(len(names))]
                 for pool in self._snapshots:
                     pages = pages[:pool.restorable(chain.rooted[:len(pages)])]
                 whole += len(pages)

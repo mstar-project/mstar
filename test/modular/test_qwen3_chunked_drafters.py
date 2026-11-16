@@ -145,3 +145,101 @@ def test_a_prefix_hit_still_cuts_an_eagle3_prompt(tmp_path, monkeypatch):
     assert following[1] == prompt[len(prompt) - rows[1] + 1:] + [-1]
     torch.testing.assert_close(carries[1], carries[0], rtol=1e-6, atol=1e-8)
     assert driver.out[1] == driver.out[2]
+
+
+# The prefix cache under EAGLE-3. Its K/V at a page's last slot is built from the next page's first token, so
+# the index names a page by the next page's key (`PagedKVConfig.names_ahead`), which covers that token.
+A = list(range(1, 15))
+
+
+def _b_after(tmp_path, monkeypatch, firsts: list[list[int]], b: list[int], ahead: int | None = None):
+    """``b`` on an engine that ran each of ``firsts`` before it, keyed: the drafter's layer K/V at b's prompt
+    positions after its prompt step, its first carry, the drafts it proposes, the reply, and the prompt
+    tokens the prefix cache held for it. ``ahead`` overrides the pool's page naming."""
+    model = make_model(write_checkpoints(tmp_path)[0], _cpu_eagle3(tmp_path), max_seq_len=512)
+    eng = engine(model, prefix_cache=True)
+    kv = eng._resources["kv_cache"]
+    if ahead is not None:
+        kv.config.names_ahead = ahead
+    driver = Driver(eng, model)
+    for rid, prompt in enumerate(firsts, start=10):
+        driver.add(rid, prompt, MAX, keyed=True)
+        driver.prefill([rid], {rid: prompt})
+        driver.run([rid])
+    drafts = []
+
+    def recorded(self, inputs):
+        out = PROPOSE(self, inputs)
+        drafts.append(out.clone())
+        return out
+
+    monkeypatch.setattr(Eagle3Drafter, "propose", recorded)
+    held_before = kv.prefix_tokens.get("LLM", (0, 0))[1]
+    driver.add(1, b, MAX, keyed=True)
+    driver.prefill([1], {1: b})
+    held = kv.prefix_tokens.get("LLM", (0, 0))[1] - held_before
+    layer = [drafter_first_layer(model)]
+    out = (
+        prompt_kv(eng, 1, len(b), layer),
+        eng._resources["sampler"].loopback_state(DRAFT_CARRY, [1])[:1].clone(),
+    )
+    driver.run([1])
+    return (*out, drafts, driver.out[1], held)
+
+
+def _same_as_cold(warm, cold):
+    torch.testing.assert_close(warm[0], cold[0], rtol=1e-6, atol=1e-8)
+    torch.testing.assert_close(warm[1], cold[1], rtol=1e-6, atol=1e-8)
+    assert warm[3] == cold[3]
+    assert len(warm[2]) == len(cold[2]) and all(torch.equal(x, y) for x, y in zip(warm[2], cold[2], strict=True))
+
+
+def test_a_reused_prefix_page_holds_the_drafter_k_v_of_its_own_following_token(tmp_path, monkeypatch):
+    """A's page 1 ends at position 7, whose EAGLE-3 K/V reads A's token at 8. B shares A's first 8 tokens and
+    differs at 8, so it may reuse page 0 but not page 1: it drafts as on a cold engine. Named by its own key,
+    page 1 was reused, and B's drafter read A's token there."""
+    b = A[:8] + [20, 21, 22, 23]
+    warm = _b_after(tmp_path, monkeypatch, [A], b)
+    _same_as_cold(warm, _b_after(tmp_path, monkeypatch, [], b))
+    assert warm[4] == 4, "page 0 alone"
+
+
+def test_a_page_another_request_filed_first_is_never_read_past_its_following_token(tmp_path, monkeypatch):
+    """The index keeps the first writer of a page. A files page 1 for token 9 after it; D shares A's first 8
+    tokens, recomputes page 1 for token 50 and files page 2 under it; B matches D through page 1 and differs
+    at 12. Trimming the last matched page would still hand B A's page 1, filed first under the same key."""
+    d, b = A[:8] + list(range(50, 56)), A[:8] + [50, 51, 52, 53] + list(range(60, 65))
+    warm = _b_after(tmp_path, monkeypatch, [A, d], b)
+    _same_as_cold(warm, _b_after(tmp_path, monkeypatch, [], b))
+    assert warm[4] == 8, "pages 0 and 1, D's"
+
+
+def test_a_pool_that_names_each_page_by_its_own_key_reuses_as_before(tmp_path, monkeypatch):
+    """The naming is the pool's alone: with names_ahead 0 the three requests above lease what they always
+    did, B three pages of A's and D's (so its drafter reads A's token at 8, the bug the naming fixes); an
+    exact repeat of A leases two pages either way, its whole pages but the last."""
+    d, b = A[:8] + list(range(50, 56)), A[:8] + [50, 51, 52, 53] + list(range(60, 65))
+    assert _b_after(tmp_path, monkeypatch, [A, d], b, ahead=0)[4] == 12
+    assert _b_after(tmp_path, monkeypatch, [A], A, ahead=0)[4] == 8
+    assert _b_after(tmp_path, monkeypatch, [A], A)[4] == 8
+
+
+def test_a_page_is_filed_and_offloaded_under_the_next_pages_key(tmp_path):
+    """Under EAGLE-3 a page enters the index once the next page's key covers a whole page, and an offload
+    files the pages it carries to the host under those names, so its reload finds them again."""
+    from mstar.engine.resources.kv.keys import fingerprint
+
+    model = make_model(write_checkpoints(tmp_path)[0], _cpu_eagle3(tmp_path), max_seq_len=512)
+    eng = engine(model, prefix_cache=True)
+    kv = eng._resources["kv_cache"]
+    assert kv.config.names_ahead == 1
+    driver = Driver(eng, model)
+    prompt = A[:12]
+    driver.add(1, prompt, MAX, keyed=True)
+    driver.prefill([1], {1: prompt})
+    stream = kv._streams[1]["main"]
+    # three whole pages keyed, the third page's successor not yet: two filed
+    assert stream.chain.keyed_pages == 3 and stream.chain.cursor == 2
+    names = [fingerprint(kv._prefix_root, key) for key in kv._offload_keys(stream)]
+    assert names == [fingerprint(kv._prefix_root, key) for key in stream.chain.keys[1:3]]
+    assert kv._filed(names, stream.page_indices) == 2

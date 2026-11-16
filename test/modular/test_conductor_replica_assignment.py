@@ -575,3 +575,42 @@ def test_the_kv_mirror_predicts_the_hits_the_real_cache_serves(monkeypatch):
         kv.commit(step, ctx)
     assert any(served), "no request hit, so the sequence pins nothing"
     assert predicted == served
+
+
+@pytest.mark.parametrize("names_ahead, hit", [(0, 2), (1, 1)])
+def test_the_mirror_names_a_page_as_its_pool_does(names_ahead, hit):
+    """On a pool whose pages a drafter's following token reads (`PagedKVConfig.names_ahead`), a page is
+    named by the next page's key, so a prompt that shares two pages' keys and differs in the third reuses
+    one page: the second's name covers the third page's tokens. The mirror predicts what the cache takes."""
+    from mstar.engine.resources.kv.routing import KVRoutingMirror
+
+    mirror = KVRoutingMirror(1, 64, PAGE, {"main"}, names_ahead=names_ahead)
+    mirror.add_request(_configs(_prompt("P"))["kv"], 0)
+    other = _configs({**_prompt("P"), "prefix_keys": {"kv": {"main": [b"P0", b"P1", b"Q2", b"Q3"]}}})["kv"]
+    assert mirror.facts(other)[0].kv_hit == hit * PAGE
+    # an exact repeat leases its whole pages but the last, whichever page names them
+    assert mirror.facts(_configs(_prompt("P"))["kv"])[0].kv_hit == 3 * PAGE
+
+
+@pytest.mark.parametrize("names_ahead", [0, 1])
+@pytest.mark.parametrize("protected", [None, 3])
+def test_the_mirror_counts_the_pages_the_cache_files_in_the_caches_order(names_ahead, protected):
+    """The cache files a page once the key naming it covers a whole page, then caps at a retention policy's
+    protected prefix (`KVManager._index_filled_pages`). The mirror counts the same pages in the same order:
+    with five whole pages, three protected and pages named a page ahead, that is three, not two."""
+    from mstar.engine.resources.kv.config import RetentionPolicy
+    from mstar.engine.resources.kv.routing import KVRoutingMirror
+
+    page, pages = 16, 5
+    tokens = list(range(pages * page + 1))
+    retention = None if protected is None else RetentionPolicy(context_budget=4096, protected_prefix=protected * page)
+    config = KVReqConfig(
+        prefix_keys={"main": chain([tokens[at:at + page] for at in range(0, len(tokens), page)])},
+        prefix_cache=True,
+        kv_layout={"main": StreamLayout(
+            spans=(PrefixSpan(len(tokens), len(tokens), "prefill"),), keyed_spans=1, retention=retention,
+        )},
+    )
+    filed = min(pages - names_ahead, protected if protected is not None else pages)
+    keyed = KVRoutingMirror(1, 64, page, {"main"}, names_ahead=names_ahead)._keyed(config)["main"]
+    assert keyed.whole == filed

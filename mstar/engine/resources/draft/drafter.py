@@ -223,6 +223,7 @@ def drafter_resources(
     node's sampler as loop-back state `DRAFT_CARRY`. Anything a deployment
     chose is left for startup to refuse."""
     from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+    from mstar.engine.resources.recurrent.config import RecurrentStateSpec
     from mstar.engine.resources.sampler.config import LoopbackState, SamplerSpec
 
     needs = decl.needs
@@ -234,6 +235,15 @@ def drafter_resources(
         if not isinstance(pools[0].config, PagedKVConfig):
             raise ValueError(f"the drafter joins KV {needs.kv.kv_cache!r}, which is not a paged pool")
         pools[0].config.join(needs.kv)
+        if needs.chunk_boundary is ChunkBoundary.FOLLOWING:
+            # the drafter's K/V at a page's last slot reads the next page's first token, so the prefix index
+            # names each page by the next page's key, which covers that token
+            if any(isinstance(spec, RecurrentStateSpec) and spec.nodes & nodes for spec in out):
+                raise ValueError(
+                    "a drafter that reads each row's following token names the KV pool's pages a page ahead, "
+                    "which a recurrent pool's prefix snapshots, keyed by page, don't follow"
+                )
+            pools[0].config.names_ahead = 1
     kept = {}
     if needs.carry is not None:
         width, dtype = needs.carry

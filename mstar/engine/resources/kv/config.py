@@ -212,6 +212,10 @@ class PagedKVConfig(KVConfig):
     # ``extra_storages[i - 1]`` (`join`). Slots come from these when read (`layer_sets`).
     joined: tuple[tuple[str, int, int], ...] = field(default=(), init=False, repr=False, compare=False)
     extra_storages: tuple[KVStorage, ...] = field(default=(), init=False, repr=False, compare=False)
+    # Derived, never declared: the prefix index names page ``i`` by the chain key of page ``i + names_ahead``.
+    # 1 on a pool a drafter joins whose K/V at a page's last slot reads the next page's first token
+    # (`ChunkBoundary.FOLLOWING`, set by `drafter_resources`), so the name covers that token; 0 elsewhere.
+    names_ahead: int = field(default=0, init=False, repr=False, compare=False)
 
     def __post_init__(self):
         self._check_sizes()
@@ -1147,7 +1151,10 @@ class KVSpec(NodeResourceSpec):
             return None
         from mstar.engine.resources.kv.routing import KVRoutingMirror
 
-        return KVRoutingMirror(ctx.num_replicas, self.config.num_units, self.config.tokens_per_page, labels)
+        return KVRoutingMirror(
+            ctx.num_replicas, self.config.num_units, self.config.tokens_per_page, labels,
+            names_ahead=getattr(self.config, "names_ahead", 0),
+        )
 
     def resource_capabilities(self, ctx) -> ResourceCapabilities:
         verify = None
