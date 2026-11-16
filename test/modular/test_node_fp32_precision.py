@@ -7,7 +7,9 @@ node that needed full fp32 had to flip the process-wide flags inside its own
 forward; these tests drive a real ``Engine`` on CPU and read the flags from
 inside the forward, so they fail on a build whose engine ignores the setting.
 """
+import ast
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -19,10 +21,38 @@ import mstar.engine.engine as engine_module  # noqa: E402
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.distributed.communication import CommGroup, JointGroups  # noqa: E402
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
+from mstar.engine.fp32_precision import native_convolutions  # noqa: E402
 from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule  # noqa: E402
 
 WALK = "run"
+
+
+def test_native_convolutions_restores_cudnn_after_failure():
+    before = torch.backends.cudnn.enabled
+    with pytest.raises(RuntimeError, match="failed"), native_convolutions():
+        assert torch.backends.cudnn.enabled is False
+        raise RuntimeError("failed")
+    assert torch.backends.cudnn.enabled == before
+
+
+def test_model_code_does_not_set_process_wide_cudnn_benchmark():
+    model_dir = Path(__file__).resolve().parents[2] / "mstar/model"
+    writes = []
+    for path in model_dir.rglob("*.py"):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                targets = [node.target]
+            else:
+                continue
+            for target in targets:
+                if isinstance(target, ast.Attribute) and target.attr == "benchmark" \
+                        and ast.unparse(target.value).endswith("cudnn"):
+                    writes.append(f"{path.relative_to(model_dir)}:{node.lineno}")
+    assert not writes, f"model code changes cuDNN's process-wide benchmark flag: {writes}"
 
 
 def _flags():
