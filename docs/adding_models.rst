@@ -461,6 +461,38 @@ A prompt on a walk the keys don't name sets 0, because the data worker refuses a
 from any other walk. This key is temporary, with ``kv_labels``.
 A name either key doesn't declare fails the request.
 
+Within-step chunk attention uses an ``Array(max_len=0)`` with one
+``Read(mask=ChunkCausal(chunk_len), op=Attend(...))``. The request gives that
+read's ``ChunkCausalLayout(global_len=, noised_len=, clean_len=)`` under
+``Layout(chunk_causal={read_key: ...})``. Those lengths describe the global,
+noised and clean parts of one step; they must sum to its segment length.
+When the lengths depend on an episode or another admission result, ``walk_plan``
+can set ``step_metadata["__state_chunk_causal_layout__"]`` instead, as
+``{array: {label: {read: [global_len, noised_len, clean_len]}}}``. The model may
+still return paged KV or sized Value layouts from ``process_prompt``. A walk's
+value wins for a read it also names at prompt intake. Every planned walk
+containing a node that declares this mask must receive lengths, even if that
+node skips the read on one walk: ``Array.nodes`` does not identify which walks
+use it. The conductor refuses missing or malformed lengths before dispatch.
+
+Within-step expert attention uses the same array and walk rule with
+``ExpertSelf(chunk_len, future_per_chunk=...)`` or
+``ExpertCross(chunk_len, future_per_chunk=..., tokens_per_frame=..., window_frames=..., include_noised=True)``.
+The typed prompt layouts are ``Layout(expert_self={read: ExpertSelfLayout(num_chunks=)})``
+and ``Layout(expert_cross={read: ExpertCrossLayout(num_chunks=, global_len=,
+clean_frames=, noised_frames=)})``. A walk can instead set
+``step_metadata["__state_expert_layout__"]`` with
+``{array: {label: {read: [num_chunks]}}}`` for self attention or
+``{array: {label: {read: [num_chunks, global_len, clean_frames, noised_frames]}}}``
+for cross attention. The walk's read-keyed value overrides the prompt's value;
+the conductor checks the names and frame counts before dispatch. For cross
+attention, ``noised_frames`` equals ``num_chunks * chunk_len``. With
+``clean_frames > 0``, it must also be ``1``, ``chunk_len``,
+``clean_frames + 1``, or ``clean_frames + chunk_len``. The engine checks the
+segment span: ``global_len + (clean_frames + noised_frames) * tokens_per_frame``
+for cross attention, and ``num_chunks * (1 + future_per_chunk + chunk_len)``
+for self attention. A span mismatch fails when the engine plans the step.
+
 The footprint adds the spans, the growth at each loop's iterations (up to the layout's
 ``max_growth``) and the scratch, and rounds up to whole pages per label. A span's own scratch counts only with the spans before
 it, so a window's denoise steps and its commit count once. Under a ``RetentionPolicy`` it
