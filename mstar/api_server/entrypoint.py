@@ -1189,8 +1189,8 @@ class APIServer:
                             "result delivery timed out; response is incomplete"
                         )
                         req.error_status = 500
-                elif (drained and self.model_name == "orpheus"
-                      and "audio" in req.output_modalities
+                elif (drained and "audio" in req.output_modalities
+                      and self.model_name == "orpheus"
                       and not req.has_audio_output and req.error is None):
                     # An EOS before one SNAC frame can produce a final empty
                     # audio chunk. It is not a successful speech answer.
@@ -1432,7 +1432,7 @@ class APIServer:
                         req.profile.timing.output_postprocess_s += result_chunk.postprocess_s
                         req.completion_tokens += result_chunk.num_tokens
                         req.stopped |= result_chunk.stopped
-                        if self.model_name == "orpheus" and result_chunk.modality == "audio":
+                        if result_chunk.modality == "audio" and self.model_name == "orpheus":
                             if not result_chunk.data:
                                 # SNAC can flush an unfinished frame as an
                                 # empty chunk. Keep it out of both frontends;
