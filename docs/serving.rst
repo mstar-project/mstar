@@ -1243,9 +1243,11 @@ Tracing is off by default and starts after warmups. This first API-server slice
 exports a root ``request`` span and ``preprocess``, ``graph`` and ``delivery``
 children when their existing timestamps are available. The current default
 Rust frontend and the deprecated Python frontend both produce these API
-spans. For ``/v1/chat/completions``, either frontend passes an incoming W3C
-``traceparent`` to the API server. A valid parent is used for the request span;
-a malformed one starts a root trace. When tracing is enabled, the workers collect
+spans. For ``/v1/chat/completions`` and ``/generate``, either frontend passes
+an incoming W3C ``traceparent`` to the API server. ``/generate/ws`` uses the
+handshake header as the parent for each call on that socket. A valid parent is
+used for the request span; a malformed one starts a root trace. When tracing
+is enabled, the workers collect
 their existing per-request node timings. Each ``node.activity`` child of ``graph``
 spans the first to last step in the conductor's retained timing for one node
 and walk. Its execution count and CPU-measured phase sums use the same batch-wide

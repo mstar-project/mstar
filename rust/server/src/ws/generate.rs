@@ -421,6 +421,7 @@ type Turn = Shared<BoxFuture<'static, ()>>;
 
 struct Socket {
     st: AppState,
+    traceparent: Option<String>,
     out: mpsc::UnboundedSender<Message>,
     live: Mutex<HashMap<String, CallSlot>>,
     appends: Mutex<HashMap<String, Turn>>,
@@ -480,6 +481,7 @@ async fn serve_one(
         }
         let (uploads, parts) = decode_owned(message.get("files").cloned(), upload_dir.clone()).await.map_err(refusal)?;
         let mut args = SubmitArgs { file_paths: uploads.paths.clone(), ..SubmitArgs::default() };
+        args.traceparent = sock.traceparent.clone();
         let streams = file_streams(message.get("files"), &parts);
         let modalities = ws_modalities(message.get("input_modalities"), "input_modalities");
         let kwargs = ws_model_kwargs(message.get("model_kwargs"));
@@ -704,13 +706,16 @@ async fn append_one(sock: Arc<Socket>, message: Val, binary: bool, mut call: Cal
 }
 
 /// `GET /generate/ws`.
-pub async fn generate_ws(State(st): State<AppState>, ws: super::Upgrade) -> Response {
+pub async fn generate_ws(
+    State(st): State<AppState>, headers: axum::http::HeaderMap, ws: super::Upgrade,
+) -> Response {
     let ws = match super::upgrade(ws) {
         Ok(ws) => ws,
         Err(not_found) => return not_found,
     };
     let limit = super::max_message_bytes();
-    ws.max_message_size(limit).max_frame_size(limit).on_upgrade(move |socket| serve(socket, st))
+    let traceparent = crate::incoming_traceparent(&headers);
+    ws.max_message_size(limit).max_frame_size(limit).on_upgrade(move |socket| serve(socket, st, traceparent))
 }
 
 fn parse_frame(message: Message) -> Option<(Result<Val, String>, bool)> {
@@ -728,7 +733,7 @@ fn parse_frame(message: Message) -> Option<(Result<Val, String>, bool)> {
     }
 }
 
-async fn serve(socket: WebSocket, st: AppState) {
+async fn serve(socket: WebSocket, st: AppState, traceparent: Option<String>) {
     let (mut sink, mut source) = socket.split();
     let (out, mut outbox) = mpsc::unbounded_channel::<Message>();
     let writer = tokio::spawn(async move {
@@ -749,7 +754,10 @@ async fn serve(socket: WebSocket, st: AppState) {
         }
         _ => None,
     };
-    let sock = Arc::new(Socket { st: st.clone(), out: out.clone(), live: Mutex::new(HashMap::new()), appends: Mutex::new(HashMap::new()), notices });
+    let sock = Arc::new(Socket {
+        st: st.clone(), traceparent, out: out.clone(),
+        live: Mutex::new(HashMap::new()), appends: Mutex::new(HashMap::new()), notices,
+    });
     let mut tasks = tokio::task::JoinSet::new();
     if let Some(mut rx) = notice_rx {
         // an append the model found late: answered as late on its own socket
