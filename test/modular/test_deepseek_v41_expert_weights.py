@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from mstar.model.deepseek_v41.expert_weights import (
+from mstar.utils.deepseek_v41_expert_weights import (
     convert_expert_fp4_to_fp8,
     dequantize_expert_fp4,
 )
