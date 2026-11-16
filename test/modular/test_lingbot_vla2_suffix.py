@@ -24,7 +24,7 @@ def _checkpoint(tmp_path):
     source = LingBotVLASuffixInputs(config)
     weights = {}
     for i, name in enumerate((
-        "state_proj", "action_in_proj", "action_time_mlp_in", "action_time_mlp_out",
+        "state_proj", "action_in_proj", "action_time_mlp_in", "action_time_mlp_out", "action_out_proj",
     )):
         layer = getattr(source, name)
         weights[f"model.{name}.weight"] = (
@@ -33,7 +33,6 @@ def _checkpoint(tmp_path):
         weights[f"model.{name}.bias"] = (
             torch.linspace(-0.12, 0.12, layer.bias.numel()) - i * 0.009
         ).contiguous()
-    weights["model.action_out_proj.weight"] = torch.zeros(2, 4)
     save_file(weights, tmp_path / "model.safetensors")
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
         "weight_map": {name: "model.safetensors" for name in weights},
@@ -83,6 +82,7 @@ def test_suffix_refuses_incomplete_or_unknown_projection_index(tmp_path):
     original = json.loads(index.read_text())
     for key, pattern in (
         ("model.state_proj.weight", "1 missing"),
+        ("model.action_out_proj.bias", "1 missing"),
         ("model.state_proj.unknown", "1 extra"),
     ):
         changed = json.loads(json.dumps(original))
@@ -145,3 +145,43 @@ def test_suffix_requires_matching_input_shapes():
         suffix(state, actions, timestep[:1])
     with pytest.raises(ValueError, match="same device"):
         suffix(state.to("meta"), actions, timestep)
+
+
+def test_action_output_projection_matches_reference_dtype_rules(tmp_path):
+    config, _ = _checkpoint(tmp_path)
+    decoded = torch.tensor([
+        [[0.2, -0.1, 0.3, 0.4], [-0.7, 0.8, 0.5, -0.2]],
+        [[0.9, -0.3, 0.6, -0.4], [0.1, 0.7, -0.8, 0.2]],
+    ])
+    suffix = LingBotVLASuffixInputs(config)
+    load_suffix_input_weights(suffix, tmp_path)
+    # FlowMatchingV2.sample_actions takes the last action rows before this
+    # projection and calls action_out_proj on them.
+    # Golden from the pinned reference's action_out_proj with the fixture weights.
+    expected = torch.tensor([
+        [[-0.1401714087, 0.3284000158], [-0.1230856925, 0.2312000096]],
+        [[-0.2830285430, 0.1855428517], [-0.2038285434, 0.0933142826]],
+    ])
+    torch.testing.assert_close(suffix.project_actions(decoded), expected, rtol=0, atol=1e-7)
+
+    default_bf16 = suffix.to(torch.bfloat16)
+    actual_bf16 = default_bf16.project_actions(decoded)
+    expected_bf16 = torch.nn.functional.linear(
+        decoded.to(torch.bfloat16), default_bf16.action_out_proj.weight,
+        default_bf16.action_out_proj.bias,
+    )
+    assert actual_bf16.dtype == torch.bfloat16
+    torch.testing.assert_close(actual_bf16, expected_bf16, rtol=0, atol=0)
+
+    suffix = LingBotVLASuffixInputs(LingBotVLASuffixConfig(3, 2, 4, action_fp32=True))
+    load_suffix_input_weights(suffix, tmp_path)
+    suffix = suffix.to(torch.bfloat16)
+    actual = suffix.project_actions(decoded.to(torch.bfloat16))
+    expected = torch.nn.functional.linear(
+        decoded.to(torch.bfloat16).float(), suffix.action_out_proj.weight.float(),
+        suffix.action_out_proj.bias.float(),
+    )
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="decoded actions must"):
+        suffix.project_actions(decoded[..., :3])

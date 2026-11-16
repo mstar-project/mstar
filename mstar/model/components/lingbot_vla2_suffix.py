@@ -1,8 +1,9 @@
 """LingBot-VLA 2.0's state, noisy-action and timestep input projections.
 
 The released V2 policy inherits ``embed_suffix`` from its V1 flow-matching
-model. This component keeps those checkpoint parameter names and assembles the
-expert input; the decoder, action output projection and graph are separate.
+model. This component keeps those checkpoint parameter names, assembles the
+expert input and projects the decoded action rows; the decoder and graph are
+separate.
 """
 from __future__ import annotations
 
@@ -40,6 +41,7 @@ class LingBotVLASuffixInputs(nn.Module):
         width = config.expert_hidden_size
         self.state_proj = nn.Linear(config.max_state_dim, width)
         self.action_in_proj = nn.Linear(config.max_action_dim, width)
+        self.action_out_proj = nn.Linear(width, config.max_action_dim)
         self.action_time_mlp_in = nn.Linear(width * 2, width)
         self.action_time_mlp_out = nn.Linear(width, width)
 
@@ -94,19 +96,27 @@ class LingBotVLASuffixInputs(nn.Module):
         attention_mask[:, :2] = True
         return time_emb, embeddings, pad_mask, attention_mask
 
+    def project_actions(self, decoded_actions: torch.Tensor) -> torch.Tensor:
+        """Project the decoder's selected action rows to the policy action width."""
+        if decoded_actions.ndim != 3 or decoded_actions.shape[-1] != self.config.expert_hidden_size:
+            raise ValueError("LingBot-VLA decoded actions must be [batch, chunk, expert_hidden_size]")
+        if self.config.action_fp32:
+            return self._project(self.action_out_proj, decoded_actions)
+        return self.action_out_proj(decoded_actions.to(self.action_out_proj.weight.dtype))
+
 
 def load_suffix_input_weights(
     suffix: LingBotVLASuffixInputs, checkpoint_dir: str | Path,
     *, device: str | torch.device = "cpu",
 ) -> set[str]:
-    """Read only the eight indexed input-projection tensors from the VLA checkpoint."""
+    """Read the indexed input and action-output projections from the VLA checkpoint."""
     checkpoint_dir = Path(checkpoint_dir)
     index_path = checkpoint_dir / "model.safetensors.index.json"
     if not index_path.exists():
         raise FileNotFoundError(f"LingBot-VLA suffix requires {index_path}")
     expected = {f"model.{name}" for name in dict(suffix.named_parameters())}
     index_keys = set(json.loads(index_path.read_text())["weight_map"])
-    stems = ("model.state_proj.", "model.action_in_proj.",
+    stems = ("model.state_proj.", "model.action_in_proj.", "model.action_out_proj.",
              "model.action_time_mlp_in.", "model.action_time_mlp_out.")
     actual = {name for name in index_keys if name.startswith(stems)}
     missing, extra = sorted(expected - actual), sorted(actual - expected)
