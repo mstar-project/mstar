@@ -17,6 +17,7 @@ import functools
 import numpy as np
 import torch
 
+from mstar.engine.resources.attn.ragged.wrappers import zero_unplanned_rows
 from mstar.platforms import current_platform
 
 try:
@@ -224,14 +225,13 @@ class FA3RaggedWrapper:
         self._stager = PinnedStager(torch.int32)
         self._rows = 0
         self._max_q = 0
-        self._page_table = self._seqused = self._qo_indptr_buf = self._token_ids = None
+        self._page_table = self._seqused = self._qo_indptr_buf = None
         if accelerator_graph:
             assert batch_size is not None and max_tokens is not None, "batch_size and max_tokens for a capture"
             self._rows, self._max_q = batch_size, max_tokens
             self._page_table = torch.zeros(batch_size, self.width, dtype=torch.int32, device=device)
             self._seqused = torch.zeros(batch_size, dtype=torch.int32, device=device)
             self._qo_indptr_buf = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-            self._token_ids = torch.arange(max_tokens, dtype=torch.int32, device=device)
 
     @torch.compiler.disable
     def plan(
@@ -303,8 +303,8 @@ class FA3RaggedWrapper:
             cu_seqlens_q=self._qo_indptr_buf, max_seqlen_q=max(self._max_q, 1), causal=self.causal,
             num_splits=self.NUM_SPLITS, pack_gqa=self.PACK_GQA,
         )
-        if self._token_ids is not None:
-            # the queries past every row's (a replay's padding) are never written by the kernel
-            tail = self._token_ids[: out.shape[0]] >= self._qo_indptr_buf[-1]
-            out = out.masked_fill(tail[:, None, None], 0)
+        if self.accelerator_graph:
+            # the queries past every row's (a replay's padding) are never written by the kernel: one in-place
+            # kernel zeroes them from the planned total on the device, so on every replay
+            zero_unplanned_rows(out, self._qo_indptr_buf)
         return out

@@ -94,6 +94,8 @@ def test_eager_and_captured_steps_run_the_kernel_with_the_same_pinned_schedule(m
         return torch.zeros_like(q)
 
     monkeypatch.setattr(fa3_mod, "flash_attn_with_kvcache", kernel)
+    zeroed = []
+    monkeypatch.setattr(fa3_mod, "zero_unplanned_rows", lambda out, qo_indptr: zeroed.append(out.shape[0]))
     views = _mixed_views([5], [(2, 3)], {0: [3, 4, 5], 1: [6, 7]})
     cache = torch.zeros(8, 2, PAGE, 1, 8)
     eager = FA3RaggedWrapper(page_size=PAGE, table_width=8, device=CPU)
@@ -105,6 +107,8 @@ def test_eager_and_captured_steps_run_the_kernel_with_the_same_pinned_schedule(m
     pinned = (FA3RaggedWrapper.NUM_SPLITS, FA3RaggedWrapper.PACK_GQA)
     assert [(s["num_splits"], s["pack_gqa"]) for s in seen] == [pinned, pinned]
     assert [s["max_seqlen_q"] for s in seen] == [4, 12]
+    # only a captured step has padding queries to zero
+    assert zeroed == [12]
 
 
 def _stub_manager(verify_fa3: bool):
@@ -333,3 +337,66 @@ def test_fa3_reads_a_long_rows_last_page_past_its_length_only_on_large_pages(pag
     wrapper.plan(dtype=torch.bfloat16, **build_paged_indptrs(views, page).to_kwargs_dict())
     finite = bool(torch.isfinite(wrapper.run(q, cache)).all())
     assert finite == (page <= FA3_TAIL_SAFE_PAGE_SIZE or prompt < 64)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("block,hide,max_tokens", [(4, 0, 288), (8, 1, 544), (8, 1, 640)],
+                         ids=["eagle3_288", "dspark_544", "dspark_640"])
+def test_a_replay_at_qwen3_8b_buckets_zeroes_its_padding_in_place(block, hide, max_tokens):
+    """Qwen3-8B's mixed buckets (64 rows): a replay after its output memory was poisoned with NaN leaves every
+    real row the eager wrapper's, bit for bit, and every padding query exactly zero, from one planned total and
+    then a smaller one (other rows on the same bucket)."""
+    reason = fa3_paged_unavailable_reason(torch.device("cuda"), 128, torch.bfloat16)
+    if reason is not None:
+        pytest.skip(reason)
+    heads, kv_heads, dim, page = 32, 8, 128, 128
+    torch.manual_seed(0)
+    verify = torch.randint(600, 2000, (60,)).tolist()
+    prompts = [(1024, max_tokens - 64 * block - 7), (0, 3)]
+    totals = [n + block for n in verify] + [c + n for c, n in prompts]
+    pages_per = [-(-t // page) for t in totals]
+    total = sum(pages_per) + 1
+    cache = torch.randn(total, 2, page, kv_heads, dim, device="cuda", dtype=torch.bfloat16)
+    perm = torch.randperm(total - 1).tolist()
+    pages_of, at = {}, 0
+    for i, count in enumerate(pages_per):
+        pages_of[i] = [p + 1 for p in perm[at: at + count]]
+        at += count
+    views = [SequenceView(request_id=i, label="main", page_idxs=pages_of[i], length=totals[i], to_compute=block)
+             for i in range(len(verify))]
+    if hide:
+        views = hide_tail_views(views, hide, page)
+    views += [SequenceView(request_id=len(verify) + j, label="main", page_idxs=pages_of[len(verify) + j],
+                           length=c + n, to_compute=n) for j, (c, n) in enumerate(prompts)]
+    n_q = len(verify) * block + sum(n for _, n in prompts)
+    assert n_q < max_tokens
+    device = torch.device("cuda", torch.cuda.current_device())
+    causal = not hide
+    bs = 64
+    padding = [SequenceView(request_id=-1, label="main", page_idxs=[], length=0, to_compute=0)] * (bs - len(views))
+    captured = FA3RaggedWrapper(page_size=page, table_width=4096 // page, device=device, batch_size=bs,
+                                max_tokens=max_tokens, accelerator_graph=True, causal=causal)
+    q_static = torch.zeros(max_tokens, heads, dim, device=device, dtype=torch.bfloat16)
+    captured.plan(dtype=torch.bfloat16, **build_paged_indptrs(views + padding, page).to_kwargs_dict())
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        captured.run(q_static, cache)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        out = captured.run(q_static, cache)
+    q = torch.randn(n_q, heads, dim, device=device, dtype=torch.bfloat16)
+    # the same bucket at its step's rows, then at a step with the first verify row gone
+    for step_views, step_q in ((views, q), (views[1:], q[block:])):
+        captured.plan(dtype=torch.bfloat16, **build_paged_indptrs(
+            step_views + padding + padding[: len(views) - len(step_views)], page).to_kwargs_dict())
+        q_static.zero_()
+        q_static[: step_q.shape[0]] = step_q
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        eager = FA3RaggedWrapper(page_size=page, table_width=4096 // page, device=device, causal=causal)
+        eager.plan(dtype=torch.bfloat16, **build_paged_indptrs(step_views, page).to_kwargs_dict())
+        assert torch.equal(out[: step_q.shape[0]], eager.run(step_q, cache))
+        assert out[step_q.shape[0]:].eq(0).all()
