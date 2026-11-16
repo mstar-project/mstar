@@ -22,7 +22,7 @@ import time
 import uuid
 from pathlib import Path
 
-from benchmark.eval.e2e import calibrate, hosts, media, report, stress, trees
+from benchmark.eval.e2e import calibrate, hosts, media, report, review, stress, trees
 from benchmark.eval.e2e import manifest as mf
 from benchmark.eval.e2e.report import RERUN_TAG
 
@@ -75,6 +75,9 @@ def add_args(sub) -> None:
     p.add_argument("--out", default=None, help="run directory (default eval-results/compare/<time>-<head>)")
     p.add_argument("--chart-url", default=None, help="image URL for the markdown (default: the local chart)")
     p.add_argument("--render", default=None, metavar="RUN_DIR", help="only re-render RUN_DIR's report")
+    p.add_argument("--review", action="store_true", help="add a local HTML page of changed base/head outputs")
+    p.add_argument("--review-fetch", action="store_true",
+                   help="with --review, also copy saved media from remote hosts (can be large)")
     p.add_argument("--list", action="store_true", help="list models, tags and cases")
     p.add_argument("--dry-run", action="store_true", help="resolve refs and slots, print the plan, run nothing")
     s = p.add_argument_group("stress", "--stress replaces the cases with a pinned-id workload of cancels, drops, "
@@ -107,12 +110,20 @@ def run_models(man: mf.Manifest, run: dict) -> list[mf.Model]:
     return man.select(",".join(run["models"]), include_optional=run.get("include_optional", False))
 
 
-def render(run_dir: Path, man: mf.Manifest, calibration: str, chart_url: str | None = None) -> tuple[Path, int]:
+def render(run_dir: Path, man: mf.Manifest, calibration: str, chart_url: str | None = None,
+           with_review: bool = False) -> tuple[Path, int]:
     run = json.loads((run_dir / "run.json").read_text())
     if run.get("stress"):
+        if with_review:
+            raise SystemExit("--review is for saved compare outputs, not --stress")
         md, verdicts = stress.write(run_dir, run["models"], chart_url)
         return md, 1 if any(v.flagged for v in verdicts) else 2 if any(v.unfinished for v in verdicts) else 0
-    md, rows = report.write(run_dir, run_models(man, run), chart_url, calibrate.load(calibration))
+    models = run_models(man, run)
+    md, rows = report.write(run_dir, models, chart_url, calibrate.load(calibration))
+    if with_review:
+        page = review.write(run_dir, rows, models)
+        with md.open("a") as out:
+            out.write(f"\n[Changed output review]({page.name})\n")
     bare = sorted({r.model for r in rows if r.no_baseline})
     if bare:
         print(f"no A/A noise floor on {run.get('gpu')} for: {', '.join(bare)}. Calibrate with python -m "
@@ -145,6 +156,10 @@ def public_command(args) -> str:
         parts.append(f"--sessions {args.sessions}")
     if args.repeats:
         parts.append(f"--repeats {args.repeats}")
+    if getattr(args, "review", False):
+        parts.append("--review")
+    if getattr(args, "review_fetch", False):
+        parts.append("--review-fetch")
     if getattr(args, "stress", False):
         parts += ["--stress", f"--stress-runs {args.stress_runs}", f"--stress-seconds {args.stress_seconds:g}",
                   f"--stress-clients {args.stress_clients}"]
@@ -206,6 +221,13 @@ def parse_poll(text: str) -> tuple[bool, str, dict | None]:
 
 def is_local(slot: hosts.Slot) -> bool:
     return isinstance(slot.transport, hosts.LocalTransport)
+
+
+def fetch_exclude(args, slot: hosts.Slot) -> tuple[str, ...]:
+    """Keep large media remote unless a local review needs it or remote fetch was explicitly requested."""
+    include_media = getattr(args, "review", False) and (
+        is_local(slot) or getattr(args, "review_fetch", False))
+    return () if include_media else FETCH_EXCLUDE
 
 
 def slot_python(args, slot: hosts.Slot) -> str:
@@ -401,7 +423,7 @@ class Runner:
                 self.set(name, progress=progress[:200])
         part = dst.with_name(dst.name + ".partial")   # published only once the copy is complete
         shutil.rmtree(part, ignore_errors=True)
-        t.pull(out, part, FETCH_EXCLUDE)
+        t.pull(out, part, fetch_exclude(self.args, slot))
         # The report reads done.json: write compare's own verdict when the job left none (killed, stopped), and
         # keep host names and host paths out of the reason.
         done = {**done, "reason": self.redact(done.get("reason", ""), slot)}
@@ -453,6 +475,8 @@ def make_slots(args, provider: hosts.HostProvider | None) -> list[hosts.Slot]:
 
 
 def cmd_compare(args) -> int:
+    if getattr(args, "review_fetch", False) and not getattr(args, "review", False):
+        raise SystemExit("--review-fetch requires --review")
     man = mf.load(args.cases)
     if args.list:
         for m in man.models.values():
@@ -464,9 +488,12 @@ def cmd_compare(args) -> int:
         print("* request path or served invariants (--rp); + optional model: name it or use its own tag")
         return 0
     if args.render:
-        md, code = render(Path(args.render), man, args.calibration, args.chart_url)
+        md, code = render(Path(args.render), man, args.calibration, args.chart_url,
+                          getattr(args, "review", False))
         print(md)
         return code
+    if getattr(args, "review", False) and args.stress:
+        raise SystemExit("--review is for saved compare outputs, not --stress")
     if not args.head:
         raise SystemExit("compare needs --head (or --render / --list)")
     if args.out and (Path(args.out) / "run.json").exists():
@@ -566,7 +593,7 @@ def _run(args, man, models, base, head, slots) -> int:
         run["gpu_hours"] = round(sum(s.get("gpu_s", 0) for s in st.values()) / 3600, 2)
         run["model_status"] = {n: {k: v for k, v in s.items() if k in ("status", "reason")} for n, s in st.items()}
         (run_dir / "run.json").write_text(json.dumps(run, indent=1))
-    md, code = render(run_dir, man, args.calibration, args.chart_url)
+    md, code = render(run_dir, man, args.calibration, args.chart_url, getattr(args, "review", False))
     print(f"report: {md}\nGPU-hours: {run['gpu_hours']}", file=sys.stderr)
     print(md.read_text())
     return code

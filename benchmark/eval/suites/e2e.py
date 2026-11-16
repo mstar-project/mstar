@@ -193,12 +193,23 @@ class E2ESuite(Suite):
         first: list[float] = []
         text: list[str] = []
         audio = bytearray()
+        audio_boundaries: list[int] | None = []
         blob: bytes | None = None
         timeout = aiohttp.ClientTimeout(total=a.timeout)
 
         def mark() -> None:
             if not first:
                 first.append(time.perf_counter() - t0)
+
+        def append_audio(data: bytes) -> None:
+            nonlocal audio_boundaries
+            if not data:
+                return
+            if len(audio) % 2 or len(data) % 2:
+                audio_boundaries = None  # cannot locate PCM16 sample joins in malformed chunks
+            elif audio and audio_boundaries is not None:
+                audio_boundaries.append(len(audio) // 2)
+            audio.extend(data)
 
         try:
             if a.kind == "praxis_openpi":
@@ -225,7 +236,7 @@ class E2ESuite(Suite):
                                 text.append(d["content"])   # one delta per decode step: the token count
                             if (d.get("audio") or {}).get("data"):
                                 mark()
-                                audio.extend(base64.b64decode(d["audio"]["data"]))
+                                append_audio(base64.b64decode(d["audio"]["data"]))
                     if not finished:   # the connection ended before the reply did
                         return error_row(item, "incomplete stream", "no finish_reason or [DONE]")
             elif a.kind in ("image", "video", "video_i2v"):
@@ -256,7 +267,7 @@ class E2ESuite(Suite):
                             mark()
                             data = base64.b64decode(msg["data"])
                             if msg.get("modality") == "audio":
-                                audio.extend(data)
+                                append_audio(data)
                             else:
                                 chunks.append(data)
                 blob = b"".join(chunks) or None
@@ -268,7 +279,8 @@ class E2ESuite(Suite):
         out = "".join(text).encode() + bytes(audio) + (blob or b"")
         return {"id": item.id, "ok": True, "error": None, "e2e_s": e2e, "ttft_s": first[0] if first else None,
                 "text": "".join(text), "n_chunks": len(text), "audio_s": len(audio) / 2 / a.sample_rate,
-                "out_sha": hashlib.sha256(out).hexdigest()[:16], "_audio": bytes(audio), "_blob": blob}
+                "out_sha": hashlib.sha256(out).hexdigest()[:16], "_audio": bytes(audio), "_blob": blob,
+                "_audio_boundaries": audio_boundaries, "_audio_sample_rate": a.sample_rate}
 
     def score(self, items: list[Item], rows: list[dict[str, Any]], wall_s: float, audio_dir: Path | None) -> dict:
         ok = [r for r in rows if r["ok"]]
@@ -326,4 +338,15 @@ def save_outputs(rows: list[dict[str, Any]], d: Path, kind: str) -> None:
         if r["_blob"]:
             (d / f"{r['id']}.{EXT.get(kind, 'bin')}").write_bytes(r["_blob"])
         if r["_audio"]:
-            (d / f"{r['id']}.pcm").write_bytes(r["_audio"])
+            pcm = d / f"{r['id']}.pcm"
+            sidecar = pcm.with_name(pcm.name + ".chunks.json")
+            if pcm.is_symlink() or sidecar.is_symlink():
+                raise ValueError("audio output path is a symlink")
+            pcm.write_bytes(r["_audio"])
+            boundaries = r.get("_audio_boundaries")
+            if boundaries and len(r["_audio"]) % 2 == 0:
+                sidecar.write_text(json.dumps({"schema": "mstar-eval/audio-chunks/1",
+                                               "sample_rate": r["_audio_sample_rate"],
+                                               "boundaries": boundaries}), encoding="utf-8")
+            else:
+                sidecar.unlink(missing_ok=True)
