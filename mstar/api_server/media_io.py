@@ -324,6 +324,9 @@ logger = logging.getLogger(__name__)
 REMOTE_MAX_BYTES = 64 * 2**20
 REMOTE_MAX_REDIRECTS = 3
 REMOTE_USER_AGENT = "mstar"
+# Leave two default executor threads for requests without remote media, even on small hosts.
+REMOTE_FETCH_SLOTS = min(8, max(1, min(32, (os.cpu_count() or 1) + 4) - 2))
+_remote_fetch_slots = threading.BoundedSemaphore(REMOTE_FETCH_SLOTS)
 _URL_SAFE = "".join(map(chr, range(0x21, 0x7F)))  # printable ASCII, so existing %-escapes stay
 # Refused unless the host is allowlisted: loopback, private, link-local (cloud
 # metadata at 169.254.169.254), shared/CGNAT, multicast, reserved. The same list
@@ -457,6 +460,16 @@ class _PinnedConnection(http.client.HTTPConnection):
 
 
 def save_remote_url(url: str, upload_dir: Path, timeout: float = 30.0) -> tuple[str, str]:
+    """Fetch one remote media URL, refusing immediately when all fetch slots are busy."""
+    if not _remote_fetch_slots.acquire(blocking=False):
+        raise _fetch_error("", "too many concurrent fetches")
+    try:
+        return _save_remote_url(url, upload_dir, timeout)
+    finally:
+        _remote_fetch_slots.release()
+
+
+def _save_remote_url(url: str, upload_dir: Path, timeout: float) -> tuple[str, str]:
     """Download an ``http(s)`` URL into ``upload_dir``. Returns (modality, path).
 
     With ``MSTAR_REMOTE_ALLOWED_HOSTS`` set (comma-separated hosts and
