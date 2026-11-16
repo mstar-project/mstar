@@ -20,6 +20,8 @@ import numpy as np
 from benchmark.eval.schema import validate
 
 PCM_RATE = 24000
+CHUNK_SIDECAR = ".pcm.chunks.json"
+JOIN_WINDOW = 32  # compare each join to the first differences immediately on either side
 TRUNCATED_RATIO = 0.8   # a head reply that is base's reply cut below this share of its length is truncated
 
 
@@ -56,6 +58,53 @@ def _try_load(p: Path) -> Any:
         return None
 
 
+def audio_joins(pcm: Path) -> list[dict] | None:
+    """Diagnostic PCM16 join facts, or None for an older saved output without chunk metadata.
+
+    ``normalized_jump`` is the sample step at the join divided by the median neighboring step (at least one
+    PCM16 unit). It is not a quality verdict; natural transients also produce large steps.
+    """
+    sidecar = pcm.with_name(pcm.name + ".chunks.json")
+    if sidecar.is_symlink():
+        raise ValueError("chunk metadata path is a symlink")
+    if not sidecar.exists():
+        return None
+    if pcm.suffix != ".pcm" or pcm.is_symlink() or not pcm.is_file() or not sidecar.is_file():
+        raise ValueError("chunk metadata must belong to a regular PCM file in the same directory")
+    if sidecar.stat().st_size > 1 << 20:
+        raise ValueError("chunk metadata is too large")
+    try:
+        meta = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, RecursionError, UnicodeError, ValueError) as exc:
+        raise ValueError("chunk metadata is unreadable") from exc
+    if not isinstance(meta, dict) or meta.get("schema") != "mstar-eval/audio-chunks/1":
+        raise ValueError("unknown chunk metadata schema")
+    rate = meta.get("sample_rate")
+    if type(rate) is not int or rate <= 0:
+        raise ValueError("invalid audio sample rate")
+    if pcm.stat().st_size % 2:
+        raise ValueError("PCM16 file has an odd byte count")
+    samples = np.fromfile(pcm, dtype="<i2").astype(np.int32)
+    boundaries = meta.get("boundaries")
+    if (not isinstance(boundaries, list) or not boundaries or
+            any(type(b) is not int or b <= 0 or b >= len(samples) for b in boundaries) or
+            boundaries != sorted(set(boundaries))):
+        raise ValueError("chunk boundaries must be strictly increasing positions inside the PCM file")
+    steps = np.abs(np.diff(samples))
+    for b in boundaries:
+        steps[b - 1] = -1  # exclude every join from its neighbors' reference level
+    joins = []
+    for b in boundaries:
+        near = np.concatenate((steps[max(0, b - JOIN_WINDOW):b - 1],
+                               steps[b:min(len(steps), b + JOIN_WINDOW - 1)]))
+        near = near[near >= 0]
+        level = max(1.0, float(np.median(near)) if len(near) else 0.0)
+        jump = abs(int(samples[b]) - int(samples[b - 1]))
+        joins.append({"sample": b, "jump": jump, "neighbor_step": level,
+                      "normalized_jump": round(jump / level, 3)})
+    return joins
+
+
 def text_facts(pairs: list[tuple[str, str]]) -> dict:
     """Identity plus how close the texts are: greedy decoding forks at near-ties across server processes, so a
     late fork is not a regression, while an empty, truncated or unrelated reply is. ``text_truncated`` counts head
@@ -77,7 +126,8 @@ def saved(a: Path | None, b: Path | None) -> dict:
     """Facts from two directories of saved outputs, matched by file name."""
     if a is None or b is None or not a.is_dir() or not b.is_dir():
         return {"missing": [arm for arm, x in (("base", a), ("head", b)) if x is None or not x.is_dir()]}
-    na, nb = {p.name for p in a.iterdir()}, {p.name for p in b.iterdir()}
+    na, nb = ({p.name for p in d.iterdir()
+               if p.is_file() and not p.is_symlink() and not p.name.endswith(CHUNK_SIDECAR)} for d in (a, b))
     texts, ps, act, bad = [], [], [], []
     for n in sorted(na & nb):
         x, y = _try_load(a / n), _try_load(b / n)
@@ -95,7 +145,8 @@ def saved(a: Path | None, b: Path | None) -> dict:
     # Outputs base returned and head did not (speech without its audio, an empty reply) fail on their own.
     out: dict = {"n_base": len({n.split(".")[0] for n in na}), "n_head": len({n.split(".")[0] for n in nb}),
                  "only_base": sorted(na - nb), "head_undecodable": bad}
-    pcm = {arm: sum(f.stat().st_size for f in d.glob("*.pcm")) / 2 / PCM_RATE for arm, d in (("base", a), ("head", b))}
+    pcm = {arm: sum(f.stat().st_size for f in d.glob("*.pcm") if f.is_file() and not f.is_symlink()) / 2 / PCM_RATE
+           for arm, d in (("base", a), ("head", b))}
     if texts:
         out.update(text_facts(texts))
     if ps:
@@ -105,6 +156,20 @@ def saved(a: Path | None, b: Path | None) -> dict:
         out["shape_mismatch"] = len(ps) - len(finite)
     if any(n.endswith(".pcm") for n in na | nb):
         out["audio_s_base"], out["audio_s_head"] = round(pcm["base"], 2), round(pcm["head"], 2)
+        for arm, d, names in (("base", a, na), ("head", b, nb)):
+            joins, invalid = [], []
+            for n in sorted(n for n in names if n.endswith(".pcm")):
+                try:
+                    facts = audio_joins(d / n)
+                except (OSError, ValueError):
+                    invalid.append(n)
+                    continue
+                if facts is not None:
+                    joins.extend({"file": n, **fact} for fact in facts)
+            if joins:
+                out[f"audio_joins_{arm}"] = joins
+            if invalid:
+                out[f"audio_joins_invalid_{arm}"] = invalid
     if act:
         out["action_max_abs_diff"] = max(act)
     return out

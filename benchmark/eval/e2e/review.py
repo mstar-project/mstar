@@ -53,7 +53,16 @@ def _media(path: Path, root: Path, page: Path) -> str:
                     out.writeframesraw(block)
     url = _url(target, page)
     if path.suffix in (".wav", ".pcm"):
-        return f'<audio controls src="{url}"></audio>'
+        player = f'<audio controls src="{url}"></audio>'
+        if path.suffix == ".pcm":
+            try:
+                joins = checks.audio_joins(path)
+            except (OSError, ValueError):
+                return player + "<p>Invalid chunk metadata</p>"
+            if joins:
+                detail = ", ".join(f"sample {j['sample']}: {j['normalized_jump']:g}x" for j in joins)
+                return player + f"<p>Chunk joins (jump / neighboring step): {html.escape(detail)}</p>"
+        return player
     if path.suffix == ".png":
         return f'<img src="{url}" alt="{label}">'
     if path.suffix == ".mp4":
@@ -99,7 +108,8 @@ def write(run_dir: Path, rows: list, models: list) -> Path:
                 names = set()
                 for directory in (base, head):
                     if directory is not None and directory.is_dir():
-                        names.update(p.name for p in directory.iterdir() if _safe_file(p, run_dir))
+                        names.update(p.name for p in directory.iterdir()
+                                     if _safe_file(p, run_dir) and not p.name.endswith(checks.CHUNK_SIDECAR))
                 pairs.extend((f"{run_label}/{session.name}/{name}", base / name if base else None,
                               head / name if head else None) for name in sorted(names))
         if not pairs:
