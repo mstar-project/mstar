@@ -8,8 +8,8 @@ string hash on every store/lookup. The replacement is one ``u64``::
 
 The entity prefix is what keeps it globally unique. A bare per-process counter
 would not be: the *receiving* worker keys its own maps
-(``TensorStore.per_req_tensors``, ``read_finished``, ``_shm_files``,
-``_arena_locs``, ``uuid_to_shard_dim``) by the **sender's** uuid, so two
+(``TensorStore.per_req_tensors``, ``read_finished``, the arena's slot table,
+``uuid_to_shard_dim``) by the **sender's** uuid, so two
 senders both minting 5 would collide and silently hand back the wrong tensor.
 
 The production entities -- ``worker_{rank}`` and the api-server data worker --

@@ -13,8 +13,8 @@ from types import SimpleNamespace
 
 import torch
 
+from mstar.communication.arena import ArenaShmCommunicationManager
 from mstar.communication.communicator import BaseCommunicator
-from mstar.communication.tensors import SharedMemoryCommunicationManager
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext
 from mstar.graph.runtime.base import FreedTensors, PhasedPostprocess, RouteOutput
@@ -192,9 +192,10 @@ def _postprocess(tmp_path, runtime_checks=False):
     """One step of ``_Producer`` through the worker's postprocess; the runtime."""
     engine = _engine(_Producer())
     runtime = _RecordingRuntime()
-    tensor_manager = SharedMemoryCommunicationManager(
+    tensor_manager = ArenaShmCommunicationManager(
         my_entity_id="worker_0", hostname="localhost", device="cpu",
         communicator=_Communicator(), shm_dir=str(tmp_path),
+        use_arena=False,
     )
     request_state = SimpleNamespace(
         per_request_info={},

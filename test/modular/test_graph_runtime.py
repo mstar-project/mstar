@@ -1021,12 +1021,13 @@ def _build_on_real_manager(section, nodes, tmp_path, loops=frozenset(), inboxes=
     ``stream_consumer`` is a node on this worker in a sibling worker graph of
     its own walk, as Orpheus's vocoder is, for a stream to land on.
     """
-    from mstar.communication.tensors import SharedMemoryCommunicationManager
+    from mstar.communication.arena import ArenaShmCommunicationManager
 
-    tm = SharedMemoryCommunicationManager(
+    tm = ArenaShmCommunicationManager(
         my_entity_id="worker_0", hostname="localhost", device="cpu",
         communicator=SimpleNamespace(send=lambda *a, **k: None),
         shm_dir=str(tmp_path),
+        use_arena=False,
     )
     worker_graphs = [WorkerGraph(
         section=section, graph_walks={"w"}, ranks=[0], worker_graph_id=0,

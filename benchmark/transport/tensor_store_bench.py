@@ -28,8 +28,8 @@ import time
 
 import torch
 
+from mstar.communication.arena import ArenaShmCommunicationManager
 from mstar.communication.tensor_store import RustTensorBookkeeping, TensorStore
-from mstar.communication.tensors import SharedMemoryCommunicationManager
 from mstar.distributed.base import ShardingConfig
 from mstar.model.submodule_base import BatchedModelOutput
 
@@ -52,21 +52,11 @@ def _store(kind: str) -> TensorStore:
 
 
 def _manager(kind: str, shm_dir: str, arena_like: bool):
-    cls = SharedMemoryCommunicationManager
-    if arena_like:
-        from mstar.communication.arena import ArenaShmCommunicationManager
-
-        # The arena's inlined batch teardown, without mapping an arena: the
-        # uuids timed here are never staged, so it only walks its dicts.
-        class _ArenaLike(SharedMemoryCommunicationManager):
-            cleanup_collectable = ArenaShmCommunicationManager.cleanup_collectable
-
-        cls = _ArenaLike
-    mgr = cls(
+    # The uuids timed here are never staged, so teardown only walks the tables.
+    mgr = ArenaShmCommunicationManager(
         my_entity_id="worker_0", hostname="localhost", device="cpu",
-        communicator=_NullCommunicator(), shm_dir=shm_dir,
+        communicator=_NullCommunicator(), shm_dir=shm_dir, use_arena=arena_like,
     )
-    mgr._arena_ts, mgr._arena_locs = {}, {}
     mgr.tensor_store = _store(kind)
     return mgr
 

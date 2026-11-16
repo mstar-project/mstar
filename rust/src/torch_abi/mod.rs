@@ -169,6 +169,9 @@ pub trait TorchAbi: Send + Sync + 'static {
     /// `tensor.permute(dim, <the rest in order>).contiguous()`.
     fn lead_contiguous(&self, tensor: &Bound<'_, PyAny>, dim: i64) -> PyResult<Py<PyAny>>;
 
+    /// The inverse of [`Self::lead_contiguous`].
+    fn unlead_contiguous(&self, tensor: &Bound<'_, PyAny>, dim: i64) -> PyResult<Py<PyAny>>;
+
     fn cat(&self, tensors: &[Bound<'_, PyAny>], dim: i64) -> PyResult<Py<PyAny>>;
 }
 
@@ -204,6 +207,7 @@ pub struct TorchV2 {
     wrap: WrapFn,
     narrow: NarrowFn,
     lead_contiguous: LeadFn,
+    unlead_contiguous: LeadFn,
     cat: CatFn,
 }
 
@@ -250,6 +254,7 @@ impl TorchV2 {
             wrap: t(sym("mstar_wrap")?),
             narrow: t(sym("mstar_narrow")?),
             lead_contiguous: t(sym("mstar_lead_contiguous")?),
+            unlead_contiguous: t(sym("mstar_unlead_contiguous")?),
             cat: t(sym("mstar_cat")?),
         })
     }
@@ -344,6 +349,13 @@ impl TorchAbi for TorchV2 {
         check_tensor(self, tensor)?;
         Self::new_ref(tensor.py(), unsafe {
             (self.lead_contiguous)(tensor.as_ptr(), dim)
+        })
+    }
+
+    fn unlead_contiguous(&self, tensor: &Bound<'_, PyAny>, dim: i64) -> PyResult<Py<PyAny>> {
+        check_tensor(self, tensor)?;
+        Self::new_ref(tensor.py(), unsafe {
+            (self.unlead_contiguous)(tensor.as_ptr(), dim)
         })
     }
 

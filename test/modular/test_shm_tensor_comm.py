@@ -1,10 +1,10 @@
-"""Unit tests for SharedMemoryCommunicationManager and tensor serialization."""
+"""Unit tests for the SHM transport's spill files and tensor serialization."""
 
 import ctypes
 import errno
 import logging
 import os
-import shutil
+import resource
 import tempfile
 from types import SimpleNamespace
 
@@ -12,12 +12,14 @@ import pytest
 import torch
 
 import mstar.communication.tensors as tensors_mod
+from mstar.communication.arena import (
+    ArenaShmCommunicationManager,
+    _deserialize_tensor,
+    _serialize_tensor,
+)
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
 from mstar.communication.tensors import (
     MooncakeCommunicationManager,
-    SharedMemoryCommunicationManager,
-    _deserialize_tensor,
-    _serialize_tensor,
     create_tensor_communication_manager,
 )
 from mstar.distributed.base import NodeAndGraphWalk, ShardingConfig, ShardingGroup
@@ -84,13 +86,14 @@ def _stub_info(t: torch.Tensor) -> TensorPointerInfo:
 def _make_manager(
     shm_dir: str, entity_id: str = "worker_0",
     request_id: str | None = None,
-) -> SharedMemoryCommunicationManager:
-    mgr = SharedMemoryCommunicationManager(
+) -> ArenaShmCommunicationManager:
+    mgr = ArenaShmCommunicationManager(
         my_entity_id=entity_id,
         hostname="localhost",
         device="cpu",
         communicator=MockCommunicator(),
         shm_dir=shm_dir,
+        use_arena=False,
     )
     if request_id is not None:
         mgr.register_request(request_id, _empty_sharding_config())
@@ -143,7 +146,7 @@ def test_serialize_high_dim():
 
 
 # ---------------------------------------------------------------------------
-# SharedMemoryCommunicationManager tests
+# Per-uuid file tests
 # ---------------------------------------------------------------------------
 
 def test_store_and_register_creates_file():
@@ -168,9 +171,10 @@ class _DeploymentCommunicator(MockCommunicator):
 
 def _deployed_manager(shm_dir, prefix, entity_id="worker_0",
                       protocol=CommProtocol.IPC):
-    mgr = SharedMemoryCommunicationManager(
+    mgr = ArenaShmCommunicationManager(
         my_entity_id=entity_id, hostname="localhost", device="cpu",
         communicator=_DeploymentCommunicator(prefix, protocol), shm_dir=shm_dir,
+        use_arena=False,
     )
     mgr.register_request("req1", _empty_sharding_config())
     return mgr
@@ -298,66 +302,23 @@ def test_cleanup_unlinks_file():
         assert not os.path.isfile(path)
 
 
-class _StubFullDir:
-    """Opens files that take half of a write and then fail it, as a tmpfs out of space does."""
-
-    def __init__(self):
-        self.partial: dict[str, int] = {}
-
-    def __call__(self, path: str):
-        return _StubFullFile(self, path)
-
-
-class _StubFullFile:
-    """One file of a ``_StubFullDir``; records the bytes it kept before failing."""
-
-    def __init__(self, full_dir: _StubFullDir, path: str):
-        self._dir, self._path, self._f = full_dir, path, open(path, "wb")
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc_info):
-        self._f.close()
-
-    def write(self, data: bytes):
-        self._f.write(data[: len(data) // 2])
-        self._f.flush()
-        self._dir.partial[self._path] = os.path.getsize(self._path)
-        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
-
-
-def _send_into(monkeypatch, mgr, full_dir: _StubFullDir) -> tuple[TensorPointerInfo, OSError]:
-    info = mgr.store_and_return_tensor_info("req1", {"out": [torch.zeros(4096)]})["out"][0]
-    monkeypatch.setattr(mgr, "_create_shm_file", full_dir)
-    with pytest.raises(OSError) as err:
-        mgr.register_for_send("req1", [info])
-    return info, err.value
-
-
-def test_a_full_shm_dir_fails_the_send_with_what_ran_out(monkeypatch):
-    monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(free=1024))
+def test_a_failed_send_leaves_nothing_in_the_shm_dir():
+    """A write that fails part way, as a filling tmpfs does: the send fails and no
+    partial file holds the space with no cleanup tracking it. The limit is the one
+    way to fail a real write here; CPython ignores SIGXFSZ, so it reaches the
+    write as EFBIG. Its ENOSPC wording is a cargo test in arena_capacity.rs."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        info, err = _send_into(monkeypatch, _make_manager(tmpdir, request_id="req1"), _StubFullDir())
-    ran_out = f"{tmpdir} has 1024 bytes free, too few for a {info.nbytes}-byte tensor"
-    assert ran_out in str(err) and "--shm-size" in str(err), "the error hides what ran out"
-
-
-def test_a_full_shm_dir_with_room_left_is_not_called_too_small(monkeypatch):
-    with tempfile.TemporaryDirectory() as tmpdir:
-        _, err = _send_into(monkeypatch, _make_manager(tmpdir, request_id="req1"), _StubFullDir())
-    assert "after the failed write" in str(err) and "too few" not in str(err), (
-        "the error would blame the dir's size for inodes or another writer"
-    )
-
-
-def test_a_failed_send_leaves_nothing_in_the_shm_dir(monkeypatch):
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mgr, full_dir = _make_manager(tmpdir, request_id="req1"), _StubFullDir()
-        info, _ = _send_into(monkeypatch, mgr, full_dir)
-        path = mgr._shm_path(mgr.my_entity_id, info.uuid)
-        assert full_dir.partial[path] > 0, "the write must fail part way, as a filling tmpfs does"
-        assert not os.path.lexists(path), "a partial file no cleanup tracks would hold the space for good"
+        mgr = _make_manager(tmpdir, request_id="req1")
+        info = mgr.store_and_return_tensor_info("req1", {"out": [torch.zeros(4096)]})["out"][0]
+        soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (1024, hard))
+        try:
+            with pytest.raises(OSError) as err:
+                mgr.register_for_send("req1", [info])
+        finally:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+        assert err.value.errno == errno.EFBIG
+        assert not os.path.lexists(mgr._shm_path(mgr.my_entity_id, info.uuid))
 
 
 def test_a_small_shm_dir_warns_at_boot(monkeypatch, caplog):
@@ -729,9 +690,10 @@ class _InProcessTransferEngine:
 
 def _transport(protocol, entity_id, shm_dir):
     if protocol == CommProtocol.SHM:
-        return SharedMemoryCommunicationManager(
+        return ArenaShmCommunicationManager(
             my_entity_id=entity_id, hostname="localhost", device="cpu",
             communicator=MockCommunicator(), shm_dir=shm_dir,
+            use_arena=False,
         )
     return MooncakeCommunicationManager(
         my_entity_id=entity_id, hostname="localhost", device="cpu",
@@ -1078,27 +1040,6 @@ def test_write_reclaims_our_own_stale_file():
             assert f.read(4) != b"resi"
 
 
-def test_write_refuses_a_file_we_do_not_own(monkeypatch):
-    """The path is namespace + entity + counter: predictable, in a
-    world-writable directory. Writing through into someone else's file is
-    what O_EXCL is there to stop."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mgr = _make_manager(tmpdir, request_id="req1")
-        [info] = mgr.store_and_return_tensor_info(
-            "req1", {"out": [torch.ones(4)]},
-        )["out"]
-        path = mgr._shm_path("worker_0", info.uuid)
-        with open(path, "wb") as f:
-            f.write(b"squatted")
-        # Cheaper than actually running as a second uid.
-        monkeypatch.setattr(os, "getuid", lambda: os.stat(path).st_uid + 1)
-
-        with pytest.raises(RuntimeError, match="not ours"):
-            mgr.register_for_send("req1", [info])
-        with open(path, "rb") as f:
-            assert f.read() == b"squatted", "someone else's file was written"
-
-
 def test_write_refuses_a_symlink_planted_at_the_path():
     """A symlink we own still points wherever its planter chose; O_EXCL fails
     on it and the ownership check must not follow it."""
@@ -1113,7 +1054,7 @@ def test_write_refuses_a_symlink_planted_at_the_path():
             f.write(b"do not clobber")
         os.symlink(target, path)
 
-        with pytest.raises(RuntimeError, match="not ours"):
+        with pytest.raises(RuntimeError, match="not a regular file we own"):
             mgr.register_for_send("req1", [info])
         with open(target, "rb") as f:
             assert f.read() == b"do not clobber"
@@ -1140,8 +1081,9 @@ def test_register_for_send_uuids_writes_every_request_not_just_the_first():
 
         for rid, infos in per_request.items():
             for info in infos:
-                assert info.uuid in mgr._shm_files, f"{rid} never written"
-                assert os.path.exists(mgr._shm_files[info.uuid])
+                path = mgr._transport.spilled_path(mgr.my_entity_id, info.uuid)
+                assert path is not None, f"{rid} never written"
+                assert os.path.exists(path)
 
 
 # ---------------------------------------------------------------------------
@@ -1219,7 +1161,7 @@ def test_host_copies_not_kept_for_device_transports():
     """TCP / RDMA read device memory, so a host copy would only be held."""
     assert not MooncakeCommunicationManager.needs_cpu_tensor.fget(object())
 
-    class _DeviceTransport(SharedMemoryCommunicationManager):
+    class _DeviceTransport(ArenaShmCommunicationManager):
         needs_cpu_tensor = False
 
     with tempfile.TemporaryDirectory() as tmpdir:
