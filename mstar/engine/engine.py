@@ -782,9 +782,10 @@ class Engine:
         for node in sorted(node_names):
             group = parallel_groups.get_joint_group_for_node(node)
             sp = group.sp_group.world_size
+            sp_collective = {"sp_collective": True} if node in sp_collective_nodes else {}
             refusals = sequence_parallel_refusals(
                 specs, node, group.tp_group.world_size, sp, (moe_parallel or {}).get(node),
-                sp_collective=node in sp_collective_nodes,
+                **sp_collective,
             )
             if refusals:
                 raise ValueError("; ".join(refusals))
