@@ -77,7 +77,11 @@ def run_probe(wav: Path, flac: Path, repeat: int) -> dict:
                 check=True, capture_output=True, text=True,
             )
             samples.append({"format": label, **json.loads(result.stdout)})
-    return {"repeat": repeat, "samples": samples}
+    return {
+        "repeat": repeat,
+        "cache_condition": "warm: header inspection and a protective file copy precede timing",
+        "samples": samples,
+    }
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -93,6 +97,12 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.wav is None or args.flac is None:
         parser.error("--wav and --flac are required")
+    if args.output is not None:
+        for source in (args.wav, args.flac):
+            if args.output.resolve() == source.resolve() or (
+                args.output.exists() and source.exists() and args.output.samefile(source)
+            ):
+                parser.error("--output must not refer to either input audio file")
     report = run_probe(args.wav, args.flac, args.repeat)
     encoded = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if args.output is None:
