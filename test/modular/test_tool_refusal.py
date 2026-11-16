@@ -30,14 +30,14 @@ def test_a_chat_to_a_model_without_a_tool_format_refuses_a_call_or_a_tool_messag
 
 def test_a_chat_to_a_model_without_a_tool_format_drops_the_rest():
     """Tools with ``tool_choice`` none, and an assistant turn's ``tool_calls`` and reasoning, which
-    ask for no call: served as before tools were, without them."""
+    ask for no call: served as before tools were, without them (a turn that held nothing else,
+    its content null, is skipped, as it was then)."""
     kwargs = {"tools": TOOLS, "tool_choice": "none", "parallel_tool_calls": True, "seed": 1}
     called = PromptPart(modality="text", text="", role="assistant", extras='{"tool_calls":[]}')
     parts = [PromptPart(modality="text", text="hi", role="user"), REASONED, called]
     kept = APIServer._serve_tool_fields(_server(None), kwargs, parts, chat=True)
     assert kwargs == {"seed": 1}
-    assert [(p.role, p.text, p.extras) for p in kept] == [
-        ("user", "hi", None), ("assistant", "Hi", None), ("assistant", "", None)]
+    assert [(p.role, p.text, p.extras) for p in kept] == [("user", "hi", None), ("assistant", "Hi", None)]
 
 
 def test_generate_on_a_model_without_a_tool_format_is_as_before():

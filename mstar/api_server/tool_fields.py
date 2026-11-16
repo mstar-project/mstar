@@ -77,4 +77,6 @@ def without_tools(model_kwargs: dict, parts: list[PromptPart] | None) -> list[Pr
         model_kwargs.pop(name, None)
     if parts is None or all(p.extras is None for p in parts):
         return parts
-    return [replace(p, extras=None) if p.extras is not None else p for p in parts]
+    # a message that held only calls or reasoning (its content null) was skipped then; one with
+    # text keeps it
+    return [p if p.extras is None else replace(p, extras=None) for p in parts if p.extras is None or p.text]
