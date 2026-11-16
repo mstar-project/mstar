@@ -489,6 +489,82 @@ def _flac_without_length(path: Path, seconds: float, rate: int = 16000) -> None:
     path.write_bytes(bytes(data))
 
 
+def test_headerless_flac_decodes_without_torchcodec(tmp_path, monkeypatch):
+    sf = pytest.importorskip("soundfile")
+    path = tmp_path / "speech.flac"
+    _flac_without_length(path, 5)
+    assert sf.info(path).frames == 2**63 - 1
+    monkeypatch.setitem(sys.modules, "torchcodec", None)
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)
+
+    from mstar.model.components.audio_features import load_speech_file
+
+    audio = load_speech_file(str(path), 16000, max_seconds=5)
+    assert len(audio) == 5 * 16000
+    reference = tmp_path / "reference.flac"
+    tone = (0.1 * np.sin(np.arange(5 * 16000) * 2 * np.pi * 440 / 16000)).astype(np.float32)
+    sf.write(reference, tone, 16000)
+    expected, _ = sf.read(reference, dtype="float32")
+    np.testing.assert_array_equal(audio.numpy(), expected)
+
+
+def test_headerless_flac_still_obeys_the_decoded_limit(tmp_path):
+    path = tmp_path / "speech.flac"
+    _flac_without_length(path, 5)
+    with pytest.raises(AudioTooLongError):
+        media_io.read_soundfile_capped(str(path), max_seconds=1)
+
+
+def test_headerless_flac_still_obeys_the_30_minute_cap(monkeypatch):
+    class LongFile:
+        format = "FLAC"
+        samplerate = 1
+        channels = 1
+        frames = 2**63 - 1
+
+        def __init__(self, path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, frames, **kwargs):
+            return np.zeros((frames, 1), dtype=np.float32)
+
+    monkeypatch.setitem(sys.modules, "soundfile", types.SimpleNamespace(SoundFile=LongFile))
+    with pytest.raises(AudioTooLongError):
+        media_io.read_soundfile_capped("long.flac", max_seconds=MAX_AUDIO_SECONDS)
+
+
+@pytest.mark.parametrize("format_, frames", [
+    ("FLAC", 16000), ("WAV", 2**63 - 1), ("FLAC", 2**63 - 1),
+])
+def test_soundfile_read_errors_outside_headerless_flac_still_raise(monkeypatch, format_, frames):
+    class FailingFile:
+        format = format_
+        samplerate = 16000
+        channels = 1
+
+        def __init__(self, path):
+            self.frames = frames
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, *args, **kwargs):
+            raise RuntimeError("decode failed")
+
+    monkeypatch.setitem(sys.modules, "soundfile", types.SimpleNamespace(SoundFile=FailingFile))
+    with pytest.raises(RuntimeError, match="decode failed"):
+        media_io.read_soundfile_capped("corrupt.flac", max_seconds=10)
+
+
 def test_flac_without_a_length_is_measured_by_decoding_it(client, tmp_path):
     # main read libsndfile's "unknown" frame count as a duration of about
     # 5.8e14 s and refused a 2 minute clip with a 413
