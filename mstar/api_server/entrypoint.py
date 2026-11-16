@@ -938,6 +938,7 @@ class APIServer:
             self._check_call_input(input_bytes)
 
         # Register pending request
+        child_traceparent = None
         with self.request_lock:
             if self.fatal_error is not None:
                 raise HTTPException(status_code=503, detail=self.fatal_error)
@@ -963,6 +964,7 @@ class APIServer:
                 self.pending_requests[key].trace = self.tracing.start(
                     self.pending_requests[key], key, traceparent,
                 )
+                child_traceparent = self.pending_requests[key].trace.traceparent
         if self.metrics is not None:
             mark_submitted()
 
@@ -979,6 +981,7 @@ class APIServer:
             ends=ending,
             streaming=streaming,
             raw_inputs=raw_inputs,
+            traceparent=child_traceparent,
         ))
 
         request_log.debug(

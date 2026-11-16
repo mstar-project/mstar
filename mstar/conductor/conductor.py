@@ -54,6 +54,7 @@ from mstar.model.base import Model, WorkerGraph, serving_resources, streamed_inp
 from mstar.model.submodule_base import chunk_loop_name
 from mstar.observability import catalog
 from mstar.observability.recorders import Gauge, MetricSnapshot, merge
+from mstar.observability.tracing import trace_id_from_parent
 from mstar.platforms import apply_process_env_defaults, current_platform
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
@@ -389,6 +390,8 @@ class RequestData:
     routing: RoutingHandle | None = None
     # set once a NewRequest goes out; before that a failed ingest has nothing to drain
     dispatched: bool = False
+    # Active API request span context, also forwarded to the workers.
+    traceparent: str | None = None
     # persisted name -> the (partition, pass) whose reports wrote what is held
     # under it; an initial signal has none
     persist_writers: dict[str, tuple[str, int]] = field(default_factory=dict)
@@ -1316,11 +1319,17 @@ class Conductor:
                 )
                 return
             self._queued_since_summary += 1
-            request_log.debug(
-                "Request %s queued (at capacity: %d/%d)",
-                body.request_id, len(self.requests),
-                self.max_concurrent_requests,
-            )
+            trace_id = trace_id_from_parent(body.traceparent)
+            if trace_id is None:
+                request_log.debug(
+                    "Request %s queued (at capacity: %d/%d)",
+                    body.request_id, len(self.requests), self.max_concurrent_requests,
+                )
+            else:
+                request_log.debug(
+                    "Request %s queued (at capacity: %d/%d) trace_id=%s",
+                    body.request_id, len(self.requests), self.max_concurrent_requests, trace_id,
+                )
             self.waiting_queue.append(body)
             if self._status_interval_s is not None:
                 self._queued_since[body.request_id] = time.perf_counter()
@@ -1387,7 +1396,11 @@ class Conductor:
         self, body: NewRequestConductor
     ):
         """Actually dispatch a request to workers (no admission check)."""
-        request_log.debug("Conductor ingesting request %s", body.request_id)
+        trace_id = trace_id_from_parent(body.traceparent)
+        if trace_id is None:
+            request_log.debug("Conductor ingesting request %s", body.request_id)
+        else:
+            request_log.debug("Conductor ingesting request %s trace_id=%s", body.request_id, trace_id)
         ingest_time = time.perf_counter()
         # A request admitted on arrival never waited.
         arrival_time = (
@@ -1542,6 +1555,7 @@ class Conductor:
             conductor_ingest_time=ingest_time,
             conductor_arrival_time=arrival_time,
             prompt_tokens=body.prompt_tokens,
+            traceparent=body.traceparent,
         )
         self._register_request(body.request_id, request_data)
 
@@ -1576,6 +1590,7 @@ class Conductor:
 
                 message = NewRequest(
                     request_id=body.request_id,
+                    traceparent=request_data.traceparent,
                     partition_worker_graph_ids=partition_wg_ids,
                     worker_graph_to_workers=worker_graph_to_workers,
                     initial_inputs=initial_inputs,
@@ -1886,7 +1901,11 @@ class Conductor:
         self, request_id: str
     ):
         """Called when all partitions are done."""
-        request_log.debug("Request %s done", request_id)
+        trace_id = trace_id_from_parent(self.requests[request_id].traceparent)
+        if trace_id is None:
+            request_log.debug("Request %s done", request_id)
+        else:
+            request_log.debug("Request %s done trace_id=%s", request_id, trace_id)
         self._done_since_summary += 1
         request_data = self.requests[request_id]
         request_data.conductor_finish_time = time.perf_counter()
