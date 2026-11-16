@@ -134,6 +134,45 @@ def test_two_passes_reported_in_one_cycle_end_the_partition_once():
     assert rec.producer_done == [("r", "B", "C")]
 
 
+@pytest.mark.parametrize("n_ranks", [1, 2])
+@pytest.mark.parametrize("report_order", [(0, 1), (1, 0)], ids=["consumer_first", "successor_first"])
+def test_gated_stream_pass_across_workers_keeps_its_final_flag(n_ranks, report_order):
+    """A gated next pass cannot start until both worker graphs finish this one.
+
+    The consumer may be on another worker and report the final chunk before or
+    after its successor. Every rank must report before the conductor closes the
+    pass; the final-stream flag then ends the partition exactly once.
+    """
+    c, req, rec = _conductor()
+    c.enable_prof = False
+    pstate = req.partition_states["B"]
+    pstate.current_worker_graph_ids = {0, 1}
+    req.worker_graph_to_workers = {
+        0: [f"consumer_{rank}" for rank in range(n_ranks)],
+        1: [f"successor_{rank}" for rank in range(n_ranks)],
+    }
+
+    reports = [
+        WorkerGraphsDone(
+            request_id="r", partition_name="B", worker_graph_ids=[wg],
+            is_first_tp_rank=(rank == 0), partition_done=(wg == 0 and rank == 0),
+        )
+        for wg in report_order for rank in range(n_ranks)
+    ]
+    flag_seen = False
+    for report in reports[:-1]:
+        assert c._process_worker_graphs_done(report) == []
+        flag_seen |= report.partition_done
+        assert pstate.worker_reported_done == flag_seen
+
+    assert c._process_worker_graphs_done(reports[-1]) == ["B"]
+    assert c._process_done_forward("r", "B") is False
+    assert pstate.is_done is True
+    assert pstate.fwd_pass_number == 1
+    assert rec.partition_inputs == []
+    assert rec.producer_done == [("r", "B", "C")]
+
+
 def test_chain_closes_partition_by_partition():
     c, req, rec = _conductor()
     req.partition_states["A"].plan = [WalkStep("a")]

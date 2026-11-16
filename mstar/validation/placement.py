@@ -311,13 +311,6 @@ def _input_limits(walk_to_wgs: Mapping[str, list[WorkerGraph]]) -> Iterator[str]
                     )
 
 
-def _on_same_workers(wgs: list[WorkerGraph]) -> bool:
-    """Whether every request runs all of these worker graphs on the same
-    workers: the conductor picks one replica for every node_group on the same
-    lockstep instances (``ReplicaRouter``), so they share those instances."""
-    return len({tuple(map(tuple, wg.replica_ranks)) for wg in wgs}) == 1
-
-
 def _stream_driven_walks(model: Model, walk_to_wgs: Mapping[str, list[WorkerGraph]]) -> Iterator[str]:
     """Stream-driven walk shapes the runtime and conductor can't account for.
 
@@ -328,9 +321,9 @@ def _stream_driven_walks(model: Model, walk_to_wgs: Mapping[str, list[WorkerGrap
     gated on a non-streamed input waits for that input instead, which is
     safe when it arrives once per pass (from the conductor, say).
     Across worker graphs, self-triggered passes overlap with no pass
-    identity, and the conductor reads the final-stream flag only off the
-    report that closes a pass: the flag is per worker, so it is there only
-    if every worker graph of the walk runs on the consumer's workers. A walk
+    identity. A gated consumer waits for its next non-streamed input until the
+    conductor closes the current pass; the conductor retains the final-stream
+    flag from any report of that pass, including a different worker's. A walk
     with no stream-consuming node is conductor driven and unaffected, and a
     TP worker graph is one worker graph on several ranks.
     """
@@ -349,14 +342,13 @@ def _stream_driven_walks(model: Model, walk_to_wgs: Mapping[str, list[WorkerGrap
         triggered = sorted(
             name for ents in entities for name, e in ents.items() if self_triggered(e)
         )
-        if len(wgs) > 1 and (triggered or not _on_same_workers(wgs)):
+        if len(wgs) > 1 and triggered:
             yield (
                 f"{where} consumes a stream and spans {len(wgs)} worker graphs "
                 f"{[sorted(wg.section.get_nodes()) for wg in wgs]} on ranks "
                 f"{[wg.ranks for wg in wgs]}. Across worker graphs a stream-driven walk "
                 "is served only with every consumer gated on a non-streamed input that "
-                "arrives once per pass and every worker graph on the same workers (node_groups "
-                "on the same ranks, instance for instance); otherwise run it as "
+                "arrives once per pass; otherwise run it as "
                 "one worker graph, or move the work after the consumer into a "
                 "downstream partition fed by a StreamingGraphEdge."
             )

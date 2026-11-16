@@ -7,8 +7,8 @@ for one walk, a node_group naming an undefined walk, a rank no walk runs on,
 and the stream-driven
 shapes the runtime and conductor can't account for: a self-triggered consumer
 (every input streamed) sharing its worker graph with another top-level entity,
-and a consumer walk across worker graphs, unless its consumers are gated and
-its worker graphs share workers. The sweep at the bottom builds every shipped config
+and a consumer walk across worker graphs, unless its consumers are gated.
+The sweep at the bottom builds every shipped config
 through ``Conductor.__init__`` (workers and sockets stubbed, no weights) so
 none of them trips the new checks.
 """
@@ -43,6 +43,7 @@ from mstar.streaming.topology import Connection, PartitionTopology, StreamingGra
 from mstar.testing_utils.model import StubModel
 from mstar.utils.containers import ParallelList
 from mstar.validation import validate_deployment
+from mstar.validation.placement import _stream_driven_walks
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -366,11 +367,35 @@ _ONE = {"ranks": [1]}
 _TP2 = {"ranks": [1, 2], "tp_size": 2}
 
 
+def test_gated_cross_worker_stream_placement_needs_no_colocation(tmp_path):
+    cfg = _config(tmp_path, [
+        {"node_names": ["producer"], "ranks": [0]},
+        {"node_names": ["vocoder"], "ranks": [1]},
+        {"node_names": ["post"], "ranks": [2]},
+    ])
+    model = _stream_model(_gated_vocoder_then_post)
+    wgs = model.get_worker_graphs(cfg)
+    by_walk = {walk: [wg for wg in wgs if walk in wg.graph_walks]
+               for walk in model.get_graph_walk_graphs()}
+    assert list(_stream_driven_walks(model, by_walk)) == []
+
+    # The same placement remains unsafe when the consumer can self-trigger
+    # its next chunk before the successor finishes this pass.
+    self_triggered = _stream_model(_vocoder_then_post)
+    wgs = self_triggered.get_worker_graphs(cfg)
+    by_walk = {walk: [wg for wg in wgs if walk in wg.graph_walks]
+               for walk in self_triggered.get_graph_walk_graphs()}
+    assert "consumes a stream and spans 2 worker graphs" in next(
+        iter(_stream_driven_walks(self_triggered, by_walk))
+    )
+
+
 @pytest.mark.parametrize("chunk_walk,vocoder,post,accepted", [
-    # post's worker never pops the final chunk, so its report closing the pass
-    # lacks the flag; a self-triggered vocoder's passes also overlap post's
+    # a self-triggered vocoder's passes can overlap post's pass
     (_vocoder_then_post, _ONE, {"ranks": [2]}, False),
-    (_gated_vocoder_then_post, _ONE, {"ranks": [2]}, False),
+    # gated passes cannot overlap; the conductor keeps the final-stream flag
+    # from the vocoder's report until post's worker closes that pass
+    (_gated_vocoder_then_post, _ONE, {"ranks": [2]}, True),
     # on one worker the flag is shared, but self-triggered passes still overlap
     (_vocoder_then_post, _ONE, _ONE, False),
     (_gated_vocoder_then_post, _ONE, _ONE, True),
@@ -378,7 +403,7 @@ _TP2 = {"ranks": [1, 2], "tp_size": 2}
     (_gated_vocoder_then_post, _TP2, _TP2, True),
     # node_groups on the same ranks, replica for replica, pick one replica together
     (_gated_vocoder_then_post, {"ranks": [1, 2]}, {"ranks": [1, 2]}, True),
-], ids=["self_triggered", "gated", "self_triggered_colocated", "gated_colocated", "gated_colocated_tp",
+], ids=["self_triggered", "gated_cross_worker", "self_triggered_colocated", "gated_colocated", "gated_colocated_tp",
      "gated_dp_replicas"])
 def test_consumer_walk_across_worker_graphs(chunk_walk, vocoder, post, accepted, tmp_path, monkeypatch):
     cfg = _config(tmp_path, [
