@@ -74,6 +74,8 @@ from mstar.api_server import media_io
 from mstar.api_server.openai._util import SSE_DONE, error_type, rid, sse
 from mstar.api_server.openai.adapters import Transcript
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
+from mstar.utils.client_errors import client_error_text
+from mstar.utils.runtime_dir import ensure_private_dir, write_private_file
 from mstar.utils.utf8_stream import Utf8Stream
 
 logger = logging.getLogger(__name__)
@@ -153,11 +155,10 @@ def save_upload(audio_bytes: bytes, filename: str | None, upload_dir: Path) -> s
     embedded ``../`` cannot escape the directory; the extension is kept
     because the data worker's decoder sniffs the container by it.
     """
-    upload_dir = Path(upload_dir)
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    upload_dir = ensure_private_dir(upload_dir)
     base = os.path.basename(filename or "") or "audio.wav"
     path = upload_dir / f"{uuid.uuid4()}_{base}"
-    path.write_bytes(audio_bytes)
+    write_private_file(path, audio_bytes)
     return str(path)
 
 
@@ -801,6 +802,9 @@ def _stream_error_event(exc: Exception) -> str:
     memory, a bug), which is logged."""
     if isinstance(exc, HTTPException):
         return _error_event(str(exc.detail), exc.status_code)
+    if isinstance(exc, OSError):
+        text, _ = client_error_text(exc, "cutting the upload failed", type_name=False)
+        return _error_event(text, 500)
     logger.exception("Streamed transcription failed")
     return _error_event(f"transcription failed ({type(exc).__name__})", 500)
 

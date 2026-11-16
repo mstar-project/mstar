@@ -349,11 +349,12 @@ fn check(adapter: &dyn crate::adapters::OpenAIAdapter, req: &TranscriptionReques
 
 /// `save_upload`: under the upload directory, as `<uuid>_<basename>`, the
 /// extension kept for the decoder to sniff the container by.
-fn save_upload(audio: &[u8], filename: Option<&str>, upload_dir: &std::path::Path) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(upload_dir)?;
+fn save_upload(audio: &[u8], filename: Option<&str>, upload_dir: &std::path::Path) -> Result<PathBuf, String> {
+    crate::media::check_upload_dir(upload_dir)?;
     let base = filename.and_then(|f| f.rsplit('/').next()).filter(|b| !b.is_empty()).unwrap_or("audio.wav");
     let path = upload_dir.join(format!("{}_{base}", uuid::Uuid::new_v4()));
-    std::fs::write(&path, audio)?;
+    crate::runtime_dir::write_private_file(&path, audio)
+        .map_err(|e| crate::client_errors::server_error(&e, "writing a transcription upload failed"))?;
     Ok(path)
 }
 
@@ -372,7 +373,10 @@ async fn create_transcription(
     let dir = st.upload_dir.clone();
     let path = match crate::blocking(move || save_upload(&audio, filename.as_deref(), &dir)).await {
         Ok(path) => path,
-        Err(e) => return error(500, &e.to_string()),
+        Err(e) => {
+            let (status, message) = crate::client_errors::status_and_message(&e, 500);
+            return error(status, message);
+        }
     };
     let policy = adapter.transcription_policy();
     let shape = drive::PlanShape::of(&policy, window);
@@ -393,5 +397,30 @@ async fn create_transcription(
 impl IntoResponse for drive::OpError {
     fn into_response(self) -> Response {
         error(self.status, &self.message)
+    }
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn transcription_uploads_are_private_and_refuse_a_symlink_dir() {
+        let dir = std::env::temp_dir().join(format!("mstar-transcription-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let path = save_upload(b"audio", Some("clip.wav"), &dir).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        let link = dir.with_extension("link");
+        symlink(&dir, &link).unwrap();
+        let err = save_upload(b"audio", None, &link).unwrap_err();
+        let (status, text) = crate::client_errors::status_and_message(&err, 500);
+        assert_eq!(status, 500);
+        assert!(text.starts_with("internal error (error id "));
+        assert!(!text.contains(&link.to_string_lossy().to_string()));
+        std::fs::remove_file(link).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

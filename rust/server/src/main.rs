@@ -34,6 +34,7 @@ mod media;
 mod protocol;
 mod realtime;
 mod refusals;
+mod runtime_dir;
 mod served_models;
 mod lora_admin;
 mod serving;
@@ -49,7 +50,7 @@ use client_errors::scrub_paths;
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
@@ -112,10 +113,11 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8000);
     let socket_dir = std::env::args().nth(3);
-    let upload_dir = PathBuf::from(
-        std::env::args()
+    let upload_dir = private_dir_or_exit(
+        &std::env::args()
             .nth(4)
-            .unwrap_or_else(|| "/tmp/mstar_uploads".to_string()),
+            .map(PathBuf::from)
+            .unwrap_or_else(runtime_dir::default_upload_dir),
     );
     let sample_rate: u32 = std::env::var("MSTAR_SAMPLE_RATE")
         .ok()
@@ -128,6 +130,7 @@ async fn main() {
         parse_max_images(std::env::var("MSTAR_MAX_IMAGES_PER_REQUEST").ok().as_deref());
 
     let bridge = socket_dir.map(|dir| {
+        private_dir_or_exit(Path::new(&dir));
         eprintln!("bridging to conductor at {dir}");
         Arc::new(Bridge::new(&dir).expect("bind bridge"))
     });
@@ -304,6 +307,13 @@ fn exit_with_launcher() {
     }
 }
 
+fn private_dir_or_exit(path: &Path) -> PathBuf {
+    runtime_dir::ensure_private_dir(path).unwrap_or_else(|e| {
+        eprintln!("mstar-server: {e}");
+        std::process::exit(1);
+    })
+}
+
 /// SIGTERM/SIGINT: stop accepting, drain in-flight requests, exit — with a
 /// hard 30 s cap so a wedged stream can't hold the process forever.
 async fn shutdown_signal() {
@@ -440,6 +450,21 @@ fn multipart_failure(e: &MultipartError, fallback: String) -> (u16, String) {
     } else {
         (400, fallback)
     }
+}
+
+/// A refusal forwarded from `media`/`adapters`: `default_status` for a bad
+/// request, 500 for one `client_errors::server_error` already turned into an
+/// error id (the upload dir check, an upload write), whose full text is in the
+/// server log and must not reach the client.
+fn forwarded_error(err: &str, default_status: u16) -> Response {
+    let (status, message) = client_errors::status_and_message(err, default_status);
+    error(status, message, error_type(status))
+}
+
+/// The same, FastAPI-`HTTPException`-shaped, for the native `/generate` routes.
+fn forwarded_detail_error(err: &str, default_status: u16) -> Response {
+    let (status, message) = client_errors::status_and_message(err, default_status);
+    detail_error(status, message)
 }
 
 /// Blocking work off the async workers: decoding a data URL, writing an
@@ -713,7 +738,7 @@ async fn chat_completions(
     .await;
     let mut args = match translated {
         Ok(a) => a,
-        Err(e) => return error(400, &e, "invalid_request_error"),
+        Err(e) => return forwarded_error(&e, 400),
     };
     // Resolved before it is submitted: the response names the adapter that served it.
     let model_name = match select_lora(&st, req.model.as_deref(), &mut args) {
@@ -1135,7 +1160,7 @@ async fn audio_speech(
     // frontend cannot produce is the client's error.
     let fmt = match media::check_audio_format(&req.response_format, stream, st.sample_rate) {
         Ok(fmt) => fmt,
-        Err(e) => return error(400, &e, "invalid_request_error"),
+        Err(e) => return forwarded_error(&e, 400),
     };
     // "inf" / "nan" parse but have no JSON number; refused as the server's normalizer does
     if let Some(x) = req.speed.flatten().filter(|x| !x.is_finite()) {
@@ -1150,7 +1175,7 @@ async fn audio_speech(
     .await;
     let adapters::Speech { mut args, ref_audio } = match translated {
         Ok(s) => s,
-        Err((status, e)) => return error(status, &e, error_type(status)),
+        Err((status, e)) => return forwarded_error(&e, status),
     };
     // only a sent speed (an explicit null too), as Python's speech_request; an adapter-set one wins
     if let Some(speed) = req.speed {
@@ -1170,7 +1195,7 @@ async fn audio_speech(
     let pieces =
         match speech_chunking::plan_chunks(req.extra.get("sentence_chunking"), &chunking, &req.input) {
             Ok(pieces) => pieces,
-            Err(e) => return error(400, &e, "invalid_request_error"),
+            Err(e) => return forwarded_error(&e, 400),
         };
     if let Err(r) = select_lora(&st, req.model.as_deref(), &mut args) {
         return r;
@@ -1318,7 +1343,7 @@ async fn images_generations(
     }
     let base = match adapter.image_to_request(&req) {
         Ok(a) => a,
-        Err(e) => return error(400, &e, "invalid_request_error"),
+        Err(e) => return forwarded_error(&e, 400),
     };
     // OpenAI `n`: submit n engine requests up front and aggregate their images,
     // matching serving_images.create_images. Seeded requests follow the seed
@@ -1326,7 +1351,7 @@ async fn images_generations(
     // the same request with n=1; unseeded requests draw independent seeds.
     let n = match image_count(req.n, st.max_images_per_request) {
         Ok(n) => n,
-        Err(e) => return error(400, &e, "invalid_request_error"),
+        Err(e) => return forwarded_error(&e, 400),
     };
     let mut base = base;
     if let Err(r) = select_lora(&st, req.model.as_deref(), &mut base) {
@@ -1419,7 +1444,7 @@ async fn videos_generations(
     let translated = blocking(move || adapter.video_to_request(&req, &dir, remote)).await;
     let mut args = match translated {
         Ok(a) => a,
-        Err(e) => return error(400, &e, "invalid_request_error"),
+        Err(e) => return forwarded_error(&e, 400),
     };
     schedule_upload_cleanup(&st.upload_dir, &args);
     if let Err(r) = select_lora(&st, model.as_deref(), &mut args) {
@@ -1590,8 +1615,8 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         return error(400, &e, "invalid_request_error");
     }
     // Persist the uploaded image so the data-worker's loader can read it by path.
-    if let Err(e) = std::fs::create_dir_all(&st.upload_dir) {
-        return error(500, &e.to_string(), "server_error");
+    if let Err(e) = media::check_upload_dir(&st.upload_dir) {
+        return forwarded_error(&e, 500);
     }
     let ext = image_filename
         .as_deref()
@@ -1599,8 +1624,8 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         .unwrap_or_else(|| ".png".to_string());
     let image_path = st.upload_dir.join(format!("{}{}", Uuid::new_v4().simple(), ext));
     let path = image_path.clone();
-    if let Err(e) = blocking(move || std::fs::write(&path, &image_bytes)).await {
-        return error(500, &e.to_string(), "server_error");
+    if let Err(e) = blocking(move || runtime_dir::write_private_file(&path, &image_bytes)).await {
+        return forwarded_error(&client_errors::server_error(&e, "writing an upload failed"), 500);
     }
 
     let mut args = match adapter.image_edit_to_request(&prompt, &image_path.to_string_lossy(), extra) {
@@ -1732,11 +1757,11 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
                 "output_modalities" => out_mods_raw = v.into_owned(),
                 "streaming" => match parse_form_bool(&v) {
                     Ok(b) => streaming = b,
-                    Err(e) => return detail_error(400, &e),
+                    Err(e) => return forwarded_detail_error(&e, 400),
                 },
                 "tokenize" => match parse_form_bool(&v) {
                     Ok(b) => tokenize = b,
-                    Err(e) => return detail_error(400, &e),
+                    Err(e) => return forwarded_detail_error(&e, 400),
                 },
                 "model_kwargs" => mk_raw = Some(v.into_owned()),
                 "request_id" => request_id = Some(v.into_owned()),
@@ -1786,8 +1811,8 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
                     return detail_error(status, &msg);
                 }
             };
-            if let Err(e) = std::fs::create_dir_all(&st.upload_dir) {
-                return detail_error(500, &e.to_string());
+            if let Err(e) = media::check_upload_dir(&st.upload_dir) {
+                return forwarded_detail_error(&e, 500);
             }
             // Sanitize: take ONLY the final path component of the
             // client-supplied name. `join` treats embedded separators as
@@ -1801,8 +1826,9 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
                 .unwrap_or("upload");
             let save_path = st.upload_dir.join(format!("{}_{}", Uuid::new_v4().simple(), safe));
             let path = save_path.clone();
-            if let Err(e) = blocking(move || std::fs::write(&path, &bytes)).await {
-                return detail_error(500, &e.to_string());
+            if let Err(e) = blocking(move || runtime_dir::write_private_file(&path, &bytes)).await {
+                return forwarded_detail_error(
+                    &client_errors::server_error(&e, "writing an upload failed"), 500);
             }
             let paths = uploads.paths.entry(modality.to_string()).or_default();
             parts.push(Part { modality: modality.to_string(), text: None, index: paths.len(), role: None });
@@ -1824,11 +1850,11 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
                 "output_modalities" => out_mods_raw = val,
                 "streaming" => match parse_form_bool(&val) {
                     Ok(b) => streaming = b,
-                    Err(e) => return detail_error(400, &e),
+                    Err(e) => return forwarded_detail_error(&e, 400),
                 },
                 "tokenize" => match parse_form_bool(&val) {
                     Ok(b) => tokenize = b,
-                    Err(e) => return detail_error(400, &e),
+                    Err(e) => return forwarded_detail_error(&e, 400),
                 },
                 "model_kwargs" => mk_raw = Some(val),
                 "request_id" => request_id = Some(val),
@@ -2207,8 +2233,10 @@ mod tests {
     }
 
     fn socket_dir() -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
         let dir = std::env::temp_dir().join(format!("mstar-metrics-{}", Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // 0700 whatever the umask: tests use it as an upload dir, which is checked
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
         dir
     }
 
@@ -2565,7 +2593,7 @@ mod tests {
             assert_eq!((status, body["error"]["message"].as_str()), (StatusCode::BAD_REQUEST, Some(detail)), "{adapter}");
             left.push((adapter, std::fs::read_dir(&st.upload_dir).unwrap().count()));
             let _ = std::fs::remove_dir_all(&st.upload_dir);
-            std::fs::create_dir_all(&st.upload_dir).unwrap();
+            runtime_dir::ensure_private_dir(&st.upload_dir).unwrap();
         }
         let _ = std::fs::remove_dir_all(&st.upload_dir);
         assert_eq!(left, [("Qwen3_5Adapter", 0), ("Qwen3OmniAdapter", 0), ("Cosmos3EdgeAdapter", 0)]);

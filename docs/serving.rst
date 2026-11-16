@@ -92,6 +92,26 @@ mstar serve
      - (auto)
      - Network device for TCP tensor transport.
 
+The server creates the socket and upload directories with mode 0700 and
+refuses to start if one already exists as a symlink, as something other than
+a directory, or under another user; remove it or pass another path. One of its
+own that it finds there it sets to mode 0700, so a directory an earlier
+release left group-writable (0775 under Ubuntu's default umask 002) needs no
+cleanup, and the sockets and uploaded files inside stay out of reach of the
+group whatever the umask. The upload directory is checked again before each
+upload is written, so a request fails instead of writing into a directory
+someone else recreated after startup (say, after a ``/tmp`` cleaner removed
+it); the client gets a 500 with an error id and the reason goes to the server
+log. Uploaded files are written 0600. The same holds for ``python -m
+mstar.api_server.entrypoint`` and the Rust frontend. Only the last path
+component is checked, so to use a shared or group-writable volume (for example
+a Kubernetes volume with ``fsGroup``), pass a subdirectory of its mount point;
+the server creates that subdirectory 0700 and leaves it at 0700 on a restart.
+Do not pass the mount point itself: the server would set that to 0700, and
+nothing else sharing the volume could reach it. Anyone who can write the mount
+point itself can still rename that subdirectory away, so only trusted accounts
+should have write access to it.
+
 Each model maps to a default config (override with ``--config``):
 
 .. list-table::
@@ -159,8 +179,10 @@ mstar-serve
        worker (``python -m mstar.integrations.dynamo``) has no HTTP port, so
        it defaults to a new directory per launch and removes it at exit.
    * - ``--upload-dir``
-     - ``/tmp/mstar_uploads``
-     - Temp directory for uploaded media.
+     - ``/tmp/mstar_uploads_<user>/``
+     - Temp directory for uploaded media; per user, because the server
+       refuses an upload dir another user owns. The Dynamo worker uses the
+       same default.
    * - ``--timeout``
      - ``600``
      - Per-request timeout (seconds).

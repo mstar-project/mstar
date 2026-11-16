@@ -35,6 +35,7 @@ import msgpack
 
 from mstar.api_server.media_io import _decode_base64_payload
 from mstar.utils.orphan import watch_parent
+from mstar.utils.runtime_dir import ensure_private_dir, write_private_file
 
 logger = logging.getLogger(__name__)
 
@@ -110,8 +111,9 @@ def save_entry(name: str, data, upload_dir: Path, prefix: str | None = None) -> 
     if not isinstance(data, (bytes, bytearray)):
         raise ValueError(f"file {name!r} carries no data")
     path = Path(upload_dir) / f"{prefix or uuid.uuid4()}_{os.path.basename(name) or 'upload'}"
+    ensure_private_dir(upload_dir)
     try:
-        path.write_bytes(data)
+        write_private_file(path, bytes(data))
     except BaseException:
         _unlink(str(path))
         raise
@@ -222,6 +224,7 @@ async def parse_frame(payload: bytes | str, upload_dir: Path):
     frame = str(Path(upload_dir) / f"{stem}.wsframe")
     pool = None
     try:
+        await loop.run_in_executor(None, ensure_private_dir, upload_dir)
         await loop.run_in_executor(None, _write_frame, payload, frame)
         pool = _pool
         try:

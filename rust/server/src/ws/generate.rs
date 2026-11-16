@@ -339,11 +339,11 @@ fn decode_files(files: Option<&Val>, upload_dir: &Path) -> Result<(PathsByModali
                 _ => return Err(format!("file {} carries no data", crate::media::py_repr(name))),
             };
             let base = Path::new(name).file_name().map(|b| b.to_string_lossy().into_owned()).filter(|b| !b.is_empty());
-            std::fs::create_dir_all(upload_dir).map_err(|e| e.to_string())?;
+            crate::media::check_upload_dir(upload_dir)?;
             let path = upload_dir.join(format!("{}_{}", uuid::Uuid::new_v4(), base.as_deref().unwrap_or("upload")));
-            std::fs::write(&path, &data).map_err(|e| {
+            crate::runtime_dir::write_private_file(&path, &data).map_err(|e| {
                 let _ = std::fs::remove_file(&path);
-                e.to_string()
+                crate::client_errors::server_error(&e, "writing a websocket upload failed")
             })?;
             saved.push(path.clone());
             let list = paths.entry(modality.to_string()).or_default();
@@ -409,7 +409,8 @@ fn input_layout(text: Option<&str>, input_modalities: Option<Vec<String>>, mut p
 /// What a refusal raised: the client's (a 400 with its text) or the server's
 /// (a 500 naming only an error id).
 fn refusal(text: String) -> (u16, String) {
-    (400, crate::scrub_paths(&text))
+    let (status, message) = crate::client_errors::status_and_message(&text, 400);
+    (status, crate::scrub_paths(message))
 }
 
 /// A live call's submission: `None` until it is submitted or refused, then
@@ -871,6 +872,30 @@ async fn serve(socket: WebSocket, st: AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn websocket_uploads_check_the_dir_and_write_private_files() {
+        let dir = scratch();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let files = Val::List(vec![Val::Map(vec![
+            ("name".into(), Val::Str("a.png".into())),
+            ("data".into(), Val::Bytes(b"image".to_vec())),
+        ])]);
+        let (paths, _) = decode_files(Some(&files), &dir).unwrap();
+        let path = Path::new(&paths["image"][0]);
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(path).unwrap(), b"image");
+        let link = dir.with_extension("link");
+        symlink(&dir, &link).unwrap();
+        let (status, text) = refusal(decode_files(Some(&files), &link).unwrap_err());
+        assert_eq!(status, 500);
+        assert!(text.starts_with("internal error (error id "));
+        assert!(!text.contains(&link.to_string_lossy().to_string()));
+        std::fs::remove_file(link).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn an_append_is_named_by_append_or_by_ending_input_with_nothing_else() {

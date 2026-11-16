@@ -459,7 +459,11 @@ def test_a_partial_write_is_finished_or_refused(upstream, uploads, monkeypatch, 
     up = upstream()
     up.routes["/a.png"] = reply(body=PNG)
     monkeypatch.setenv("MSTAR_REMOTE_ALLOWED_HOSTS", "127.0.0.1")
-    monkeypatch.setattr(media_io, "open", lambda *a, **kw: _ShortWrites(open(*a, **kw), 3, cap), raising=False)
+    real_fdopen = media_io.os.fdopen
+    monkeypatch.setattr(
+        media_io.os, "fdopen",
+        lambda fd, *args, **kwargs: _ShortWrites(real_fdopen(fd, *args, **kwargs), 3, cap),
+    )
     if cap > len(PNG):
         _, path = media_io.save_remote_url(up.url("/a.png"), uploads)
         assert open(path, "rb").read() == PNG

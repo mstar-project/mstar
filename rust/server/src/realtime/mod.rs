@@ -978,7 +978,11 @@ async fn run_step(
     let path = st.upload_dir.join(format!("{request_id}.wav"));
     let bytes = wav_bytes(&heard);
     let p = path.clone();
-    crate::blocking(move || std::fs::write(&p, bytes)).await.map_err(|e| StepError { message: e.to_string(), client: false, type_name: "OSError" })?;
+    let dir = st.upload_dir.clone();
+    crate::blocking(move || {
+        crate::runtime_dir::ensure_private_dir(&dir)?;
+        crate::runtime_dir::write_private_file(&p, &bytes)
+    }).await.map_err(|e| StepError { message: e.to_string(), client: false, type_name: "OSError" })?;
     let result = async {
         let mut args = adapter
             .realtime_step_request(&request, &path.to_string_lossy(), &prefix)

@@ -38,7 +38,10 @@ WHO="${USER:-mstar}"
 # that breaks. Port is unique per server by construction, so it is the right key.
 INSTANCE="${WHO}_${PORT}"
 
-mkdir -p "$SCRATCH" "$SCRATCH/mstar_sock_$INSTANCE" "$SCRATCH/mstar_uploads_$INSTANCE"
+# $SCRATCH alone: $STATS_FILE below is written into it. The server makes the
+# socket and upload directories itself, mode 0700, and refuses a group- or
+# other-writable one, so making them here would hand it 0775 under umask 002.
+mkdir -p "$SCRATCH"
 # Fresh profiling log per launch so the benchmark's offset slicing starts clean.
 : > "$STATS_FILE"
 

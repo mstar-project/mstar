@@ -19,6 +19,7 @@
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
@@ -270,23 +271,32 @@ pub fn save_ref_audio(
         return Ok(RefAudioCheck { path, decoder, bare: false });
     }
     let raw = decode_b64_lenient(reference).map_err(|_| (400, BARE_REF_AUDIO_REFUSAL.to_string()))?;
-    let stored = std::fs::create_dir_all(upload_dir).and_then(|()| {
-        let path = upload_dir.join(format!("{}.wav", Uuid::new_v4()));
-        std::fs::write(&path, raw).map(|()| path)
-    });
-    match stored {
-        Ok(path) => Ok(RefAudioCheck { path: path.to_string_lossy().into_owned(), decoder, bare: true }),
-        Err(e) => {
-            eprintln!("could not store a ref_audio upload under {}: {e}", upload_dir.display());
-            Err((500, "the server could not store ref_audio".to_string()))
-        }
-    }
+    check_upload_dir(upload_dir).map_err(|e| (500, e))?;
+    let path = upload_dir.join(format!("{}.wav", Uuid::new_v4()));
+    write_upload(&path, &raw).map_err(|e| (500, e))?;
+    Ok(RefAudioCheck { path: path.to_string_lossy().into_owned(), decoder, bare: true })
 }
 
-fn save_bytes(raw: &[u8], mime: &str, upload_dir: &Path) -> std::io::Result<(String, String)> {
-    std::fs::create_dir_all(upload_dir)?;
+/// Check the upload dir, and keep the refusal's text out of the answer: it
+/// names the server's upload path and both uids. `client_errors::server_error`
+/// logs it and yields an error id, which the handler sends with a 500.
+pub fn check_upload_dir(upload_dir: &Path) -> Result<(), String> {
+    crate::runtime_dir::ensure_private_dir(upload_dir)
+        .map(|_| ())
+        .map_err(|e| crate::client_errors::server_error(&e, "the upload dir check failed"))
+}
+
+/// Write one upload. The error names the path too (`AlreadyExists` on a file
+/// or symlink planted at the name), so it goes the same way.
+fn write_upload(path: &Path, raw: &[u8]) -> Result<(), String> {
+    crate::runtime_dir::write_private_file(path, raw)
+        .map_err(|e| crate::client_errors::server_error(&e, "writing an upload failed"))
+}
+
+fn save_bytes(raw: &[u8], mime: &str, upload_dir: &Path) -> Result<(String, String), String> {
+    check_upload_dir(upload_dir)?;
     let path = upload_dir.join(format!("{}{}", Uuid::new_v4(), ext_for(mime)));
-    std::fs::write(&path, raw)?;
+    write_upload(&path, raw)?;
     Ok((modality_from_mime(mime).to_string(), path.to_string_lossy().into_owned()))
 }
 
@@ -308,7 +318,7 @@ fn save_data_url(data_url: &str, upload_dir: &Path) -> Result<(String, String), 
         .unwrap_or("application/octet-stream");
     let raw = decode_b64_lenient(payload)
         .map_err(|e| format!("data URL base64 decode failed: {e}"))?;
-    save_bytes(&raw, mime, upload_dir).map_err(|e| e.to_string())
+    save_bytes(&raw, mime, upload_dir)
 }
 
 /// Persist a bare base64 blob with a known `fmt` (e.g. "wav"). Returns
@@ -319,7 +329,7 @@ pub fn save_base64(
     modality_hint: &str,
     upload_dir: &Path,
 ) -> Result<(String, String), String> {
-    std::fs::create_dir_all(upload_dir).map_err(|e| e.to_string())?;
+    check_upload_dir(upload_dir)?;
     let raw = decode_b64_lenient(b64)
         .map_err(|e| format!("input_audio base64 decode failed: {e}"))?;
     // Sanitize the client-controlled `format`: keep only alphanumerics, so
@@ -336,7 +346,7 @@ pub fn save_base64(
         format!(".{clean}")
     };
     let path = upload_dir.join(format!("{}{}", Uuid::new_v4(), ext));
-    std::fs::write(&path, &raw).map_err(|e| e.to_string())?;
+    write_upload(&path, &raw)?;
     Ok((modality_hint.to_string(), path.to_string_lossy().into_owned()))
 }
 
@@ -827,9 +837,10 @@ fn fetch_hop(
         return Err(fetch_error(host, &too_large, format!("Content-Length {length}")));
     }
     let mime = mime_for(header(&headers, "content-type"), url);
-    std::fs::create_dir_all(upload_dir).map_err(|e| fetch_error(host, "could not save the file", e))?;
+    check_upload_dir(upload_dir).map_err(|e| fetch_error(host, "could not save the file", e))?;
     let path = upload_dir.join(format!("{}{}", Uuid::new_v4(), ext_for(&mime)));
-    let copied = std::fs::File::create(&path).map_err(BodyError::Store).and_then(|mut f| {
+    let copied = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)
+        .map_err(BodyError::Store).and_then(|mut f| {
         if chunked {
             copy_chunked(&mut r, &mut f, max_bytes)?;
         } else {
@@ -1057,6 +1068,7 @@ pub fn b64(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
     #[test]
@@ -1508,6 +1520,18 @@ mod tests {
         let out = save_remote_url(&format!("http://127.0.0.1:{port}/a.png"), &occupied, &local());
         let _ = std::fs::remove_file(&occupied);
         assert_eq!(out.unwrap_err(), "remote media fetch failed: could not save the file");
+    }
+
+    #[test]
+    fn a_remote_fetch_tightens_its_dir_and_writes_0600() {
+        let (port, _) = serve();
+        let dir = std::env::temp_dir().join(format!("mstar-remote-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let (_, path) = save_remote_url(&format!("http://127.0.0.1:{port}/a.png"), &dir, &local()).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
