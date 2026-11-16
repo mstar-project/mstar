@@ -30,6 +30,7 @@ mod auth;
 mod bridge;
 mod client_errors;
 mod generation_kwargs;
+mod generation_admin;
 mod media;
 mod protocol;
 mod realtime;
@@ -221,7 +222,7 @@ async fn main() {
     // outside admission, so an unauthenticated request never takes a permit.
     // The refusal counter sits between the two, so it sees the 401 and not
     // the preflights.
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/models", get(list_models))
@@ -234,7 +235,13 @@ async fn main() {
         .route("/healthz", get(ws::openpi::healthz))
         .route("/generate/ws", any(ws::generate::generate_ws))
         .route("/v1/realtime", any(realtime::realtime))
-        .merge(api)
+        .merge(api);
+    // A reload path is client-controlled, so no admin route exists without
+    // both authentication and a deployment-owned checkpoint allowlist.
+    if generation_admin::enabled(key_enabled, std::env::var("MSTAR_WEIGHT_RELOAD_ROOTS").ok().as_deref()) {
+        app = app.merge(generation_admin::router());
+    }
+    let app = app
         .layer(DefaultBodyLimit::max(body_limit_mb << 20))
         .layer(axum::middleware::from_fn_with_state(
             api_key,
