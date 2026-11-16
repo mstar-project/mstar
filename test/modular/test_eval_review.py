@@ -59,3 +59,36 @@ def test_saved_media_is_copied_only_for_local_or_opted_in_remote_review() -> Non
     assert compare.fetch_exclude(args, remote) == ()
     args.review = False
     assert compare.fetch_exclude(args, remote) == compare.FETCH_EXCLUDE
+
+
+def test_review_text_excerpt_does_not_read_the_whole_file(tmp_path: Path, monkeypatch) -> None:
+    saved = tmp_path / "model <one>" / "base" / "s0" / "case & one" / "audio" / "x-c1" / "r2"
+    saved.mkdir(parents=True)
+    large = saved / "large.txt"
+    large.write_text("x" * 10000)
+    original = Path.read_text
+
+    def forbid_whole_file(self, *args, **kwargs):
+        if self == large:
+            raise AssertionError("review read the whole saved text")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", forbid_whole_file)
+    text = review.write(tmp_path, [row()]).read_text()
+    assert "<pre>" + "x" * 4000 + "</pre>" in text
+    assert "x" * 4001 not in text
+
+
+def test_review_refuses_preexisting_media_output_symlink(tmp_path: Path) -> None:
+    saved = tmp_path / "model <one>" / "base" / "s0" / "case & one" / "audio" / "x-c1" / "r2"
+    saved.mkdir(parents=True)
+    (saved / "voice.pcm").write_bytes(b"\0\0" * 16)
+    outside = tmp_path.parent / (tmp_path.name + "-outside")
+    outside.mkdir()
+    report = tmp_path / "report"
+    report.mkdir()
+    (report / "review-media").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="review output path contains a symlink"):
+        review.write(tmp_path, [row()])
+    assert not list(outside.rglob("*.wav"))

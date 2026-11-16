@@ -15,6 +15,21 @@ def _safe_file(path: Path, root: Path) -> bool:
     return path.is_file() and not path.is_symlink() and path.resolve().is_relative_to(root.resolve())
 
 
+def _check_output_path(path: Path, root: Path) -> None:
+    """Do not follow a preexisting symlink while writing the local review page or its WAV files."""
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        raise ValueError("review output escapes the run directory") from None
+    current = root
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"review output path contains a symlink: {current}")
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise ValueError("review output escapes the run directory")
+
+
 def _url(path: Path, page: Path) -> str:
     return html.escape(quote(os.path.relpath(path, page.parent).replace(os.sep, "/"), safe="/"), quote=True)
 
@@ -26,6 +41,7 @@ def _media(path: Path, root: Path, page: Path) -> str:
     target = path
     if path.suffix == ".pcm":
         target = page.parent / "review-media" / path.relative_to(root).with_suffix(".wav")
+        _check_output_path(target, root)
         target.parent.mkdir(parents=True, exist_ok=True)
         with wave.open(str(target), "wb") as out:
             out.setnchannels(1)
@@ -42,13 +58,16 @@ def _media(path: Path, root: Path, page: Path) -> str:
     if path.suffix == ".mp4":
         return f'<video controls src="{url}"></video>'
     if path.suffix == ".txt":
-        return f"<pre>{html.escape(path.read_text(encoding='utf-8')[:4000])}</pre>"
+        with path.open(encoding="utf-8") as source:
+            excerpt = source.read(4000)
+        return f"<pre>{html.escape(excerpt)}</pre>"
     return f'<a href="{url}">download {label}</a>'
 
 
 def write(run_dir: Path, rows: list) -> Path:
     """Write report/review.html using local saved outputs only; no media is fetched here."""
     page = run_dir / "report" / "review.html"
+    _check_output_path(page, run_dir)
     page.parent.mkdir(parents=True, exist_ok=True)
     parts = ["<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">",
              "<title>Compare media review</title>",
