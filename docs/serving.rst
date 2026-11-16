@@ -1257,7 +1257,14 @@ requests, including ones the sampler drops, so transfer accounting and periodic
 arena logs also run. It does not print a per-request profile unless
 ``--log-stats`` is set. The timing conversion assumes the current same-host
 process clocks; worker hosts outside that clock domain need a separate clock
-mapping. Other routes, HTTP server spans, transfer spans and exemplars remain
+mapping. At DEBUG log level, API submission, conductor queue, intake and
+completion, and worker intake log the same ``trace_id`` with the request ID.
+One worker may log intake for several partitions of that request.
+``MSTAR_LOG_REQUESTS=1`` enables these request lines in all three processes
+without enabling other DEBUG logs. A trace ID can appear in logs when the
+sampler drops its span. Later worker step logs still use their request
+IDs and are not automatically tagged. Other
+routes, HTTP server spans, transfer spans and exemplars remain
 in `issue #771 <https://github.com/mstar-project/mstar/issues/771>`_.
 
 .. _serving-metrics:

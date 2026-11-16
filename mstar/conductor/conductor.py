@@ -79,7 +79,7 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
-from mstar.utils.logging_config import REQUEST_LOGGER, quiet_noisy_loggers
+from mstar.utils.logging_config import REQUEST_LOGGER, configure_request_log, quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
 from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
 from mstar.utils.threads import Thread
@@ -329,6 +329,7 @@ def _worker_process_target(
         format=f"%(asctime)s %(levelname)s [{worker_id}] %(name)s: %(message)s",
         force=True,
     )
+    configure_request_log()
     quiet_noisy_loggers()
     built: list = []  # the Worker, once it exists
     Thread(

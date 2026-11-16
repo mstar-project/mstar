@@ -78,6 +78,7 @@ from mstar.observability.tracing import (
     RequestSpan,
     RequestTracing,
     require_tracing,
+    trace_id_from_parent,
 )
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
@@ -985,10 +986,18 @@ class APIServer:
             traceparent=child_traceparent,
         ))
 
-        request_log.debug(
-            "Request %s submitted as %s  in=%s  out=%s",
-            request_id, key, input_modalities, output_modalities,
-        )
+        if request_log.isEnabledFor(logging.DEBUG):
+            trace_id = trace_id_from_parent(child_traceparent)
+            if trace_id is None:
+                request_log.debug(
+                    "Request %s submitted as %s  in=%s  out=%s",
+                    request_id, key, input_modalities, output_modalities,
+                )
+            else:
+                request_log.debug(
+                    "Request %s submitted as %s  in=%s  out=%s trace_id=%s",
+                    request_id, key, input_modalities, output_modalities, trace_id,
+                )
         return request_id
 
     def lora_kwargs(self, model: str | None, model_kwargs: dict | None) -> Selected:
