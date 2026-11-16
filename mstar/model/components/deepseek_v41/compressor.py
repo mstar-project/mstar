@@ -29,7 +29,7 @@ class DeepSeekV41Compressor(nn.Module):
     """Pool complete groups while returning the incomplete group's state.
 
     The graph owns ``(kv_state, score_state)`` for each request. The module has
-    no cross-request buffers; a future Value array can retain these tensors.
+    no cross-request buffers; the source binding retains them in an engine Value.
     ``start_pos`` follows the reference's prefill-at-zero, one-token-decode
     schedule. The returned latent is before compressed-position RoPE.
     """
