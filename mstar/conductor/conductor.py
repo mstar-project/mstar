@@ -692,7 +692,7 @@ class Conductor:
         )
         self._generation = GenerationControl(
             workers=self.worker_ids,
-            send=lambda peer, message: self.communicator.send(peer, message),
+            send=lambda peer, message: self.communicator.send(peer, message),  # noqa: PLW0108
             reject_queued=lambda: self._reject_waiting_queue("generation is paused", status=503),
             abort_in_flight=self._abort_in_flight_for_pause,
             timeout_s=float(self.model_config.get("weight_update_timeout_s", 600)),

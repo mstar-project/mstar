@@ -175,6 +175,23 @@ def test_wait_mode_lets_requests_finish_and_refuses_new_ones():
     assert (answer.status, answer.state, answer.paused) == (200, "paused", True)
 
 
+@pytest.mark.parametrize("mode", ["wait", "abort"])
+def test_continue_cancels_a_draining_pause_before_any_rank_is_touched(mode):
+    c = _conductor({"r1": _request_data()})
+    c._generation.pause(PauseGeneration(op_id="p1", mode=mode))
+    c._generation.pause(PauseGeneration(op_id="p2", mode=mode))
+    c._generation.resume(ContinueGeneration(op_id="continue"))
+
+    assert _steps(c) == []
+    for op_id in ("p1", "p2"):
+        answer = _answers(c, op_id)[-1]
+        assert answer.status == 409 and not answer.paused
+    assert _answers(c, "continue")[-1].status == 200
+    assert not c._generation.paused
+    c._generation.tick(0)
+    assert _steps(c) == [], "a cancelled pause started quiescing later"
+
+
 def test_abort_mode_fails_requests_through_the_drain_barrier():
     c = _conductor({"r1": _request_data(), "r2": _request_data()})
 
@@ -391,7 +408,9 @@ def test_operations_in_the_wrong_order_are_refused():
 
     c._generation.pause(PauseGeneration(op_id="p", mode="wait"))
     c._generation.resume(ContinueGeneration(op_id="draining"))
-    assert _answers(c, "draining")[-1].status == 409
+    assert _answers(c, "draining")[-1].status == 200
+    assert _answers(c, "p")[-1].status == 409
+    c._generation.pause(PauseGeneration(op_id="p2", mode="wait"))
     c.requests.clear()
     c._generation.tick(0)
     _ack_all(c, WeightOp.QUIESCE)

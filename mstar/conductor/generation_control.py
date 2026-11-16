@@ -175,6 +175,15 @@ class GenerationControl:
         if self.state is GenerationState.SERVING:
             self._answer(body.op_id, 200)
             return
+        if self.state is GenerationState.DRAINING:
+            # No rank has received QUIESCE yet. Reopen admission; requests
+            # already failed by an abort-mode pause still finish their drain.
+            self.state = GenerationState.SERVING
+            self.mode = None
+            self._quiesced = False
+            self._answer_pause(409, "pause cancelled by continue before generation paused")
+            self._answer(body.op_id, 200)
+            return
         if self.state is not GenerationState.PAUSED:
             self._answer(body.op_id, 409, f"generation is {self.state.value}; try again once it is paused")
             return

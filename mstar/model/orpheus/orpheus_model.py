@@ -115,6 +115,7 @@ class OrpheusModel(Model):
 
     DECODE_LOOP = "decode_loop"
     _llm_weights_dir: str | None = None
+    _llm_reload_manifest = None
 
     def __init__(
         self,
@@ -459,6 +460,10 @@ class OrpheusModel(Model):
         language_model.to_empty(device=device)
 
         load_weights(language_model, local_dir, device=device)
+        from mstar.model.loader import HF_DEFAULT_SKIP_FRAGMENTS
+        from mstar.model.loader.reload import reload_manifest
+
+        self._llm_reload_manifest = reload_manifest(local_dir, skip_fragments=HF_DEFAULT_SKIP_FRAGMENTS)
         self._llm_weights_dir = local_dir
         language_model.eval()
 
@@ -474,9 +479,10 @@ class OrpheusModel(Model):
         llm = submodules.get("LLM")
         if llm is None:
             return
-        if self._llm_weights_dir is None:
+        reference = self._llm_reload_manifest
+        if reference is None:
             raise WeightReloadRefusedError("the Orpheus LLM was not loaded from a checkpoint directory")
-        check_reload_compatible(path, self._llm_weights_dir, skip_fragments=HF_DEFAULT_SKIP_FRAGMENTS)
+        check_reload_compatible(path, reference, skip_fragments=HF_DEFAULT_SKIP_FRAGMENTS)
         if not check_only:
             load_weights(llm.model, path, device="cpu")
 

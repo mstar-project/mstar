@@ -67,8 +67,8 @@ from mstar.worker.speculation import (
 from mstar.worker.step_executor import StepExecutor
 from mstar.worker.step_pipeline import StepPipeline
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker_metrics import WorkerMetrics
 from mstar.worker.weight_ops import WeightOps
+from mstar.worker.worker_metrics import WorkerMetrics
 
 logger = logging.getLogger(__name__)
 

@@ -13,6 +13,7 @@ from test_weight_reload import _checkpoint, _engine, _lm, _orpheus, _state
 
 from mstar.conductor.generation_control import GenerationControl
 from mstar.distributed.communication import CommGroup
+from mstar.model.loader.reload import reload_manifest
 from mstar.model.orpheus.orpheus_model import OrpheusModel
 from mstar.utils.ipc_format import (
     ContinueGeneration,
@@ -20,8 +21,6 @@ from mstar.utils.ipc_format import (
     UpdateWeightsFromDisk,
     WeightControl,
     WeightOp,
-    WorkerMessage,
-    WorkerMessageType,
 )
 from mstar.worker.weight_ops import WeightOps
 
@@ -228,6 +227,7 @@ def test_both_ranks_reload_their_shards_in_one_epoch_and_commit(ckpts):
 def test_a_follower_that_fails_mid_copy_keeps_the_deployment_paused(ckpts):
     failing = _FailingAfterCopy.__new__(_FailingAfterCopy)
     failing.config, failing._llm_weights_dir = _orpheus(ckpts.a_dir).config, ckpts.a_dir
+    failing._llm_reload_manifest = reload_manifest(ckpts.a_dir)
     lms, d = _tp2(ckpts, follower_model=failing)
     assert d.pause().status == 200
 
@@ -286,7 +286,7 @@ def test_a_checkpoint_one_rank_refuses_copies_nothing_anywhere(ckpts, tmp_path):
     lms, d = _tp2(ckpts)
     # the follower was loaded from a deeper config, so it refuses this one
     deeper = _checkpoint(tmp_path / "deeper", ckpts.a, extra_config={"num_hidden_layers": 3})
-    d.workers["worker_1"].ops._engine._model._llm_weights_dir = deeper
+    d.workers["worker_1"].ops._engine._model._llm_reload_manifest = reload_manifest(deeper)
     assert d.pause().status == 200
 
     d.control.update(UpdateWeightsFromDisk(op_id="u", model_path=ckpts.b_dir, weight_version="v1"))

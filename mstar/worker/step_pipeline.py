@@ -36,8 +36,8 @@ from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout, WorkerServices
 from mstar.worker.speculation import Speculation, Speculator
 from mstar.worker.step_executor import PendingBatch, StepExecutor
-from mstar.worker.worker_metrics import WorkerMetrics
 from mstar.worker.weight_ops import WeightOps
+from mstar.worker.worker_metrics import WorkerMetrics
 
 logger = logging.getLogger(__name__)
 

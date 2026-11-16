@@ -80,7 +80,7 @@ class WeightOps:
             return False
         self.pending = None
         error = None
-        if op.op == WeightOp.QUIESCE or op.op == WeightOp.VERIFY:
+        if op.op in (WeightOp.QUIESCE, WeightOp.VERIFY):
             pass
         elif blockers:
             error = "not idle: " + "; ".join(blockers)

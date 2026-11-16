@@ -27,8 +27,8 @@ from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.model.base import Model
-from mstar.model.loader import load_weights
-from mstar.model.loader.reload import WeightReloadRefusedError, check_reload_compatible
+from mstar.model.loader import HF_DEFAULT_SKIP_FRAGMENTS, load_weights
+from mstar.model.loader.reload import WeightReloadRefusedError, check_reload_compatible, reload_manifest
 from mstar.model.orpheus.components.language_model import OrpheusForCausalLM
 from mstar.model.orpheus.config import OrpheusModelConfig
 from mstar.model.orpheus.orpheus_model import OrpheusModel
@@ -100,6 +100,7 @@ def _orpheus(weights_dir: str) -> OrpheusModel:
     model = OrpheusModel.__new__(OrpheusModel)
     model.config = _config()
     model._llm_weights_dir = weights_dir
+    model._llm_reload_manifest = reload_manifest(weights_dir, skip_fragments=HF_DEFAULT_SKIP_FRAGMENTS)
     return model
 
 
@@ -308,6 +309,35 @@ def test_an_index_naming_a_file_outside_the_checkpoint_is_refused(ckpts):
         {"weight_map": {"model.norm.weight": "../b/model.safetensors"}},
     ))
     _refused(ckpts, str(outside), "outside")
+
+
+def test_hub_snapshot_index_accepts_a_blob_symlink(ckpts):
+    blob_dir = ckpts.tmp / "hub" / "blobs"
+    snapshot = ckpts.tmp / "hub" / "snapshots" / "hash"
+    blob_dir.mkdir(parents=True)
+    snapshot.mkdir(parents=True)
+    shard_name = "model-00001-of-00001.safetensors"
+    (blob_dir / "blob-hash").write_bytes((ckpts.tmp / "b" / "model.safetensors").read_bytes())
+    (snapshot / shard_name).symlink_to("../../blobs/blob-hash")
+    (snapshot / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {name: shard_name for name in ckpts.b},
+    }))
+    check_reload_compatible(snapshot, ckpts.a_dir)
+
+
+def test_reload_uses_the_loaded_manifest_after_startup_files_move(ckpts, tmp_path):
+    model = _orpheus(ckpts.a_dir)
+    engine = _engine(model, _lm(ckpts.a_dir))
+    (ckpts.tmp / "a").rename(tmp_path / "moved-startup-checkpoint")
+    engine.check_weight_reload(ckpts.b_dir)
+    engine.reload_weights(ckpts.b_dir, "v1")
+
+
+def test_reload_uses_the_loaded_config_not_a_later_overwrite(ckpts):
+    model = _orpheus(ckpts.a_dir)
+    engine = _engine(model, _lm(ckpts.a_dir))
+    (ckpts.tmp / "a" / "config.json").write_text(json.dumps({"num_hidden_layers": 999}))
+    engine.check_weight_reload(ckpts.b_dir)
 
 
 def test_a_rank_hosting_only_the_snac_decoder_has_nothing_to_reload(ckpts):

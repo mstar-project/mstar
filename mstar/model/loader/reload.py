@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
+from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 
 from safetensors import safe_open
@@ -31,10 +33,18 @@ class WeightReloadRefusedError(ValueError):
     """The checkpoint cannot be reloaded in place; nothing was copied."""
 
 
+@dataclass(frozen=True)
+class ReloadManifest:
+    """The compatibility facts from the checkpoint actually loaded at startup."""
+    tensors: dict[str, tuple[tuple[int, ...], str]]
+    configs: dict[str, dict | bytes]
+
+
 def safetensors_files(path: str | Path) -> list[Path]:
     """The files the loader reads for ``path``: the file itself, the shards an
-    index names, or a lone ``model.safetensors``. Refuses a shard outside the
-    checkpoint's directory."""
+    index names, or a lone ``model.safetensors``. Index names must stay within
+    the checkpoint directory lexically; Hugging Face snapshot shard symlinks
+    may resolve into its shared blobs directory."""
     path = Path(path)
     if path.is_file():
         return [path]
@@ -46,13 +56,11 @@ def safetensors_files(path: str | Path) -> list[Path]:
             weight_map = json.loads(index.read_text())["weight_map"]
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise WeightReloadRefusedError(f"unreadable {index.name}: {exc}") from exc
-        root = path.resolve()
         files = []
         for name in sorted(set(weight_map.values())):
-            shard = (path / name).resolve()
-            if not shard.is_relative_to(root):
+            if not isinstance(name, str) or not name or Path(name).is_absolute() or ".." in Path(name).parts:
                 raise WeightReloadRefusedError(f"{index.name} names {name!r}, outside {path}")
-            files.append(shard)
+            files.append(path / name)
         return files
     single = path / "model.safetensors"
     if single.is_file():
@@ -88,38 +96,57 @@ def _config_dir(path: Path) -> Path:
     return path.parent if path.is_file() else path
 
 
-def _config_mismatches(new: Path, reference: Path) -> list[str]:
+def reload_manifest(path: str | Path, skip_fragments: Iterable[str] = ()) -> ReloadManifest:
+    """Read a small, durable compatibility snapshot before the source path changes."""
+    path = Path(path)
+    configs: dict[str, dict | bytes] = {}
+    for name in _CONFIG_FILES:
+        file = _config_dir(path) / name
+        if not file.is_file():
+            continue
+        try:
+            if name == "config.json":
+                value = json.loads(file.read_text())
+                if not isinstance(value, dict):
+                    raise WeightReloadRefusedError(f"{name} is not a JSON object")
+                configs[name] = value
+            else:
+                configs[name] = sha256(file.read_bytes()).digest()
+        except (OSError, ValueError) as exc:
+            raise WeightReloadRefusedError(f"unreadable {name}: {exc}") from exc
+    return ReloadManifest(tensors=tensor_specs(path, skip_fragments), configs=configs)
+
+
+def _config_mismatches(new: ReloadManifest, reference: ReloadManifest) -> list[str]:
     mismatched = []
     for name in _CONFIG_FILES:
-        new_file, ref_file = _config_dir(new) / name, _config_dir(reference) / name
-        if not (new_file.is_file() and ref_file.is_file()):
+        if name not in new.configs or name not in reference.configs:
             continue
         if name == "config.json":
-            try:
-                new_cfg, ref_cfg = json.loads(new_file.read_text()), json.loads(ref_file.read_text())
-            except (OSError, ValueError) as exc:
-                raise WeightReloadRefusedError(f"unreadable {name}: {exc}") from exc
-            if not (isinstance(new_cfg, dict) and isinstance(ref_cfg, dict)):
-                raise WeightReloadRefusedError(f"{name} is not a JSON object")
+            new_cfg, ref_cfg = new.configs[name], reference.configs[name]
             keys = (new_cfg.keys() | ref_cfg.keys()) - _CONFIG_IGNORED_KEYS
             differ = sorted(k for k in keys if new_cfg.get(k) != ref_cfg.get(k))
             if differ:
                 mismatched.append(f"{name} differs in {differ[:5]}")
-        elif new_file.read_bytes() != ref_file.read_bytes():
+        elif new.configs[name] != reference.configs[name]:
             mismatched.append(f"{name} differs")
     return mismatched
 
 
 def check_reload_compatible(
-    new: str | Path, reference: str | Path, skip_fragments: Iterable[str] = (),
+    new: str | Path, reference: str | Path | ReloadManifest, skip_fragments: Iterable[str] = (),
 ) -> None:
     """Raise ``WeightReloadRefusedError`` unless ``new`` can be copied in place over
     weights loaded from ``reference``: the same tensor names and shapes (names
     containing ``skip_fragments`` aside), float dtypes or unchanged ones, and the
     same configs where both ship them."""
-    new, reference = Path(new), Path(reference)
-    new_specs = tensor_specs(new, skip_fragments)
-    ref_specs = tensor_specs(reference, skip_fragments)
+    new = Path(new)
+    new_manifest = reload_manifest(new, skip_fragments)
+    ref_manifest = (
+        reference if isinstance(reference, ReloadManifest)
+        else reload_manifest(reference, skip_fragments)
+    )
+    new_specs, ref_specs = new_manifest.tensors, ref_manifest.tensors
     problems = []
     missing = sorted(ref_specs.keys() - new_specs.keys())
     extra = sorted(new_specs.keys() - ref_specs.keys())
@@ -135,6 +162,6 @@ def check_reload_compatible(
             problems.append(f"{name}: dtype {new_dtype}, loaded {ref_dtype}")
         if len(problems) >= 8:
             break
-    problems += _config_mismatches(new, reference)
+    problems += _config_mismatches(new_manifest, ref_manifest)
     if problems:
         raise WeightReloadRefusedError(f"{new} does not match the loaded checkpoint: " + "; ".join(problems))
