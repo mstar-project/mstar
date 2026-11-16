@@ -25,9 +25,10 @@ _SENTENCE = re.compile(
     )""",
     re.VERBOSE | re.DOTALL,
 )
-# Soft break points inside an over-long sentence, most preferred first.
+# Soft break points inside an over-long sentence, most preferred first. A Latin
+# clause mark breaks only before whitespace, so "4,500,000" and "9:45" stay whole.
 _SOFT_BREAKS = (
-    re.compile(r"(?<=[,;:，；：])\s*"),
+    re.compile(r"(?<=[,;:])\s+|(?<=[，；：])\s*"),
     re.compile(r"\s+"),
 )
 

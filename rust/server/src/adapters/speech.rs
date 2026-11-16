@@ -181,6 +181,12 @@ impl OpenAIAdapter for CosyVoice3 {
             set_default(&mut mk, "voice", Value::from(voice.clone()));
         }
         instructions_as_instruct(&mut mk);
+        // The frontend decides once for the full request; a client-supplied
+        // flag must not change how an English piece in a Chinese request reads.
+        mk.remove("text_has_chinese");
+        if crate::speech_chunking::cosyvoice3_has_chinese(&req.input) {
+            mk.insert("text_has_chinese".to_string(), Value::Bool(true));
+        }
         sampling(&mut mk, req, "temperature", "top_p");
         Ok(speech_submission(req, mk))
     }

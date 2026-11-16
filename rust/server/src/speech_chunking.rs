@@ -15,7 +15,9 @@ use crate::unicode_marks::MARK_RANGES;
 const LATIN_ENDS: [char; 4] = ['.', '!', '?', ';'];
 const CLOSERS: [char; 6] = ['"', '\'', '”', '’', ')', ']'];
 const CJK_ENDS: [char; 4] = ['。', '！', '？', '；'];
-const CLAUSE_ENDS: [char; 6] = [',', ';', ':', '，', '；', '：'];
+// A Latin clause mark cuts only before whitespace; a full-width one always does.
+const LATIN_CLAUSE_ENDS: [char; 3] = [',', ';', ':'];
+const CJK_CLAUSE_ENDS: [char; 3] = ['，', '；', '：'];
 
 /// Python's `str.isspace`: Unicode White_Space plus the separators U+001C..U+001F.
 fn is_space(c: char) -> bool {
@@ -113,13 +115,21 @@ fn cut_evenly(text: &[char], max_chars: usize) -> Vec<Vec<char>> {
     pieces
 }
 
-/// `re.split(r"(?<=[,;:，；：])\s*", s)`: a cut after each clause mark, which
-/// drops the whitespace that follows it.
+/// `re.split(r"(?<=[,;:])\s+|(?<=[，；：])\s*", s)`: a cut after each clause
+/// mark, which drops the whitespace that follows it. A Latin mark cuts only
+/// when whitespace follows it, so "4,500,000" and "9:45" stay whole; a
+/// full-width mark needs no space after it, so its cut can take none.
 fn split_clauses(s: &[char]) -> Vec<&[char]> {
     let mut parts = Vec::new();
     let (mut last, mut i) = (0, 1);
     while i <= s.len() {
-        if CLAUSE_ENDS.contains(&s[i - 1]) {
+        let mark = s[i - 1];
+        let cuts = if LATIN_CLAUSE_ENDS.contains(&mark) {
+            i < s.len() && is_space(s[i])
+        } else {
+            CJK_CLAUSE_ENDS.contains(&mark)
+        };
+        if cuts {
             parts.push(&s[last..i]);
             let mut j = i;
             while j < s.len() && is_space(s[j]) {
@@ -243,11 +253,15 @@ pub enum Splitter {
     CosyVoice3,
 }
 
+pub(crate) fn cosyvoice3_has_chinese(text: &str) -> bool {
+    text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+}
+
 /// `CosyVoice3Adapter.split_speech_text`: Chinese text as the reference's
 /// `split_paragraph(lang="zh")` cuts it, anything else as sentences sized by
 /// an estimate of its BPE tokens.
 fn cosyvoice3_split(text: &str, max_chars: usize) -> Vec<String> {
-    if text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) {
+    if cosyvoice3_has_chinese(text) {
         return cosyvoice3_split_chinese(text);
     }
     // `_estimated_tokens`: an upper estimate of the Qwen2 BPE token count
@@ -358,6 +372,20 @@ pub fn plan_chunks(
         ));
     }
     Ok(if chunks.is_empty() { vec![input.to_string()] } else { chunks })
+}
+
+/// Written digits can expand when the Python CosyVoice3 frontend speaks them,
+/// so its fitted boundaries must be planned there. Keep the common short
+/// request and unchunked request on the local path.
+pub fn needs_cosyvoice3_spoken_plan(requested: Option<&Value>, chunking: &SpeechChunking, input: &str) -> bool {
+    if chunking.splitter != Splitter::CosyVoice3 || !input.chars().any(char::is_numeric) {
+        return false;
+    }
+    let requested = requested.filter(|v| !v.is_null());
+    if requested == Some(&Value::Bool(false)) {
+        return false;
+    }
+    requested.is_some() || chunking.min_chars.is_some_and(|min| input.chars().count() >= min)
 }
 
 /// `_chunk_kwargs`: a piece's model kwargs, the request's except that
@@ -476,6 +504,25 @@ mod tests {
         let text = format!("{},{}", "a ".repeat(150).trim_end(), " b".repeat(100));
         let chunks = split_sentences(&text, 400, 24);
         assert_eq!(chunks, [format!("{},", "a ".repeat(150).trim_end()), "b ".repeat(100).trim_end().to_string()]);
+    }
+
+    #[test]
+    fn a_clause_mark_with_no_space_after_it_keeps_a_number_whole() {
+        // Python's `test_overlong_sentence_keeps_its_numbers_whole`, piece for piece
+        let sentence = "The budget for the whole program across all regional offices is $4,500,000 \
+                        and the review starts at 9:45 on the third floor near the main entrance hall";
+        assert_eq!(split_sentences(sentence, 60, 0), [
+            "The budget for the whole program across all regional offices",
+            "is $4,500,000 and the review starts at 9:45 on the third",
+            "floor near the main entrance hall",
+        ]);
+        // a full-width comma still cuts with no space after it
+        let zh = "第一部分已经完成，第二部分正在进行，第三部分将在下个月开始，第四部分还在计划之中";
+        assert_eq!(split_sentences(zh, 20, 0), [
+            "第一部分已经完成， 第二部分正在进行，",
+            "第三部分将在下个月开始，",
+            "第四部分还在计划之中",
+        ]);
     }
 
     #[test]

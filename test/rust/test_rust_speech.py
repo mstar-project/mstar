@@ -32,7 +32,7 @@ from mstar.api_server.entrypoint import APIServer
 from mstar.api_server.openai import _util, serving_speech
 from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
 from mstar.api_server.openai.protocol import SpeechRequest
-from mstar.api_server.rust_frontend import LIBSNDFILE_ENV, soundfile_library
+from mstar.api_server.rust_frontend import LIBSNDFILE_ENV, RustFrontendBridge, soundfile_library
 from mstar.api_server.served_models import ServedModels
 
 pytestmark = pytest.mark.skipif(BINARY is None, reason="mstar-server binary not built")
@@ -468,13 +468,14 @@ def test_stream_format_is_not_forwarded_as_a_model_kwarg(tmp_path, monkeypatch):
 def test_split_sentences_matches_python_on_random_long_inputs(tmp_path, monkeypatch):
     """Piece texts from both frontends over inputs built from the splitter's
     edge cases: terminators with and without closers, CJK ends, paragraph
-    breaks, clause marks, runs with no spaces, combining marks, and Python's
-    whitespace (U+001C and U+00A0 among it)."""
+    breaks, clause marks with and without a space after them, runs with no
+    spaces, combining marks, and Python's whitespace (U+001C and U+00A0 among
+    it)."""
     from mstar.api_server.openai.speech_chunking import split_sentences
 
     words = ["word", "longerword", "3.5", "end.", 'quote."', "aside!)", "really?'", "semi;", "海は広い。",
              "質問？", "clause,", "colon:", "，中文", "\n\n", "\n \t\n", " ", "\u001c", "áb́",
-             "x" * 120, "é" * 450, "e\u0301" * 300, "Done.”", "  "]
+             "$4,500,000", "9:45", "x" * 120, "é" * 450, "e\u0301" * 300, "Done.”", "  "]
     rng = random.Random(1234)
     texts = []
     while len(texts) < 120:
@@ -527,6 +528,41 @@ def test_cosyvoice3_cuts_long_text_as_its_python_adapter_does(script, tmp_path, 
                 continue
             assert status == 200, data
             assert [s["text"] for s in stub.submitted] == want, text
+
+
+def test_cosyvoice3_numeric_plan_only_probes_when_chunking_can_change_spoken_length(monkeypatch):
+    model = _model_of("CosyVoice3Adapter")
+    adapter = ADAPTER_REGISTRY[model]
+    calls = []
+    original = RustFrontendBridge._plan_speech_chunks
+
+    def counted(self, msg):
+        calls.append(msg["text"])
+        return original(self, msg)
+
+    monkeypatch.setattr(RustFrontendBridge, "_plan_speech_chunks", counted)
+    stub = _RustSpeechStub()
+    short = "Version 3.5 is ready."
+    long = "The price is 3.5 dollars. " * 12
+    with _model_stack(model, stub) as (port, _upload):
+        for body, want_probes in [
+            ({"input": short}, 0),
+            ({"input": short, "sentence_chunking": True}, 1),
+            ({"input": long}, 2),
+            ({"input": long, "sentence_chunking": False}, 2),
+            ({"input": long, "text_frontend": False}, 2),
+        ]:
+            stub.submitted.clear()
+            status, data = _post(port, "/v1/audio/speech", body)
+            assert status == 200, data
+            requested = body.get("sentence_chunking")
+            if requested is False or (requested is None and len(body["input"]) < 81):
+                want = [body["input"]]
+            else:
+                req = SpeechRequest(**body)
+                want = adapter.split_speech_text(body["input"], req) or [body["input"]]
+            assert [s["text"] for s in stub.submitted] == want
+            assert len(calls) == want_probes
 
 
 # ── voice cloning: ref_audio ────────────────────────────────────────────────
