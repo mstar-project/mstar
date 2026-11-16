@@ -77,7 +77,6 @@ from mstar.observability.metrics import (
 from mstar.observability.tracing import (
     RequestSpan,
     RequestTracing,
-    TraceContextMiddleware,
     require_tracing,
 )
 from mstar.profile.display import pretty_print_profile
@@ -2255,10 +2254,6 @@ app.add_middleware(
     metrics=lambda: getattr(api_server, "metrics", None),
     routes=lambda: (*app.router.routes, *openai_router.routes),
 )
-app.add_middleware(
-    TraceContextMiddleware,
-    tracing=lambda: getattr(api_server, "tracing", None),
-)
 
 
 @app.exception_handler(RequestValidationError)
@@ -3236,7 +3231,7 @@ def main(argv: list[str] | None = None):
     if args.otlp_traces_endpoint:
         try:
             require_tracing()
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError) as exc:
             parser.error(str(exc))
     if args.socket_path_prefix is None:
         args.socket_path_prefix = per_port_socket_prefix(args.port)

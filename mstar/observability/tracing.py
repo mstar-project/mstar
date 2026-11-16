@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from mstar.api_server.entrypoint import PendingRequest
@@ -17,8 +18,19 @@ if TYPE_CHECKING:
 INSTALL_HINT = "--otlp-traces-endpoint needs OpenTelemetry: pip install 'mstar-ai[tracing]'"
 
 
+def otlp_protocol() -> str:
+    """Validate the configured OTLP wire format before model loading."""
+    protocol = os.getenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL") or os.getenv(
+        "OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"
+    )
+    if protocol not in ("http/protobuf", "grpc"):
+        raise ValueError(f"Unsupported OTLP traces protocol: {protocol!r} (use http/protobuf or grpc)")
+    return protocol
+
+
 def require_tracing() -> None:
     """Fail before model loading, rather than after starting worker processes."""
+    otlp_protocol()
     try:
         import opentelemetry.exporter.otlp.proto.grpc.trace_exporter  # noqa: F401
         import opentelemetry.exporter.otlp.proto.http.trace_exporter  # noqa: F401
@@ -43,7 +55,7 @@ class RequestTracing:
     """One live request span and stage spans reconstructed on completion."""
 
     def __init__(self, model_name: str, endpoint: str | None = None, *, provider: Any = None):
-        from opentelemetry import trace
+        from opentelemetry import context, trace
 
         if provider is None:
             require_tracing()
@@ -51,15 +63,11 @@ class RequestTracing:
             from opentelemetry.sdk.trace import TracerProvider
             from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-            protocol = os.getenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL") or os.getenv(
-                "OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"
-            )
+            protocol = otlp_protocol()
             if protocol == "http/protobuf":
                 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-            elif protocol == "grpc":
-                from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
             else:
-                raise ValueError(f"Unsupported OTLP traces protocol: {protocol!r}")
+                from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
             provider = TracerProvider(resource=Resource.create({
                 "service.name": os.getenv("OTEL_SERVICE_NAME", "mstar"),
             }))
@@ -67,6 +75,7 @@ class RequestTracing:
         self.provider = provider
         self.tracer = provider.get_tracer("mstar.api_server")
         self._trace = trace
+        self._root_context = context.Context()
         self.model_name = model_name
 
     def start(self, req: PendingRequest, key: str) -> RequestSpan:
@@ -76,6 +85,7 @@ class RequestTracing:
         timing = req.profile.timing
         span = self.tracer.start_span(
             "request",
+            context=self._root_context,
             start_time=wall_ns + int(timing.recv_time * 1_000_000_000) - perf_ns,
             attributes={
                 "mstar.model_name": self.model_name,
@@ -125,25 +135,3 @@ class RequestTracing:
             return
         span = self.tracer.start_span(name, context=parent, start_time=start_ns)
         span.end(end_time=end_ns)
-
-
-class TraceContextMiddleware:
-    """Read W3C context for requests served by the Python HTTP frontend."""
-
-    def __init__(self, app: Any, tracing: Callable[[], RequestTracing | None]):
-        self.app = app
-        self.tracing = tracing
-
-    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
-        if scope["type"] not in ("http", "websocket") or self.tracing() is None:
-            await self.app(scope, receive, send)
-            return
-        from opentelemetry import context, propagate
-
-        headers = {key.decode("ascii", "ignore").lower(): value.decode("ascii", "ignore")
-                   for key, value in scope.get("headers", ())}
-        token = context.attach(propagate.extract(headers))
-        try:
-            await self.app(scope, receive, send)
-        finally:
-            context.detach(token)
