@@ -104,7 +104,7 @@ def _runtime(
         ),
     )
     caps = {name: loop.max_iters for name, loop in section.get_loops().items()}
-    rid = runtime.add_request("request", "default", "walk", [0], mapping, caps)
+    rid = runtime.add_request(101, "default", "walk", [0], mapping, caps)
     manager.register_request(rid, runtime.get_sharding_config(rid))
     block = ColumnarEdgeSpecs.empty()
     block.add_edge(rid, GraphEdge(name="token", next_node="producer"))
