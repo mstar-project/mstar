@@ -1595,6 +1595,26 @@ def _listening(port) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _process_gone(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] == "Z"  # exited, not yet reaped
+    except (FileNotFoundError, ProcessLookupError):
+        # /proc can disappear after open succeeds but before read completes.
+        return True
+
+
+def test_process_gone_if_proc_stat_disappears_during_read(monkeypatch):
+    from unittest.mock import mock_open
+
+    opened = mock_open()
+    opened.return_value.__enter__.return_value.read.side_effect = ProcessLookupError
+    monkeypatch.setattr("builtins.open", opened)
+
+    assert _process_gone(123)
+    opened.assert_called_once_with("/proc/123/stat")
+
+
 def test_a_taken_port_exits_3_and_says_so():
     """``mstar serve`` exits when mstar-server does, and ``test/e2e/server.py``
     tells a lost port race by this message."""
@@ -1636,17 +1656,10 @@ def test_mstar_server_exits_when_its_launcher_is_killed():
         launcher.kill()
         launcher.wait()
 
-    def gone() -> bool:
-        try:
-            with open(f"/proc/{pid}/stat") as f:
-                return f.read().rsplit(")", 1)[1].split()[0] == "Z"  # exited, not yet reaped
-        except FileNotFoundError:
-            return True
-
     deadline = time.time() + 15
-    while not gone() and time.time() < deadline:
+    while not _process_gone(pid) and time.time() < deadline:
         time.sleep(0.1)
-    if not gone():
+    if not _process_gone(pid):
         try:
             os.kill(pid, 9)
         except ProcessLookupError:
