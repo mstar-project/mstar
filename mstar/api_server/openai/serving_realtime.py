@@ -584,6 +584,13 @@ def error_event(message: str, kind: str = "invalid_request_error", code: str | N
     return server_event("error", error=error)
 
 
+def _unhandled_event_error(session_id: str, exc: Exception) -> dict:
+    error_id = uuid.uuid4().hex[:12]
+    logger.error("realtime event handler failed (error id %s, session %s)", error_id, session_id,
+                 exc_info=exc)
+    return error_event(f"realtime event failed (error id {error_id})", kind="server_error")
+
+
 def response_object(response_id: str, status: str, modalities: list[str], output: list | None = None,
                     status_details: dict | None = None) -> dict:
     """A GA ``realtime.response``, as ``response.created`` / ``.done`` carry it."""
@@ -666,7 +673,17 @@ class RealtimeTranscription:
         await self.send(server_event("transcription_session.created", session=self._session_view()))
         try:
             async for event in _events(self.ws, self.send):
-                await self.handle(event)
+                try:
+                    await self.handle(event)
+                except WebSocketDisconnect:
+                    raise
+                except Exception as exc:
+                    error = _unhandled_event_error(self.session.session_id, exc)
+                    with contextlib.suppress(Exception):
+                        await self.send(error)
+                    with contextlib.suppress(Exception):
+                        await self.ws.close(code=1011)
+                    return
         except WebSocketDisconnect:
             return
 
@@ -1046,7 +1063,14 @@ class RealtimeConversation:
         await self.send(server_event("session.created", session=self._session_view()))
         try:
             async for event in _events(self.ws, self.send):
-                await self.handle(event)
+                try:
+                    await self.handle(event)
+                except WebSocketDisconnect:
+                    raise
+                except Exception as exc:
+                    await self.send(_unhandled_event_error(self.session_id, exc))
+                    await self.close(code=1011)
+                    return
         except WebSocketDisconnect:
             pass
         finally:

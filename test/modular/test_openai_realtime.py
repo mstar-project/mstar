@@ -573,12 +573,16 @@ class _ScriptedWS:
     def __init__(self, messages):
         self.inbox = list(messages)
         self.sent: list[dict] = []
+        self.close_code: int | None = None
 
     async def accept(self):
         pass
 
     async def send_text(self, payload):
         self.sent.append(json.loads(payload))
+
+    async def close(self, code):
+        self.close_code = code
 
     async def receive(self):
         if not self.inbox:
@@ -604,6 +608,29 @@ def test_unparseable_message_is_an_error_and_the_session_survives(message):
     asyncio.run(serving_realtime.RealtimeTranscription(_StubAPI(), "rt_test", _ContinuingAdapter(), ws).run())
     assert [e["type"] for e in ws.sent] == ["transcription_session.created", "error", "transcription_session.updated"]
     assert ws.sent[-1]["session"]["mstar"]["chunk_seconds"] == 1.0
+
+
+def test_unhandled_transcription_event_reports_one_generic_error_then_closes(client_and_stub, monkeypatch, caplog):
+    client, _ = client_and_stub
+
+    async def broken(self, event):
+        raise RuntimeError("secret /srv/model-path")
+
+    monkeypatch.setattr(serving_realtime.RealtimeTranscription, "handle", broken)
+    with caplog.at_level("ERROR", logger=serving_realtime.__name__):
+        with client.websocket_connect("/v1/realtime") as ws:
+            created = json.loads(ws.receive_text())
+            _send(ws, "input_audio_buffer.clear")
+            error = json.loads(ws.receive_text())
+            with pytest.raises(WebSocketDisconnect) as closed:
+                ws.receive_text()
+
+    assert error["type"] == "error" and error["error"]["type"] == "server_error"
+    assert "error id" in error["error"]["message"] and "secret" not in str(error)
+    assert closed.value.code == 1011
+    records = [r for r in caplog.records if "realtime event handler failed" in r.getMessage()]
+    assert len(records) == 1 and created["session"]["id"] in records[0].getMessage()
+    assert "secret /srv/model-path" in caplog.text
 
 
 def test_engine_requests_per_audio_second_are_bounded(client_and_stub):
@@ -1234,6 +1261,50 @@ def _send(ws, kind, **fields):
 def _session_update(ws, **session):
     _send(ws, "session.update", session=session)
     return _recv_until(ws, "session.updated")[-1]["session"]
+
+
+def test_unhandled_conversation_event_reports_one_generic_error_then_closes(duplex, monkeypatch, caplog):
+    client, _ = duplex()
+
+    async def broken(self, event):
+        raise RuntimeError("secret /srv/model-path")
+
+    monkeypatch.setattr(serving_realtime.RealtimeConversation, "handle", broken)
+    with caplog.at_level("ERROR", logger=serving_realtime.__name__):
+        with client.websocket_connect("/v1/realtime") as ws:
+            created = json.loads(ws.receive_text())
+            _send(ws, "input_audio_buffer.clear")
+            error = json.loads(ws.receive_text())
+            with pytest.raises(WebSocketDisconnect) as closed:
+                ws.receive_text()
+
+    assert error["type"] == "error" and error["error"]["type"] == "server_error"
+    assert "error id" in error["error"]["message"] and "secret" not in str(error)
+    assert closed.value.code == 1011
+    records = [r for r in caplog.records if "realtime event handler failed" in r.getMessage()]
+    assert len(records) == 1 and created["session"]["id"] in records[0].getMessage()
+    assert "secret /srv/model-path" in caplog.text
+
+
+def test_unhandled_conversation_event_aborts_an_open_call(monkeypatch):
+    api = _DuplexAPI()
+    append = json.dumps({"type": "input_audio_buffer.append",
+                         "audio": base64.b64encode(b"\0\0" * 480).decode()})
+    clear = json.dumps({"type": "input_audio_buffer.clear"})
+    ws = _ScriptedWS([append, clear])
+    original_handle = serving_realtime.RealtimeConversation.handle
+
+    async def broken_clear(self, event):
+        if event["type"] == "input_audio_buffer.clear":
+            raise RuntimeError("secret /srv/model-path")
+        await original_handle(self, event)
+
+    monkeypatch.setattr(serving_realtime.RealtimeConversation, "handle", broken_clear)
+    asyncio.run(serving_realtime.RealtimeConversation(api, api.model_name, ws, api.client_audio[0]).run())
+
+    assert len(api.submits) == 1 and api.aborted == [api.submits[0]["request_id"]]
+    assert ws.close_code == 1011
+    assert [event["type"] for event in ws.sent if event["type"] == "error"] == ["error"]
 
 
 @pytest.mark.parametrize("attr, value, reason", [("turn_tokens", None, "no turn tokens"),
