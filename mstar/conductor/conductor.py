@@ -134,6 +134,7 @@ _GENERATION_CONTROL_TYPES = frozenset({
     ConductorMessageType.CONTINUE_GENERATION,
     ConductorMessageType.UPDATE_WEIGHTS_FROM_DISK,
     ConductorMessageType.GET_GENERATION_STATE,
+    ConductorMessageType.CHECK_WEIGHTS,
     ConductorMessageType.WEIGHT_CONTROL_ACK,
 })
 
@@ -2484,6 +2485,8 @@ class Conductor:
             generation.update(message.body)
         elif t == ConductorMessageType.GET_GENERATION_STATE:
             generation.report(message.body)
+        elif t == ConductorMessageType.CHECK_WEIGHTS:
+            generation.check_weights(message.body)
         else:
             generation.ack(message.body)
 

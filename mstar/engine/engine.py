@@ -1037,6 +1037,34 @@ class Engine:
         model, modules = self._reload_target()
         model.reload_weights(path, modules, check_only=True)
 
+    def weight_checksum(self) -> str:
+        """SHA-256 of this rank's resident module tensors in stable order.
+
+        Called only at the paused StepPipeline boundary. Include names, dtypes,
+        shapes and raw tensor bytes so fused, quantized, and TP-sharded storage
+        is checked exactly as the engine serves it. This includes registered
+        buffers; models with mutable buffers should compare at the same paused
+        point in their request lifecycle.
+        """
+        import hashlib
+
+        digest = hashlib.sha256()
+        if self._device is not None and self._device.type != "cpu":
+            torch.accelerator.synchronize(self._device)
+        for node, managed in sorted(self._submodules.items()):
+            module = managed.submodule
+            for kind, tensors in (("parameter", module.named_parameters()),
+                                  ("buffer", module.named_buffers())):
+                for name, value in sorted(tensors):
+                    tensor = value.detach()
+                    header = (node, kind, name, str(tensor.dtype), tuple(tensor.shape))
+                    encoded = repr(header).encode("utf-8")
+                    digest.update(len(encoded).to_bytes(4, "big"))
+                    digest.update(encoded)
+                    data = tensor.cpu().contiguous().reshape(-1).view(torch.uint8).numpy()
+                    digest.update(memoryview(data))
+        return digest.hexdigest()
+
     def reload_weights(self, path: str, weight_version: str) -> None:
         """Drop what was derived from the old weights, then copy ``path`` into
         the loaded parameters. Only with nothing in flight on this engine.

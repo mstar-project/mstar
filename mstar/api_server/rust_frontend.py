@@ -763,7 +763,7 @@ class RustFrontendBridge:
                 admin = getattr(self.server, "generation_admin", None)
                 if admin is None:
                     raise RuntimeError("this API server has no generation admin")
-                body = {key: msg[key] for key in ("mode", "model_path", "weight_version") if key in msg}
+                body = {key: msg[key] for key in ("mode", "model_path", "weight_version", "checksums") if key in msg}
                 reply["metadata"] = {"result": await admin.call(msg.get("op"), body)}
             except Exception as exc:  # noqa: BLE001 — the bridge must answer even on a refusal
                 status, message = exception_status_text(exc, "generation admin", log=logger)

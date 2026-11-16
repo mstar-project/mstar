@@ -23,7 +23,7 @@ def test_control_messages_and_status(tmp_path):
         sent.append(message)
         admin.on_result(GenerationControlResult(
             op_id=message.body.op_id, status=200, state="paused", paused=True,
-            weight_version="v2",
+            weight_version="v2", rank_checksums={"worker_0": "a" * 64},
         ))
 
     admin = GenerationAdmin(send, key_enabled=True, roots=(root,))
@@ -34,6 +34,9 @@ def test_control_messages_and_status(tmp_path):
             "model_path": str(checkpoint), "weight_version": "v2",
         }))["weight_version"] == "v2"
         await admin.call("is_paused")
+        assert (await admin.call("weight_checker", {"mode": "checksum"}))["rank_checksums"] == {
+            "worker_0": "a" * 64,
+        }
         await admin.call("continue_generation")
 
     asyncio.run(run())
@@ -41,10 +44,12 @@ def test_control_messages_and_status(tmp_path):
         ConductorMessageType.PAUSE_GENERATION,
         ConductorMessageType.UPDATE_WEIGHTS_FROM_DISK,
         ConductorMessageType.GET_GENERATION_STATE,
+        ConductorMessageType.CHECK_WEIGHTS,
         ConductorMessageType.CONTINUE_GENERATION,
     ]
     assert sent[0].body.mode == "wait"
     assert sent[1].body.model_path == str(checkpoint.resolve())
+    assert sent[3].body.mode == "checksum"
 
 
 def test_disabled_without_key_or_roots(tmp_path):
@@ -94,6 +99,7 @@ def test_python_routes_auth_and_path_guard(tmp_path, monkeypatch):
     app.include_router(router)
     with TestClient(app) as client:
         assert client.post("/pause_generation", json={"mode": "wait"}).status_code == 401
+        assert client.post("/weight_checker", json={"mode": "checksum"}).status_code == 401
         auth = {"Authorization": "Bearer secret"}
         response = client.post("/pause_generation", json={"mode": "wait"}, headers=auth)
         assert response.status_code == 409
@@ -102,8 +108,10 @@ def test_python_routes_auth_and_path_guard(tmp_path, monkeypatch):
             "model_path": str(outside), "weight_version": "v2",
         }, headers=auth).status_code == 400
         assert client.get("/is_paused", headers=auth).json()["paused"]
+        assert client.post("/weight_checker", json={"mode": "checksum"}, headers=auth).status_code == 409
     assert [m.message_type for m in sent] == [
         ConductorMessageType.PAUSE_GENERATION, ConductorMessageType.GET_GENERATION_STATE,
+        ConductorMessageType.CHECK_WEIGHTS,
     ]
 
 

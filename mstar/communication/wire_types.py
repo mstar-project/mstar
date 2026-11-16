@@ -40,6 +40,7 @@ from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.utils.ipc_format import (
     AbortRequest,
+    CheckWeights,
     ClientStreamRoute,
     ConductorMessage,
     ContinueGeneration,
@@ -110,6 +111,7 @@ _TYPES: dict[str, type] = {
     "continue_generation": ContinueGeneration,
     "update_weights_from_disk": UpdateWeightsFromDisk,
     "get_generation_state": GetGenerationState,
+    "check_weights": CheckWeights,
     "weight_control_ack": WeightControlAck,
     # api-server bodies
     "result_tensors": ResultTensors,

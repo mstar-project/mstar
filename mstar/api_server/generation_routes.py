@@ -67,3 +67,8 @@ async def continue_generation(request: Request):
 @router.get("/is_paused")
 async def is_paused():
     return await _call("is_paused")
+
+
+@router.post("/weight_checker")
+async def weight_checker(request: Request):
+    return await _call("weight_checker", await _body(request))

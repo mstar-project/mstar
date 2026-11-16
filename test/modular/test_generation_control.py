@@ -16,6 +16,7 @@ import pytest
 from mstar.conductor.conductor import Conductor, RequestData
 from mstar.conductor.generation_control import GenerationControl
 from mstar.utils.ipc_format import (
+    CheckWeights,
     ConductorMessage,
     ConductorMessageType,
     ContinueGeneration,
@@ -116,7 +117,7 @@ def _applied(c) -> int:
     return _steps(c, WeightOp.APPLY)[-1][1].epoch
 
 
-def _ack(c, op: WeightOp, worker, error=None, version=None, dirty=False, weight_epoch=None):
+def _ack(c, op: WeightOp, worker, error=None, version=None, dirty=False, weight_epoch=None, checksum=None):
     epoch = _steps(c, op)[-1][1].epoch
     if weight_epoch is None:
         if op is WeightOp.APPLY and error is None:
@@ -128,6 +129,7 @@ def _ack(c, op: WeightOp, worker, error=None, version=None, dirty=False, weight_
     c._generation.ack(WeightControlAck(
         epoch=epoch, worker_id=worker, op=op.value, error=error,
         weight_version=version, weight_epoch=weight_epoch, dirty=dirty,
+        checksum=checksum,
     ))
 
 
@@ -148,6 +150,32 @@ def _paused(c):
     _ack_all(c, WeightOp.QUIESCE)
     assert _answers(c, "pause")[-1].status == 200
     return c
+
+
+def test_weight_checker_is_paused_only_and_requires_complete_expected_map():
+    c = _conductor()
+    c._generation.check_weights(CheckWeights(op_id="before", mode="checksum"))
+    assert _answers(c, "before")[-1].status == 409
+    _paused(c)
+    c._generation.check_weights(CheckWeights(op_id="bad", mode="compare", checksums={"worker_0": "0" * 64}))
+    assert _answers(c, "bad")[-1].status == 400
+    assert _steps(c, WeightOp.CHECKSUM) == []
+
+    c._generation.check_weights(CheckWeights(op_id="check", mode="checksum"))
+    _ack(c, WeightOp.CHECKSUM, "worker_0", checksum="0" * 64)
+    _ack(c, WeightOp.CHECKSUM, "worker_1", checksum="1" * 64)
+    answer = _answers(c, "check")[-1]
+    assert answer.status == 200 and answer.rank_checksums == {
+        "worker_0": "0" * 64, "worker_1": "1" * 64,
+    }
+    assert c._generation.state.value == "paused"
+
+    c._generation.check_weights(CheckWeights(op_id="compare", mode="compare", checksums=answer.rank_checksums))
+    _ack(c, WeightOp.CHECKSUM, "worker_0", checksum="0" * 64)
+    _ack(c, WeightOp.CHECKSUM, "worker_1", checksum="2" * 64)
+    mismatch = _answers(c, "compare")[-1]
+    assert mismatch.status == 409 and mismatch.rank_checksums["worker_1"] == "2" * 64
+    assert c._generation.state.value == "paused"
 
 
 # ── pausing ─────────────────────────────────────────────────────────────────

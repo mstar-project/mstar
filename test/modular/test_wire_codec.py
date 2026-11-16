@@ -25,6 +25,7 @@ from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.profile.format import GraphTiming, RxInfo, TxInfo
 from mstar.utils.ipc_format import (
+    CheckWeights,
     ConductorMessage,
     ConductorMessageType,
     ContinueGeneration,
@@ -288,7 +289,9 @@ def test_pause_and_weight_reload_messages():
         ContinueGeneration(op_id="c"),
         UpdateWeightsFromDisk(op_id="u", model_path="/ckpt", weight_version="v1"),
         GetGenerationState(op_id="s"),
-        WeightControlAck(epoch=3, worker_id="worker_1", op="apply", error="OSError: x", dirty=True),
+        CheckWeights(op_id="h", mode="compare", checksums={"worker_0": "a" * 64}),
+        WeightControlAck(epoch=3, worker_id="worker_1", op="apply", error="OSError: x", dirty=True,
+                         checksum="a" * 64),
     ):
         msg = ConductorMessage(message_type=ConductorMessageType.PAUSE_GENERATION, body=body)
         assert roundtrip(msg).body == body

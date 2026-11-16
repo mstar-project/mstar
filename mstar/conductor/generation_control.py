@@ -42,6 +42,7 @@ from enum import Enum
 
 from mstar.api_server.request_types import APIServerMessage, GenerationControlResult
 from mstar.utils.ipc_format import (
+    CheckWeights,
     ContinueGeneration,
     GetGenerationState,
     PauseGeneration,
@@ -66,6 +67,7 @@ class GenerationState(str, Enum):
     PREPARING = "preparing"
     APPLYING = "applying"
     VERIFYING = "verifying"
+    CHECKING = "checking"
 
 
 @dataclass(slots=True)
@@ -123,6 +125,7 @@ class GenerationControl:
         self._pause_waiters: list[str] = []
         self._update: UpdateWeightsFromDisk | None = None
         self._continue_op: str | None = None
+        self._checker: CheckWeights | None = None
 
     @property
     def paused(self) -> bool:
@@ -205,6 +208,25 @@ class GenerationControl:
 
     def report(self, body: GetGenerationState) -> None:
         self._answer(body.op_id, 200)
+
+    def check_weights(self, body: CheckWeights) -> None:
+        """Hash settled rank-local parameters through the existing worker step."""
+        if self.state is not GenerationState.PAUSED or not self._quiesced:
+            self._answer(body.op_id, 409, "weight checker requires every rank paused and idle")
+            return
+        if body.mode not in ("checksum", "compare"):
+            self._answer(body.op_id, 400, "mode must be 'checksum' or 'compare'")
+            return
+        if body.mode == "compare" and (
+            set(body.checksums) != set(self._workers)
+            or any(not isinstance(value, str) or len(value) != 64
+                   or any(c not in "0123456789abcdef" for c in value)
+                   for value in body.checksums.values())
+        ):
+            self._answer(body.op_id, 400, "checksums must contain one lowercase SHA-256 hex digest per rank")
+            return
+        self._checker = body
+        self._start(WeightOp.CHECKSUM, GenerationState.CHECKING)
 
     # ---- worker answers and the run loop ----------------------------------------
 
@@ -322,6 +344,31 @@ class GenerationControl:
             logger.info("Weight version %r committed on every rank", self.weight_version)
             self._answer_update(200)
             return
+        if step.op is WeightOp.CHECKSUM:
+            self.state = GenerationState.PAUSED
+            check, self._checker = self._checker, None
+            checksums = {
+                worker: ack.checksum for worker, ack in step.acks.items()
+                if ack.error is None and ack.checksum is not None
+            }
+            missing = {
+                worker: "rank returned no checksum" for worker in self._workers
+                if worker not in failed and worker not in checksums
+            }
+            failed.update(missing)
+            if failed:
+                self._answer(check.op_id, timeout_status or 500,
+                             self._detail("weight checksum failed", failed), checksums=checksums)
+                return
+            mismatched = {
+                worker: f"expected {check.checksums[worker]}, got {checksums[worker]}"
+                for worker in self._workers
+                if check.mode == "compare" and checksums[worker] != check.checksums[worker]
+            }
+            self._answer(check.op_id, 409 if mismatched else 200,
+                         self._detail("weight checksum mismatch", mismatched) if mismatched else None,
+                         checksums=checksums)
+            return
         # VERIFY: same label and same copy on every rank. A rank whose apply
         # never ran, or ran after its step timed out, reports another epoch.
         mismatched = {
@@ -372,12 +419,16 @@ class GenerationControl:
         update, self._update = self._update, None
         self._answer(update.op_id, status, error)
 
-    def _answer(self, op_id: str, status: int, error: str | None = None) -> None:
+    def _answer(
+        self, op_id: str, status: int, error: str | None = None,
+        *, checksums: dict[str, str] | None = None,
+    ) -> None:
         self._send("api_server", APIServerMessage(
             message_type="generation_control_result",
             body=GenerationControlResult(
                 op_id=op_id, status=status, state=self.state.value, paused=self.paused,
                 weight_version=self.weight_version, error_message=error,
                 ranks=dict(self._ranks), rank_versions=dict(self._rank_versions),
+                rank_checksums=checksums or {},
             ),
         ))

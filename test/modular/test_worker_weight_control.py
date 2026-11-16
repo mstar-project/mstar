@@ -18,6 +18,7 @@ from mstar.distributed.communication import CommGroup
 from mstar.model.loader.reload import snapshot_checkpoint
 from mstar.model.orpheus.orpheus_model import OrpheusModel
 from mstar.utils.ipc_format import (
+    CheckWeights,
     ContinueGeneration,
     PauseGeneration,
     UpdateWeightsFromDisk,
@@ -228,9 +229,67 @@ def test_both_ranks_reload_their_shards_in_one_epoch_and_commit(ckpts):
         assert {n: p.data_ptr() for n, p in lm.named_parameters()} == pointers[rank]
         assert torch.equal(lm.model.layers[0].self_attn.qkv_proj.weight, _shard(ckpts.b, rank))
 
+    d.control.check_weights(CheckWeights(op_id="after-reload", mode="checksum"))
+    d.run()
+    checked = d.answer("after-reload")
+    assert checked.status == 200 and checked.weight_version == "v1"
+    assert set(checked.rank_checksums) == set(WORKERS)
+
     d.control.resume(ContinueGeneration(op_id="c"))
     d.run()
     assert d.answer("c").status == 200 and not d.control.paused
+
+
+def test_checker_hashes_resident_rank_tensors_and_compares(ckpts):
+    lms, d = _tp2(ckpts)
+    assert d.pause().status == 200
+    d.control.check_weights(CheckWeights(op_id="first", mode="checksum"))
+    d.run()
+    first = d.answer("first")
+    assert first.status == 200 and first.weight_version is None
+    assert set(first.rank_checksums) == set(WORKERS)
+    assert all(len(value) == 64 for value in first.rank_checksums.values())
+    assert first.rank_checksums["worker_0"] != first.rank_checksums["worker_1"]
+
+    d.control.check_weights(CheckWeights(op_id="match", mode="compare", checksums=first.rank_checksums))
+    d.run()
+    assert d.answer("match").status == 200
+
+    # A TP follower's loaded parameter, and a quantized/fused weight buffer,
+    # must both affect its own rank's digest.
+    with torch.no_grad():
+        next(lms[1].named_parameters())[1].view(-1)[0].add_(1)
+    d.control.check_weights(CheckWeights(op_id="different", mode="compare", checksums=first.rank_checksums))
+    d.run()
+    changed = d.answer("different")
+    assert changed.status == 409 and changed.paused
+    assert changed.rank_checksums["worker_0"] == first.rank_checksums["worker_0"]
+    assert changed.rank_checksums["worker_1"] != first.rank_checksums["worker_1"]
+
+
+def test_checksum_includes_nonpersistent_fused_weight_buffers():
+    from mstar.engine.engine import Engine
+
+    module = torch.nn.Module()
+    module.register_buffer("qkv_proj_weight", torch.tensor([1.0, 2.0]), persistent=False)
+    engine = Engine.__new__(Engine)
+    engine._device = torch.device("cpu")
+    engine._submodules = {"attention": SimpleNamespace(submodule=module)}
+    before = engine.weight_checksum()
+    module.qkv_proj_weight[0] = 3.0
+    assert engine.weight_checksum() != before
+
+
+def test_dirty_rank_refuses_weight_checksum(ckpts):
+    _, d = _tp2(ckpts)
+    assert d.pause().status == 200
+    d.workers["worker_1"].ops.dirty = True
+    d.control.check_weights(CheckWeights(op_id="dirty", mode="checksum"))
+    d.run()
+    answer = d.answer("dirty")
+    assert answer.status == 500 and answer.paused
+    assert "worker_1" not in answer.rank_checksums
+    assert "partially copied" in answer.ranks["worker_1"]
 
 
 def test_a_follower_that_fails_mid_copy_keeps_the_deployment_paused(ckpts):
