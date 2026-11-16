@@ -480,6 +480,25 @@ impl Bridge {
         }
     }
 
+    /// Generation control uses the Python API server's shared path guard and
+    /// the conductor messages from #845; the reply carries the HTTP status.
+    pub async fn generation_admin(&self, op: &str, body: &serde_json::Map<String, Value>, timeout: Duration) -> Result<Value, (u16, String)> {
+        let mut args = body.clone();
+        args.insert("op".into(), Value::from(op));
+        match self.round_trip("generation_admin", Extras { op: Some(&args), ..Extras::default() }, timeout).await {
+            Some(StreamItem::Chunk(chunk)) => match (chunk.metadata.get("result"), chunk.metadata.get("error")) {
+                (Some(result), _) => Ok(result.clone()),
+                (_, Some(error)) => Err((
+                    error.get("status").and_then(Value::as_u64).unwrap_or(500) as u16,
+                    error.get("message").and_then(Value::as_str).unwrap_or_default().to_string(),
+                )),
+                _ => Err((500, "the API server's generation admin gave no answer".to_string())),
+            },
+            Some(StreamItem::Error { status, message, .. }) => Err((status, message)),
+            _ => Err((503, "backend bridge unreachable".to_string())),
+        }
+    }
+
     /// One operation on a transcription upload's `WindowPlanner` (`op` and its
     /// arguments): the reply's `metadata` carries the planner's `duration`,
     /// `single` and the `windows` it cut, or the `error` it raised. None on
@@ -630,7 +649,7 @@ fn deliver(routes: &Routes, msg: Inbound) {
             Some(message) => (Some(StreamItem::Error { status: msg.status.unwrap_or(400), message, refused: false }), true),
             None => (Some(StreamItem::Done), true),
         },
-        "metrics" | "voices" | "windows" | "live" | "end_of_turn" | "lora" => (
+        "metrics" | "voices" | "windows" | "live" | "end_of_turn" | "lora" | "generation_admin" => (
             Some(StreamItem::Chunk(ResultChunk {
                 modality: msg.t,
                 data: msg.data.into_vec(),

@@ -44,6 +44,7 @@ from mstar.api_server.auth import (
 )
 from mstar.api_server.body_limit import BodyLimitMiddleware, max_body_bytes
 from mstar.api_server.data_worker import PreprocessWorker, unlink_files
+from mstar.api_server.generation_admin import GenerationAdmin, reload_roots
 from mstar.api_server.lora_admin import LoraAdmin
 from mstar.api_server.openpi import OpenpiPolicy, serve_connection
 from mstar.api_server.request_types import (
@@ -539,6 +540,7 @@ class APIServer:
     _process_cpus: frozenset[int] = frozenset()
     # set in __init__; None until then, which a server built without it (a test's) keeps
     lora_admin: LoraAdmin | None = None
+    generation_admin: GenerationAdmin | None = None
 
     def __init__(
         self,
@@ -633,6 +635,12 @@ class APIServer:
         self.lora_admin = LoraAdmin(
             lora, self.served_models,
             lambda message: self.preprocess_worker.send_to_conductor(message),  # noqa: PLW0108 - late-bound
+            timeout_s=timeout_seconds,
+        )
+        self.generation_admin = GenerationAdmin(
+            self.preprocess_worker.send_to_conductor,
+            key_enabled=api_key_guard.enabled,
+            roots=reload_roots() if api_key_guard.enabled else (),
             timeout_s=timeout_seconds,
         )
 
@@ -1280,6 +1288,11 @@ class APIServer:
                     if message.message_type == "lora_adapter_result":
                         if self.lora_admin is not None:
                             self.lora_admin.on_result(message.body)
+                        continue
+
+                    if message.message_type == "generation_control_result":
+                        if self.generation_admin is not None:
+                            self.generation_admin.on_result(message.body)
                         continue
 
                     if message.message_type == "conductor_status":
@@ -3218,6 +3231,12 @@ def main(argv: list[str] | None = None):
     log_off_thread()
     api_key = resolve_api_key(args.api_key)
     api_key_guard.set(api_key)
+    # These routes read deployment checkpoint paths; leave them absent unless
+    # both HTTP authentication and a trusted checkpoint root are configured.
+    if api_key and reload_roots():
+        from mstar.api_server.generation_routes import router as generation_router
+
+        app.include_router(generation_router)
     # The Rust frontend gets the key explicitly.
     keep_api_key_from_children(api_key)
 
