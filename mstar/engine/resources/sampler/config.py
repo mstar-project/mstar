@@ -8,7 +8,7 @@ step without pulling them in behind it.
 import hashlib
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
@@ -104,6 +104,13 @@ class SamplerSpec(NodeResourceSpec):
     # Allows ``logprobs_mode: "processed"``; the captured sampler then also
     # renorms every step's distribution again (CUDA only).
     enable_processed_logprobs: bool = False
+    # A node may pass a per-row boolean token mask to ``sample``. The mask is
+    # applied to logits before any penalty, temperature or filter.
+    enable_blocked_tokens: bool = False
+    # Use the RAS nucleus draw and repetition-window redraw, with per-request
+    # hash noise and the shared generation-history ring. Default draws stay on
+    # the existing Philox path.
+    enable_ras: bool = False
     # Whether a step whose rows all sample greedily may take each row's argmax
     # (`SamplerResource.lean_for`), in a twin of each batched capture: None
     # decides by the vocabulary (past the one-kernel draw), False never, True
@@ -149,6 +156,10 @@ class SamplingReqConfig(ResourceReqConfig):
     # the last ``repetition_window`` generated tokens; 0: presence over prompt
     # and output.
     repetition_window: int = 0
+    # Internal sampler modes are supplied by a model-specific request config,
+    # not exposed as generation knobs to every model and frontend.
+    ras_mode: ClassVar[bool] = False
+    ras_tau: ClassVar[float] = 0.0
     # The spec's stop ids get no probability until this many tokens exist
     # (applied after top-k/top-p).
     min_tokens: int = 0
@@ -173,7 +184,9 @@ class SamplingReqConfig(ResourceReqConfig):
         **kwargs
     ):
         # each sampler of a request draws its own stream from the request's seed
-        self._seed = seed if resource_key is None else derive_seed(seed, resource_key)
+        # RAS's existing CosyVoice stream is keyed directly by the request
+        # seed. Its token parity would change if this were stream-derived.
+        self._seed = seed if resource_key is None or self.ras_mode else derive_seed(seed, resource_key)
 
     @property
     def seed(self):
@@ -184,6 +197,9 @@ class SamplingReqConfig(ResourceReqConfig):
         node cannot honour. None means the sampler's default."""
         for name, (rule, ok) in REAL_KNOB_RULES.items():
             if (value := getattr(self, name)) is not None:
+                if name == "top_p" and self.ras_mode:
+                    check_real_knob(name, value, "in [0, 1]", lambda v: 0 <= v <= 1)
+                    continue
                 check_real_knob(name, value, rule, ok)
         for name, (rule, ok) in INT_KNOB_RULES.items():
             if (value := getattr(self, name)) is not None:
@@ -195,6 +211,15 @@ class SamplingReqConfig(ResourceReqConfig):
             raise ValueError(f"logprobs_mode must be 'raw' or 'processed'; got {self.logprobs_mode!r}")
         if spec is None:
             return
+        if self.ras_mode:
+            if not spec.enable_ras:
+                raise ValueError("this model does not declare RAS sampling")
+            if self.top_k is None or not 1 <= self.top_k <= 128:
+                raise ValueError("RAS top_k must be in [1, 128]")
+            if self.repetition_window > spec.max_repetition_window:
+                raise ValueError("RAS window exceeds the sampler's declared history")
+            if self.repetition_penalty not in (None, 1) or self.min_p or self.return_logprobs:
+                raise ValueError("RAS cannot combine with repetition_penalty, min_p or logprobs")
         # refused here, not ignored: the node's sampler has no such filter
         if self.min_p and not spec.enable_min_p:
             raise ValueError("this model does not support min_p; send 0 or leave it unset")
@@ -208,6 +233,21 @@ class SamplingReqConfig(ResourceReqConfig):
             raise ValueError(
                 "this model does not support repetition_penalty; send 1 or leave it unset"
             )
+
+
+@dataclass
+class RASSamplingReqConfig(SamplingReqConfig):
+    """Opt-in RAS settings supplied by a model, outside the public knob set."""
+
+    ras_mode: bool = True
+    ras_tau: float = 0.1
+
+    def validate(self, spec: "SamplerSpec | None" = None) -> None:
+        check_bool_knob("ras_mode", self.ras_mode)
+        if not self.ras_mode:
+            raise ValueError("RASSamplingReqConfig requires ras_mode=True")
+        check_real_knob("ras_tau", self.ras_tau, "in [0, 1]", lambda v: 0 <= v <= 1)
+        super().validate(spec)
 
 
 def derive_seed(seed: int, stream: str) -> int:

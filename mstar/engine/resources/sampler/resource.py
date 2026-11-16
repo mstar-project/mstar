@@ -15,16 +15,19 @@ from mstar.engine.resources.sampler.config import (
     SamplerStep,
     SamplingReqConfig,
 )
+from mstar.engine.resources.sampler.ras import ras_sample
 from mstar.engine.resources.sampler.resident import SamplerCells
 from mstar.engine.resources.sampler.utils import (
     FUSED_SAMPLE_MAX_VOCAB,
     AcceleratorGraphableSampler,
     FusedDrawArgs,
     GenerationHistory,
+    HistoryRows,
     Sampler,
     SamplerBuffers,
     SamplingConfig,
     _rng_offset_stride,
+    advance_history,
     samples_greedy,
 )
 from mstar.engine.resources.step import ASKS, AdmitOutcome, SlotLease, StepContext
@@ -62,12 +65,16 @@ class SamplerResource(Resource):
         enable_logprobs: bool = False,
         enable_processed_logprobs: bool = False,
         greedy_capture: bool | None = None,
+        enable_blocked_tokens: bool = False,
+        enable_ras: bool = False,
     ):
         self._track_seen_tokens = enable_repetition_penalty
         self._loopback_state = dict(loopback_state or {})
         self._enable_min_p = enable_min_p
         self._enable_logprobs = enable_logprobs
         self._enable_processed_logprobs = enable_processed_logprobs
+        self._enable_blocked_tokens = enable_blocked_tokens
+        self._enable_ras = enable_ras
         self._vocab_size = vocab_size if self._track_seen_tokens else None
         # A step whose rows all sample greedily runs lean, taking each row's argmax
         # (`lean_for`). By default only where the full sampler is the multi-kernel
@@ -85,7 +92,7 @@ class SamplerResource(Resource):
         # only when the spec enables one of them. The filter order needs none.
         self._history: GenerationHistory | None = None
         self._stop_ids: torch.Tensor | None = None
-        if max_repetition_window or min_tokens_stop_ids:
+        if max_repetition_window or min_tokens_stop_ids or enable_ras:
             self._history = GenerationHistory(max_repetition_window, device)
         if min_tokens_stop_ids:
             self._stop_ids = torch.tensor(
@@ -96,6 +103,7 @@ class SamplerResource(Resource):
         # so a node that enables one draws through FlashInfer, asked for or not.
         self.fused_draw = not (
             enable_min_p or self._history is not None or enable_top_p_first or enable_processed_logprobs
+            or enable_ras
         )
         self._sampler = Sampler(
             device=device,
@@ -206,6 +214,8 @@ class SamplerResource(Resource):
             enable_logprobs=spec.enable_logprobs,
             enable_processed_logprobs=spec.enable_processed_logprobs,
             greedy_capture=spec.greedy_capture,
+            enable_blocked_tokens=spec.enable_blocked_tokens,
+            enable_ras=spec.enable_ras,
         )
 
     def build_accelerator_graph_buffers(
@@ -238,7 +248,7 @@ class SamplerResource(Resource):
     def _scalar_options(self) -> dict:
         """What decides the scalars a captured sampler reads per row."""
         options = dict(enable_min_p=self._enable_min_p, enable_logprobs=self._enable_logprobs)
-        if self._device.type == "cuda":
+        if self._device.type == "cuda" or self._enable_ras:
             # CUDA-only (requests asking for them are refused elsewhere), so
             # another device's captured sampler is left exactly as it was
             options.update(
@@ -246,6 +256,7 @@ class SamplerResource(Resource):
                 stop_ids=self._stop_ids,
                 enable_top_p_first=self._enable_top_p_first,
                 enable_processed_logprobs=self._enable_processed_logprobs,
+                enable_ras=self._enable_ras,
             )
         return options
 
@@ -260,6 +271,9 @@ class SamplerResource(Resource):
         # Read off the resolved config rather than `overrides`, so a request
         # that leaves the penalty unset takes the same default the sampler will.
         resolved = self._sampler._sampling_config[rid]
+        if self._enable_ras != resolved.ras_mode:
+            self._sampler.remove_request(rid)
+            raise ValueError("RAS sampler and request mode must match")
         # written so NaN fails too; NaN would also slip past the `> 0` check below
         if not 0.0 <= resolved.min_p <= 1.0:
             self._sampler.remove_request(rid)
@@ -330,7 +344,8 @@ class SamplerResource(Resource):
         processed = cfg.return_logprobs and cfg.logprobs_mode == "processed"
         if processed and not self._enable_processed_logprobs:
             return "asks for processed logprobs but the node's SamplerSpec has enable_processed_logprobs=False"
-        if (cfg.uses_history or cfg.uses_filter_order or processed) and self._sampler.device.type != "cuda":
+        if (cfg.uses_history or cfg.uses_filter_order or processed) and self._sampler.device.type != "cuda" \
+                and not self._enable_ras:
             return (
                 "asks for repetition_window, min_tokens, top_p_first, top_p_min_keep or "
                 f"processed logprobs, which are CUDA-only (device {self._sampler.device})"
@@ -748,7 +763,8 @@ class SamplerResource(Resource):
     # Out of the caller's compiled frame: dynamo would guard on the ids it passes on.
     @torch.compiler.disable
     def sample(
-        self, request_ids: list[str], logits: torch.Tensor, **kwargs
+        self, request_ids: list[str], logits: torch.Tensor,
+        blocked_tokens: torch.Tensor | None = None,
     ):
         """One token per row of ``logits``, in ``request_ids`` order.
 
@@ -756,7 +772,19 @@ class SamplerResource(Resource):
         here: under capture that is the slot's padded rows and its dummy ids,
         which is what the graph sampler's per-row params were gathered for.
         The eager sampler keys off request ids and sees the real batch only.
+        ``blocked_tokens`` is a bool [B, V] tensor computed by the node for
+        this step. The node must leave at least one token unblocked per row.
         """
+        if blocked_tokens is not None:
+            if not self._enable_blocked_tokens:
+                raise ValueError("this sampler does not declare blocked-token support")
+            if blocked_tokens.shape != logits.shape or blocked_tokens.dtype != torch.bool \
+                    or blocked_tokens.device != logits.device:
+                raise ValueError("blocked_tokens must be a bool tensor with the logits' shape and device")
+        if self._enable_ras:
+            return self._sample_ras(request_ids, logits, blocked_tokens)
+        if blocked_tokens is not None:
+            logits = logits.masked_fill(blocked_tokens, float("-inf"))
         if self._enable_logprobs:
             # under capture this fires once, at capture; a replay never calls in
             if self._sampled_this_step:
@@ -795,6 +823,61 @@ class SamplerResource(Resource):
         # by request, so the next step can still read its token on the device.
         if self._keep_last_token and by_slot:
             bufs.write_last_tokens(request_ids, tokens, kept_rids=self._kept_rids)
+        return tokens
+
+    def _sample_ras(
+        self, request_ids: list[str], logits: torch.Tensor, blocked: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """The opt-in RAS draw, using the sampler's shared generation ring.
+
+        Its count is the CosyVoice step: zero for prefill, then one per kept
+        sample. The ring's first W columns hold a request's last W tokens.
+        """
+        history = self._history
+        if history is None:
+            raise RuntimeError("RAS requires generation history")
+        if blocked is None:
+            blocked = torch.zeros_like(logits, dtype=torch.bool)
+        captured = self._cg_sampler
+        if captured is not None:
+            rows = captured.history
+            if rows is None or captured.ras_threshold_buf is None:
+                raise RuntimeError("captured RAS rows were not allocated")
+            window = rows.window if rows.window is not None else torch.zeros_like(rows.count)
+            tokens = ras_sample(
+                logits, seed=captured.seed_buf, step=rows.count.to(torch.long),
+                history=rows.tokens if rows.tokens is not None else logits.new_empty(
+                    (logits.shape[0], 0), dtype=torch.long,
+                ),
+                temperature=captured.temperature_buf, top_p=captured.top_p_buf,
+                top_k=captured.top_k_buf, window=window,
+                repeat_threshold=captured.ras_threshold_buf, blocked=blocked,
+                history_is_ring=True,
+            )
+            tokens = captured._broadcast_tokens(tokens)
+            advance_history(rows, tokens)
+            return tokens
+
+        slots, recent, count = history.read(request_ids)
+        configs = [self._sampler._sampling_config[rid] for rid in request_ids]
+        device = logits.device
+        window = torch.tensor([c.repetition_window for c in configs], dtype=torch.int32, device=device)
+        threshold = torch.tensor(
+            [float(c.repetition_window) * float(c.ras_tau) for c in configs],
+            dtype=torch.float32, device=device,
+        )
+        rows = HistoryRows(count=count, tokens=recent if recent.shape[1] else None, window=window)
+        tokens = ras_sample(
+            logits, seed=torch.tensor([c.seed for c in configs], dtype=torch.long, device=device),
+            step=count.to(torch.long), history=recent,
+            temperature=torch.tensor([c.temperature for c in configs], dtype=torch.float32, device=device),
+            top_p=torch.tensor([c.top_p for c in configs], dtype=torch.float32, device=device),
+            top_k=torch.tensor([c.top_k for c in configs], dtype=torch.long, device=device),
+            window=window, repeat_threshold=threshold,
+            blocked=blocked, history_is_ring=True,
+        )
+        tokens = self._sampler._broadcast_tokens(tokens)
+        self._sampler._write_history(rows, slots, tokens, request_ids, self._kept_rids)
         return tokens
 
     def step_host_rows(self) -> dict[str, torch.Tensor]:
