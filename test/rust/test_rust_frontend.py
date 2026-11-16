@@ -1605,7 +1605,8 @@ def test_mstar_server_exits_when_its_launcher_is_killed():
         try:
             with open(f"/proc/{pid}/stat") as f:
                 return f.read().rsplit(")", 1)[1].split()[0] == "Z"  # exited, not yet reaped
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
+            # The process may disappear between opening and reading procfs.
             return True
 
     deadline = time.time() + 15
