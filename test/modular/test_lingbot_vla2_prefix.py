@@ -140,12 +140,7 @@ def test_prefix_requires_index_before_reading_weights(tmp_path):
 @pytest.mark.parametrize("on_array", [False, True], ids=["resources", "array"])
 def test_prefix_interleaved_mrope_matches_qwen3_vl_text_tower(with_image, on_array):
     """Tiny FP32 prefix, including an image grid whose H/W positions differ from text."""
-    from transformers.models.qwen3_vl import Qwen3VLTextConfig, Qwen3VLTextModel
-
-    from mstar.engine.state import Positions
-    from mstar.engine.state.adapters import StateSetup, _resolve, build_handle
-    from mstar.engine.state.analysis import position_key
-    from test.modular.test_qwen3_lm import (
+    from test_qwen3_lm import (
         ATTN,
         KV,
         _declared,
@@ -154,6 +149,11 @@ def test_prefix_interleaved_mrope_matches_qwen3_vl_text_tower(with_image, on_arr
         _FakePositions,
         _next_step,
     )
+    from transformers.models.qwen3_vl import Qwen3VLTextConfig, Qwen3VLTextModel
+
+    from mstar.engine.state import Positions
+    from mstar.engine.state.adapters import StateSetup, _resolve, build_handle
+    from mstar.engine.state.analysis import position_key
 
     torch.manual_seed(41)
     cfg = Qwen3LMConfig(
