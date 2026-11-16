@@ -146,6 +146,29 @@ def test_both_frontends_use_the_same_generated_mark_table():
         assert ranges == generator["mark_ranges"]()
 
 
+def test_generator_refuses_an_unintended_ucd_change(tmp_path, monkeypatch):
+    generator = runpy.run_path(str(GENERATOR))
+    globals_ = generator["main"].__globals__
+    python_table = tmp_path / "unicode_marks.py"
+    rust_table = tmp_path / "unicode_marks.rs"
+    python_table.write_text('UCD_VERSION = "15.0.0"\n')
+    rust_table.write_text("old Rust table\n")
+    monkeypatch.setitem(globals_, "PYTHON_TABLE", python_table)
+    monkeypatch.setitem(globals_, "RUST_TABLE", rust_table)
+    monkeypatch.setitem(globals_, "mark_ranges", lambda: [(0x300, 0x301)])
+    monkeypatch.setitem(globals_, "unicodedata", types.SimpleNamespace(unidata_version="14.0.0"))
+    monkeypatch.setattr(sys, "argv", ["gen_unicode_marks.py"])
+
+    with pytest.raises(SystemExit, match="--allow-version-change"):
+        generator["main"]()
+    assert python_table.read_text() == 'UCD_VERSION = "15.0.0"\n'
+    assert rust_table.read_text() == "old Rust table\n"
+
+    generator["main"](["--allow-version-change"])
+    assert 'UCD_VERSION = "14.0.0"' in python_table.read_text()
+    assert "Source UCD 14.0.0" in rust_table.read_text()
+
+
 # ---------------------------------------------------------------------------
 # handler
 # ---------------------------------------------------------------------------

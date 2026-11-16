@@ -5,10 +5,14 @@ Both frontends read generated tables from the repository, so upgrading a
 Python interpreter or Rust dependency does not silently move speech cut
 points. Regenerating both files is the explicit way to change the mark set.
 
-The checked-in tables hold CPython 3.12's UCD 15.0.0 marks. Run this when the
-repository deliberately moves its cut points to a newer Unicode version::
+The checked-in tables hold CPython 3.12's UCD 15.0.0 marks. Regenerate them
+without changing cut points with the matching interpreter::
 
     python scripts/gen_unicode_marks.py
+
+To deliberately move to another UCD, run::
+
+    python scripts/gen_unicode_marks.py --allow-version-change
 
 ``test/modular/test_speech_chunking.py`` checks that the two generated tables
 agree and, when run under the source UCD version, checks every code point
@@ -17,6 +21,8 @@ against ``unicodedata``. A different interpreter no longer changes chunking.
 
 from __future__ import annotations
 
+import argparse
+import re
 import sys
 import unicodedata
 from pathlib import Path
@@ -33,8 +39,8 @@ HEADER = """\
 // overlapping nor adjacent. Both frontends use these cut points regardless of
 // their interpreter or dependency Unicode versions.
 //
-// Regenerate both tables with `python scripts/gen_unicode_marks.py` when
-// deliberately changing speech cut points.
+// Regenerate both tables with `python scripts/gen_unicode_marks.py` and pass
+// `--allow-version-change` when deliberately changing speech cut points.
 """
 
 PYTHON_HEADER = """\
@@ -87,7 +93,21 @@ def render_python(ranges: list[tuple[int, int]], ucd_version: str) -> str:
     )
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--allow-version-change", action="store_true",
+                        help="replace the checked-in tables with this interpreter's UCD")
+    args = parser.parse_args(argv)
+    if PYTHON_TABLE.exists():
+        source = PYTHON_TABLE.read_text()
+        version = re.search(r'^UCD_VERSION = "([^"]+)"$', source, re.MULTILINE)
+        if version is None:
+            raise SystemExit(f"{PYTHON_TABLE} has no UCD_VERSION; refusing to overwrite it")
+        if version.group(1) != unicodedata.unidata_version and not args.allow_version_change:
+            raise SystemExit(
+                f"checked-in UCD {version.group(1)} differs from interpreter UCD "
+                f"{unicodedata.unidata_version}; pass --allow-version-change to update both tables"
+            )
     ranges = mark_ranges()
     RUST_TABLE.write_text(render(ranges, unicodedata.unidata_version))
     PYTHON_TABLE.write_text(render_python(ranges, unicodedata.unidata_version))

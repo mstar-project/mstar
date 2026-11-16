@@ -4,8 +4,8 @@
 // overlapping nor adjacent. Both frontends use these cut points regardless of
 // their interpreter or dependency Unicode versions.
 //
-// Regenerate both tables with `python scripts/gen_unicode_marks.py` when
-// deliberately changing speech cut points.
+// Regenerate both tables with `python scripts/gen_unicode_marks.py` and pass
+// `--allow-version-change` when deliberately changing speech cut points.
 
 // Source UCD 15.0.0.
 /// 2450 code points in 310 ranges.
