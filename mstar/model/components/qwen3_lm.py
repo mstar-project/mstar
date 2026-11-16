@@ -1,7 +1,8 @@
 """Dense Qwen3 causal language model from the shared components.
 
 Qwen3 = Llama-style pre-norm decoder with GQA, per-head QK RMSNorm, SwiGLU
-MLP and plain RoPE (``rope_theta`` 1e6, no Llama-3 scaling). Several
+MLP and plain RoPE (``rope_theta`` 1e6, no Llama-3 scaling). The Qwen3-VL
+prefix can opt into interleaved 3D MRoPE without changing the default path. Several
 audio-LLM checkpoints ship one as their text decoder (Qwen3-ASR, Higgs-Audio,
 Qwen3-Omni's dense layers); this is the one place to build it from
 ``ParallelAttention`` / ``ParallelGatedMLP`` / ``RMSNorm``, bound to the
@@ -28,6 +29,7 @@ from mstar.model.components.distributed import (
     ParallelGatedMLP,
     VocabParallelEmbedding,
 )
+from mstar.model.components.mrope import MRoPETables, apply_partial_mrope, compute_3d_cos_sin, compute_inv_freq
 from mstar.model.components.norm import RMSNorm
 from mstar.model.components.qk_norm_rope import norm_rotate, rope_cos_sin
 
@@ -82,12 +84,16 @@ class Qwen3Attention(ParallelAttention):
     _fuse_qk = False
     _fuse = False
 
+    def __init__(self, *, mrope_tables: MRoPETables | None = None, **kwargs):
+        super().__init__(**kwargs)
+        self.mrope_tables = mrope_tables
+
     def bind_resources(self, resources: dict) -> None:
         super().bind_resources(resources)
         # the kernel is plain non-interleaved RoPE over the whole head dim;
         # anything else the position resource would apply stays unfused
         self._rope_theta = None if self.pos is None else self.pos.fusable_rope_theta(self.head_dim)
-        self._fuse_qk = (
+        self._fuse_qk = self.mrope_tables is None and (
             self._rope_theta is not None and self.q_norm is not None and self.rope_scale == 1.0
         )
 
@@ -95,7 +101,19 @@ class Qwen3Attention(ParallelAttention):
         super().bind_state(handles)
         declared = None if self.state is None else self.state.array.positions
         self._theta = None if declared is None else _plain_theta(declared.rope, self.head_dim)
-        self._fuse = self._theta is not None
+        self._fuse = self.mrope_tables is None and self._theta is not None
+
+    def _rotate_state(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.mrope_tables is not None:
+            return apply_partial_mrope(q, k, self.mrope_tables.cos, self.mrope_tables.sin)
+        return super()._rotate_state(q, k)
+
+    def _apply_rope(
+        self, q: torch.Tensor, k: torch.Tensor, label: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.mrope_tables is not None:
+            return apply_partial_mrope(q, k, self.mrope_tables.cos, self.mrope_tables.sin)
+        return super()._apply_rope(q, k, label)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # The state op is a graph break. Called from a helper method, the op makes Dynamo compile that helper as one
@@ -152,13 +170,27 @@ class Qwen3DenseLM(nn.Module):
         pos_key: str | None = None,
         array: str | None = None,
         comm_group: CommGroup | None = None,
+        mrope_section: tuple[int, int, int] | None = None,
     ):
         """``array`` is what the layers attend through on a model on the state contract, and the keys are the resources
         a model still on resources names."""
         super().__init__()
         self.config = config
+        if mrope_section is not None and (
+            len(mrope_section) != 3 or any(size <= 0 for size in mrope_section)
+            or sum(mrope_section) * 2 != config.head_dim
+        ):
+            raise ValueError("Qwen3 MRoPE sections must fill one attention head")
+        self.mrope_section = mrope_section
+        self.mrope_tables = MRoPETables() if mrope_section is not None else None
+        if mrope_section is not None:
+            self.register_buffer(
+                "mrope_inv_freq", compute_inv_freq(config.head_dim, config.rope_theta), persistent=False,
+            )
         comm_group = comm_group or CommGroup.trivial()
         keys = {"attn_key": attn_key, "kv_key": kv_key, "pos_key": pos_key} if array is None else {"kv_key": array}
+        if mrope_section is not None:
+            keys["pos_key"] = None
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -173,6 +205,7 @@ class Qwen3DenseLM(nn.Module):
                     num_kv_heads=config.num_key_value_heads,
                     head_dim=config.head_dim,
                     qk_norm=True,
+                    mrope_tables=self.mrope_tables,
                     rms_norm_eps=config.rms_norm_eps,
                     rope_theta=config.rope_theta,
                     input_hidden_size=config.hidden_size,
@@ -227,7 +260,10 @@ class Qwen3DenseLM(nn.Module):
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    def forward(self, input_embeds: torch.Tensor, *, label: str | None = None) -> torch.Tensor:
+    def forward(
+        self, input_embeds: torch.Tensor, *, label: str | None = None,
+        position_ids_3d: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """``(tokens, hidden)`` -> ``(tokens, hidden)`` after the final norm.
 
         On resources, the label and layer index are cursors on the shared
@@ -236,6 +272,15 @@ class Qwen3DenseLM(nn.Module):
         On the state contract each row's label comes from the step's segments,
         and ``label`` goes unread.
         """
+        if self.mrope_section is not None:
+            if position_ids_3d is None or position_ids_3d.shape != (3, input_embeds.shape[0]):
+                raise ValueError("Qwen3 MRoPE requires [3, tokens] position ids for this step")
+            self.mrope_tables.set(*compute_3d_cos_sin(
+                position_ids_3d, self.mrope_inv_freq, self.mrope_section,
+                target_dtype=input_embeds.dtype,
+            ))
+        elif position_ids_3d is not None:
+            raise ValueError("Qwen3 MRoPE positions require mrope_section")
         attention = self.layers[0].self_attn
         if attention.state is not None:
             return run_layers(self.layers, input_embeds, self.norm, no_cursor)

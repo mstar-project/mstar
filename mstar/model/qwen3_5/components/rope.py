@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import torch
 
-from mstar.model.components.mrope import compute_3d_cos_sin, compute_inv_freq  # noqa: F401
+from mstar.model.components.mrope import apply_partial_mrope, compute_3d_cos_sin, compute_inv_freq  # noqa: F401
 
 
 def compute_text_cos_sin(
@@ -39,34 +39,3 @@ def compute_text_cos_sin(
     if target_dtype is not None:
         cos, sin = cos.to(target_dtype), sin.to(target_dtype)
     return cos, sin
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    half = x.shape[-1] // 2
-    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
-
-
-def apply_partial_mrope(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    unsqueeze_dim: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rotate the leading ``cos.shape[-1]`` dims of each head, pass the rest.
-
-    ``q``/``k`` are ``[tokens, heads, head_dim]``; cos/sin are
-    ``[tokens, rotary_dim]`` and broadcast over the head axis.
-    """
-    rotary_dim = cos.shape[-1]
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-    q_rot = (q_rot * cos) + (_rotate_half(q_rot) * sin)
-    k_rot = (k_rot * cos) + (_rotate_half(k_rot) * sin)
-    return (
-        torch.cat((q_rot, q_pass), dim=-1),
-        torch.cat((k_rot, k_pass), dim=-1),
-    )
