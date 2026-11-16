@@ -2821,9 +2821,9 @@ async def generate(
         model_kwargs: Optional JSON string of model-specific parameters.
         request_id: Optional client-supplied request id. When omitted, the
             server generates a fresh uuid4. Pinning this is useful for
-            deterministic-noise debugging because the conductor seeds its
-            per-request RNG via ``hash(request_id)``. An id that still has
-            a request in flight is refused with a 409; it is free again once
+            deterministic-noise debugging because, without an explicit seed,
+            the fallback seed is derived from this client ID. An ID that still
+            has a request in flight is refused with a 409; it is free again once
             that request finished, failed or was aborted.
     """
     if api_server is None:
