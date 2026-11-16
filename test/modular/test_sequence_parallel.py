@@ -202,17 +202,26 @@ def _split_exchanges(rank, world, total, rows):
     want = run(q, k, v)
     exchanges = []
     original_all_to_all = group.all_to_all
+    original_single = communication._all_to_all_single
+    single_calls = []
 
     def counted_all_to_all(value, *args, **kwargs):
         exchanges.append(len(value) if isinstance(value, list) else 1)
         return original_all_to_all(value, *args, **kwargs)
 
+    def counted_single(*args, **kwargs):
+        single_calls.append(1)
+        return original_single(*args, **kwargs)
+
     group.all_to_all = counted_all_to_all
+    communication._all_to_all_single = counted_single
     try:
         got = ulysses(run, local(q), local(k), local(v), r=r)
     finally:
         group.all_to_all = original_all_to_all
+        communication._all_to_all_single = original_single
     assert exchanges == [3, 1], "q/k/v must share one exchange and the output one more"
+    assert len(single_calls) == 2, "q/k/v and output must use two all_to_all_single calls"
     assert torch.equal(got, local(want))
     if rows is None:
         torch.testing.assert_close(all_gather(run, local(q), local(k), local(v), r), local(want))
