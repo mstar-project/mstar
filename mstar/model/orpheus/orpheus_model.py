@@ -461,9 +461,15 @@ class OrpheusModel(Model):
 
         load_weights(language_model, local_dir, device=device)
         from mstar.model.loader import HF_DEFAULT_SKIP_FRAGMENTS
-        from mstar.model.loader.reload import reload_manifest
+        from mstar.model.loader.reload import WeightReloadRefusedError, reload_manifest
 
-        self._llm_reload_manifest = reload_manifest(local_dir, skip_fragments=HF_DEFAULT_SKIP_FRAGMENTS)
+        try:
+            self._llm_reload_manifest = reload_manifest(local_dir, skip_fragments=HF_DEFAULT_SKIP_FRAGMENTS)
+        except WeightReloadRefusedError as exc:
+            # The loaded model can still serve, but its starting checkpoint
+            # cannot be used as a safe reference for an in-place reload.
+            self._llm_reload_manifest = None
+            logger.warning("Orpheus weight reload unavailable: %s", exc)
         self._llm_weights_dir = local_dir
         language_model.eval()
 

@@ -143,6 +143,11 @@ def test_no_checkpoint_download_fetches_the_training_state(monkeypatch):
     model = OrpheusModel("canopylabs/orpheus-3b-0.1-ft")
     model.checkpoint_path()
     model._create_llm_submodule("meta", tp_group=CommGroup.trivial())
+    assert model._llm_reload_manifest is None
+    from mstar.model.loader.reload import WeightReloadRefusedError
+
+    with pytest.raises(WeightReloadRefusedError, match="not loaded from a checkpoint directory"):
+        model.reload_weights("/new", {"LLM": object()}, check_only=True)
 
     def fetched(name, call):
         return any(fnmatch(name, p) for p in call["allow_patterns"] or ["*"])
