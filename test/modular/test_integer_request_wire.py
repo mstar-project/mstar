@@ -51,7 +51,7 @@ def test_tp_and_stream_columns_keep_integer_request_keys():
         ScheduleTPNode(
             node_name="llm", graph_walk="decode", request_ids=[RID],
             resident_delta=delta,
-            prefix_hits={RID: {}}, page_trails={RID: (1, 2)},
+            prefix_hits={RID: {}}, page_trails={"kv": (1, 2)},
         ),
     )
     body = _round_trip(schedule).body
@@ -59,7 +59,7 @@ def test_tp_and_stream_columns_keep_integer_request_keys():
     assert body.resident_delta.rids == [RID]
     assert body.resident_delta.victims == [[RID + 1]]
     assert body.prefix_hits == {RID: {}}
-    assert body.page_trails == {RID: (1, 2)}
+    assert body.page_trails == {"kv": (1, 2)}
 
     items = WorkerMessage(
         WorkerMessageType.EDGE_ITEMS,
