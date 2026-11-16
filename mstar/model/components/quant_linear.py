@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 BF16 = "bf16"
 # a format's name -> the module that declares it, imported on first use (it registers its ops)
 _FORMAT_MODULES = {
+    "dense_fp8": "mstar.model.components.dense_fp8_format",
     "mxfp8": "mstar.model.components.block_scaled",
     "nvfp4": "mstar.model.components.block_scaled",
 }
