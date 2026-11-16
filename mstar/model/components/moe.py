@@ -19,7 +19,8 @@ Router contract
 
 Each block computes its expert assignment with a router. The block keeps
 the router in ``self.gate``. The default router is :class:`TopKRouter`;
-:class:`NoAuxTcRouter` is DeepSeek-V3's sigmoid ``noaux_tc`` one (GLM-5.x).
+:class:`NoAuxTcRouter` supports the DeepSeek-style ``noaux_tc`` rule used by GLM-5.x
+and DeepSeek-V4.1.
 
 A router is an ``nn.Module``. A router does not extend a base class. The
 ``forward`` method of the router must obey this contract::
@@ -52,7 +53,8 @@ flag on the block.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+import math
+from typing import TYPE_CHECKING, Literal
 
 import torch
 import torch.nn.functional as F
@@ -193,11 +195,11 @@ class TopKRouter(nn.Module):
 
 
 class NoAuxTcRouter(nn.Module):
-    """DeepSeek-V3's ``noaux_tc`` router, groupless (``n_group=1``), as GLM-5.x routes.
+    """Groupless ``noaux_tc`` routing for GLM-5.x and DeepSeek-V4.1.
 
-    Sigmoid scores in fp32; each token's top-k by score + ``e_score_correction_bias``; weights
-    are the unbiased scores of those experts, renormalized if ``norm_topk_prob``, times
-    ``routed_scaling_factor``. Stateless (see the router contract above).
+    Each token's top-k is chosen by score plus correction bias; its weights use the
+    unbiased fp32 scores. GLM uses sigmoid; V4.1 uses sqrt(softplus) and can select
+    a separate correction bias for image-span tokens. Stateless (see above).
     """
 
     def __init__(
@@ -207,17 +209,31 @@ class NoAuxTcRouter(nn.Module):
         num_experts_per_tok: int,
         routed_scaling_factor: float,
         norm_topk_prob: bool = True,
+        *,
+        score_func: Literal["sigmoid", "sqrtsoftplus"] = "sigmoid",
+        gate_temp: float = 1.0,
+        image_bias: bool = False,
     ) -> None:
         super().__init__()
+        if score_func not in ("sigmoid", "sqrtsoftplus"):
+            raise ValueError(f"unsupported noaux_tc score function: {score_func}")
+        if not math.isfinite(gate_temp) or gate_temp <= 0:
+            raise ValueError("noaux_tc gate temperature must be finite and positive")
         self.hidden_size = hidden_size
         self.n_routed_experts = n_routed_experts
         self.top_k = num_experts_per_tok
         self.routed_scaling_factor = routed_scaling_factor
         self.norm_topk_prob = norm_topk_prob
+        self.score_func = score_func
+        self.gate_temp = gate_temp
 
         self.weight = nn.Parameter(torch.zeros(n_routed_experts, hidden_size))
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros(n_routed_experts, dtype=torch.float32)
+        )
+        self.bias_vl = (
+            nn.Parameter(torch.zeros(n_routed_experts, dtype=torch.float32))
+            if image_bias else None
         )
         # fused_moe's router ops, from ``finalize_weights(topk_kernel=True)``: the decode
         # router (logits and top-k) for up to ``_route_rows`` tokens, its top-k program on
@@ -240,6 +256,8 @@ class NoAuxTcRouter(nn.Module):
         self._weight_fp32 = self.weight.detach().float()
         self._route_op = self._topk_op = None
         if topk_kernel:
+            if self.score_func != "sigmoid" or self.gate_temp != 1.0 or self.bias_vl is not None:
+                raise ValueError("fused noaux_tc router supports only unit-temperature sigmoid without image bias")
             from mstar.utils.fused_moe import decode  # registers the ops
 
             self._route_op, self._topk_op = decode.route_op, decode.router_topk
@@ -247,8 +265,14 @@ class NoAuxTcRouter(nn.Module):
 
     def forward(
         self, hidden_states: torch.Tensor, router_states: torch.Tensor | None = None,
+        *, image_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, None]:
         flat = hidden_states.reshape(-1, self.hidden_size)
+        if image_mask is not None:
+            if (image_mask.dtype != torch.bool or image_mask.numel() != flat.shape[0]
+                    or image_mask.device != flat.device):
+                raise ValueError("image mask must be one boolean per token on the input device")
+            image_mask = image_mask.reshape(-1)
         if self._route_op is not None and flat.is_cuda and flat.shape[0] <= self._route_rows:
             topk_weights, topk_ids = self._route_op(
                 flat.contiguous(), self.weight, self.e_score_correction_bias, self.top_k,
@@ -270,13 +294,20 @@ class NoAuxTcRouter(nn.Module):
                 logits, self.e_score_correction_bias, self.top_k, self.routed_scaling_factor,
                 self.norm_topk_prob)
             return topk_weights, topk_ids, None
-        scores = logits.sigmoid()  # (T, E)
+        if self.gate_temp != 1.0:
+            logits = logits / self.gate_temp
+        scores = logits.sigmoid() if self.score_func == "sigmoid" else F.softplus(logits).sqrt()
 
-        biased = scores + self.e_score_correction_bias.unsqueeze(0)
-        topk_ids = torch.topk(biased, k=self.top_k, dim=-1, sorted=False)[1]
+        bias = self.e_score_correction_bias
+        if image_mask is not None and self.bias_vl is not None:
+            bias = torch.where(image_mask.unsqueeze(-1), self.bias_vl, bias)
+        biased = scores + bias
+        topk_ids = torch.topk(
+            biased, k=self.top_k, dim=-1, sorted=self.score_func != "sigmoid",
+        )[1]
         topk_weights = scores.gather(1, topk_ids)
 
-        if self.norm_topk_prob:
+        if self.norm_topk_prob and (self.score_func == "sigmoid" or self.top_k > 1):
             # HF's 1e-20, as the fused kernel adds: it guards an all-zero top-k and rounds
             # away for any sum above 2^-42
             topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
