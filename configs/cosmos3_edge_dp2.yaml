@@ -8,6 +8,8 @@ knobs:
 resources:
   kv:
     max_num_pages: 1024
+  decode_cache:
+    max_bytes: 11401728000
 model_kwargs:
   accelerator_graph: true
   graph_max_latent_area: 2000

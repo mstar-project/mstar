@@ -130,13 +130,22 @@ def test_a_request_s_sizes_may_pass_largest_one_by_one():
     ({"caches": {"main": Layout(sizes={"lat_h": 3})}}, r"must give a positive int for each of \['lat_h', 'lat_w'\]"),
     ({"caches": {"main": Layout(sizes={"lat_h": 3, "lat_w": 2.0})}}, "must give a positive int for each"),
     ({"kv": {"main": Layout(sizes=SMALL)}}, "give sizes, and 'kv' is no sized Value"),
-    ({}, r"state_layout gives no sizes for \['caches'\]"),
-    ({"caches": {}}, r"state_layout gives no sizes for \['caches'\]"),
-], ids=["past_largest", "size_missing", "size_float", "not_sized", "left_out", "no_label"])
+    ({"caches": {"main": Layout()}}, r"must give a positive int for each of \['lat_h', 'lat_w'\], got \{\}"),
+], ids=["past_largest", "size_missing", "size_float", "not_sized", "no_sizes"])
 def test_sizes_the_model_got_wrong_fail_the_request_at_intake(layout, message):
     kv = Array("kv", nodes={"dit"}, layers={0}, entry=KVEntry(heads=1, head_dim=8), max_len=0)
     with pytest.raises(RuntimeError, match=message):
         state_sizes([_caches(), kv], layout)
+
+
+@pytest.mark.parametrize("layout", [{}, {"caches": {}}], ids=["left_out", "no_label"])
+def test_a_request_that_lays_out_no_label_of_a_sized_value_holds_none_of_it(layout):
+    """A model's sized Value may serve some of its requests only, as Cosmos3's decoder cache serves the windowed ones.
+    The others give it no sizes, open nothing in its store and never wait on its budget."""
+    sizes = state_sizes([_caches()], layout)
+    assert sizes == {}
+    (spec,) = build_specs([_caches()])
+    assert spec.request_config({"state_sizes": sizes}) is None, "the request would be admitted by bytes it never holds"
 
 
 def test_a_request_past_the_budget_is_refused_at_intake():

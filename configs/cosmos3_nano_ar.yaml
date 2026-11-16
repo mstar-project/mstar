@@ -5,6 +5,10 @@ max_seq_len: 8192
 resources:
   kv:
     max_num_pages: 1024
+  # Each windowed stream's VAE decoder cache, held between its windows: 1.33 GiB at 832x480 in bf16. Eight
+  # 832x480 streams decode at once (three at 1280x720), and a stream past them waits for one to end.
+  decode_cache:
+    max_bytes: 11401728000
 # Windowed-AR serving config: the cosmos3_nano.yaml deployment plus the opt-in
 # windowed video walk (enable_windowed_video adds the vae_decoder_ar node and
 # its streaming decoder partition; requests opt in per call via window_mode).
@@ -14,11 +18,6 @@ model_kwargs:
   accelerator_graph: true
   graph_max_latent_area: 2000
   enable_windowed_video: true
-  # The streaming decoder keeps each live stream's VAE conv cache (1.33 GiB
-  # of tensors per stream at 832x480 in bf16; it grows with the frame area and
-  # doubles in fp32). Uncomment to cap the warm streams per decoder copy;
-  # streams past the cap take the stateless context re-decode.
-  # windowed_decode_max_warm_streams: 0   # 0: no cap
   # Latents per decoder call in the streaming decode (default 1). 0 decodes a
   # steady window's new latents in one call: the decoder alone is ~6% faster at
   # 832x480, but served end to end it is no faster and takes about 15 GiB more

@@ -58,8 +58,12 @@ SNAPSHOT = {
     ],
     "Bidirectional": [
         ["kept_window", "KEYWORD_ONLY", 'False'],
+        ["whole_pages", "KEYWORD_ONLY", 'False'],
     ],
     "Block": [],
+    "BlockCausal": [
+        ["size", "POSITIONAL_OR_KEYWORD", None],
+    ],
     "Causal": [],
     "CausalConv": [
         ["activation", "KEYWORD_ONLY", "'silu'"],

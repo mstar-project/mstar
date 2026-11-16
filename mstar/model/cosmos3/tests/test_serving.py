@@ -18,9 +18,12 @@ import pytest
 
 from mstar.conductor.conductor import Conductor
 from mstar.engine.resources import SamplingReqConfig
+from mstar.engine.state import Sampler
+from mstar.engine.state.adapters import build_specs, sampling_configs
 from mstar.model.base import MAX_OUTPUT_TOKENS
 from mstar.model.cosmos3.cosmos3_model import SAMPLER, Cosmos3Model
 from mstar.model.cosmos3.tests.stubs import StubSampler
+from mstar.model.cosmos3.tests.test_edge import _tiny_edge_config
 from mstar.model.utils import load_generation_defaults
 
 NANO_DIR = Path(os.environ.get("COSMOS3_NANO_DIR", "/nonexistent-cosmos3-nano"))
@@ -592,27 +595,24 @@ def test_ingest_cond_latents_routing() -> None:
     )
     anchor = torch.ones(1, 16, 1, 2, 2)
 
-    st = dit.request_state("i2v")
+    st = {}
     dit._ingest_cond_latents(st, {"cond_latents": [anchor]}, "cpu")
     assert torch.equal(st["cond_latents"], anchor) and st.get("cond_video_latents") is None
 
-    st = dit.request_state("t2v")
+    st = {}
     dit._ingest_cond_latents(st, {"cond_latents": []}, "cpu")
     assert st.get("cond_latents") is None
 
-    st = dit.request_state("v2v")
-    st.add("vmask", torch.ones(1, 1, 1, 1, 1))
+    st = {"vmask": torch.ones(1, 1, 1, 1, 1)}
     dit._ingest_cond_latents(st, {"cond_latents": [anchor]}, "cpu")
     assert torch.equal(st["cond_video_latents"], anchor)
 
-    st = dit.request_state("act")
-    st.add_all(vmask=torch.ones(1, 1, 1, 1, 1), action_chunk=4, latent_shape=(1, 16, 1, 2, 2))
+    st = {"vmask": torch.ones(1, 1, 1, 1, 1), "action_chunk": 4, "latent_shape": (1, 16, 1, 2, 2)}
     dit._ingest_cond_latents(st, {"cond_latents": []}, "cpu")
     assert st["cond_video_latents"].abs().sum() == 0
     assert st["cond_video_latents"].dtype == torch.bfloat16
 
-    st = dit.request_state("v2v_missing")
-    st.add("vmask", torch.ones(1, 1, 1, 1, 1))
+    st = {"vmask": torch.ones(1, 1, 1, 1, 1)}
     with pytest.raises(ValueError, match="no conditioning video"):
         dit._ingest_cond_latents(st, {}, "cpu")
 
@@ -634,14 +634,15 @@ def test_postprocess_finishes_captured_step() -> None:
 
     # One all-noisy latent frame of 2x2 patches (the layout the captured
     # graph's velocity mask is derived from).
-    dit.request_state("r").add_all(
-        gs=2.0, scheduler=StubSampler(torch.tensor([900.0, 500.0, 100.0]), lambda lat, v: lat + v),
-        cond={"vision_token_shapes": [(1, 2, 2)], "vision_noisy_frame_indexes": [torch.tensor([0])]},
-        uncond={},
-    )
+    cond = {"vision_token_shapes": [(1, 2, 2)], "vision_noisy_frame_indexes": [torch.tensor([0])]}
+    dit._add_layout_masks(cond, "cpu")
+    settings = {
+        "gs": 2.0, "scheduler": StubSampler(torch.tensor([900.0, 500.0, 100.0]), lambda lat, v: lat + v),
+        "cond": cond, "uncond": {},
+    }
     info = types.SimpleNamespace(graph_walk="image_gen", dynamic_loop_iter_counts={IMAGE_GEN_LOOP: 1})
     lat = torch.ones(1, 1, 2, 2)
-    inp = ARNodeInputs(tensor_inputs={"latents": lat})
+    inp = ARNodeInputs(tensor_inputs={"latents": lat}, kwargs={"settings": settings})
 
     # Captured shape: velocity = uncond + gs*(cond - uncond) = 3, latents += 3.
     out = {"cond_v": [torch.full((1, 1, 2, 2), 2.0)], "uncond_v": [torch.ones(1, 1, 2, 2)]}
@@ -678,28 +679,29 @@ def test_a_step_outside_the_guidance_interval_keeps_the_conditional_branch(path)
         model_path_hf="unused", skip_weight_loading=True).config, scheduler=None)
     dit.transformer = types.SimpleNamespace(
         denoise_step_row=lambda *args, **kwargs: None,
-        denoise_step_batched=lambda reqs, label, attn: [branches] * len(reqs),
+        denoise_step_batched=lambda reqs: [branches] * len(reqs),
     )
     dit._solver_state = ()
-    dit.node_resources = {"attn": None}
     # the step at t=100 is outside the t2i default interval [400, 1000]
-    dit.request_state("r").add_all(
-        gs=2.0, guidance_interval=(400.0, 1000.0),
-        scheduler=StubSampler(torch.tensor([900.0, 500.0, 100.0]), lambda lat, v: lat + v),
-        cond={"vision_token_shapes": [(1, 2, 2)], "vision_noisy_frame_indexes": [torch.tensor([0])],
-              "num_noisy_vision_tokens": 1, "rotary": None},
-        uncond={"rotary": None}, num_sound=1,
-    )
+    cond = {"vision_token_shapes": [(1, 2, 2)], "vision_noisy_frame_indexes": [torch.tensor([0])],
+            "num_noisy_vision_tokens": 1, "rotary": None}
+    dit._add_layout_masks(cond, "cpu")
+    settings = {
+        "gs": 2.0, "guidance_interval": (400.0, 1000.0),
+        "scheduler": StubSampler(torch.tensor([900.0, 500.0, 100.0]), lambda lat, v: lat + v),
+        "cond": cond, "uncond": {"rotary": None}, "num_sound": 1,
+    }
     walk, loop = ("image_gen", IMAGE_GEN_LOOP) if path != "sound" else (VIDEO_SOUND_GEN_WALK, VIDEO_SOUND_GEN_LOOP)
     info = types.SimpleNamespace(graph_walk=walk, dynamic_loop_iter_counts={loop: 2})
     lat = torch.ones(1, 1, 2, 2)
     if path == "captured":
         out = {"cond_v": [cond_v], "uncond_v": [uncond_v]}
-        dit.postprocess("r", info, out, inputs=ARNodeInputs(tensor_inputs={"latents": lat}))
+        inputs = ARNodeInputs(tensor_inputs={"latents": lat}, kwargs={"settings": settings})
+        dit.postprocess("r", info, out, inputs=inputs)
     else:
         out = dit.forward_batched(
             walk, ModelInputsFromEngine(request_ids=["r"], per_request_info={"r": info}), latents={"r": lat},
-            sound_latents={"r": lat[0, 0]},
+            sound_latents={"r": lat[0, 0]}, settings={"r": settings},
         )["r"]
     # 1 + cond (2), not 1 + the combine uncond + gs * (cond - uncond) (3)
     assert torch.equal(out["latents"][0], torch.full((1, 1, 2, 2), 3.0))
@@ -748,7 +750,20 @@ def contract_model() -> Cosmos3Model:
 
 
 def _contract_sampler(contract_model, mk) -> SamplingReqConfig:
-    return contract_model.get_request_resource_configs(["text"], ["text"], mk)[SAMPLER]
+    """The request config of the reasoner's sampler, as the engine converts a request's settings for it."""
+    declared = _serving_reasoner(contract_model).declare_state()
+    return sampling_configs(contract_model.get_request_resource_configs(["text"], ["text"], mk), declared)[SAMPLER]
+
+
+def _reasoner_sampler_spec(contract_model):
+    declared = _serving_reasoner(contract_model).declare_state()
+    (spec,) = build_specs([sampler for sampler in declared if isinstance(sampler, Sampler)])
+    return spec
+
+
+def _serving_reasoner(model: Cosmos3Model) -> Cosmos3Model:
+    model.config.reasoner = _tiny_edge_config().reasoner
+    return model
 
 
 # ----- request_kwargs -----
@@ -800,7 +815,7 @@ def test_sampler_forwards_values(contract_model) -> None:
 
 
 def test_min_p_refused_by_reasoner_node(contract_model) -> None:
-    spec = contract_model._reasoner_sampler_spec()
+    spec = _reasoner_sampler_spec(contract_model)
     with pytest.raises(ValueError, match="min_p"):
         _contract_sampler(contract_model, {"min_p": 0.1}).validate(spec)
     _contract_sampler(contract_model, {"repetition_penalty": 1.2}).validate(spec)
@@ -808,7 +823,7 @@ def test_min_p_refused_by_reasoner_node(contract_model) -> None:
 
 def test_checkpoint_min_p_turns_the_reasoner_capability_on(contract_model) -> None:
     contract_model._generation_defaults = {"min_p": 0.05}
-    spec = contract_model._reasoner_sampler_spec()
+    spec = _reasoner_sampler_spec(contract_model)
     assert spec.enable_min_p
     # a plain request takes that default and is not refused
     _contract_sampler(contract_model, {}).validate(spec)
@@ -1018,8 +1033,10 @@ def test_the_denoise_loops_cap_is_the_dits_step_count(kwargs, inputs, outputs) -
     """The loop's cap (``_denoise_cap``) and the DiT's schedule are computed apart; a loop past the
     schedule indexes off its end mid-request, and one short of it returns noisy latents."""
 
+    import torch
     from diffusers import UniPCMultistepScheduler
 
+    from mstar.model.cosmos3.constants import PROMPT_LENGTHS
     from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
     from mstar.model.cosmos3.tests.test_dit_step_guard import EDGE_SCHEDULER
     from mstar.model.cosmos3.tests.test_windowed import _stand_in
@@ -1041,9 +1058,6 @@ def test_the_denoise_loops_cap_is_the_dits_step_count(kwargs, inputs, outputs) -
         assert cap == len(sampler.host_timesteps)
         return
     dit.transformer = _stand_in(dit)
-    fwd = SimpleNamespace(request_id="r", rid_handle="r")
-    dit._prepare_windowed_prefill(
-        fwd, md, [1, 2], [3], p["height"], p["width"], 24.0, 6.0, int(md["num_inference_steps"]), "cpu",
-    )
-    st = dit.request_states["r"]
-    assert len(st["scheduler"].host_timesteps) == st["ar_steps"] and cap == st["ar_total_iters"]
+    st = dit._settings({**md, PROMPT_LENGTHS: (2, 1)}, 0, {}, torch.device("cpu"))
+    assert len(st["scheduler"].host_timesteps) == st["ar_steps"]
+    assert cap == st["ar_schedule"].num_windows * st["ar_iters_per_window"]

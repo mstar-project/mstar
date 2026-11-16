@@ -51,7 +51,7 @@ Parameter paths match ``hift.pt`` (weight norm folded).
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -456,6 +456,18 @@ class HiftStreamState:
     def mel_end(self) -> int:
         return self.mel_start + int(self.mel.shape[-1])
 
+    def edges(self) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """The state as it goes to the stream's next chunk: its counts on the host, then its mel and, once it has
+        one, its phase carry."""
+        counts = torch.tensor([self.mel_start, self.carry_frame, self.emitted, self.done], dtype=torch.int64)
+        return counts, [self.mel] if self.carry is None else [self.mel, self.carry]
+
+    @classmethod
+    def from_edges(cls, counts: Sequence[int], mel: Sequence[torch.Tensor]) -> HiftStreamState:
+        mel_start, carry_frame, emitted, done = counts
+        window, *carry = mel
+        return cls(window, mel_start, carry[0] if carry else None, carry_frame, emitted, bool(done))
+
 
 def stream_vocode(
     hift: CausalHiFTGenerator,
@@ -520,6 +532,17 @@ class CapturedStream:
     done: bool = False
     # frames not run yet, since nothing was final to emit
     pending: torch.Tensor | None = None
+
+    def edges(self) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """As `HiftStreamState.edges`: the counts on the host, then the pending mel when there is one. Most chunks
+        leave none, and a placeholder tensor would be copied and stored on every one of them."""
+        counts = torch.tensor([self.received, self.emitted, self.carry_frame, self.done], dtype=torch.int64)
+        return counts, [] if self.pending is None else [self.pending]
+
+    @classmethod
+    def from_edges(cls, counts: Sequence[int], mel: Sequence[torch.Tensor]) -> CapturedStream:
+        received, emitted, carry_frame, done = counts
+        return cls(received, emitted, carry_frame, bool(done), mel[0] if mel else None)
 
 
 class StreamRow(NamedTuple):

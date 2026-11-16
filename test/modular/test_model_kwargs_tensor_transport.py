@@ -7,7 +7,6 @@ dependencies installed.
 
 import queue
 import threading
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -216,11 +215,10 @@ def test_cosmos_worker_prepares_action_values(device):
     dit = Cosmos3DiTSubmodule(Cosmos3OmniTransformer(config).to(device), config, scheduler=scheduler)
     # Run the actual worker preparation: the shorter trajectory repeats its last
     # action to fill the requested chunk, and padding beyond raw_action_dim is zero.
-    dit._prepare_action_prefill(
-        SimpleNamespace(rid_handle="r"), dict(prefill.step_metadata), output.new_input_tensors,
-        [1, 2, 3], None, 64, 64, 24.0, 1.0, 2, device,
-    )
-    action = dit.request_state("r")["clean_action"].cpu()
+    # a three-token prompt, which the tokenizer-less model leaves unmeasured
+    md = {**prefill.step_metadata, model.PROMPT_LENGTHS: (3, 0)}
+    settings = dit._settings(md, 0, output.new_input_tensors, torch.device(device))
+    action = dit._clean_action(md, settings, output.new_input_tensors, torch.device(device)).cpu()
     expected = torch.tensor([[[0.0] * 7, [0.1] * 7, [0.1] * 7]])
     torch.testing.assert_close(action[:, :, :7], expected)
     assert torch.count_nonzero(action[:, :, 7:]) == 0

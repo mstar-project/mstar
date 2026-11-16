@@ -4,6 +4,7 @@ attention over it, each rank's partial over its slots exchanged and merged."""
 
 from __future__ import annotations
 
+import functools
 import itertools
 import logging
 import math
@@ -69,7 +70,7 @@ from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.sequence_shard import SeqShardSpec, SequenceShard
 from mstar.engine.resources.spec import NodeResourceSpec, apply_yaml_overrides, resolve_spec_dependencies
 from mstar.engine.resources.step import BucketKey, ResourceStep, Segment, SlotLease, StepContext
-from mstar.model.base import declared_resources, serving_resources
+from mstar.model.base import declared_resources, deployment_setup, serving_resources
 from mstar.model.qwen3_5.config import GDN_STATE, KV_CACHE, LLM_SHARD
 from mstar.model.submodule_base import NodeInputs, engine_step, with_segment_steps
 from mstar.testing_utils.engine import make_engine, make_mgmt
@@ -373,7 +374,7 @@ def test_a_node_that_splits_its_steps_refuses_block_causal_attention():
         )),
         SeqShardSpec("shard", {NODE}, ("main",), 0),
     ]
-    with pytest.raises(ValueError, match="does not support steps split over SP ranks"):
+    with pytest.raises(ValueError, match="block-causal attention 'attn' takes no split steps"):
         Engine(graph_runtime=None).load_model(
             {NODE: _Submodule()}, specs=specs, parallel_groups=_sp_groups(NODE), device=CPU,
             transfer_engine_info=None,
@@ -1418,13 +1419,13 @@ def _cosmos3(reasoner: bool = False):
     return model, sub
 
 
-def _cosmos3_resources(model, joint: JointGroups) -> dict:
-    """The model's own declaration, built and bound as the engine does, small."""
-    from mstar.model.cosmos3.submodules import KV_CACHE as C3_KV
+def _cosmos3_resources(model, joint: JointGroups) -> tuple:
+    """The model's own declaration, built and bound as the engine does, small, and the setup its handles take."""
+    from mstar.model.cosmos3.constants import KV_CACHE as C3_KV
 
-    specs = model.get_node_resources()
-    apply_yaml_overrides(specs, {"resources": {C3_KV: {"max_num_pages": 16, "page_size": 16, "max_seq_len": 256}}})
-    by_key = resolve_spec_dependencies(specs)
+    config = {"resources": {C3_KV: {"max_num_pages": 16, "page_size": 16, "max_seq_len": 256}}}
+    setup = deployment_setup(model, config)
+    by_key = resolve_spec_dependencies(declared_resources(model, config, setup))
     res = {
         key: build_resource(spec, EngineResourceInfo(
             device=CPU, joint_comm_group=joint, kv_dtype=torch.float32, nodes=frozenset(spec.nodes),
@@ -1434,70 +1435,72 @@ def _cosmos3_resources(model, joint: JointGroups) -> dict:
     }
     for key, spec in by_key.items():
         res[key].bind_dependencies({dep: res[dep] for dep in spec.depends_on()})
-    return res
+    return res, setup
 
 
-def _run_step(runner, step, walk, rids=("r0",)):
+def _run_step(runner, step, walk, fn=None, rids=("r0",)):
+    """Admit and plan ``step``, then run ``fn`` inside it and commit, returning what ``fn`` returns."""
     step.set_ctx(StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0, capture=False))
     assert runner.admit(step).ok
     runner.plan(step)
+    if fn is None:
+        return None
+    step.begin_calls()
+    try:
+        out = fn()
+        step.check_calls()
+        runner.commit(step)
+    finally:
+        step.end_calls()
+    return out
 
 
-def _gen_input(static):
-    """A two-branch eager denoise step's inputs, as ``prepare_inputs`` makes them."""
+def _gen_input(static, both: bool = True):
+    """An eager denoise step's inputs, as ``prepare_inputs`` makes them: both guidance branches, or the
+    conditional one alone (a step outside the guidance interval)."""
     from mstar.model.cosmos3.submodules import GenStepInfo
     from mstar.model.submodule_base import ARNodeInputs
 
     return ARNodeInputs(
         input_seq_len=static["num_vision_tokens"],
-        resource_step_info=GenStepInfo(cfg=True, cfg_active=True, capture_key=None),
+        resource_step_info=GenStepInfo(cfg=True, cfg_active=both, capture_key=None),
     )
 
 
-def _cosmos3_steps(sub, resources, statics, latents, timesteps) -> tuple[list[torch.Tensor], StepRunner]:
+def _cosmos3_steps(sub, resources, handles, statics, latents, timesteps) -> tuple[list[torch.Tensor], StepRunner]:
     """One request through the DiT: its two-branch text prefill (copied: the prefill walk splits
-    nothing), then a denoise step three ways: both branches as one combined label (the compiled
-    step's pack, and the cross-request step's eager bracket), and each branch on its own label (the
-    sequential path). Returns every velocity, and the runner, the request still on it."""
+    nothing), then a denoise step three ways: both branches as one combined label, as the compiled
+    step packs them and as the cross-request step's eager bracket runs them, and the conditional
+    branch alone. Returns every velocity, and the runner, the request still on it."""
     from mstar.model.cosmos3 import constants as C
-    from mstar.model.cosmos3.submodules import ATTN, CFG_BATCHED_LABEL, COND_LABEL, UNCOND_LABEL
+    from mstar.model.cosmos3.submodules import COND_LABEL, UNCOND_LABEL
 
     tower = sub.transformer
+    # as the engine binds a node at load
     sub.bind_node_resources(resources)
+    sub.bind_node_state(handles)
     runner = StepRunner(resources)
-    runner.ingest_request("r0", {"kv": KVReqConfig(needed_labels=[COND_LABEL, UNCOND_LABEL])})
+    runner.ingest_request("r0", {C.KV_CACHE: KVReqConfig(needed_labels=[COND_LABEL, UNCOND_LABEL])})
     cond, uncond = statics
-    prefill = sub._get_prefill_node_inputs(cond, uncond)
-    step = engine_step(sub, C.PREFILL_WALK, ["r0"], [prefill])
-    _run_step(runner, step, C.PREFILL_WALK)
+    prefill = sub._get_prefill_node_inputs(cond["input_ids"].tolist(), uncond["input_ids"].tolist(), CPU)
     labels = (COND_LABEL, UNCOND_LABEL)
-    tower.prefill_und(
+    step = engine_step(sub, graph_walk=C.PREFILL_WALK, request_ids=["r0"], inputs=[prefill])
+    _run_step(runner, step, C.PREFILL_WALK, lambda: tower.prefill_und(
         torch.cat([prefill.tensor_inputs[f"input_ids_{label}"] for label in labels]),
         torch.cat([prefill.tensor_inputs[f"text_mrope_ids_{label}"] for label in labels], dim=1),
-        CFG_BATCHED_LABEL,
-    )
-    runner.commit(step)
+    ))
 
-    gen = _gen_input(cond)
     layout = (cond["vision_token_shapes"], cond["vision_noisy_frame_indexes"], cond["mse_gen_indexes"])
-    attn = resources[ATTN]
+    row = tower.denoise_step_row(cond, latents, timesteps, cond["rotary"], uncond["rotary"])
+    runs = (
+        (True, lambda: tower.denoise_step_batched_cfg(latents, timesteps, cond["rotary"], uncond["rotary"], *layout)),
+        (True, lambda: tower.denoise_step_batched([row])[0]),
+        (False, lambda: (tower.denoise_step(latents, timesteps, cond["rotary"], *layout),)),
+    )
     out = []
-    for batched_cfg in (True, False):
-        sub.batched_cfg = batched_cfg
-        for run in range(2 if batched_cfg else 1):
-            step = engine_step(sub, C.IMAGE_GEN_WALK, ["r0"], [gen])
-            _run_step(runner, step, C.IMAGE_GEN_WALK)
-            if not batched_cfg:
-                out += [tower.denoise_step(latents, timesteps, s["rotary"], *layout, label, attn)
-                        for s, label in zip(statics, labels, strict=True)]
-            elif run == 0:
-                out += tower.denoise_step_batched_cfg(
-                    latents, timesteps, cond["rotary"], uncond["rotary"], *layout, CFG_BATCHED_LABEL, attn,
-                )
-            else:
-                row = tower.denoise_step_row(cond, latents, timesteps, cond["rotary"], uncond["rotary"])
-                out += tower.denoise_step_batched([row], CFG_BATCHED_LABEL, attn)[0]
-            runner.commit(step)
+    for both, run in runs:
+        step = engine_step(sub, graph_walk=C.IMAGE_GEN_WALK, request_ids=["r0"], inputs=[_gen_input(cond, both)])
+        out += _run_step(runner, step, C.IMAGE_GEN_WALK, run)
     return out, runner
 
 
@@ -1509,9 +1512,11 @@ def _cosmos3_over_ranks(rank, world, store):
     compiled denoise step splits and copies at two sizes without recompiling a size it saw."""
     from torch._dynamo.utils import counters
 
+    from mstar.engine.state.adapters import node_handles
     from mstar.model.cosmos3 import constants as C
-    from mstar.model.cosmos3.submodules import ATTN, CFG_BATCHED_LABEL, SEQ_SHARD, _WarmupAttention
-    from mstar.model.cosmos3.tests.test_engine_cache import _SdpaResources
+    from mstar.model.cosmos3.cosmos3_model import DIT_NODE
+    from mstar.model.cosmos3.submodules import COND_LABEL, UNCOND_LABEL, _warmup_kv
+    from mstar.model.cosmos3.tests.test_engine_cache import _SdpaResources, dit_handles
 
     dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
     torch.set_num_threads(1)
@@ -1531,13 +1536,19 @@ def _cosmos3_over_ranks(rank, world, store):
 
         statics, latents, timesteps = inputs(32, 64)
         with torch.no_grad():
-            want, _ = _cosmos3_steps(sub, _SdpaResources().as_dict(), statics, latents, timesteps)
-            res = _cosmos3_resources(model, JointGroups(tp_group=CommGroup.trivial(), sp_group=group, instance=group))
-            got, runner = _cosmos3_steps(sub, res, statics, latents, timesteps)
+            reference = _SdpaResources().as_dict()
+            want, _ = _cosmos3_steps(sub, reference, dit_handles(model, reference)[0], statics, latents, timesteps)
+            res, setup = _cosmos3_resources(
+                model, JointGroups(tp_group=CommGroup.trivial(), sp_group=group, instance=group),
+            )
+            handles = node_handles(model, DIT_NODE, res, setup=setup)
+            got, runner = _cosmos3_steps(sub, res, handles, statics, latents, timesteps)
             row = tower.denoise_step_row(statics[0], latents, timesteps, statics[0]["rotary"], statics[0]["rotary"])
-            warm = tower.denoise_step_batched([row, row], CFG_BATCHED_LABEL, _WarmupAttention())
+            sub._bind_transformer({**handles, C.KV_CACHE: _warmup_kv(handles[C.KV_CACHE])})
+            warm = tower.denoise_step_batched([row, row])
+            sub._bind_transformer(handles)
             assert [v.shape for branches in warm for v in branches] == [latents.shape] * 4
-        assert len(got) == len(want) == 6
+        assert len(got) == len(want) == 5
         for g, w in zip(got, want, strict=True):
             torch.testing.assert_close(g, w, rtol=1e-4, atol=1e-4)
 
@@ -1545,20 +1556,23 @@ def _cosmos3_over_ranks(rank, world, store):
         counters.clear()
         cfg_step = torch.compile(tower.denoise_step_batched_cfg, backend="eager", dynamic=False)
         graphs = []
-        sub.batched_cfg = True
+
+        def compiled_step(cond, uncond, latents, timesteps, label, splits):
+            assert (res[C.SEQ_SHARD].split_range(label) is not None) == splits
+            return cfg_step(
+                latents, timesteps, cond["rotary"], uncond["rotary"], cond["vision_token_shapes"],
+                cond["vision_noisy_frame_indexes"], cond["mse_gen_indexes"],
+            )
+
         with torch.no_grad():
             for (height, width), min_tokens in [((32, 64), 0), ((64, 64), 0), ((32, 64), 1 << 20)]:
                 (cond, uncond), latents, timesteps = inputs(height, width)
-                res[SEQ_SHARD].min_tokens = min_tokens
+                res[C.SEQ_SHARD].min_tokens = min_tokens
                 for _ in range(2):
-                    step = engine_step(sub, C.IMAGE_GEN_WALK, ["r0"], [_gen_input(cond)])
-                    _run_step(runner, step, C.IMAGE_GEN_WALK)
-                    assert (res[SEQ_SHARD].split_range(CFG_BATCHED_LABEL) is None) == bool(min_tokens)
-                    cfg_step(
-                        latents, timesteps, cond["rotary"], uncond["rotary"], cond["vision_token_shapes"],
-                        cond["vision_noisy_frame_indexes"], cond["mse_gen_indexes"], CFG_BATCHED_LABEL, res[ATTN],
-                    )
-                    runner.commit(step)
+                    step = engine_step(sub, graph_walk=C.IMAGE_GEN_WALK, request_ids=["r0"], inputs=[_gen_input(cond)])
+                    label = step.steps[C.KV_CACHE].combined_labels[(COND_LABEL, UNCOND_LABEL)]
+                    run = functools.partial(compiled_step, cond, uncond, latents, timesteps, label, not min_tokens)
+                    _run_step(runner, step, C.IMAGE_GEN_WALK, run)
                     graphs.append(counters["stats"]["unique_graphs"])
         # a second step of a size and split it compiled for compiles nothing
         assert graphs[0] > 0 and graphs[0::2] == graphs[1::2], graphs
@@ -1578,29 +1592,31 @@ def test_cosmos3s_reasoner_shares_the_dits_sequence_shard_and_plans_it(monkeypat
     the attention refuses a step without its plan."""
     from dataclasses import replace as replaced
 
+    from mstar.engine.state.adapters import node_handles
     from mstar.model.cosmos3 import constants as C
     from mstar.model.cosmos3.cosmos3_model import DIT_NODE, REASONER_NODE
-    from mstar.model.cosmos3.submodules import REASONER_LABEL, SAMPLER, SEQ_SHARD, Cosmos3ReasonerSubmodule
+    from mstar.model.cosmos3.submodules import REASONER_LABEL, SAMPLER, Cosmos3ReasonerSubmodule
     from mstar.model.submodule_base import ARNodeInputs
 
     monkeypatch.setitem(sys.modules, "flashinfer", reference_flashinfer())
     model, sub = _cosmos3(reasoner=True)
-    specs = model.get_node_resources()
-    shard, = (spec for spec in specs if spec.resource_key == SEQ_SHARD)
+    trivial = CommGroup.trivial()
+    res, setup = _cosmos3_resources(model, JointGroups(tp_group=trivial, sp_group=trivial, instance=trivial))
+    specs = declared_resources(model, {}, setup)
+    shard, = (spec for spec in specs if spec.resource_key == C.SEQ_SHARD)
     assert shard.nodes == {DIT_NODE, REASONER_NODE}
     with pytest.raises(ValueError, match=r"spans nodes \['reasoner'\] without the sequence shard"):
         resolve_spec_dependencies([replaced(spec, nodes={DIT_NODE}) if spec is shard else spec for spec in specs])
 
-    trivial = CommGroup.trivial()
-    res = _cosmos3_resources(model, JointGroups(tp_group=trivial, sp_group=trivial, instance=trivial))
     runner = StepRunner(res)
-    runner.ingest_request("t", {"kv": KVReqConfig(needed_labels=[REASONER_LABEL]), SAMPLER: SamplingReqConfig()})
+    runner.ingest_request("t", {C.KV_CACHE: KVReqConfig(needed_labels=[REASONER_LABEL]), SAMPLER: SamplingReqConfig()})
     reasoner = Cosmos3ReasonerSubmodule(sub.transformer, model.config)
     reasoner.bind_node_resources(res)
-    step = engine_step(reasoner, C.REASONER_PREFILL_WALK, ["t"], [ARNodeInputs(input_ids=torch.arange(6),
-                                                                                input_seq_len=6)])
+    reasoner.bind_node_state(node_handles(model, REASONER_NODE, res, setup=setup))
+    inputs = [ARNodeInputs(input_ids=torch.arange(6), input_seq_len=6)]
+    step = engine_step(reasoner, graph_walk=C.REASONER_PREFILL_WALK, request_ids=["t"], inputs=inputs)
     _run_step(runner, step, C.REASONER_PREFILL_WALK, rids=("t",))
-    assert not runner.resources[SEQ_SHARD].can_split
+    assert not runner.resources[C.SEQ_SHARD].can_split
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")

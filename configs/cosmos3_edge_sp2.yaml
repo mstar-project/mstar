@@ -8,6 +8,8 @@ max_seq_len: 8192
 resources:
   kv:
     max_num_pages: 1024
+  decode_cache:
+    max_bytes: 11401728000
 model_kwargs:
   enable_reasoner: false
   accelerator_graph: true

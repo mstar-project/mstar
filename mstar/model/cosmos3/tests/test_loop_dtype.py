@@ -26,14 +26,13 @@ from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer  #
 from mstar.model.cosmos3.config import Cosmos3Config  # noqa: E402
 from mstar.model.cosmos3.submodules import (  # noqa: E402
     ACTION_GEN_LOOP,
-    ATTN,
-    COND_LABEL,
     IMAGE_GEN_LOOP,
     LATENT_DTYPE,
     VIDEO_GEN_LOOP,
     VIDEO_SOUND_GEN_LOOP,
     Cosmos3DiTSubmodule,
 )
+from mstar.model.cosmos3.tests.stubs import bind_progress  # noqa: E402
 from mstar.model.cosmos3.tests.test_dit_step_guard import EDGE_SCHEDULER  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs  # noqa: E402
 
@@ -67,21 +66,21 @@ class _Tower:
             return v, _velocity(sound_latents.shape, branch)
         return v
 
-    def denoise_step(self, latents, vts, rotary, shapes, noisy, mse, label, attn, **kwargs):
-        return self._branch(latents, 1 if label == COND_LABEL else 2, **kwargs)
+    def denoise_step(self, latents, vts, rotary, shapes, noisy, mse, **kwargs):
+        return self._branch(latents, 1, **kwargs)
 
-    def denoise_step_batched_cfg(self, latents, vts, rot_c, rot_u, shapes, noisy, mse, label, attn, **kwargs):
+    def denoise_step_batched_cfg(self, latents, vts, rot_c, rot_u, shapes, noisy, mse, **kwargs):
         kwargs.pop("noisy_token_mask", None)
         return self._branch(latents, 1, **kwargs), self._branch(latents, 2, **kwargs)
 
-    def denoise_step_batched(self, reqs, label, attn):
+    def denoise_step_batched(self, reqs):
         out = []
         for r in reqs:
             extra = {"sound_latents": r["sound_latents"]} if r.get("sound_latents") is not None else {}
             out.append((self._branch(r["latents"], 1, **extra), self._branch(r["latents"], 2, **extra)))
         return out
 
-    def denoise_step_action_batched(self, reqs, label, attn, with_cfg):
+    def denoise_step_action_batched(self, reqs, with_cfg):
         branches = (1, 2) if with_cfg else (1,)
         return [
             [self._branch(r["latents"], b, action_latents=r["action_latents"]) for b in branches] for r in reqs
@@ -99,33 +98,36 @@ def _dit() -> Cosmos3DiTSubmodule:
     sub = Cosmos3DiTSubmodule(
         transformer=_Tower(cfg), config=cfg, scheduler=UniPCMultistepScheduler.from_config(EDGE_SCHEDULER),
     )
-    sub.node_resources = {ATTN: None}
+    # each request's settings, which a served step rebuilds from its step metadata
+    sub.settings = {}
+    sub._settings = lambda md, step_index, inputs, device: sub.settings[md["rid"]]
+    bind_progress(sub, "v", "s", "a", "b", "r")
     return sub
 
 
 def _static(shape, **extra) -> dict:
     t = shape[2]
     tokens = t * (shape[3] // 2) * (shape[4] // 2)
-    return {
+    static = {
         "num_vision_tokens": tokens, "num_noisy_vision_tokens": tokens, "rotary": (None, None),
         "vision_token_shapes": [(t, shape[3] // 2, shape[4] // 2)],
         "vision_noisy_frame_indexes": [torch.arange(t)], "mse_gen_indexes": None, **extra,
     }
+    Cosmos3DiTSubmodule._add_layout_masks(static, "cpu")
+    return static
 
 
 def _gen_request(sub, rid, shape, num_sound=None):
-    st = sub.request_state(rid)
     extra = {"sound_token_shapes": None, "sound_noisy_frame_indexes": None, "sound_mse_gen_indexes": None}
     cond = _static(shape, **(extra if num_sound else {}))
-    st.add_all(
-        cond=cond, uncond=cond, gs=GS, scheduler=sub._new_scheduler(4, "cpu", flow_shift=12.0),
-        latent_shape=shape, num_sound=num_sound,
-    )
-    return st
+    sub.settings[rid] = {
+        "cond": cond, "uncond": cond, "gs": GS, "scheduler": sub._new_scheduler(4, "cpu", flow_shift=12.0),
+        "latent_shape": shape, "num_sound": num_sound,
+    }
+    return sub.settings[rid]
 
 
 def _action_request(sub, rid, cfg_branch=True):
-    st = sub.request_state(rid)
     shape = VIDEO_SHAPE
     vmask = torch.zeros((1, 1, shape[2], 1, 1), dtype=torch.bfloat16)
     vmask[:, :, 0] = 1.0
@@ -133,20 +135,20 @@ def _action_request(sub, rid, cfg_branch=True):
         shape, num_action_tokens=CHUNK, num_noisy_action_tokens=CHUNK, action_token_shapes=[(CHUNK, 1, 1)],
         action_noisy_frame_indexes=[torch.arange(CHUNK)], action_mse_gen_indexes=None,
     )
-    st.add_all(
-        cond=cond, uncond=cond if cfg_branch else None, gs=GS,
-        scheduler=sub._new_scheduler(4, "cpu", flow_shift=5.0), latent_shape=shape,
-        action_chunk=CHUNK, action_dim=sub.transformer.action_dim, raw_action_dim=RAW,
-        domain_t=torch.tensor([1]), vmask=vmask,
-        action_clean_mask=torch.zeros((1, CHUNK, 1), dtype=torch.bfloat16),
-        clean_action=torch.zeros((1, CHUNK, sub.transformer.action_dim), dtype=torch.bfloat16),
-    )
-    return st
+    sub.settings[rid] = {
+        "cond": cond, "uncond": cond if cfg_branch else None, "gs": GS,
+        "scheduler": sub._new_scheduler(4, "cpu", flow_shift=5.0), "latent_shape": shape,
+        "action_chunk": CHUNK, "action_dim": sub.transformer.action_dim, "raw_action_dim": RAW,
+        "domain_t": torch.tensor([1]), "vmask": vmask, "cond_video_latents": torch.zeros(shape, dtype=torch.bfloat16),
+        "action_clean_mask": torch.zeros((1, CHUNK, 1), dtype=torch.bfloat16),
+    }
+    return sub.settings[rid]
 
 
 def _fwd(rid, loop, k=0, seed=7):
     return SimpleNamespace(
         request_id=rid, rid_handle=rid, random_seed=seed, dynamic_loop_iter_counts=defaultdict(int, {loop: k}),
+        step_metadata={"rid": rid, "action_mode": "policy"},
     )
 
 
@@ -173,10 +175,10 @@ def test_sound_step_combines_and_steps_in_fp32(guided) -> None:
     sub = _dit()
     st = _gen_request(sub, "s", VIDEO_SHAPE, num_sound=5)
     if not guided:
-        st.add("guidance_interval", (0.0, 1.0))  # every step outside: the conditional branch alone
+        st["guidance_interval"] = (0.0, 1.0)  # every step outside: the conditional branch alone
     inp = sub._prepare_video_sound_gen(_fwd("s", VIDEO_SOUND_GEN_LOOP), {}, "cpu").tensor_inputs
     lat, snd = inp["latents"], inp["sound_latents"]
-    out = sub._forward_video_sound_gen(None, st, 0, lat, snd, **_solver(sub, inp))
+    out = sub._forward_video_sound_gen(st, 0, lat, snd, **_solver(sub, inp))
     v_c, s_c = _velocity(lat.shape, 1), _velocity(snd.shape, 1)
     if guided:
         v, s = _guided(v_c, _velocity(lat.shape, 2)), _guided(s_c, _velocity(snd.shape, 2))
@@ -203,7 +205,7 @@ def test_batched_sound_step_combines_in_fp32() -> None:
     )
     solvers = {name: {rid: inps[rid][name] for rid in rids} for name in sub._solver_state}
     out = sub._forward_batched_sound(
-        C.VIDEO_SOUND_GEN_WALK, ei, {r: inps[r]["latents"] for r in rids},
+        C.VIDEO_SOUND_GEN_WALK, ei, sub.settings, {r: inps[r]["latents"] for r in rids},
         {r: inps[r]["sound_latents"] for r in rids}, solvers,
     )
     for rid in rids:
@@ -211,7 +213,7 @@ def test_batched_sound_step_combines_in_fp32() -> None:
         v = _guided(_velocity(lat.shape, 1), _velocity(lat.shape, 2))
         s = _guided(_velocity(snd.shape, 1), _velocity(snd.shape, 2))
         ref_lat, ref_snd, _ = sub._sound_scheduler_step(
-            sub.request_states[rid], lat, snd, v, s, 0, _solver(sub, inps[rid]),
+            sub.settings[rid], lat, snd, v, s, 0, _solver(sub, inps[rid]),
         )
         assert torch.equal(out[rid]["latents"][0], ref_lat) and torch.equal(out[rid]["sound_latents"][0], ref_snd)
 
@@ -224,7 +226,7 @@ def test_action_step_draws_combines_and_steps_in_fp32(cfg_branch) -> None:
     lat, act = inp["latents"], inp["action_latents"]
     assert lat.dtype == LATENT_DTYPE and act.dtype == LATENT_DTYPE
     assert all(inp[name].dtype == LATENT_DTYPE for name in sub._solver_state)
-    out = sub._forward_action_gen(None, st, 0, lat, act, **_solver(sub, inp))
+    out = sub._forward_action_gen(st, 0, lat, act, **_solver(sub, inp))
     v_c, a_c = _velocity(lat.shape, 1), _velocity(act.shape, 1)
     if cfg_branch:
         v, a = _guided(v_c, _velocity(lat.shape, 2)), _guided(a_c, _velocity(act.shape, 2))
@@ -250,7 +252,7 @@ def test_batched_action_step_combines_in_fp32(cfg_branch) -> None:
     )
     solvers = {name: {rid: inps[rid][name] for rid in rids} for name in sub._solver_state}
     out = sub._forward_batched_action(
-        C.ACTION_GEN_WALK, ei, {r: inps[r]["latents"] for r in rids},
+        C.ACTION_GEN_WALK, ei, sub.settings, {r: inps[r]["latents"] for r in rids},
         {r: inps[r]["action_latents"] for r in rids}, solvers,
     )
     for rid in rids:
@@ -261,7 +263,7 @@ def test_batched_action_step_combines_in_fp32(cfg_branch) -> None:
         else:
             v, a = v_c.float(), a_c.float()
         ref_lat, ref_act, _ = sub._action_scheduler_step(
-            sub.request_states[rid], lat, act, v, a, 0, _solver(sub, inps[rid]),
+            sub.settings[rid], lat, act, v, a, 0, _solver(sub, inps[rid]),
         )
         assert torch.equal(out[rid]["latents"][0], ref_lat) and torch.equal(out[rid]["action_latents"][0], ref_act)
 
@@ -294,9 +296,10 @@ def test_eager_image_step_matches_the_captured_tail() -> None:
     info = SimpleNamespace(graph_walk=C.IMAGE_GEN_WALK, dynamic_loop_iter_counts=fwd.dynamic_loop_iter_counts)
     for k in range(len(st["scheduler"].timesteps)):
         fwd.dynamic_loop_iter_counts[IMAGE_GEN_LOOP] = k
-        eager = sub.forward(C.IMAGE_GEN_WALK, ei, latents=lat, **solver)
+        eager = sub.forward(C.IMAGE_GEN_WALK, ei, latents=lat, settings=st, **solver)
         captured = {"cond_v": [_velocity(lat.shape, 1)], "uncond_v": [_velocity(lat.shape, 2)]}
-        sub.postprocess("r", info, captured, inputs=ARNodeInputs(tensor_inputs={"latents": lat, **solver}))
+        inputs = ARNodeInputs(tensor_inputs={"latents": lat, **solver}, kwargs={"settings": st})
+        sub.postprocess("r", info, captured, inputs=inputs)
         for name in ("latents", *sub._solver_state):
             assert eager[name][0].dtype == LATENT_DTYPE
             assert torch.equal(eager[name][0], captured[name][0]), (k, name)
@@ -324,7 +327,6 @@ def test_forwards_run_with_the_engine_autocast_off(walk, monkeypatch) -> None:
     ):
         monkeypatch.setattr(sub, name, _record_autocast(seen))
     sub.transformer.prefill_und = _record_autocast(seen)
-    sub.request_state("r")
     ei = SimpleNamespace(
         request_ids=["r"], per_request_states=None, step=None, resources=None,
         per_request_info={"r": SimpleNamespace(dynamic_loop_iter_counts=defaultdict(int))},
@@ -332,7 +334,7 @@ def test_forwards_run_with_the_engine_autocast_off(walk, monkeypatch) -> None:
     before = torch.is_autocast_enabled("cuda")
     torch.set_autocast_enabled("cuda", True)
     try:
-        sub.forward(walk, ei)
+        sub.forward(walk, ei, **({} if walk == C.PREFILL_WALK else {"settings": {}}))
         if walk != C.IMAGE_GEN_WALK:  # the batched image step runs inline, with no helper to record
             sub.forward_batched(walk, ei)
         assert torch.is_autocast_enabled("cuda")

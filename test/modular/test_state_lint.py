@@ -37,12 +37,11 @@ PORTED = (
     "mstar/model/bagel", "mstar/model/chatterbox", "mstar/model/whisper", "mstar/model/phi4mm",
     "mstar/model/nemotron_duplex", "mstar/model/components/fastconformer.py",
     "mstar/model/components/fastconformer_stream.py",
-    "mstar/model/waypoint", "mstar/model/lingbot_world",
+    "mstar/model/waypoint", "mstar/model/lingbot_world", "mstar/model/cosyvoice3", "mstar/model/cosmos3",
 )
 # The list only shrinks: a package leaves it when its port lands, and nothing is added to it.
 UNPORTED = (
-    "mstar/model/cosmos3", "mstar/model/cosyvoice3", "mstar/model/glm52", "mstar/model/glm5_next",
-    "mstar/model/minicpm_o", "mstar/model/muse", "mstar/model/ripple",
+    "mstar/model/glm52", "mstar/model/glm5_next", "mstar/model/minicpm_o", "mstar/model/muse", "mstar/model/ripple",
 )
 # shared code under mstar/model/ that holds no model
 SHARED = ("mstar/model/components", "mstar/model/loader")
@@ -74,6 +73,7 @@ ALLOWED = {
         "MiniMax-H3's video decoder's sequence shard, written by hand: a contract SeqShard brackets a label an array "
         "opens, and the decoder has no arrays"
     ),
+    ("mstar.engine.windowing", "WindowSchedule"): "a windowed rollout's window arithmetic, which holds no state",
 }
 _LORA = (
     "per-request LoRA, outside the contract for good: adapters are weights the bridge builds from `lora_roots` and "
@@ -89,6 +89,12 @@ ALLOWED_ONLY_IN = {("mstar.engine.resources", "SeqShardSpec"): "mstar/model/mini
 ALLOWED_IN: dict[tuple[str, str, str], str] = {
     ("mstar/model/bagel/bagel_model.py", "mstar.engine.resources", "KVReqConfig"):
         "per-node and publish labels under CFG parallel and P/D, until P/D labels",
+    ("mstar/model/cosmos3/cosmos3_model.py", "mstar.engine.resources.attn.ragged.config", "RaggedAttnBackend"):
+        "the vision tower's FA3 kernel among its kernel settings, which goes when the engine picks kernels itself",
+    ("mstar/model/cosmos3/cosmos3_model.py", "mstar.engine.resources.spec", "CombinedSplit"):
+        "the reasoner's mixed-step split among its kernel settings, which the contract doesn't type yet",
+    ("mstar/model/cosmos3/submodules.py", "mstar.engine.fp32_precision", "cudnn_benchmark"):
+        "the VAE decode's cuDNN autotune switch, which holds no state",
 } | {
     ("mstar/model/chatterbox/components/s3gen_graphs.py", module, name):
         "S3Gen's own captures per shape, which hold no state"

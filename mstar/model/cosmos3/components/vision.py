@@ -14,8 +14,8 @@ Parameter names follow ``vision_encoder/model.safetensors`` with its leading
 checkpoint loads by name. Shapes and the packed patch order come from the
 Hugging Face ``Cosmos3EdgeVisionModel`` / ``Cosmos3EdgePatchMerger``.
 
-Served, the attention runs on the node's ragged attention resource (one
-segment per frame) and the block loop replays as a captured region
+Served, the attention reads the ``vision_tokens`` array (one segment per
+frame) and the block loop replays as a captured region
 (``Cosmos3VisionEncoderSubmodule``): ``embed`` / ``encode`` / ``project``. The
 reference ``forward``, for the parity tests, runs one batched SDPA per
 distinct frame size instead of a block-diagonal mask over the whole pack.
@@ -30,7 +30,7 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed.linear import QKVParallelLinear
 from mstar.model.cosmos3.config import Cosmos3ReasonerConfig, Cosmos3VisionEncoderConfig
-from mstar.model.keys import VISION_ATTN
+from mstar.model.cosmos3.constants import VISION_TOKENS
 
 
 def _activation(name: str):
@@ -120,7 +120,7 @@ def frame_attention(
 
 
 class Cosmos3VisionAttention(nn.Module):
-    def __init__(self, config: Cosmos3VisionEncoderConfig):
+    def __init__(self, config: Cosmos3VisionEncoderConfig, layer: int = 0):
         super().__init__()
         dim = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -131,26 +131,23 @@ class Cosmos3VisionAttention(nn.Module):
         # (``cosmos3.loader.VISION_STACKED``)
         self.qkv_proj = QKVParallelLinear(CommGroup.trivial(), dim, self.head_dim, self.num_heads, self.num_heads)
         self.out_proj = nn.Linear(dim, dim)
-        self.ragged_attn = None
+        self.layer = layer
+        self.state = None
 
-    def bind_resources(self, resources: dict) -> None:
-        """See ``NodeSubmodule.bind_node_resources``."""
-        self.ragged_attn = resources.get(VISION_ATTN)
+    def bind_state(self, handles: dict) -> None:
+        self.state = handles[VISION_TOKENS]
 
     def forward(self, x: torch.Tensor, frame_lens: list[int] | None = None) -> torch.Tensor:
         """Attention within each frame: over the packed ``frame_lens`` (the
-        reference path), or, with none, the frames the step planned on the
-        ragged attention resource."""
+        reference path), or, with none, the frames the step's segments lay
+        out."""
         n = x.shape[0]
         q, k, v = (t.view(n, self.num_heads, self.head_dim) for t in self.qkv_proj(x).chunk(3, dim=-1))
         if frame_lens is not None:
             out = frame_attention(q, k, v, frame_lens)
-        elif self.ragged_attn is not None:
-            out = self.ragged_attn.run(q, k, v)
         else:
-            raise ValueError(
-                f"the vision tower has no attention plan: declare a RaggedAttentionSpec under {VISION_ATTN!r}"
-            )
+            self.state.add(self.layer, k=k, v=v)
+            out = self.state.read(self.layer, q)
         return self.out_proj(out.reshape(n, -1))
 
 
@@ -166,10 +163,10 @@ class Cosmos3VisionMLP(nn.Module):
 
 
 class Cosmos3VisionEncoderLayer(nn.Module):
-    def __init__(self, config: Cosmos3VisionEncoderConfig):
+    def __init__(self, config: Cosmos3VisionEncoderConfig, layer: int = 0):
         super().__init__()
         self.layer_norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.self_attn = Cosmos3VisionAttention(config)
+        self.self_attn = Cosmos3VisionAttention(config, layer)
         self.layer_norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.mlp = Cosmos3VisionMLP(config)
 
@@ -181,7 +178,7 @@ class Cosmos3VisionEncoderLayer(nn.Module):
 class Cosmos3VisionEncoder(nn.Module):
     def __init__(self, config: Cosmos3VisionEncoderConfig):
         super().__init__()
-        self.layers = nn.ModuleList(Cosmos3VisionEncoderLayer(config) for _ in range(config.num_hidden_layers))
+        self.layers = nn.ModuleList(Cosmos3VisionEncoderLayer(config, i) for i in range(config.num_hidden_layers))
 
     def forward(self, x: torch.Tensor, frame_lens: list[int] | None = None) -> torch.Tensor:
         for layer in self.layers:

@@ -424,7 +424,8 @@ request: lay out every paged array. A layout may be empty where an opened label 
 written. A Value's layout is ``Layout()``, because a Value takes one slot per label. A sized
 Value is the exception: ``Value(..., largest={...})`` declares fields whose shapes name sizes
 (``Size("lat_h", scale=8)``), its layout gives the request's own (``Layout(sizes={...})``), and the
-engine admits the request by its fields' bytes at those sizes. Its ``read`` hands the row's
+engine admits the request by its fields' bytes at those sizes. A request that lays out no label of
+it holds none of it. Its ``read`` hands the row's
 tensors over and ``write`` keeps the ones it is given, with no copy either way, so a step
 writes or clears every field it read. A paged layout has five fields:
 
@@ -750,7 +751,10 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   array of one label with no positions it is held in the rolling store (`Rolling (compacted)
   caches`_), which hands the read each row's sink, window and step as one range, and a step
   there lists one row and keeps its adds. Otherwise the pool keeps it in pages, and each read
-  gathers it.
+  gathers it. ``Bidirectional(kept_window=True, whole_pages=True)`` cuts the window on the
+  pool's pages: the pool releases whole pages past the sink's last and the read sees every
+  entry the row still holds, so it runs on the paged kernel, and on a captured step, as
+  Cosmos3's generation steps read their windowed context beside its prefill read.
   ``FrameWindow(tokens, frames=, stride=1)`` sees frames of ``tokens`` entries: every
   ``stride``-th of the latest ``frames``, and the step's own frame. An array whose reads are
   all frame windows is held in a ring of frames per session, which a compiled region adds to
@@ -2355,8 +2359,8 @@ example above already does this.
 It is ``None`` for an eager step. If a submodule's declaration differs between the
 captured case and the eager case, it must check the lease, not its own capture key. The
 capture key only says that the batch could be captured. The lease says that the batch was
-captured. For example, Cosmos3 packs both guidance branches into a single plan for the
-captured shape, and uses the dense backend otherwise.
+captured. For example, Cosmos3's captured denoise step declares both guidance branches,
+inside a request's guidance interval or not, and its eager step only the branches it runs.
 
 ``piecewise_leases`` names the inner regions of this node that hold their own slot for
 this step. Such a region declares, plans and commits its own work. Any resource that the

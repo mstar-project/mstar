@@ -643,7 +643,7 @@ def deployment_setup(model: "Model", model_config: dict) -> "StateSetup":
     ``validate_deployment``, which reports them all."""
     from mstar.engine.state.adapters import state_setup
 
-    setup, problems = state_setup(model_config, model.declare_state())
+    setup, problems = state_setup(model_config, model.declare_state(), model.kernel_settings())
     if problems:
         raise ValueError(problems[0])
     return setup
@@ -1346,6 +1346,10 @@ class Model(ABC):
         the key logged as ignored. None (the default) declares nothing, so
         nothing is logged.
         """
+        return None
+
+    def session_node(self, model_kwargs: Mapping[str, Any]) -> str | None:
+        """The node whose session store this request reads or writes, or None when it names no session."""
         return None
 
     def get_autocast_dtype(self):

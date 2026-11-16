@@ -23,6 +23,7 @@ from mstar.model.cosmos3.submodules import (  # noqa: E402
     VIDEO_GEN_AR_WALK,
     Cosmos3DiTSubmodule,
 )
+from mstar.model.cosmos3.tests.stubs import bind_progress  # noqa: E402
 from mstar.testing_utils.engine import make_engine, make_mgmt  # noqa: E402
 
 # nvidia/Cosmos3-Edge scheduler/scheduler_config.json (the fields UniPC reads)
@@ -45,26 +46,28 @@ def _dit() -> Cosmos3DiTSubmodule:
     )
     dit.transformer = SimpleNamespace(proj_in=SimpleNamespace(weight=torch.zeros(1)))
     dit.get_device = lambda: torch.device("cpu")
+    # each request's settings, which a served step rebuilds from its step metadata
+    dit.settings = {}
+    dit._settings = lambda md, step_index, inputs, device: dit.settings[md["rid"]]
+    bind_progress(dit, 1, 2)
     return dit
 
 
 def _kv_rollout(dit, rid):
-    """A kv-mode windowed request as its prefill leaves it."""
-    st = dit.request_state(rid)
-    st.add_all(
-        scheduler=dit._new_scheduler(STEPS, "cpu", flow_shift=12.0),
-        ar_schedule=SimpleNamespace(window=lambda i: SimpleNamespace(commit_start=0, commit_end=1)),
-        ar_steps=STEPS, ar_iters_per_window=STEPS + 1,
-        ar_total_iters=WINDOWS * (STEPS + 1), ar_kv_mode=True,
-        ar_retention={}, ar_tokens_per_unit=4,
-        cond={"num_vision_tokens": 4}, uncond=None, latent_shape=(1, 2, 1, 2, 2),
-    )
-    return st
+    """A kv-mode windowed request's settings."""
+    dit.settings[rid] = {
+        "scheduler": dit._new_scheduler(STEPS, "cpu", flow_shift=12.0),
+        "ar_schedule": SimpleNamespace(window=lambda i: SimpleNamespace(commit_start=0, commit_end=1)),
+        "ar_steps": STEPS, "ar_iters_per_window": STEPS + 1, "ar_kv_mode": True, "ar_tokens_per_unit": 4,
+        "cond": {"num_vision_tokens": 4}, "uncond": None, "latent_shape": (1, 2, 1, 2, 2), "cond_units": 0,
+    }
+    return dit.settings[rid]
 
 
 def _fwd(rid, k):
     return SimpleNamespace(
         request_id=f"req-{rid}", rid_handle=rid, random_seed=0, dynamic_loop_iter_counts={VIDEO_GEN_AR_LOOP: k},
+        step_metadata={"rid": rid, "window_mode": "kv", "guidance_scale": 1.0},
     )
 
 
@@ -93,7 +96,7 @@ def test_rollout_steps_every_window_and_commit_unchanged():
         commit = inp.resource_step_info.commit
         kinds.append("commit" if commit else "gen")
         if commit:
-            st.add("scheduler", dit._new_scheduler(STEPS, "cpu", flow_shift=12.0))
+            st["scheduler"] = dit._new_scheduler(STEPS, "cpu", flow_shift=12.0)
             lat = inp.tensor_inputs["latents"]
             solver = dit._first_solver_state(st, lat)
         else:

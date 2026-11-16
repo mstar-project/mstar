@@ -6,6 +6,7 @@ import torch
 
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.engine.resources.kv.config import (
+    KVReqConfig,
     KVStep,
     PagedKVConfig,
     PrefixSpan,
@@ -32,14 +33,8 @@ def _manager() -> KVManager:
     )
 
 
-def _grow(
-    kv: KVManager, rid: str, span: int, label: str = "main", commit: bool = True,
-    retention: RetentionPolicy | None = None,
-) -> int:
-    step = KVStep(
-        segments=(Segment(rid, label, span),), commit=commit,
-        retention={} if retention is None else {(rid, label): retention},
-    )
+def _grow(kv: KVManager, rid: str, span: int, label: str = "main", commit: bool = True) -> int:
+    step = KVStep(segments=(Segment(rid, label, span),), commit=commit)
     ctx = StepContext(request_ids=(rid,), graph_walk="w", slot=0, capture=False)
     assert kv.admit(step, ctx).ok
     held = len(kv._streams[rid][label].page_indices)
@@ -86,16 +81,16 @@ def test_scratch_counts_once_however_often_it_runs():
 def test_a_window_holds_its_peak_not_its_sum():
     for prefix, budget, window in [(13, 24, 9), (16, 16, 16), (5, 40, 7), (0, 3, 12)]:
         kv = _manager()
-        kv.ingest_request("r")
-        policy = RetentionPolicy(context_budget=budget, protected_prefix=prefix)
-        peak = _grow(kv, "r", prefix) if prefix else 0
-        for _ in range(12):
-            peak = max(peak, _grow(kv, "r", window, commit=False))
-            peak = max(peak, _grow(kv, "r", window, retention=policy))
+        policy = RetentionPolicy(context_budget=budget, protected_prefix=prefix, exact=True)
         layout = StreamLayout(
             spans=_spans(*([prefix] if prefix else []), *[window] * 12),
             scratch=window, retention=policy,
         )
+        kv.ingest_request("r", KVReqConfig(kv_layout={"main": layout}))
+        peak = _grow(kv, "r", prefix) if prefix else 0
+        for _ in range(12):
+            peak = max(peak, _grow(kv, "r", window, commit=False))
+            peak = max(peak, _grow(kv, "r", window))
 
         assert peak <= layout.pages({}, PS), f"{prefix=} {budget=} {window=}: a window outgrew its footprint"
         assert layout.pages({}, PS) - peak <= 1, f"{prefix=} {budget=} {window=}: the footprint over-counts"

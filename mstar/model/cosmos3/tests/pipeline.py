@@ -551,13 +551,18 @@ class Cosmos3Pipeline:
             und_seq = residual + layer.mlp(layer.post_attention_layernorm(residual))
         return kvs
 
-    def _ref_gen_layers(self, gen_seq, cos, sin, ctx_kv, collect=False):
-        """Generation layer stack with explicit context: each layer attends
-        its fresh tokens over ``ctx_kv[i]`` (the branch's [text | retained
-        frames] K/V) plus itself, non-causally. With ``collect`` the fresh
-        rotated (k, v) per layer is returned — what a commit appends."""
+    def _ref_gen_layers(self, gen_seq, cos, sin, ctx_kvs, collect=False):
+        """Generation layer stack with explicit context, over the guidance
+        branches' fresh tokens packed [cond | uncond] the way the served step
+        packs them: projections and MLPs over the packed rows, and each
+        branch's tokens attending its ``ctx_kvs[b][i]`` (the branch's [text |
+        retained frames] K/V) plus themselves, non-causally. A branch at a time
+        would differ from the served step by GEMM tiling rounding. With
+        ``collect`` each branch's fresh rotated (k, v) per layer is returned:
+        what a commit appends."""
         tf = self.transformer
-        collected = []
+        n = gen_seq.shape[0] // len(ctx_kvs)
+        collected = [[] for _ in ctx_kvs]
         for i, layer in enumerate(tf.layers):
             attn = layer.self_attn
             h, hkv, d = attn.num_attention_heads, attn.num_key_value_heads, attn.head_dim
@@ -567,10 +572,14 @@ class Cosmos3Pipeline:
             v = attn.add_v_proj(gen_norm).view(-1, hkv, d)
             q = attn._apply_rope(q, cos, sin)
             k = attn._apply_rope(k, cos, sin)
-            if collect:
-                collected.append((k, v))
-            ck, cv = ctx_kv[i]
-            out = attn._attend(q, torch.cat([ck, k], 0), torch.cat([cv, v], 0), is_causal=False)
+            outs = []
+            for b, ctx_kv in enumerate(ctx_kvs):
+                sl = slice(b * n, (b + 1) * n)
+                if collect:
+                    collected[b].append((k[sl], v[sl]))
+                ck, cv = ctx_kv[i]
+                outs.append(attn._attend(q[sl], torch.cat([ck, k[sl]], 0), torch.cat([cv, v[sl]], 0), is_causal=False))
+            out = torch.cat(outs, 0)
             residual = gen_seq + attn.to_add_out(out.reshape(-1, h * d))
             gen_seq = residual + layer.mlp_moe_gen(layer.post_attention_layernorm_moe_gen(residual))
         return gen_seq, collected
@@ -678,6 +687,21 @@ class Cosmos3Pipeline:
                 out.append((k, v))
             return out
 
+        def _packed_layers(gen_seq, w, collect=False):
+            """``gen_seq`` once per branch through the layer stack, each copy
+            on its branch's rotary table and context."""
+            rotary = [
+                tf._rotary(state[name]["statics"][w]["vision_mrope_ids"], gen_seq.device, gen_seq.dtype)
+                for name, _ in branches
+            ]
+            return self._ref_gen_layers(
+                torch.cat([gen_seq] * len(branches), 0),
+                torch.cat([cos for cos, _ in rotary], 0),
+                torch.cat([sin for _, sin in rotary], 0),
+                [_ctx(name) for name, _ in branches],
+                collect=collect,
+            )
+
         def _release(branch, committed_units):
             # KVManager._apply_retention: excess over prefix + budget, whole
             # pages from the first page past the prefix, tail page kept.
@@ -707,24 +731,24 @@ class Cosmos3Pipeline:
             num_noisy = s0["num_noisy_vision_tokens"]
             for t in scheduler.timesteps:
                 vts = torch.full((num_noisy,), t.item(), device=device)
+                packed, orig_shapes = tf._patchify_and_pack_latents([latents.to(dtype)])
+                packed = tf.proj_in(packed)
+                ts_embeds = tf.time_embedder(tf.time_proj(vts * tf_cfg.timestep_scale)).to(packed.dtype)
+                gen_seq = tf._apply_timestep_embeds_to_noisy_tokens(
+                    packed_tokens=packed,
+                    packed_timestep_embeds=ts_embeds,
+                    noisy_frame_indexes=s0["vision_noisy_frame_indexes"],
+                    token_shapes=s0["vision_token_shapes"],
+                )
+                gen_seq, _ = _packed_layers(gen_seq, w)
+                gen_out = tf.norm_moe_gen(gen_seq)
+                n = gen_out.shape[0] // len(branches)
                 vels = {}
-                for name, _ in branches:
+                for b, (name, _) in enumerate(branches):
                     static = state[name]["statics"][w]
-                    packed, orig_shapes = tf._patchify_and_pack_latents([latents.to(dtype)])
-                    packed = tf.proj_in(packed)
-                    ts_embeds = tf.time_embedder(tf.time_proj(vts * tf_cfg.timestep_scale)).to(packed.dtype)
-                    gen_seq = tf._apply_timestep_embeds_to_noisy_tokens(
-                        packed_tokens=packed,
-                        packed_timestep_embeds=ts_embeds,
-                        noisy_frame_indexes=static["vision_noisy_frame_indexes"],
-                        token_shapes=static["vision_token_shapes"],
-                    )
-                    cos, sin = tf._rotary(static["vision_mrope_ids"], gen_seq.device, gen_seq.dtype)
-                    gen_seq, _ = self._ref_gen_layers(gen_seq, cos, sin, _ctx(name))
-                    gen_out = tf.norm_moe_gen(gen_seq)
                     mse_idx = static["vision_mse_loss_indexes"] - static["und_len"]
                     preds = tf._unpatchify_and_unpack_latents(
-                        tf.proj_out(gen_out[mse_idx]),
+                        tf.proj_out(gen_out[b * n:(b + 1) * n][mse_idx]),
                         token_shapes_vision=static["vision_token_shapes"],
                         noisy_frame_indexes_vision=static["vision_noisy_frame_indexes"],
                         original_latent_shapes=orig_shapes,
@@ -740,13 +764,10 @@ class Cosmos3Pipeline:
             windows_out.append(latents.clone())
 
             # Commit the finished window's clean K/V per branch, then release.
-            for name, _ in branches:
+            packed, _ = tf._patchify_and_pack_latents([latents.to(dtype)])
+            _, fresh_per_branch = _packed_layers(tf.proj_in(packed), w, collect=True)
+            for (name, _), fresh in zip(branches, fresh_per_branch, strict=True):
                 st = state[name]
-                static = st["statics"][w]
-                packed, _ = tf._patchify_and_pack_latents([latents.to(dtype)])
-                gen_seq = tf.proj_in(packed)
-                cos, sin = tf._rotary(static["vision_mrope_ids"], gen_seq.device, gen_seq.dtype)
-                _, fresh = self._ref_gen_layers(gen_seq, cos, sin, _ctx(name), collect=True)
                 for i, (k, v) in enumerate(fresh):
                     fr = st["frames"][i]
                     st["frames"][i] = (

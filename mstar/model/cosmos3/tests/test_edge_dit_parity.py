@@ -73,11 +73,13 @@ def test_edge_dit_cached_path_matches_diffusers() -> None:
     the text tower's causal attention, the GEN-facing normed K re-written into
     the cache) then one ``denoise_step`` reading it, against the same
     diffusers dump as the fused check."""
+    from mstar.model.cosmos3 import constants as C
     from mstar.model.cosmos3.components.packing import build_static_inputs
     from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
     from mstar.model.cosmos3.config import Cosmos3Config
     from mstar.model.cosmos3.loader import load_transformer_weights
-    from mstar.model.cosmos3.tests.test_edge import _OverwriteKV
+    from mstar.model.cosmos3.submodules import COND_LABEL
+    from mstar.model.cosmos3.tests.test_engine_cache import _SdpaResources, declaring
 
     rec = torch.load(REF)
     cfg = Cosmos3Config.from_pretrained(EDGE_DIR)
@@ -92,23 +94,18 @@ def test_edge_dit_cached_path_matches_diffusers() -> None:
     model = model.to_empty(device="cpu").float()
     load_transformer_weights(model, EDGE_DIR, device="cpu")
     model.eval()
-    res = _OverwriteKV()
-    for child in model.modules():
-        bind = getattr(child, "bind_resources", None)
-        if bind is not None:
-            bind({"kv": res, "attn": res})
+    res = _SdpaResources()
+    res.bind(declaring(cfg), model)
     ts = torch.full((static["num_noisy_vision_tokens"],), float(rec["timestep"]))
     with torch.no_grad():
-        res.causal = True
-        model.prefill_und(static["input_ids"], static["text_mrope_ids"], "main")
-        res.commit()
-        res.causal = False
+        res.step(C.PREFILL_WALK, [("r", COND_LABEL, static["und_len"])],
+                 lambda: model.prefill_und(static["input_ids"], static["text_mrope_ids"]))
         rotary = model._rotary(static["gen_position_ids"], latents.device, model.proj_in.weight.dtype)
-        velocity = model.denoise_step(
+        gen = [("r", COND_LABEL, static["num_vision_tokens"])]
+        velocity = res.step(C.IMAGE_GEN_WALK, gen, lambda: model.denoise_step(
             latents, ts, rotary, static["vision_token_shapes"],
             static["vision_noisy_frame_indexes"], static["vision_mse_loss_indexes"] - static["und_len"],
-            "main", res,
-        )
+        ), keep=False)
     ref = rec["velocity"]
     err = (velocity - ref).abs().max().item()
     scale = ref.abs().max().item()

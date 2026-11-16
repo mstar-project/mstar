@@ -45,6 +45,7 @@ import torch.nn.functional as F
 from torch import nn
 
 import mstar.model.components.diffusion.modulation  # noqa: F401 - registers mstar::ada_layer_norm and its residual form
+from mstar.engine.state import add_read
 from mstar.model.cosyvoice3.components.dit_kernels import partial_rotary_
 from mstar.model.cosyvoice3.config import DiTConfig
 
@@ -151,15 +152,15 @@ class Attention(nn.Module):
         return self.to_out[0](out) * row_keep
 
 
-    def forward_packed(self, x: torch.Tensor, attend, real: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-        """``x`` ``[1, N, C]`` of packed rows. ``attend`` writes the K/V to the cache
-        and reads the rows' prefixes; ``real`` ``[N]`` is False on a bucket's padded
-        tail, which the kernel leaves unwritten."""
+    def forward_packed(self, x: torch.Tensor, kv, layer: int, real: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+        """``x`` ``[1, N, C]`` of packed rows. The add keeps the K/V on ``kv``'s ``layer``
+        and the read attends the rows' prefixes; ``real`` ``[N]`` is False on a bucket's
+        padded tail, which the kernel leaves unwritten."""
         n = x.shape[1]
         q = apply_partial_rotary(self.to_q(x), freqs).view(n, self.heads, -1)
         k = apply_partial_rotary(self.to_k(x), freqs).view(n, self.heads, -1)
         v = self.to_v(x).view(n, self.heads, -1)
-        out = torch.where(real[:, None, None], attend(q, k, v).to(q.dtype), 0.0)
+        out = torch.where(real[:, None, None], add_read(kv, layer, q, k=k, v=v).to(q.dtype), 0.0)
         return self.to_out[0](out.reshape(1, n, -1))
 
 
@@ -215,9 +216,9 @@ class DiTBlock(nn.Module):
         return x + gate_mlp.unsqueeze(1) * self.ff(ff_in)
 
 
-    def forward_packed(self, x, t, attend, real, freqs):
+    def forward_packed(self, x, t, kv, layer, real, freqs):
         norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, t)
-        x = x + gate_msa.unsqueeze(1) * self.attn.forward_packed(norm, attend, real, freqs)
+        x = x + gate_msa.unsqueeze(1) * self.attn.forward_packed(norm, kv, layer, real, freqs)
         ff_in = self.ff_norm(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
         return x + gate_mlp.unsqueeze(1) * self.ff(ff_in)
 
@@ -245,7 +246,7 @@ class PackedRows(NamedTuple):
     scratch: what a padded buffer leaves at zero (padding rows and tokens) lands there.
     """
 
-    positions: torch.Tensor  # [T] long, each token's frame in its row
+    frame_at: torch.Tensor  # [T] long, each token's frame in its row
     seq_at: torch.Tensor  # [T] long, each token's place in the convolution sequence
     tail_at: torch.Tensor  # [B, K-1] long, where each row's kept tail goes
     last_at: torch.Tensor  # [B, K-1] long, the row's tail after its new frames
@@ -389,7 +390,7 @@ class DiT(nn.Module):
         ]
         self._fused_steps = int(t_span.numel()) - 1
 
-    def _fused_blocks(self, h, step, attend, real, cos, sin, layer_base):
+    def _fused_blocks(self, h, step, kv, real, cos, sin, layer_base):
         """The block stack on ``h`` ``[N, D]``: each residual add and modulated norm in one
         pass (``mstar::ada_layer_norm``, the DiT scaffold's), the partial rotary in place."""
         n, dim = h.shape
@@ -403,12 +404,11 @@ class DiT(nn.Module):
             m = self._modulation[step][b]
             if norm is None:
                 norm = _modulated_norm(h, m.shift_msa, m.scale_msa, eps)
-            attend.set_layer_idx(layer_base + b)
             qkv = F.linear(norm, self._qkv_weight[b], self._qkv_bias[b])
             q, k, v = qkv[:, :inner], qkv[:, inner : 2 * inner], qkv[:, 2 * inner :]
             partial_rotary_(q, k, cos, sin)
-            out = attend(
-                q.view(n, heads, -1).contiguous(), k.view(n, heads, -1), v.view(n, heads, -1),
+            out = add_read(
+                kv, layer_base + b, q.view(n, heads, -1).contiguous(), k=k.view(n, heads, -1), v=v.view(n, heads, -1),
             )
             out = torch.where(real[:, None, None], out, 0.0).reshape(n, inner)
             h, ff_in = _residual_modulated_norm(h, block.attn.to_out[0](out), m.gate_msa, m.shift_mlp, m.scale_mlp, eps)
@@ -421,7 +421,7 @@ class DiT(nn.Module):
                 h, norm = _residual_modulated_norm(h, ff, m.gate_mlp, shift, scale, eps)
         return self.proj_out(norm)
 
-    def forward_new_frames(self, x, cond, mu, spks, t, tails, rows: PackedRows, attend, layer_base: int):
+    def forward_new_frames(self, x, cond, mu, spks, t, tails, rows: PackedRows, kv, layer_base: int):
         """One classifier-free-guided evaluation of new frames, over the cached K/V of
         the frames before them: the conditional half of ``x``/``cond``/``mu``/``spks``
         ``[T, 80]``, the unconditional half with zero ``cond``/``mu``/``spks``. Returns
@@ -437,18 +437,17 @@ class DiT(nn.Module):
         # together however far the buffers are padded
         to_plan, to_stacked = plan_order(rows.real)
         h = (conv + h).reshape(-1, h.shape[-1]).index_select(0, to_plan)[None]
-        positions = rows.positions.repeat(2).index_select(0, to_plan).float()
+        positions = rows.frame_at.repeat(2).index_select(0, to_plan).float()
         freqs = torch.outer(positions, self.inv_freq)
         freqs = torch.stack((freqs, freqs), dim=-1).flatten(-2)[None]
         real = rows.real.repeat(2).index_select(0, to_plan)
         if h.is_cuda and getattr(self, "_fused_steps", 0):
             step = layer_base // self.config.depth
-            v = self._fused_blocks(h[0], step, attend, real, freqs[0].cos(), freqs[0].sin(), layer_base)
+            v = self._fused_blocks(h[0], step, kv, real, freqs[0].cos(), freqs[0].sin(), layer_base)
         else:
             temb = self.time_embed(t.reshape(1))
             for b, block in enumerate(self.transformer_blocks):
-                attend.set_layer_idx(layer_base + b)
-                h = block.forward_packed(h, temb, attend, real, freqs)
+                h = block.forward_packed(h, temb, kv, layer_base + b, real, freqs)
             v = self.proj_out(self.norm_out(h, temb))[0]
         v = v.index_select(0, to_stacked)
         return v.reshape(2, -1, v.shape[-1]), tails

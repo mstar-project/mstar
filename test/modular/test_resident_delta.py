@@ -1556,12 +1556,12 @@ def test_under_debug_asserts_a_commit_moves_nothing_a_page_trail_carries(monkeyp
     allotted. A trail that carried the allotted pages not yet used then stopped a follower whose counts agreed."""
     monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
     leader, lead = _pool_rank(monkeypatch, 0)
-    window = RetentionPolicy(PAGE_SIZE)
+    window = RetentionPolicy(PAGE_SIZE, exact=True)
     layout = StreamLayout((PrefixSpan(3 * PAGE_SIZE, 3 * PAGE_SIZE, "prefill"),), (("decode", 1),), retention=window)
     config = KVReqConfig(kv_layout={"main": layout}, loop_caps={"decode": PAGE_SIZE})
     lead._runner.ingest_request("r", {"kv": config}, 1)
     assert _admits(leader, "r")
-    step = KVStep(segments=(Segment("r", "main", 3 * PAGE_SIZE),), retention={("r", "main"): window})
+    step = KVStep(segments=(Segment("r", "main", 3 * PAGE_SIZE),))
     assert leader.admit(step, _ctx("r")).ok
     leader.plan(step, _ctx("r"))
     trail = leader.page_trail()

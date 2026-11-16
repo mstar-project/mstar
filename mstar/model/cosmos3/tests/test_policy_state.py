@@ -18,6 +18,7 @@ import torch
 from mstar.model.base import ProcessPromptOutput
 from mstar.model.cosmos3.components.packing import action_start_frame_offset, resolve_action_domain_id
 from mstar.model.cosmos3.config import Cosmos3Config
+from mstar.model.cosmos3.constants import PROMPT_LENGTHS
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
 from mstar.model.cosmos3.submodules import ACTION_GEN_WALK, COND_LABEL, Cosmos3DiTSubmodule
 from mstar.model.cosmos3.tests.test_rotary_table import stand_in_rotary
@@ -57,13 +58,9 @@ def _dit(model: Cosmos3Model) -> Cosmos3DiTSubmodule:
     return dit
 
 
-def _prefill(dit: Cosmos3DiTSubmodule, md: dict, tensors: dict, rid: int):
-    fwd_info = types.SimpleNamespace(rid_handle=rid, request_id=str(rid))
-    dit._prepare_action_prefill(
-        fwd_info, md, tensors, [1, 2, 3], [1, 2], md["height"], md["width"], md["fps"],
-        md["guidance_scale"], md["num_inference_steps"], "cpu",
-    )
-    return dit.request_states[rid]
+def _step_settings(dit: Cosmos3DiTSubmodule, md: dict, tensors: dict) -> dict:
+    """A denoise step's settings, from the request's step metadata and its inputs."""
+    return dit._settings({**md, PROMPT_LENGTHS: (3, 2)}, 0, tensors, torch.device("cpu"))
 
 
 def test_robot_state_request_params() -> None:
@@ -186,30 +183,32 @@ def test_robot_state_reaches_the_dit_in_the_policys_convention() -> None:
     assert torch.allclose(fd.new_input_tensors["action_inputs"][0], torch.tensor([expected, expected]))
 
 
-def test_prefill_puts_the_state_in_front_of_the_chunk() -> None:
+def test_the_settings_put_the_state_in_front_of_the_chunk() -> None:
     model = _model()
     dit = _dit(model)
     common = {**POLICY, "size": "64x64", "fps": 15, "action_chunk_size": 32}
     tensors, md, _ = _submit(model, {**common, "robot_state": STATE})
-    st = _prefill(dit, md, tensors, 0)
+    st = _step_settings(dit, md, tensors)
     assert st["action_chunk"] == 33  # the state token and 32 predicted rows
     clean = st["action_clean_mask"][0, :, 0]
     assert clean[0] == 1 and clean[1:].sum() == 0
-    assert torch.allclose(st["clean_action"][0, 0, :8], tensors["action_inputs"][0][0])
-    assert st["clean_action"][0, 0, 8:].abs().sum() == 0 and st["clean_action"][0, 1:].abs().sum() == 0
-    for static in (st["cond"], st["uncond"]):
+    clean_action = dit._clean_action(md, st, tensors, torch.device("cpu"))
+    assert torch.allclose(clean_action[0, 0, :8], tensors["action_inputs"][0][0])
+    assert clean_action[0, 0, 8:].abs().sum() == 0 and clean_action[0, 1:].abs().sum() == 0
+    for static in filter(None, (st["cond"], st["uncond"])):
         assert static["action_noisy_frame_indexes"][0].tolist() == list(range(1, 33))
         assert static["num_noisy_action_tokens"] == 32
 
     tensors, md, _ = _submit(model, {**common, "raw_action_dim": 8})
-    plain = _prefill(dit, md, tensors, 1)
+    plain = _step_settings(dit, md, tensors)
     assert plain["action_chunk"] == 32
-    assert plain["action_clean_mask"].sum() == 0 and plain["clean_action"].abs().sum() == 0
+    assert plain["action_clean_mask"].sum() == 0
+    assert dit._clean_action(md, plain, tensors, torch.device("cpu")).abs().sum() == 0
     assert plain["cond"]["action_noisy_frame_indexes"][0].tolist() == list(range(32))
 
     # The state token sits at video frame 0's time, and the predicted rows keep
-    # the positions they have without a state (the prefill slims the position
-    # ids away, so build the statics again).
+    # the positions they have without a state (the settings' statics are
+    # slimmed of the position ids, so build them again).
     def static(tokens, rows):
         offset = action_start_frame_offset(tokens, 33)
         return dit._build_action_static([1, 2, 3], 64, 64, 33, tokens, "policy", 15.0, 15.0, offset, "cpu", rows)
@@ -288,26 +287,30 @@ def test_action_guidance_interval() -> None:
         model, {**POLICY, "action_chunk_size": 32, "size": "64x64", "fps": 15,
                 "guidance_scale": 3.0, "guidance_interval": [960, 1001], "robot_state": STATE},
     )
-    st = _prefill(dit, md, tensors, 0)
+    st = _step_settings(dit, md, tensors)
     assert st["guidance_interval"] == (960.0, 1001.0)
-    st.add("scheduler", types.SimpleNamespace(timesteps=torch.tensor([1000.0, 937.5, 833.3, 625.0])))
-    st.add("domain_t", torch.tensor([8]))
+    st["scheduler"] = types.SimpleNamespace(timesteps=torch.tensor([1000.0, 937.5, 833.3, 625.0]))
+    st["domain_t"] = torch.tensor([8])
+    ran = []
 
-    labels = []
-
-    def denoise(attn, static, latents, action_latents, vts, ats, domain, label):
-        labels.append(label)
+    def denoise(static, latents, action_latents, vts, ats, domain):
+        ran.append(1)
         return torch.zeros_like(latents), torch.zeros_like(action_latents)
 
+    def denoise_both(latents, *args, action_latents, **kwargs):
+        ran.append(2)
+        zeros = (torch.zeros_like(latents), torch.zeros_like(action_latents))
+        return zeros, zeros
+
     dit._denoise_action = denoise
-    dit.batched_cfg = False
+    dit.transformer.denoise_step_batched_cfg = denoise_both
     dit._action_scheduler_step = lambda st, lat, act, v, a, step, solver: (lat, act, solver)
     latents, action_latents = torch.zeros(1, 2), torch.zeros(1, 33, 64)
     for step, branches in ((0, 2), (1, 1), (3, 1)):
-        labels.clear()
-        dit._forward_action_gen(None, st, step, latents, action_latents)
-        assert len(labels) == branches, step
-        assert dit._step_info(ACTION_GEN_WALK, st, step).cfg_active == (branches == 2)
+        ran.clear()
+        dit._forward_action_gen(st, step, latents, action_latents)
+        assert ran == [branches], step
+        assert dit._step_info(ACTION_GEN_WALK, md, st, step).cfg_active == (branches == 2)
 
 
 @pytest.mark.parametrize("steps, guided", [((1, 3), False), ((0, 3), True)])
@@ -321,22 +324,22 @@ def test_batched_action_step_outside_the_interval_runs_the_conditional_branch(st
     dit = _dit(model)
     timesteps = types.SimpleNamespace(timesteps=torch.tensor([1000.0, 937.5, 833.3, 625.0]))
     rids = [0, 1]
+    settings = {}
     for rid in rids:
         tensors, md, _ = _submit(
             model, {**POLICY, "action_chunk_size": 32, "size": "64x64", "fps": 15,
                     "guidance_scale": 3.0, "guidance_interval": [960, 1001], "robot_state": STATE},
         )
-        st = _prefill(dit, md, tensors, rid)
-        st.add_all(scheduler=timesteps, domain_t=torch.tensor([8]))
-    infos = [dit._step_info(ACTION_GEN_WALK, dit.request_states[rid], k) for rid, k in zip(rids, steps, strict=True)]
-    declared = dit.declare_step(ACTION_GEN_WALK, rids, [types.SimpleNamespace(input_seq_len=4, resource_step_info=i)
-                                                       for i in infos])
+        settings[rid] = {**_step_settings(dit, md, tensors), "scheduler": timesteps, "domain_t": torch.tensor([8])}
+    infos = [dit._step_info(ACTION_GEN_WALK, md, settings[rid], k) for rid, k in zip(rids, steps, strict=True)]
+    inputs = [types.SimpleNamespace(input_seq_len=4, resource_step_info=info, kwargs={}) for info in infos]
+    declared = dit.declare_step(ACTION_GEN_WALK, rids, inputs)
     labels = {seg.label for seg in declared.segments}
     assert labels == ({COND_LABEL, UNCOND_LABEL} if guided else {COND_LABEL})
 
     seen, combined = [], []
 
-    def batched(reqs, label, attn, with_cfg):
+    def batched(reqs, with_cfg):
         seen.append(with_cfg)
         branch = (torch.zeros(1, 2), torch.ones(1, 33, 64))
         return [[branch, (torch.zeros(1, 2), torch.zeros(1, 33, 64))] if with_cfg else [branch] for _ in reqs]
@@ -349,12 +352,12 @@ def test_batched_action_step_outside_the_interval_runs_the_conditional_branch(st
     dit._action_scheduler_step = step
     dit._solver_state = ()
     ei = types.SimpleNamespace(
-        request_ids=rids, per_request_states=None, step=None, resources={"attn": None},
+        request_ids=rids,
         per_request_info={rid: types.SimpleNamespace(dynamic_loop_iter_counts={ACTION_GEN_LOOP: k})
                           for rid, k in zip(rids, steps, strict=True)},
     )
     zeros = {rid: torch.zeros(1, 2) for rid in rids}
-    dit._forward_batched_action(ACTION_GEN_WALK, ei, zeros, {rid: torch.zeros(1, 33, 64) for rid in rids}, {})
+    dit._forward_batched_action(ACTION_GEN_WALK, ei, settings, zeros, {rid: torch.zeros(1, 33, 64) for rid in rids}, {})
     assert seen == [guided]
     # cond 1, uncond 0, guidance 3: a guided row gets 3, the others the conditional 1
     assert combined == ([3.0, 1.0] if guided else [1.0, 1.0])

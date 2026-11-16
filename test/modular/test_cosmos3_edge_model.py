@@ -20,6 +20,7 @@ import torch
 from jinja2 import TemplateError
 
 from mstar.conductor.request_info import FINAL_PREFILL
+from mstar.engine.state.adapters import node_resources, state_setup
 from mstar.graph.base import GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.components.sampled_token_decoder import MEDIA_EMBEDS, MEDIA_MASK
@@ -70,6 +71,12 @@ def _fake_edge_dir(tmp_path: Path) -> Path:
 
 def _model(tmp_path: Path, **kwargs) -> Cosmos3Model:
     return Cosmos3Model(model_path_hf=str(_fake_edge_dir(tmp_path)), skip_weight_loading=True, **kwargs)
+
+
+def _specs(model: Cosmos3Model) -> list:
+    """The node resources a deployment with no ``resources:`` block builds from the model's declarations."""
+    setup, _ = state_setup({}, model.declare_state(), model.kernel_settings())
+    return node_resources(model, setup=setup)
 
 
 def test_edge_dummy_model_parses_family_and_reasoner(tmp_path) -> None:
@@ -143,13 +150,14 @@ def test_edge_recipe_defaults_from_the_checkpoint(tmp_path) -> None:
 
 def test_edge_resources_shared_between_dit_and_reasoner(tmp_path) -> None:
     model = _model(tmp_path)
-    specs = {s.resource_key: s for s in model.get_node_resources()}
+    specs = {s.resource_key: s for s in _specs(model)}
     assert specs[KV_CACHE].nodes == {DIT_NODE, REASONER_NODE}
     assert specs[ATTN].nodes == {DIT_NODE, REASONER_NODE}
     assert specs[SAMPLER].nodes == {REASONER_NODE}
     assert specs[SAMPLER].vocab_size == 131072
-    # the reasoner's position counter is its own; mixed steps split the shared attention
-    assert specs[ROPE].nodes == {REASONER_NODE}
+    # the kv array's positions are the reasoner's counter, which the DiT, a node of the array, plans too;
+    # mixed steps split the shared attention
+    assert specs[ROPE].nodes == {DIT_NODE, REASONER_NODE}
     # the vision tower's attention: a segment per frame, down to the smallest video frame (16 patches)
     assert specs["vision_attn"].nodes == {VISION_ENCODER_NODE}
     assert specs["vision_attn"].config.max_segments_per_step == 16384 // 16
@@ -159,7 +167,7 @@ def test_edge_resources_shared_between_dit_and_reasoner(tmp_path) -> None:
     assert specs[ATTN].config.splits[0].prefill_walks == ("prefill_text", "prefill_vision")
     # Nano-shaped defaults declare no reasoner resources.
     nano = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
-    nano_keys = {s.resource_key for s in nano.get_node_resources()}
+    nano_keys = {s.resource_key for s in _specs(nano)}
     assert SAMPLER not in nano_keys and ROPE not in nano_keys
     assert nano.get_combined_graph_walks() == {}
     assert Cosmos3Model.REASONER_DECODE_WALK not in nano.get_graph_walk_graphs()
@@ -213,14 +221,13 @@ def test_reasoner_plan_prefills_then_decodes_the_first_token(tmp_path, vision) -
             model.walk_plan("default", ["image", "text"], ["text"], {k: [object()] for k in names}, knobs)
 
 
-def test_reasoner_opens_its_label_and_sampler_and_media_the_guidance_labels(tmp_path) -> None:
+def test_a_text_request_sets_the_reasoner_s_sampling_and_a_media_request_nothing(tmp_path) -> None:
+    # the labels each request opens come from its state_layout
     model = _model(tmp_path)
     rc = model.get_request_resource_configs(["text"], ["text"], {"temperature": 0.0, "top_k": 5})
-    assert set(rc) == {KV_CACHE, SAMPLER}
-    assert rc[KV_CACHE].needed_labels == ["main"]
+    assert set(rc) == {SAMPLER}
     assert rc[SAMPLER].temperature == 0.0 and rc[SAMPLER].top_k == 5
-    grc = model.get_request_resource_configs(["text"], ["image"], {})
-    assert set(grc) == {KV_CACHE} and grc[KV_CACHE].needed_labels == ["main", "uncond"]
+    assert model.get_request_resource_configs(["text"], ["image"], {}) == {}
 
 
 def test_edge_generation_defaults_from_yaml_knobs(tmp_path) -> None:
@@ -337,8 +344,9 @@ def test_reasoner_submodule_places_positions_and_stops(tmp_path) -> None:
     r = model.config.reasoner
     sub = Cosmos3ReasonerSubmodule(transformer=None, config=model.config, encoders=(model._vision_encoder(),))
     sub.get_device = lambda: torch.device("cpu")
-    sub.node_resources = {ROPE: RopeManager(PositionConfig(kv_cache=KV_CACHE), torch.device("cpu"))}
-    sub.node_resources[ROPE].ingest_request("r")
+    rope = RopeManager(PositionConfig(kv_cache=KV_CACHE), torch.device("cpu"))
+    sub.kv = types.SimpleNamespace(positions=rope)
+    rope.ingest_request("r")
 
     ids = torch.tensor([5, 6, 7] + [r.image_token_id] * 8 + [8, 9])
     layout = vision_layout(ids, r, [MediaGrid(1, 4, 8)], [], "vision_embeds")
@@ -349,18 +357,17 @@ def test_reasoner_submodule_places_positions_and_stops(tmp_path) -> None:
     assert torch.equal(inp.custom_pos_ids, pos) and inp.resource_step_info == advance == int(pos.max()) + 1
     step = sub.declare_step(walk, ["r"], [inp])
     assert [(s.request_id, s.label, s.span) for s in step.segments] == [("r", "main", 13)]
-    assert step.steps[ROPE].advance == (advance,)
-    assert torch.equal(step.steps[SAMPLER].prefill_tracked_tokens["r"], ids)
+    assert step.state[KV_CACHE].advance == (advance,)
+    assert torch.equal(step.state[SAMPLER].prompt_tokens["r"], ids)
     # a replay would otherwise splice the previous step's rows
     with pytest.raises(ValueError, match="rows for the prompt's 8 pads"):
         sub.prepare_inputs(walk, fwd, {"text_inputs": [ids], "vision_embeds": [torch.zeros(7, 4)]})
 
     text = sub.prepare_inputs(Cosmos3Model.REASONER_PREFILL_WALK, fwd, {"text_inputs": [ids[:3]]})
     assert text.custom_pos_ids is None
-    assert sub.declare_step(Cosmos3Model.REASONER_PREFILL_WALK, ["r"], [text]).steps[ROPE].advance is None
+    assert sub.declare_step(Cosmos3Model.REASONER_PREFILL_WALK, ["r"], [text]).state[KV_CACHE].advance is None
     # a decode step prepared again after a refused admit feeds the same position:
     # preparing moves nothing, the position resource advances when the step commits
-    rope = sub.node_resources[ROPE]
     before = rope.position(rid="r", label="main")
     rows = [sub.prepare_inputs(Cosmos3Model.REASONER_DECODE_WALK, fwd, {"text_inputs": [torch.tensor([42])]})
             for _ in range(2)]
@@ -418,7 +425,8 @@ def test_reasoner_rotary_tables_come_from_the_layout_and_the_counter(tmp_path) -
     sub = Cosmos3ReasonerSubmodule(transformer=tower, config=cfg, encoders=(model._vision_encoder(),))
     sub.get_device = lambda: torch.device("cpu")
     planned = torch.tensor([40, 41])
-    sub.node_resources = {ROPE: types.SimpleNamespace(position=lambda rid, label: 17, pos_ids=lambda label: planned)}
+    counter = types.SimpleNamespace(position=lambda rid, label: 17, pos_ids=lambda label: planned)
+    sub.kv = types.SimpleNamespace(positions=counter, label="main", _check_open=lambda call: None)
 
     ids = torch.tensor([5, 6, 7] + [r.image_token_id] * 8 + [8, 9])
     layout = vision_layout(ids, r, [MediaGrid(1, 4, 8)], [], "vision_embeds")
@@ -462,11 +470,11 @@ def test_a_mixed_step_carries_media_prompt_rows(tmp_path) -> None:
     )
     media.graph_walk = Cosmos3Model.REASONER_PREFILL_VISION_WALK
     step = sub.declare_step("mixed", ["d", "m"], [decode, media])
-    assert step.steps[ROPE].advance == (1, 8)
+    assert step.state[KV_CACHE].advance == (1, 8)
     assert sub.max_rows_in_combined(Cosmos3Model.REASONER_PREFILL_VISION_WALK) == sub.MIXED_MAX_PREFILL_ROWS
 
-    sampler = types.SimpleNamespace(loopback_tokens=lambda rids: torch.tensor([42, 0]))
-    engine_inputs = types.SimpleNamespace(resources={SAMPLER: sampler}, request_ids=["d", "m"])
+    sub.loopback_tokens = lambda engine_inputs: torch.tensor([42, 0])
+    engine_inputs = types.SimpleNamespace(resources={}, request_ids=["d", "m"])
     out = SampledTokenDecoder.preprocess(sub, "mixed", engine_inputs, [decode, media])
     assert out["input_ids"].tolist() == [42, 5, 6, 7, 8, 9] + [image_pad] * 4 + [10]
     assert torch.equal(out[MEDIA_EMBEDS], torch.ones(4, 8))
@@ -514,7 +522,7 @@ def test_a_media_prompt_cuts_into_chunks_that_add_up_to_it(tmp_path) -> None:
     model = _model(tmp_path)
     sub = Cosmos3ReasonerSubmodule(transformer=None, config=model.config, encoders=(model._vision_encoder(),))
     sub.get_device = lambda: torch.device("cpu")
-    sub.node_resources = {ROPE: types.SimpleNamespace(position=lambda rid, label: 10)}
+    sub.kv = types.SimpleNamespace(positions=types.SimpleNamespace(position=lambda rid, label: 10))
     pad = model.config.reasoner.image_token_id
     # text 3, a 2x3 merged image, text 2, a 2x2 merged image, text 1
     layout = {"offset": [3, 11], "tokens": [6, 4], "output": ["vision_embeds"] * 2,

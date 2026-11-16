@@ -18,10 +18,12 @@ Run: python3 test_action.py
 
 from __future__ import annotations
 
-import pytest
+import functools
+
 import torch
 
 from mstar.model.components.diffusion.unipc import SOLVER_STATE, initial_state
+from mstar.model.cosmos3 import constants as C
 from mstar.model.cosmos3.components.packing import (
     action_condition_frame_indexes,
     build_action_static_inputs,
@@ -30,10 +32,14 @@ from mstar.model.cosmos3.components.packing import (
 )
 from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
 from mstar.model.cosmos3.config import Cosmos3Config
+from mstar.model.cosmos3.submodules import COND_LABEL
+from mstar.model.cosmos3.tests.test_edge import _init_all
 from mstar.model.cosmos3.tests.test_engine_cache import (
     _engine_resources,
     _forward_step,
+    _prompt_md,
     _SdpaResources,
+    declaring,
 )
 
 
@@ -160,18 +166,13 @@ def test_action_forward_shapes_and_masks() -> None:
             assert torch.count_nonzero(pa) == 0
 
 
-@pytest.mark.skip(
-    reason="Needs a randomly-initialized backbone, but ColumnParallelLinear / "
-    "RowParallelLinear leave their weights as raw torch.empty memory, so the "
-    "manual_seed doesn't reach them and the forward can see NaN/1e38. "
-    "Unskip once the parallel linears initialize in __init__ like nn.Linear."
-)
 def test_action_denoise_step_matches_fused() -> None:
     """The engine generation tower over [video|action] against the frozen
     understanding K/V reproduces the fused forward bit-for-bit (sdpa cache)."""
     cfg = _cfg()
     torch.manual_seed(0)
     model = Cosmos3OmniTransformer(cfg).eval()
+    _init_all(model)
     action_chunk = 8
     latent_t = 1 + (9 - 1) // cfg.vae.scale_factor_temporal
     latent_shape = (1, cfg.latent_channel, latent_t, 4, 4)
@@ -180,36 +181,26 @@ def test_action_denoise_step_matches_fused() -> None:
             model, cfg, mode, latent_shape, action_chunk, [1, 2, 3, 4]
         )
         cache = _SdpaResources()
-        cache.bind(model)
+        cache.bind(declaring(cfg), model)
         und_len = s["und_len"]
-        cache.plan("main", [("main", und_len)], causal=True)
-        model.prefill_und(s["input_ids"], s["text_mrope_ids"], "main")
-        cache.kv.promote()
-        cache.plan(
-            "main",
-            [("main", s["num_vision_tokens"] + s["num_action_tokens"])],
-            causal=False,
-        )
+        prefill = functools.partial(model.prefill_und, s["input_ids"], s["text_mrope_ids"])
+        cache.step(C.PREFILL_WALK, [("r", COND_LABEL, und_len)], prefill)
+        gen = [("r", COND_LABEL, s["num_vision_tokens"] + s["num_action_tokens"])]
         with torch.no_grad():
-            dv, da = model.denoise_step(
+            dv, da = cache.step(C.ACTION_GEN_WALK, gen, functools.partial(
+                model.denoise_step,
                 latents, vts, model._rotary(s["gen_position_ids"], latents.device, latents.dtype),
                 s["vision_token_shapes"], s["vision_noisy_frame_indexes"],
-                s["vision_mse_loss_indexes"] - und_len, "main", cache.attn,
+                s["vision_mse_loss_indexes"] - und_len,
                 action_latents=action_lat, action_token_shapes=s["action_token_shapes"],
                 action_noisy_frame_indexes=s["action_noisy_frame_indexes"],
                 action_mse_gen_indexes=s["action_mse_loss_indexes"] - und_len,
                 action_timesteps=ats, action_domain_id=domain,
-            )
+            ), keep=False)
         assert (pv[0] - dv).abs().max().item() < 1e-4, mode
         assert (pa - da).abs().max().item() < 1e-4, mode
 
 
-@pytest.mark.skip(
-    reason="Needs a randomly-initialized backbone, but ColumnParallelLinear / "
-    "RowParallelLinear leave their weights as raw torch.empty memory, so the "
-    "manual_seed doesn't reach them and the forward can see NaN/1e38. "
-    "Unskip once the parallel linears initialize in __init__ like nn.Linear."
-)
 def test_action_batched_one_matches_single() -> None:
     """The cross-request action batched forward, run with a single request and no
     guidance, reproduces the single-request ``denoise_step`` bit-for-bit. Checks
@@ -218,6 +209,7 @@ def test_action_batched_one_matches_single() -> None:
     cfg = _cfg()
     torch.manual_seed(0)
     model = Cosmos3OmniTransformer(cfg).eval()
+    _init_all(model)
     action_chunk = 8
     latent_t = 1 + (9 - 1) // cfg.vae.scale_factor_temporal
     latent_shape = (1, cfg.latent_channel, latent_t, 4, 4)
@@ -226,31 +218,27 @@ def test_action_batched_one_matches_single() -> None:
             model, cfg, mode, latent_shape, action_chunk, [1, 2, 3, 4]
         )
         und_len = s["und_len"]
+        prefill = functools.partial(model.prefill_und, s["input_ids"], s["text_mrope_ids"])
         # Reference: the single-request joint denoise step.
-        n_gen = s["num_vision_tokens"] + s["num_action_tokens"]
+        gen = [("r", COND_LABEL, s["num_vision_tokens"] + s["num_action_tokens"])]
         cache = _SdpaResources()
-        cache.bind(model)
-        cache.plan("main", [("main", und_len)], causal=True)
-        model.prefill_und(s["input_ids"], s["text_mrope_ids"], "main")
-        cache.kv.promote()
-        cache.plan("main", [("main", n_gen)], causal=False)
+        cache.bind(declaring(cfg), model)
+        cache.step(C.PREFILL_WALK, [("r", COND_LABEL, und_len)], prefill)
         with torch.no_grad():
-            dv, da = model.denoise_step(
+            dv, da = cache.step(C.ACTION_GEN_WALK, gen, functools.partial(
+                model.denoise_step,
                 latents, vts, model._rotary(s["gen_position_ids"], latents.device, latents.dtype),
                 s["vision_token_shapes"], s["vision_noisy_frame_indexes"],
-                s["vision_mse_loss_indexes"] - und_len, "main", cache.attn,
+                s["vision_mse_loss_indexes"] - und_len,
                 action_latents=action_lat, action_token_shapes=s["action_token_shapes"],
                 action_noisy_frame_indexes=s["action_noisy_frame_indexes"],
                 action_mse_gen_indexes=s["action_mse_loss_indexes"] - und_len,
                 action_timesteps=ats, action_domain_id=domain,
-            )
+            ), keep=False)
         # Batched path with one request and no guidance (single-label batch).
         cache2 = _SdpaResources()
-        cache2.bind(model)
-        cache2.plan("main", [("main", und_len)], causal=True)
-        model.prefill_und(s["input_ids"], s["text_mrope_ids"], "main")
-        cache2.kv.promote()
-        cache2.plan("_cfg_batched", [("main", n_gen)], causal=False)
+        cache2.bind(declaring(cfg), model)
+        cache2.step(C.PREFILL_WALK, [("r", COND_LABEL, und_len)], prefill)
         req = {
             "latents": latents, "action_latents": action_lat,
             "vision_timesteps": vts, "action_timesteps": ats,
@@ -264,9 +252,9 @@ def test_action_batched_one_matches_single() -> None:
             "action_domain_id": domain,
         }
         with torch.no_grad():
-            ((bv, ba),), = model.denoise_step_action_batched(
-                [req], "_cfg_batched", cache2.attn, with_cfg=False
-            )
+            ((bv, ba),), = cache2.step(C.ACTION_GEN_WALK, gen, functools.partial(
+                model.denoise_step_action_batched, [req], with_cfg=False,
+            ), keep=False)
         assert (dv - bv).abs().max().item() < 1e-5, mode
         assert (da - ba).abs().max().item() < 1e-5, mode
 
@@ -341,14 +329,16 @@ def test_action_engine_matches_fused() -> None:
                                   use_system_prompt=False, add_resolution_template=False,
                                   add_duration_template=False)
     rid = "ra"
-    md = {"height": h, "width": w, "num_frames": nf, "fps": fps, "action_fps": fps, "guidance_scale": 1.0,
-          "num_inference_steps": steps, "action_mode": "inverse_dynamics", "action_chunk_size": chunk,
-          "raw_action_dim": raw, "domain_id": dom, "flow_shift": fshift}
+    md = _prompt_md(
+        model, cond_ids, [], height=h, width=w, num_frames=nf, fps=fps, action_fps=fps, guidance_scale=1.0,
+        num_inference_steps=steps, action_mode="inverse_dynamics", action_chunk_size=chunk, raw_action_dim=raw,
+        domain_id=dom, flow_shift=fshift,
+    )
     fwd = CurrentForwardPassInfo(request_id=rid, rid_handle=rid, graph_walk="prefill", fwd_index=0,
                                  random_seed=0, max_tokens=0, step_metadata=md)
     resources = _SdpaResources().as_dict()
     ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": [torch.tensor(cond_ids, dtype=torch.long, device=device)]})
-    _forward_step(dit, "prefill", resources, [rid], {rid: fwd}, [ni])
+    _forward_step(model, dit, "prefill", resources, [rid], {rid: fwd}, [ni])
     fwd.graph_walk = "action_gen"
     latents, action_latents = cond_latent.to(LATENT_DTYPE), a_noise.clone()
     solver = initial_state(dit._packed(latents, action_latents))
@@ -356,7 +346,7 @@ def test_action_engine_matches_fused() -> None:
         fwd.dynamic_loop_iter_counts["action_gen_loop"] = k
         ni = dit.prepare_inputs("action_gen", fwd, {
             "latents": [latents], "action_latents": [action_latents], **{n: [t] for n, t in solver.items()}})
-        out = _forward_step(dit, "action_gen", resources, [rid], {rid: fwd}, [ni])
+        out = _forward_step(model, dit, "action_gen", resources, [rid], {rid: fwd}, [ni])
         latents, action_latents = out["latents"][0], out["action_latents"][0]
         solver = {n: out[n][0] for n in solver}
     dit.cleanup_request(rid)
@@ -539,11 +529,11 @@ def test_action_cross_request_batch_matches_individual() -> None:
     def _prefill(rid, idx, resources):
         fwd = CurrentForwardPassInfo(
             request_id=rid, rid_handle=rid, graph_walk="prefill", fwd_index=0,
-            random_seed=seeds[idx], max_tokens=0, step_metadata=_md())
+            random_seed=seeds[idx], max_tokens=0, step_metadata=_prompt_md(model, conds[idx], [], **_md()))
         ni = dit.prepare_inputs("prefill", fwd, {
             "text_inputs": [torch.tensor(conds[idx], dtype=torch.long, device=device)],
         })
-        _forward_step(dit, "prefill", resources, [rid], {rid: fwd}, [ni])
+        _forward_step(model, dit, "prefill", resources, [rid], {rid: fwd}, [ni])
         fwd.graph_walk = "action_gen"
         if rid not in cond_lat:
             cond_lat[rid] = _encode(rid)
@@ -561,9 +551,7 @@ def test_action_cross_request_batch_matches_individual() -> None:
             inp = ({"cond_latents": [cond_lat[rid]]} if lat is None
                    else {"latents": [lat], "action_latents": [act], **{n: [t] for n, t in solver.items()}})
             ni = dit.prepare_inputs("action_gen", fwd, inp)
-            out = _forward_step(
-                dit, "action_gen", resources, [rid], {rid: fwd}, [ni],
-            )
+            out = _forward_step(model, dit, "action_gen", resources, [rid], {rid: fwd}, [ni])
             lat, act = out["latents"][0], out["action_latents"][0]
             solver = {n: out[n][0] for n in SOLVER_STATE}
         dit.cleanup_request(rid)
@@ -588,9 +576,7 @@ def test_action_cross_request_batch_matches_individual() -> None:
                     **{n: [t] for n, t in solver[rid].items()},
                 }
                 inputs.append(dit.prepare_inputs("action_gen", fwds[rid], inp))
-            out = _forward_step(
-                dit, "action_gen", resources, rids, fwds, inputs, batched=True,
-            )
+            out = _forward_step(model, dit, "action_gen", resources, rids, fwds, inputs, batched=True)
             for rid in rids:
                 o = out[rid]
                 lat[rid], act[rid] = o["latents"][0], o["action_latents"][0]

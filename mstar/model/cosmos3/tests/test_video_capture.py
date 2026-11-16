@@ -17,8 +17,16 @@ import torch
 from mstar.engine.windowing import WindowSchedule
 from mstar.model.cosmos3 import constants as C
 from mstar.model.cosmos3.config import Cosmos3Config
-from mstar.model.cosmos3.submodules import COND_LABEL, Cosmos3DiTSubmodule
+from mstar.model.cosmos3.submodules import (
+    COND_LABEL,
+    SESSION_TAIL,
+    UNCOND_LABEL,
+    VIDEO_GEN_AR_LOOP,
+    WINDOW_COND,
+    Cosmos3DiTSubmodule,
+)
 from mstar.model.cosmos3.tests.stubs import StubSampler
+from mstar.model.cosmos3.tests.test_engine_cache import _SdpaResources, declaring
 from mstar.model.cosmos3.tests.test_rotary_table import stand_in_rotary
 from mstar.model.submodule_base import ARNodeInputs
 
@@ -56,29 +64,29 @@ def test_video_capture_buckets_and_keys(monkeypatch) -> None:
     assert set(sub._capture_layout) == {image_shape, video_shape}
     assert len(sub._capture_layout[video_shape]["vision_noisy_frame_indexes"][0]) == 3  # all frames noisy
 
-    def st(shape, kv=None, cfg=True):
-        d = {"latent_shape": shape, "uncond": {} if cfg else None}
-        if kv is not None:
-            d.update(ar_schedule=WindowSchedule(6, 3), ar_kv_mode=kv)
-        return d
+    window = {"window_mode": "chained", "total_latent_units": 6, "window_latent_units": 3, "overlap_latent_units": 0}
+    infos = {
+        rid: SimpleNamespace(step_metadata={"height": 64, "width": 64, "guidance_scale": 6.0, **md})
+        for rid, md in (
+            ("img", {}), ("vid", {"num_frames": 9}), ("ch", window), ("kv", {**window, "window_mode": "kv"}),
+            ("nocfg", {"num_frames": 9, "guidance_scale": 1.0}), ("odd", {"num_frames": 17}),
+        )
+    }
 
-    sub.request_states.clear()
-    for rid, state in (("img", st(image_shape)), ("vid", st(video_shape)), ("ch", st(video_shape, kv=False)),
-                       ("kv", st(video_shape, kv=True)), ("nocfg", st(video_shape, cfg=False)),
-                       ("odd", st((1, ch, 5, 4, 4)))):
-        sub.request_state(rid).add_all(**state)
-    info = lambda *rids: {r: None for r in rids}  # noqa: E731
-    assert sub.cg_key_info(C.IMAGE_GEN_WALK, info("img")) == image_key
-    assert sub.cg_key_info(C.VIDEO_GEN_WALK, info("vid")) == video_key
-    assert sub.cg_key_info(C.VIDEO_GEN_AR_WALK, info("ch")) == video_key
-    assert sub.cg_key_info(C.VIDEO_GEN_AR_WALK, info("kv")) is None
-    assert sub.cg_key_info(C.VIDEO_GEN_WALK, info("nocfg")) is None
-    assert sub.cg_key_info(C.VIDEO_GEN_WALK, info("odd")) is None
-    assert sub.cg_key_info(C.VIDEO_GEN_AR_WALK, info("ch", "kv")) is None  # mixed batch
-    assert sub.cg_key_info(C.VIDEO_GEN_AR_WALK, info("ch", "ch")) == video_key
-    assert sub.cg_key_info(C.PREFILL_WALK, info("vid")) == "cfg"
-    assert sub.cg_key_info(C.PREFILL_WALK, info("nocfg")) == "cond"  # keyed apart from the cfg graph
-    assert sub.cg_key_info(C.PREFILL_WALK, info("vid", "nocfg")) is None  # mixed regimes
+    def key(walk, *rids):
+        return sub.cg_key_info(walk, {f"{rid}{i}": infos[rid] for i, rid in enumerate(rids)})
+
+    assert key(C.IMAGE_GEN_WALK, "img") == image_key
+    assert key(C.VIDEO_GEN_WALK, "vid") == video_key
+    assert key(C.VIDEO_GEN_AR_WALK, "ch") == video_key
+    assert key(C.VIDEO_GEN_AR_WALK, "kv") is None
+    assert key(C.VIDEO_GEN_WALK, "nocfg") is None
+    assert key(C.VIDEO_GEN_WALK, "odd") is None
+    assert key(C.VIDEO_GEN_AR_WALK, "ch", "kv") is None  # mixed batch
+    assert key(C.VIDEO_GEN_AR_WALK, "ch", "ch") == video_key
+    assert key(C.PREFILL_WALK, "vid") == "cfg"
+    assert key(C.PREFILL_WALK, "nocfg") == "cond"  # keyed apart from the cfg graph
+    assert key(C.PREFILL_WALK, "vid", "nocfg") is None  # mixed regimes
 
 
 def test_conditional_only_capture_when_guidance_is_off(monkeypatch) -> None:
@@ -100,10 +108,11 @@ def test_conditional_only_capture_when_guidance_is_off(monkeypatch) -> None:
     info = image.single_request_inputs.resource_step_info
     assert (info.cfg, info.cfg_active, info.capture_key) == (False, False, image_key)
 
-    sub.request_state("off").add_all(latent_shape=image_key[0], uncond=None)
-    sub.request_state("on").add_all(latent_shape=image_key[0], uncond={})
-    assert sub.cg_key_info(C.IMAGE_GEN_WALK, {"off": None}) == image_key
-    assert sub.cg_key_info(C.IMAGE_GEN_WALK, {"on": None}) is None
+    off, on = (
+        SimpleNamespace(step_metadata={"height": 64, "width": 64, "guidance_scale": scale}) for scale in (1.0, 6.0)
+    )
+    assert sub.cg_key_info(C.IMAGE_GEN_WALK, {"off": off}) == image_key
+    assert sub.cg_key_info(C.IMAGE_GEN_WALK, {"on": on}) is None
     # the captured declaration plans the conditional label alone
     step = sub.declare_step(
         C.IMAGE_GEN_WALK, ["off"], [image.single_request_inputs], slot_lease=object(),
@@ -148,79 +157,74 @@ def test_windowed_captured_inputs_carry_the_window_layout(monkeypatch) -> None:
     the re-pinned overlap frames."""
     sub, _ = _dit_with_buckets(monkeypatch)
     monkeypatch.setattr(sub, "get_device", lambda: torch.device("cpu"))
-    ch = sub.config.latent_channel
-    cond, uncond = sub._build_window_statics(
-        list(range(7)), list(range(9)), 64, 64, 3, 24.0,
-        has_image_condition=False, cond_units=1, device="cpu", first_window=False,
-    )
+    monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: StubSampler(torch.tensor([900.0, 500.0, 100.0])))
     sub._solver_state = ()
-    st = sub.request_state("r")
-    st.add_all(
-        cond=cond, uncond=uncond, gs=6.0, guidance_interval=None,
-        scheduler=StubSampler(torch.tensor([900.0, 500.0, 100.0])),
-        latent_shape=(1, ch, 3, 4, 4), ar_schedule=WindowSchedule(6, 3, overlap_units=1),
-        ar_steps=3, ar_iters_per_window=3, ar_total_iters=9, ar_kv_mode=False,
-    )
+    ch = sub.config.latent_channel
+    md = {
+        "window_mode": "chained", "total_latent_units": 6, "window_latent_units": 3, "overlap_latent_units": 1,
+        "height": 64, "width": 64, "num_inference_steps": 3, "guidance_scale": 6.0, C.PROMPT_LENGTHS: (7, 9),
+    }
     x = torch.zeros(1, ch, 3, 4, 4)
-    counts = {"video_gen_ar_loop": 4}
-    fwd = SimpleNamespace(request_id="r", rid_handle="r", random_seed=0, dynamic_loop_iter_counts=counts)
-    ni = sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, {"latents": [x]})
+    counts = {VIDEO_GEN_AR_LOOP: 4}
+    fwd = SimpleNamespace(
+        request_id="r", rid_handle="r", random_seed=0, step_metadata=md, dynamic_loop_iter_counts=counts,
+    )
+    edges = {"latents": [x], WINDOW_COND: [x], SESSION_TAIL: [torch.zeros(0)]}
+    ni = sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, edges)
     t = ni.tensor_inputs
     assert torch.equal(t["noisy_token_mask"], torch.tensor([0.0] * 4 + [1.0] * 8))
     assert t["vision_timesteps"].shape == (12,) and torch.all(t["vision_timesteps"] == 500.0)  # window 1, step 1
     assert ni.resource_step_info.capture_key == ((1, ch, 3, 4, 4), "cfg")
-    # The per-frame mask is cached alongside, keyed on the window's statics.
-    assert torch.equal(sub._noisy_masks(st, "cpu")[1].flatten(), torch.tensor([0.0, 1.0, 1.0]))
+    # The per-frame mask rides alongside, in the window's statics.
+    assert torch.equal(ni.kwargs["settings"]["cond"]["noisy_frame_mask"].flatten(), torch.tensor([0.0, 1.0, 1.0]))
     # A kv request at the same shape stages no captured inputs (it never leases).
-    st.add("ar_kv_mode", True)
-    counts["video_gen_ar_loop"] = 1
-    ni_kv = sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, {"latents": [x]})
+    fwd.step_metadata = {**md, "window_mode": "kv", "overlap_latent_units": 0}
+    counts[VIDEO_GEN_AR_LOOP] = 1
+    ni_kv = sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, edges)
     assert "noisy_token_mask" not in ni_kv.tensor_inputs and ni_kv.resource_step_info.capture_key is None
 
 
-def test_postprocess_captured_video_step(monkeypatch) -> None:
+def test_postprocess_captured_video_step() -> None:
     """The captured tail zeroes the clean frames' velocity, re-pins masked
-    frames, and closes a chained window at its last step."""
+    frames, and ends a chained window at its last step."""
     cfg = Cosmos3Config(compile_denoise=False)
     sub = Cosmos3DiTSubmodule(transformer=_fake_transformer(cfg), config=cfg, scheduler=None)
     # No VAE here: the next window's head is the raw tail (test_windowed pins the real head).
     sub._window_head = lambda w, units: w[:, :, -units:]
     ch = sub.config.latent_channel
-    sched = StubSampler(torch.tensor([900.0, 500.0]))
     sub._solver_state = ()
-    monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: sched)
-    monkeypatch.setattr(sub, "_window_statics_for", lambda st, plan, dev: (st["cond"], st["uncond"]))
     cond = {"vision_token_shapes": [(3, 2, 2)], "vision_noisy_frame_indexes": [torch.tensor([1, 2])],
             "num_vision_tokens": 12}
-    st = sub.request_state("r")
+    sub._add_layout_masks(cond, "cpu")
     pinned = torch.full((1, ch, 3, 4, 4), 7.0)
     vmask = torch.zeros(1, 1, 3, 1, 1)
     vmask[:, :, 0] = 1.0
-    st.add_all(
-        cond=cond, uncond=cond, gs=1.0, scheduler=sched, latent_shape=(1, ch, 3, 4, 4),
-        ar_schedule=WindowSchedule(6, 3, overlap_units=1), ar_steps=2, ar_iters_per_window=2,
-        ar_total_iters=4, ar_kv_mode=False, ar_size=(64, 64), ar_generator=torch.Generator().manual_seed(0),
-        vmask=vmask, cond_video_latents=pinned,
-    )
+    settings = {
+        "cond": cond, "uncond": cond, "gs": 1.0, "scheduler": StubSampler(torch.tensor([900.0, 500.0])),
+        "latent_shape": (1, ch, 3, 4, 4), "ar_schedule": WindowSchedule(6, 3, overlap_units=1), "ar_steps": 2,
+        "ar_iters_per_window": 2, "ar_kv_mode": False, "window_index": 0, "cond_units": 1, "vmask": vmask,
+        "cond_video_latents": pinned, "session_id": None, "session_tail": None,
+    }
     lat = torch.zeros(1, ch, 3, 4, 4)  # the loop's latents carry the batch dim, like the velocities
+    inputs = ARNodeInputs(tensor_inputs={"latents": lat}, kwargs={"settings": settings})
     velocity = torch.ones(1, ch, 3, 4, 4)
-    counts = {"video_gen_ar_loop": 0}
+    counts = {VIDEO_GEN_AR_LOOP: 0}
     info = SimpleNamespace(graph_walk=C.VIDEO_GEN_AR_WALK, dynamic_loop_iter_counts=counts)
     # Window 0, step 0 (global 0): frame 0 keeps the pinned latents, noisy
     # frames move by the velocity.
     out = {"cond_v": [velocity], "uncond_v": [velocity]}
-    sub.postprocess("r", info, out, inputs=ARNodeInputs(tensor_inputs={"latents": lat}))
+    sub.postprocess("r", info, out, inputs=inputs)
     new = out["latents"][0]  # [1, C, T, H, W]
     assert new.shape == (1, ch, 3, 4, 4)
     assert torch.all(new[:, :, 0] == 7.0) and torch.all(new[:, :, 1:] == -1.0)
     assert "window_latents" not in out
-    # Window 0, step 1 (global 1) is the window's last step: emits the window
-    # and stages the next one.
+    # Window 0, step 1 (global 1) is the window's last step: it emits the
+    # window and the next window's pinned head.
     out = {"cond_v": [velocity], "uncond_v": [velocity]}
-    counts["video_gen_ar_loop"] = 1
-    sub.postprocess("r", info, out, inputs=ARNodeInputs(tensor_inputs={"latents": lat}))
-    assert "window_latents" in out
-    assert out["latents"][0].shape == (1, ch, 3, 4, 4)
+    counts[VIDEO_GEN_AR_LOOP] = 1
+    sub.postprocess("r", info, out, inputs=inputs)
+    assert torch.equal(out["window_latents"][0], out["latents"][0])
+    assert out[WINDOW_COND][0].shape == (1, ch, 3, 4, 4)
 
 
 def test_masked_capture_matches_eager_layout() -> None:
@@ -229,16 +233,13 @@ def test_masked_capture_matches_eager_layout() -> None:
     frames exactly (the clean frame's output is what postprocess zeroes)."""
     from mstar.model.cosmos3.components.packing import build_static_inputs
     from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
-    from mstar.model.cosmos3.tests.test_edge import _init_all, _OverwriteKV, _tiny_edge_config
+    from mstar.model.cosmos3.tests.test_edge import _init_all, _tiny_edge_config
 
     cfg = _tiny_edge_config()
     model = Cosmos3OmniTransformer(cfg).eval()
     _init_all(model)
-    res = _OverwriteKV()
-    for child in model.modules():
-        bind = getattr(child, "bind_resources", None)
-        if bind is not None:
-            bind({"kv": res, "attn": res})
+    res = _SdpaResources()
+    res.bind(declaring(cfg), model)
     ids = [3, 5, 7, 11, 13]
     latents = torch.randn(1, cfg.latent_channel, 3, 4, 4)
     shape = tuple(latents.shape)
@@ -248,26 +249,25 @@ def test_masked_capture_matches_eager_layout() -> None:
     assert eager["num_noisy_vision_tokens"] == n_all - 4  # frame 0 clean
     per_frame = n_all // 3
     mask = torch.cat([torch.zeros(per_frame), torch.ones(n_all - per_frame)])
+    both = [("r", COND_LABEL, n_all), ("r", UNCOND_LABEL, n_all)]
     with torch.no_grad():
-        res.causal = True
-        model.prefill_und(eager["input_ids"], eager["text_mrope_ids"], "main")
-        res.commit()
-        res.causal = False
+        for label in (COND_LABEL, UNCOND_LABEL):
+            res.step(C.PREFILL_WALK, [("r", label, eager["und_len"])],
+                     lambda: model.prefill_und(eager["input_ids"], eager["text_mrope_ids"]))
         t_noisy = torch.full((eager["num_noisy_vision_tokens"],), 600.0)
         rot_e = model._rotary(eager["gen_position_ids"], latents.device, latents.dtype)
         rot_g = model._rotary(graph["gen_position_ids"], latents.device, latents.dtype)
-        cond_e, uncond_e = model.denoise_step_batched_cfg(
+        cond_e, uncond_e = res.step(C.VIDEO_GEN_WALK, both, lambda: model.denoise_step_batched_cfg(
             latents, t_noisy, rot_e, rot_e,
             eager["vision_token_shapes"], eager["vision_noisy_frame_indexes"],
-            eager["vision_mse_loss_indexes"] - eager["und_len"], "main", res,
-        )
+            eager["vision_mse_loss_indexes"] - eager["und_len"],
+        ), keep=False)
         t_all = torch.full((n_all,), 600.0)
-        cond_g, uncond_g = model.denoise_step_batched_cfg(
+        cond_g, uncond_g = res.step(C.VIDEO_GEN_WALK, both, lambda: model.denoise_step_batched_cfg(
             latents, t_all, rot_g, rot_g,
             graph["vision_token_shapes"], graph["vision_noisy_frame_indexes"],
-            graph["vision_mse_loss_indexes"] - graph["und_len"], "main", res,
-            noisy_token_mask=mask,
-        )
+            graph["vision_mse_loss_indexes"] - graph["und_len"], noisy_token_mask=mask,
+        ), keep=False)
     for e, g in ((cond_e, cond_g), (uncond_e, uncond_g)):  # [1, C, T, H, W]
         assert torch.all(e[:, :, 0] == 0)  # the eager unpatchify leaves the clean frame at zero velocity
         assert torch.allclose(e[:, :, 1:], g[:, :, 1:], atol=1e-5, rtol=1e-4)
@@ -280,16 +280,13 @@ def test_conditional_capture_matches_eager_single_branch() -> None:
     ``denoise_step``'s velocity on the noisy frames, for its one row."""
     from mstar.model.cosmos3.components.packing import build_static_inputs
     from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
-    from mstar.model.cosmos3.tests.test_edge import _init_all, _OverwriteKV, _tiny_edge_config
+    from mstar.model.cosmos3.tests.test_edge import _init_all, _tiny_edge_config
 
     cfg = _tiny_edge_config()
     model = Cosmos3OmniTransformer(cfg).eval()
     _init_all(model)
-    res = _OverwriteKV()
-    for child in model.modules():
-        bind = getattr(child, "bind_resources", None)
-        if bind is not None:
-            bind({"kv": res, "attn": res})
+    res = _SdpaResources()
+    res.bind(declaring(cfg), model)
     ids = [3, 5, 7, 11, 13]
     latents = torch.randn(1, cfg.latent_channel, 3, 4, 4)
     shape = tuple(latents.shape)
@@ -303,24 +300,23 @@ def test_conditional_capture_matches_eager_single_branch() -> None:
         "vision_noisy_frame_indexes": graph["vision_noisy_frame_indexes"],
         "mse_gen_indexes": graph["vision_mse_loss_indexes"] - graph["und_len"],
     }
-    sub = SimpleNamespace(transformer=model, _capture_layout={shape: layout}, _gen_attn=lambda engine_inputs: res)
+    sub = SimpleNamespace(transformer=model, _capture_layout={shape: layout})
+    cond = [("r", COND_LABEL, n_all)]
     with torch.no_grad():
-        res.causal = True
-        model.prefill_und(eager["input_ids"], eager["text_mrope_ids"], COND_LABEL)
-        res.commit()
-        res.causal = False
+        res.step(C.PREFILL_WALK, [("r", COND_LABEL, eager["und_len"])],
+                 lambda: model.prefill_und(eager["input_ids"], eager["text_mrope_ids"]))
         rot_e = model._rotary(eager["gen_position_ids"], latents.device, latents.dtype)
         cos_g, sin_g = model._rotary(graph["gen_position_ids"], latents.device, latents.dtype)
-        want = model.denoise_step(
+        want = res.step(C.VIDEO_GEN_WALK, cond, lambda: model.denoise_step(
             latents, torch.full((eager["num_noisy_vision_tokens"],), 600.0), rot_e,
             eager["vision_token_shapes"], eager["vision_noisy_frame_indexes"],
-            eager["vision_mse_loss_indexes"] - eager["und_len"], COND_LABEL, res,
-        )
+            eager["vision_mse_loss_indexes"] - eager["und_len"],
+        ), keep=False)
         # the captured inputs carry a leading batch dimension of one row
-        out = Cosmos3DiTSubmodule.forward_captured_cond(
+        out = res.step(C.VIDEO_GEN_WALK, cond, lambda: Cosmos3DiTSubmodule.forward_captured_cond(
             sub, C.IMAGE_GEN_WALK, SimpleNamespace(request_ids=["r"]),
             latents[None], torch.full((1, n_all), 600.0), cos_g[None], sin_g[None], mask[None],
-        )
+        ), keep=False)
     assert list(out) == ["r"] and list(out["r"]) == ["cond_v"]
     got = out["r"]["cond_v"][0]  # [1, C, T, H, W]
     assert torch.all(want[:, :, 0] == 0)  # the eager unpatchify leaves the clean frame at zero velocity

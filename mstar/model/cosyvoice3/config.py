@@ -31,8 +31,9 @@ from mstar.model.chatterbox.config import (
 # Resource keys (LM node)
 LM_KV = "lm_kv"
 LM_ATTN = "lm_attn"
-LM_POS = "lm_pos"
 LM_LABEL = "main"
+# the tokens repetition-aware sampling looks back on
+RAS_HISTORY = "ras_history"
 
 # Resource keys (vocoder node)
 HIFT_STATE = "hift_state"
@@ -43,7 +44,6 @@ FLOW_ATTN = "flow_attn"
 FLOW_TAILS = "flow_tails"
 FLOW_COND_LABEL = "cond"
 FLOW_UNCOND_LABEL = "uncond"
-FLOW_CFG_LABEL = "cfg"
 FLOW_TAILS_LABEL = "main"
 FLOW_KV_PAGE_FRAMES = 64
 
