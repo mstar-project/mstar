@@ -120,7 +120,6 @@ class _Node:
                 addressing.slot_indices.zero_()
         inputs = _inputs(bs * SPAN, seed=self._seed())
         for layer, (x, a, b) in enumerate(inputs):
-            gdn.set_default_layer_idx(layer)
             w = WEIGHTS[layer]
             q, k, v = _split(gdn.run_conv(x, pool.block("conv", layer), w.conv_w, w.conv_b))
             gdn.run(q, k, v, a, b, pool.block("state", layer), w.a_log, w.dt_bias)

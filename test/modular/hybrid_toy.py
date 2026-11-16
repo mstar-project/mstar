@@ -111,7 +111,6 @@ class _GDNMix:
     def set_layer_idx(self, layer: int) -> None:
         """The layer's index among the recurrent layers, not the stack's."""
         self._layer = layer
-        self.attn.set_default_layer_idx(layer)
 
     @torch.compiler.disable
     def conv(self, x, weight, bias=None):

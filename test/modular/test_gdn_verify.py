@@ -110,7 +110,6 @@ def _step(pool, manager, rows: dict[int, int], walk: str, inputs) -> None:
     ctx.plan_results[POOL] = pool.plan(rstep, ctx)
     manager.plan(LinearAttnStep(segments=segments), ctx)
     for layer, (x, a, b) in enumerate(inputs):
-        manager.set_default_layer_idx(layer)
         w = WEIGHTS[layer]
         qkv = manager.run_conv(x, pool.block("conv", layer), w.conv_w, w.conv_b)
         q, k, v = _split(qkv)
@@ -246,7 +245,7 @@ def test_a_prompt_step_records_nothing_and_settles_nothing():
     pool, manager = _build()
     _add(pool, 1)
     _step(pool, manager, {1: 5}, PREFILL, _inputs(5, seed=1))
-    assert manager._kept == {} and manager._verify_block is None
+    assert not manager._kept_conv and not manager._kept_delta and manager._verify_block is None
     before = pool.block("state", 0).clone()
     manager.correct_verify_state(SimpleNamespace(accepted=torch.tensor([0])))
     assert torch.equal(pool.block("state", 0), before)
@@ -304,8 +303,8 @@ def test_settling_without_the_conv_input_raises():
     _add(pool, 1)
     _step(pool, manager, {1: 4}, PREFILL, _inputs(4, seed=1))
     _step(pool, manager, {1: K + 1}, VERIFY, _inputs(K + 1, seed=2))
-    for rerun in manager._kept.values():
-        rerun.x = None
+    # a layer that ran the delta rule but not the conv
+    manager._kept_conv.pop()
     with pytest.raises(RuntimeError, match="run_conv"):
         manager.correct_verify_state(SimpleNamespace(accepted=torch.tensor([K])))
 

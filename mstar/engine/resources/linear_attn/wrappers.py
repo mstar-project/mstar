@@ -644,7 +644,10 @@ class VerifyRerun:
     """What `GDNManager.correct_verify_state` reruns for one layer of a verify step:
     `GDNVerifyWrapper.run_conv` fills the conv input and the rows' slots,
     `GDNVerifyWrapper.run` the block's k, v and raw gates, the kernel slots, the
-    output buffer and the kernel's own settings."""
+    output buffer and the kernel's own settings. Each also keeps the pool view its
+    layer was given (``conv``, ``state``), which the rerun writes."""
+    conv: torch.Tensor | None = None
+    state: torch.Tensor | None = None
     x: torch.Tensor | None = None
     slots: torch.Tensor | None = None
     null_slot_id: int | None = None
@@ -733,7 +736,8 @@ class GDNVerifyWrapper(GDNWrapper):
 
         rows, block, dim = self._plan_state.num_rows, self.block, x.shape[-1]
         if rerun is not None:
-            rerun.x, rerun.slots, rerun.null_slot_id = x, self._plan_state.slots, self._null_slot_id
+            rerun.conv, rerun.x = conv_layer, x
+            rerun.slots, rerun.null_slot_id = self._plan_state.slots, self._null_slot_id
         # a layer's own: its k and v, cut from it, are what the rerun reads after the last layer
         out = torch.empty(rows, block, dim, dtype=x.dtype, device=x.device)
         # [rows, dim, block] views, the channel axis innermost as the kernel reads it
@@ -774,7 +778,7 @@ class GDNVerifyWrapper(GDNWrapper):
         )
         if rerun is not None:
             # ``out`` is the step's rows of the buffer, the shape the rerun's q/k/v have
-            rerun.k, rerun.v, rerun.a, rerun.b, rerun.index = k, v, a, b, index
+            rerun.state, rerun.k, rerun.v, rerun.a, rerun.b, rerun.index = state, k, v, a, b, index
             rerun.a_log, rerun.dt_bias, rerun.out = a_log, dt_bias, out
             rerun.scale, rerun.qk_l2norm = self._sm_scale, self._qk_l2norm
         return out.reshape(rows * block, *out.shape[2:])

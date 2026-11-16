@@ -89,7 +89,10 @@ class GDNManager(LinearAttnManager):
     _verify_walks: Mapping[str, int] = MappingProxyType({})
     _verify_block: int | None = None
     _cached_verify_block: int | None = None
-    _kept: Mapping[int, VerifyRerun] = MappingProxyType({})
+    # a verify step's reruns, one a layer, in the order its layers ran the conv and the delta rule; each holds
+    # the pool view its layer was given, so the rerun needs no layer id
+    _kept_conv: tuple[VerifyRerun, ...] = ()
+    _kept_delta: tuple[VerifyRerun, ...] = ()
 
     def __init__(
         self,
@@ -221,7 +224,8 @@ class GDNManager(LinearAttnManager):
         self.reset_default_cursors()
         if self._preplanned:
             self._current, self._split_rows = self._cached_plan_output
-            self._verify_block, self._kept = self._cached_verify_block, {}
+            self._verify_block = self._cached_verify_block
+            self._kept_conv, self._kept_delta = [], []
             self.clear_preplan()
             return self._current
 
@@ -249,7 +253,7 @@ class GDNManager(LinearAttnManager):
             self._cached_verify_block = block
         else:
             self._verify_block = block
-            self._kept = {}
+            self._kept_conv, self._kept_delta = [], []
         return self._current
 
     def clear_preplan(self):
@@ -461,7 +465,8 @@ class GDNManager(LinearAttnManager):
             if self._verify_block is None:
                 return plan.run(q, k, v, a, b, state_layer, a_log, dt_bias)
             # the forward leaves the slots as they were, which is what the rerun starts from
-            rerun = self._kept.setdefault(self._default_layer_idx, VerifyRerun())
+            rerun = VerifyRerun()
+            self._kept_delta.append(rerun)
             return plan.run(q, k, v, a, b, state_layer, a_log, dt_bias, rerun=rerun)
         decode, prefill, _ = plan.halves if isinstance(plan, GDNMixedWrapper) else (None, plan, 0)
         if split.run:
@@ -579,9 +584,10 @@ class GDNManager(LinearAttnManager):
         plan = self.current_plan(label)
         if self._verify_block is not None:
             # the verify conv leaves each window as it was; correct_verify_state rebuilds it from these inputs
+            rerun = VerifyRerun()
+            self._kept_conv.append(rerun)
             return plan.run_conv(
-                x=x, conv_layer=conv_layer, weight=weight, bias=bias, activation=activation,
-                rerun=self._kept.setdefault(self._default_layer_idx, VerifyRerun()),
+                x=x, conv_layer=conv_layer, weight=weight, bias=bias, activation=activation, rerun=rerun,
             )
         return plan.run_conv(
             x=x, conv_layer=conv_layer, weight=weight, bias=bias,
@@ -681,36 +687,39 @@ class GDNManager(LinearAttnManager):
         window (the forward left it as it was too) is rebuilt as the last
         ``width`` entries of the window and the kept tokens' inputs. Fixed
         shapes, no host reads: capturable."""
-        if self._verify_block is None or not self._kept:
+        if self._verify_block is None or not (self._kept_conv or self._kept_delta):
             return
         from flashinfer.gdn_decode import gated_delta_rule_mtp
 
         from mstar.engine.resources.linear_attn.settle_conv import settle_conv
 
         accepted = result.accepted
-        for layer, rerun in self._kept.items():
-            if rerun.k is None or rerun.x is None:
-                # its state or its conv window would keep the rejected tokens
-                raise RuntimeError(f"gdn layer {layer}: a verify step ran only one of run_conv and the delta rule")
+        if len(self._kept_conv) != len(self._kept_delta):
+            # a layer's state or its conv window would keep the rejected tokens
+            raise RuntimeError(
+                f"gdn: a verify step ran run_conv on {len(self._kept_conv)} layers and the delta rule on "
+                f"{len(self._kept_delta)}; every layer runs both"
+            )
         # every layer's rows and block are the step's
-        first = next(iter(self._kept.values()))
+        first = self._kept_delta[0]
         rows, block = first.k.shape[0], first.k.shape[1]
         accepted = accepted[:rows]
         # a row keeps its last token and the drafts it accepted
         kept = accepted.clamp(max=block - 1) + 1
         live = (torch.arange(block, device=accepted.device)[None, :] < kept[:, None])[..., None]
         closed = torch.full((), CLOSED_GATE, dtype=first.a.dtype, device=accepted.device)
-        for layer, rerun in self._kept.items():
+        for rerun in self._kept_delta:
             k, a, b = rerun.k, rerun.a, rerun.b
             # the outputs are discarded: k stands in for q
             gated_delta_rule_mtp(
-                q=k, k=k, v=rerun.v, initial_state=self._pool.block("state", layer),
+                q=k, k=k, v=rerun.v, initial_state=rerun.state,
                 initial_state_indices=rerun.index, A_log=rerun.a_log, a=torch.where(live, a, closed),
                 dt_bias=rerun.dt_bias, b=torch.where(live, b, closed), scale=rerun.scale,
                 output=rerun.out, disable_state_update=False, use_qk_l2norm=rerun.qk_l2norm,
             )
-            settle_conv(self._pool.block("conv", layer), rerun.slots, accepted, rerun.x, block, rerun.null_slot_id)
-        self._kept = {}
+        for rerun in self._kept_conv:
+            settle_conv(rerun.conv, rerun.slots, accepted, rerun.x, block, rerun.null_slot_id)
+        self._kept_conv, self._kept_delta = [], []
 
     # Engine lifecycle
 

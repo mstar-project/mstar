@@ -337,7 +337,6 @@ def _gdn_step(pool, manager, geometry, span: int, walk: str, x, a, b, weights, r
     assert pool.admit(rstep, ctx).ok
     ctx.plan_results["gdn_state"] = pool.plan(rstep, ctx)
     manager.plan(LinearAttnStep(segments=segments), ctx)
-    manager.set_default_layer_idx(0)
     conv_w, a_log, dt_bias = weights
     qkv = manager.run_conv(x, pool.block("conv", 0), conv_w, None)
     kd, vd = geometry.num_k_heads * geometry.head_k_dim, geometry.num_v_heads * geometry.head_v_dim
