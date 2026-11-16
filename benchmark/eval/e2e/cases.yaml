@@ -7,7 +7,7 @@
 # Case drivers:
 #   suite: tts | asr | duplex    the eval suites (`python -m benchmark.eval run <suite>`), on a dataset below
 #   client: <kind>               the `e2e` suite (`run e2e --kind <kind>`): chat_text, chat_image, chat_audio,
-#                                chat_video, chat_count, image, video, video_i2v, gen_clone, pi05, frames,
+#                                chat_video, chat_count, image, video, video_i2v, gen_omni, gen_clone, pi05, frames,
 #                                world (image to world video along a seeded camera path),
 #                                praxis_openpi, praxis_positronic (DROID WebSocket calls)
 #   rp: whisper | omni           request-path cases (status codes per request), `--rp` only
@@ -629,11 +629,35 @@ models:
         quality: [mos]
         perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
 
-  # ---------------- newer models (optional until their PRs are on main) ----------------
-  # Each adds an engine path none of the models above covers (#577). Base must serve the model too, so these stay
-  # optional (out of `all`, select with `tag:new-model` or by name) until the model's PR is on main; until then
-  # compare them with a base that has the model, e.g. `--base 515 --head <a PR stacked on it>`. No entry yet for
-  # Fish S2-Pro (#491: its PR #492 is closed) or MiniCPM-o (#382 serves it on /generate only, with no chat adapter).
+  # ---------------- newer models (select explicitly) ----------------
+  # These cases need model-specific weights, so they stay out of `all`. Select with `tag:new-model` or a model
+  # name; both revisions being compared must serve that model. MiniCPM-o uses native `/generate` until it has a
+  # chat adapter.
+  fish_s2_pro:            # slow/fast AR and streamed 44.1 kHz DAC; plain and reference-audio requests
+    serve: fish_s2_pro
+    optional: true
+    family: TTS
+    tags: [new-model, tts, speech-out, clone]
+    requires: [soundfile]
+    est_min: 10
+    cases:
+      - id: tts
+        modality: tts
+        suite: tts
+        data: tts
+        args: [--seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
+      - id: clone
+        modality: tts (voice clone)
+        suite: tts
+        data: clone
+        args: [--clone, --seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        quality: [mos, speaker_sim]
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, sim_mean]}
+
   cosyvoice3:            # #495: speech codes streamed into a flow-matching decoder at 24 kHz; clone from an upload
     serve: cosyvoice3
     optional: true
@@ -716,6 +740,44 @@ models:
         warmup: 1
         check: {kind: psnr, min_db: 25}
         perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+
+  minicpm_o:             # #382: Qwen3 LLM with image/audio encoders and streamed speech output
+    serve: minicpm_o
+    config: configs/minicpm_o.yaml
+    optional: true
+    family: Omni
+    tags: [new-model, omni, llm, text, image-in, audio-in, speech-out]
+    est_min: 20
+    cases:
+      - id: text
+        modality: text
+        client: gen_omni
+        n: 16
+        args: [--input-modality, text, --max-tokens, "96"]
+        check: {kind: text_match, min_match: 0.5}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: image_in
+        modality: image in
+        client: gen_omni
+        n: 16
+        args: [--input-modality, image, --max-tokens, "96"]
+        check: {kind: text_match, min_match: 0.25}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: audio_in
+        modality: audio in
+        client: gen_omni
+        n: 16
+        args: [--input-modality, audio, --max-tokens, "96"]
+        check: {kind: text_match, min_match: 0.5}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: speech_out
+        modality: text and speech out
+        client: gen_omni
+        n: 8
+        args: [--input-modality, text, --audio-out, --max-tokens, "64"]
+        check: {kind: audio_len, pct: 25}
+        quality: [mos]
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s, audio_s_total]}
 
   # ---------------- worker-to-worker transport (optional) ----------------
   # The split and disaggregated configs above move tensors between worker processes. Each runs here over shared

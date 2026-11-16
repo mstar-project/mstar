@@ -15,7 +15,7 @@ DRIVERS = ("suite", "client", "rp", "invariants")
 SUITES = ("tts", "asr", "duplex")
 RP_SUITES = ("whisper", "omni", "cancel_speech", "cancel_chat", "timeout_speech", "timeout_chat")
 CLIENT_KINDS = ("chat_text", "chat_image", "chat_audio", "chat_video", "chat_count", "image", "video", "video_i2v",
-                "gen_clone", "pi05", "frames", "world", "praxis_openpi", "praxis_positronic")
+                "gen_omni", "gen_clone", "pi05", "frames", "world", "praxis_openpi", "praxis_positronic")
 CHECKS = {
     "text_match": {"min_match"},
     "wer": {"max_increase"},
@@ -181,7 +181,7 @@ def _case(raw: dict, where: str, defaults: dict, model_conc: list[int], datasets
     if not isinstance(quality, list) or any(q not in QUALITY for q in quality):
         raise ManifestError(f"{where}: quality must be a list of {', '.join(QUALITY)}")
     speech = (driver, kind) in (("suite", "tts"), ("client", "gen_clone")) or (
-        driver == "client" and kind.startswith("chat_") and "--audio-out" in args)
+        driver == "client" and (kind.startswith("chat_") or kind == "gen_omni") and "--audio-out" in args)
     if {"mos", "speaker_sim"} & set(quality) and not speech:
         raise ManifestError(f"{where}: mos and speaker_sim need speech outputs (tts, gen_clone, --audio-out)")
     if "speaker_sim" in quality and not data:

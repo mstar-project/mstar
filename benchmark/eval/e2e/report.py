@@ -407,7 +407,7 @@ def judge_correct(case: Case, facts: list[dict], errors: dict[str, int],
 
 # Output length is the model's choice for these (greedy text can fork, sampled speech varies); latency then measures
 # the length as much as the server. Images, video, frames, actions and ASR have a fixed output size.
-LENGTH_KINDS = {"chat_text", "chat_image", "chat_audio", "chat_video", "chat_count", "gen_clone", "tts"}
+LENGTH_KINDS = {"chat_text", "chat_image", "chat_audio", "chat_video", "chat_count", "gen_omni", "gen_clone", "tts"}
 E2E_LATENCY = {"lat_p50_s", "e2e_s_p50"}    # c=1 latency metrics that are the p50 of per-request e2e_s
 LENGTH_TOL = 0.02                           # two outputs "match" within 2% (and one token)
 MIN_MATCHED = 3                             # matched requests per pass needed to judge latency on them alone
