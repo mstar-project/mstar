@@ -730,6 +730,37 @@ def test_an_async_mixed_refusal_names_a_min_chunk_tokens_no_kept_bucket_holds():
     assert "mixed steps off" not in message and "left out" not in message
 
 
+@pytest.mark.parametrize("align", [1, 8])
+def test_an_async_mixed_refusal_names_the_buckets_capture_left_out_and_a_floor_a_kept_bucket_holds(
+    monkeypatch, align,
+):
+    """No kept bucket holds the 128-token floor beside its verify rows: the refusal names the mixed buckets
+    capture left out (not another walk's), and a lower `min_chunk_tokens` only where a kept bucket leaves an
+    aligned chunk beside its verify rows, as a multiple of the alignment; the floor it names starts the node."""
+    from mstar.engine.resources.step import BucketKey
+
+    block, budget = 4, 1024
+    for room, advised in [(4, None if align > 1 else 4), (13, 8 if align > 1 else 13)]:
+        eng = engine(3, oracle, mode="asynchronous", mixed=True)
+        _mixed_budget(eng, budget)
+        monkeypatch.setattr(eng, "chunk_alignment", lambda node_name: align)
+        runner = _captured(BucketKey("mixed", 128, 127 * block + room))
+        left_out = BucketKey("mixed", 128, budget)
+        runner.dropped_buckets = [left_out, BucketKey(eng._drafts[NODE].walk, 128, 128 * block)]
+        with pytest.raises(RuntimeError) as refused:
+            eng._fit_mixed_steps_to_captures({NODE: runner})
+        message = str(refused.value)
+        assert "min_chunk_tokens (128)" in message
+        assert f"free memory for the buckets capture left out, {[str(left_out)]}" in message
+        if advised is None:
+            assert "lower min_chunk_tokens" not in message
+            continue
+        assert f"lower min_chunk_tokens to at most {advised}" in message
+        eng.set_token_budgets({}, {"mixed"}, min_chunk_tokens=advised)
+        eng._fit_mixed_steps_to_captures({NODE: runner})
+        assert eng.get_max_batch_tokens(NODE, "mixed") == 127 * block + room
+
+
 def test_two_mixed_buckets_of_one_size_pick_an_envelope_without_ordering_their_keys():
     """Buckets that tie on (bs, tokens) and differ in their capture key: the envelope is one of them, and
     picking it never compares two `BucketKey`s, which have no order."""
