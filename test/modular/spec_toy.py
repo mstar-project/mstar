@@ -360,11 +360,11 @@ class Driver:
 
     def add(
         self, rid: int, prompt: list[int], max_tokens: int, temperature: float = 0.0, seed: int = 0,
-        arrival: int | None = None,
+        arrival: int | None = None, top_k: int = 0, top_p: float = 1.0,
     ):
         """``arrival``: the conductor's number for the request, which preemption chooses victims by. A numbered
         request is admitted as a readiness scan admits it, so its pool allots it pages."""
-        cfg = SamplingReqConfig(temperature=temperature)
+        cfg = SamplingReqConfig(temperature=temperature, top_k=top_k, top_p=top_p)
         cfg.apply_conductor_config(seed=seed)
         info = None if arrival is None else CurrentForwardPassInfo(
             str(rid), "prefill", 0, seed, max_tokens, arrival=arrival,
