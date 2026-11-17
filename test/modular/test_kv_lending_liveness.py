@@ -239,6 +239,25 @@ def test_a_follower_replays_the_guarantee_preempt_makes():
     )
 
 
+@pytest.mark.parametrize("allotted", [True, False], ids=["holding an allotment", "asking for one"])
+def test_a_follower_stops_on_a_guarantee_for_a_request_it_already_guarantees(allotted):
+    """Rank 0 journals a guarantee only for a request it doesn't guarantee yet, so a follower that already does has
+    diverged from it. It raises, as for any move that doesn't fit its counts, rather than apply the move again."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(1)
+    if allotted:
+        _running(kv, "g", 1, arrival=0, guaranteed=True, decodes=3 * PAGE_SIZE)
+    else:
+        _request(kv, "g", 1, 0, guaranteed=True, decodes=3 * PAGE_SIZE)
+        assert kv.ask("g", NODE, WALK) is not None and "g" in kv._guaranteed
+    allotment = kv._allotments.get("g")
+    before = (allotment and replace(allotment), dict(kv._asks), kv._unused, kv._borrowable)
+
+    with pytest.raises(RuntimeError, match="already guarantees"):
+        kv.replay(MoveKind.GUARANTEE, "g", kv._footprint("g"), [])
+    assert (allotment and replace(allotment), dict(kv._asks), kv._unused, kv._borrowable) == before
+
+
 class _Refuses(StubResource):
     """A resource after the KV pool that asks for the requests in ``refuse`` and refuses each one's next reservation,
     so admission gives back what the KV pool reserved."""

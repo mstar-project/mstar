@@ -4951,7 +4951,7 @@ class KVManager(AttentionResource):
             victims, asks = None, short.pages
             if pages_short <= 0:
                 self._claim(rid, claim)
-                if not (short.flip and self._borrowable):
+                if not (short.flip and self._borrowable and rid not in self._guaranteed):
                     return Victims([], [], [])
                 # A claim can't cover a flip. Turn guaranteed here if the room covers it, otherwise wait for 0 pages,
                 # only for the room borrowers took.
@@ -5321,6 +5321,12 @@ class KVManager(AttentionResource):
                     )
                 self.unreserve(rid)
             elif kind == MoveKind.GUARANTEE:
+                # Rank 0 journals it only for a request it doesn't guarantee yet: one that asks with no allotment
+                # (`_admit`), or one that holds its allotment (`preempt`).
+                if rid in self._guaranteed:
+                    raise RuntimeError(
+                        f"KV {self.name}: rank 0 turned {rid} guaranteed, which this rank already guarantees"
+                    )
                 if rid in self._allotments:
                     # `preempt` turned a request that holds an allotment guaranteed, with ``count`` pages to grow into
                     self._guarantee_allotted(rid, count)
