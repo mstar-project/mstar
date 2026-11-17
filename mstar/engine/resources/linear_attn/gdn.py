@@ -85,7 +85,8 @@ class GDNManager(LinearAttnManager):
     supports_drop = True
     # Speculative decoding: walk -> its verify block (k + 1), and the block of the step planned
     # (None for any other step). A verify step keeps, per layer, what `correct_verify_state` reruns.
-    # Immutable class defaults, rebound rather than mutated, so a node that never verifies sets none.
+    # Class defaults a node that never verifies keeps: the walks and the block are rebound, never mutated, and
+    # only a verify step's plan gives the instance lists of its own to keep its reruns in.
     _verify_walks: Mapping[str, int] = MappingProxyType({})
     _verify_block: int | None = None
     _cached_verify_block: int | None = None
@@ -225,7 +226,8 @@ class GDNManager(LinearAttnManager):
         if self._preplanned:
             self._current, self._split_rows = self._cached_plan_output
             self._verify_block = self._cached_verify_block
-            self._kept_conv, self._kept_delta = [], []
+            if self._verify_block is not None:
+                self._kept_conv, self._kept_delta = [], []
             self.clear_preplan()
             return self._current
 
@@ -253,7 +255,8 @@ class GDNManager(LinearAttnManager):
             self._cached_verify_block = block
         else:
             self._verify_block = block
-            self._kept_conv, self._kept_delta = [], []
+            if block is not None:
+                self._kept_conv, self._kept_delta = [], []
         return self._current
 
     def clear_preplan(self):
