@@ -1124,9 +1124,12 @@ class KVManager(AttentionResource):
         admit, commit and remove would wait on it."""
         rooted = [fingerprint(self._prefix_root, key) for key in keys]
         ends, at = [], 0
+        # a pool whose pages are named a page ahead (an EAGLE-3 drafter's, text-only) caches no image ends: an
+        # image end's page is filed under the key of the page before it, which those names don't follow
+        cached = not self.config.names_ahead
         for span in spans:
             at += span.length
-            if span.end_key is not None:
+            if span.end_key is not None and cached:
                 ends.append((at, fingerprint(self._prefix_root, span.end_key)))
         return rooted, ends
 
@@ -1391,6 +1394,9 @@ class KVManager(AttentionResource):
             if end <= stream.stored_len and span.end_key is not None:
                 ended = end, span.end_key
         ahead = self.config.names_ahead
+        if ahead:
+            # no image ends on a pool whose pages are named ahead (`_root`)
+            ended = None
         # a page is named by the key ``ahead`` pages on, so it is filed once that key covers a whole page
         filled = min(chain.pages_filled(stream.stored_len, self.config.tokens_per_page), chain.keyed_pages - ahead)
         if stream.retention is not None:

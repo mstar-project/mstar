@@ -618,3 +618,26 @@ def test_the_mirror_counts_the_pages_the_cache_files_in_the_caches_order(names_a
     assert list(keyed.keys) == list(keys[names_ahead:])
     # pages named by their own keys: the request's key list, not a copy of it
     assert (keyed.keys is keys) == (names_ahead == 0)
+
+
+@pytest.mark.parametrize("names_ahead", [0, 1])
+def test_a_pool_whose_pages_are_named_ahead_caches_no_image_ends_in_the_mirror_or_the_cache(names_ahead):
+    """An image end's page is filed under the key of the page before it, which names a page ahead don't follow,
+    so a pool an EAGLE-3 drafter joins (text-only) caches none: the cache's chain keeps no item ends
+    (`KVManager._root`), and the mirror counts none."""
+    from types import SimpleNamespace
+
+    from mstar.engine.resources.kv.manager import KVManager
+    from mstar.engine.resources.kv.routing import KVRoutingMirror
+
+    page = 16
+    spans = (PrefixSpan(20, 20, "prefill", end_key=b"image"), PrefixSpan(30, 30, "prefill"))
+    config = KVReqConfig(
+        prefix_keys={"main": chain([list(range(at, at + page)) for at in range(0, 48, page)])},
+        prefix_cache=True,
+        kv_layout={"main": StreamLayout(spans=spans, keyed_spans=2)},
+    )
+    keyed = KVRoutingMirror(1, 64, page, {"main"}, names_ahead=names_ahead)._keyed(config)["main"]
+    manager = SimpleNamespace(config=SimpleNamespace(names_ahead=names_ahead), _prefix_root=b"root")
+    _, ends = KVManager._root(manager, [b"a", b"b", b"c"], list(spans))
+    assert (len(keyed.ends), len(ends)) == ((1, 1) if names_ahead == 0 else (0, 0))

@@ -127,7 +127,8 @@ class KVRoutingMirror:
             total, ends = 0, []
             for span in layout.spans[:layout.keyed_spans]:
                 total += span.length
-                if span.end_key is not None:
+                # `KVManager._root`: no image ends where pages are named ahead
+                if span.end_key is not None and not self._names_ahead:
                     ends.append((total, span.end_key))
             # the whole pages the worker files, in its order: a page once the key naming it covers a whole
             # page (`KVManager._index_filled_pages`), then the retention cap
