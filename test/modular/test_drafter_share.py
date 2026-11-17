@@ -89,6 +89,26 @@ def test_each_walks_step_is_the_one_its_target_declared_before_and_the_target_de
         assert walks[draft.walk][1] == {DRAFT_CARRY, DRAFT_KEEP_FIRST}
 
 
+@pytest.mark.parametrize("method", ["dspark", "eagle3", "draft_model"])
+def test_the_engine_binds_a_lagged_drafter_one_pass_selector_over_its_nodes_resources(tmp_path, monkeypatch, method):
+    """A lagged drafter (the draft model) selects its passes through the selector the engine binds when it loads
+    the node (`DrafterShare.select_pass`), over the KV, positions and attention the lag names among the node's
+    resources; every verify step hands the drafter that one (`test_draft_lag`). A drafter with no lag gets none."""
+    eng = _qwen3_engine(tmp_path, monkeypatch, method)
+    (node, draft), = eng._drafts.items()
+    share = eng._submodules[node].submodule.drafter_share
+    if method != "draft_model":
+        assert draft.lag is None and share.select_pass is None
+        return
+    lag, resources = draft.lag, eng._submodules[node].resources
+    selected = {key: [] for key in (lag.kv_key, lag.pos_key, lag.attn_key)}
+    for key, passes in selected.items():
+        monkeypatch.setattr(resources[key], "select_pass", passes.append, raising=False)
+    share.select_pass(1)
+    share.select_pass(None)
+    assert selected == {key: [1, None] for key in selected}
+
+
 @pytest.mark.parametrize("method", ["dspark", "eagle3"])
 def test_a_pre_plans_key_is_the_real_steps_on_a_prompt_walk(tmp_path, monkeypatch, method):
     """The runner matches a staged pre-plan to the step that runs by its key, every resource's segments
