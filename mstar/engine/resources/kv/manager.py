@@ -4950,17 +4950,19 @@ class KVManager(AttentionResource):
             pages_short = short.pages - claim
             victims, asks = None, short.pages
             if pages_short <= 0:
-                self._claim(rid, claim)
                 if not (short.flip and self._borrowable and rid not in self._guaranteed):
+                    self._claim(rid, claim)
                     return Victims([], [], [])
-                # A claim can't cover a flip. Turn guaranteed here if the room covers it, otherwise wait for 0 pages,
-                # only for the room borrowers took.
+                # A claim can't cover a flip. Turn guaranteed here if the room covers it, which allots every page
+                # ``rid`` grows into, so nothing is claimed first. Otherwise wait for 0 pages, only for the room
+                # borrowers took.
                 grows = self._grows(rid)
                 if grows - self._allotments[rid].remaining <= self._room():
                     self._guarantee_allotted(rid, grows)
                     if self.journal is not None:
                         self.journal(MoveKind.GUARANTEE, rid, grows)
                     return Victims([], [], [])
+                self._claim(rid, claim)
                 asks = 0
             else:
                 victims = self._choose(pages_short, self._movers(rid, newer, older, running=True), droppable)

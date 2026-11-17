@@ -227,6 +227,7 @@ def test_a_follower_replays_the_guarantee_preempt_makes():
             assert _ready(kv, "p")
     else:
         raise AssertionError("preempt never turned p guaranteed")
+    assert [kind for kind, *_ in moves] == [MoveKind.GUARANTEE], f"rank 0 journaled moves the guarantee undoes: {moves}"
 
     for kind, rid, count, victims in moves:
         follower.replay(kind, rid, count, victims)
