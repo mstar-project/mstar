@@ -29,12 +29,13 @@ from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAt
 from mstar.engine.resources.linear_attn.gdn_stage import gdn_stage_applies
 from mstar.engine.resources.linear_attn.wrappers import (
     CLOSED_GATE,
+    ConvRerun,
+    DeltaRerun,
     GDNDecodeWrapper,
     GDNMixedWrapper,
     GDNPrefillWrapper,
     GDNVerifyWrapper,
     GDNWrapper,
-    VerifyRerun,
     gdn_kernel,
 )
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry
@@ -92,8 +93,8 @@ class GDNManager(LinearAttnManager):
     _cached_verify_block: int | None = None
     # a verify step's reruns, one a layer, in the order its layers ran the conv and the delta rule; each holds
     # the pool view its layer was given, so the rerun needs no layer id
-    _kept_conv: tuple[VerifyRerun, ...] = ()
-    _kept_delta: tuple[VerifyRerun, ...] = ()
+    _kept_conv: list[ConvRerun] | tuple[()] = ()
+    _kept_delta: list[DeltaRerun] | tuple[()] = ()
 
     def __init__(
         self,
@@ -468,7 +469,7 @@ class GDNManager(LinearAttnManager):
             if self._verify_block is None:
                 return plan.run(q, k, v, a, b, state_layer, a_log, dt_bias)
             # the forward leaves the slots as they were, which is what the rerun starts from
-            rerun = VerifyRerun()
+            rerun = DeltaRerun()
             self._kept_delta.append(rerun)
             return plan.run(q, k, v, a, b, state_layer, a_log, dt_bias, rerun=rerun)
         decode, prefill, _ = plan.halves if isinstance(plan, GDNMixedWrapper) else (None, plan, 0)
@@ -587,7 +588,7 @@ class GDNManager(LinearAttnManager):
         plan = self.current_plan(label)
         if self._verify_block is not None:
             # the verify conv leaves each window as it was; correct_verify_state rebuilds it from these inputs
-            rerun = VerifyRerun()
+            rerun = ConvRerun()
             self._kept_conv.append(rerun)
             return plan.run_conv(
                 x=x, conv_layer=conv_layer, weight=weight, bias=bias, activation=activation, rerun=rerun,

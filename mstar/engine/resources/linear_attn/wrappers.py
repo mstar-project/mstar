@@ -640,17 +640,22 @@ CLOSED_GATE = -1e4
 
 
 @dataclass(slots=True)
-class VerifyRerun:
-    """What `GDNManager.correct_verify_state` reruns for one layer of a verify step:
-    `GDNVerifyWrapper.run_conv` fills the conv input and the rows' slots,
-    `GDNVerifyWrapper.run` the block's k, v and raw gates, the kernel slots, the
-    output buffer and the kernel's own settings. Each also keeps the pool view its
-    layer was given (``conv``, ``state``), which the rerun writes."""
+class ConvRerun:
+    """What `GDNManager.correct_verify_state` rebuilds one layer's conv windows from, which
+    `GDNVerifyWrapper.run_conv` fills: the pool view the layer was given, the block's conv input,
+    and the rows' slots."""
     conv: torch.Tensor | None = None
-    state: torch.Tensor | None = None
     x: torch.Tensor | None = None
     slots: torch.Tensor | None = None
     null_slot_id: int | None = None
+
+
+@dataclass(slots=True)
+class DeltaRerun:
+    """What `GDNManager.correct_verify_state` reruns the delta rule over for one layer, which
+    `GDNVerifyWrapper.run` fills: the pool view the layer was given, the block's k, v and raw gates,
+    the kernel slots, the output buffer and the kernel's own settings."""
+    state: torch.Tensor | None = None
     k: torch.Tensor | None = None
     v: torch.Tensor | None = None
     a: torch.Tensor | None = None
@@ -730,7 +735,7 @@ class GDNVerifyWrapper(GDNWrapper):
         weight: torch.Tensor,
         bias: torch.Tensor | None = None,
         activation: str | None = "silu",
-        rerun: VerifyRerun | None = None,
+        rerun: ConvRerun | None = None,
     ):
         from mstar.utils.causal_conv1d import causal_conv1d_update
 
@@ -755,7 +760,7 @@ class GDNVerifyWrapper(GDNWrapper):
         )
         return out.reshape(rows * block, dim)
 
-    def run(self, q, k, v, a, b, state, a_log, dt_bias, rerun: VerifyRerun | None = None):
+    def run(self, q, k, v, a, b, state, a_log, dt_bias, rerun: DeltaRerun | None = None):
         """The forward over each row's block from its slot, outputs only.
         ``rerun`` (`GDNManager.correct_verify_state`) receives what the rerun reads:
         the block's k, v and raw gates, and the rows' kernel slots."""
