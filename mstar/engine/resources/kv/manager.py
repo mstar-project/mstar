@@ -111,8 +111,8 @@ class RoomMark(NamedTuple):
 class PassMark(NamedTuple):
     """What `reserve_past` refused a request against: the room of its class less `KVManager._kept`, and the index
     counts when a page the index files could still make the request fit. A class is whether the request is guaranteed
-    and whether it may borrow (`KVManager._borrows`). Passers of one class refused against the same room share a
-    mark."""
+    and, for one that isn't, whether it may borrow (`KVManager._borrows`). Passers of one class refused against the
+    same room share a mark."""
     guaranteed: bool
     borrows: bool
     room: int
@@ -4615,7 +4615,9 @@ class KVManager(AttentionResource):
 
     def _pass_mark(self, rid: str, filed: int | None = None, taken: int | None = None) -> PassMark:
         """The mark of passing ``rid``, which holds no allotment, so its own room is the room of its class."""
-        guaranteed, borrows = rid in self._guaranteed, self._borrows(rid)
+        # as in `_room_for`: a guaranteed room counts no lent pages, so every guaranteed passer is of one class
+        guaranteed = rid in self._guaranteed
+        borrows = guaranteed or self._borrows(rid)
         return PassMark(guaranteed, borrows, self._class_room(guaranteed, passing=True, borrows=borrows), filed, taken)
 
     def _admit(self, rid: str, pages: int, passed: bool = False) -> bool:
