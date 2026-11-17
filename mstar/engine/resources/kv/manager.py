@@ -740,8 +740,8 @@ class KVManager(AttentionResource):
         # `_unused` counts the pages admitted requests were allotted and haven't used yet.
         # `_guaranteed` holds the requests that reserve what they grow into and are never preempted once they start,
         #   decided at their first `ask`, or later when the host has no room to set aside for their move.
-        # `_borrowable` counts the pages of `_unused` that guaranteed requests lend, which preemptible requests may
-        #   borrow.
+        # `_borrowable` counts the pages of `_unused` that guaranteed requests lend, which preemptible requests a drop
+        #   can always free may borrow (`_borrows`).
         # `_changes` moves whenever an allotment's counts or a request's class change, and `_reclaim` holds the last
         #   `_reclaimable` with the arena's, the pool's and the index's counts it was walked at.
         # `_snapshots` holds the pools that restore a hit's recurrent state. A prefill hit counts only as far as they

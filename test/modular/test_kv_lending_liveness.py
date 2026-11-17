@@ -189,7 +189,8 @@ def test_a_request_that_turns_guaranteed_asks_for_no_page_its_lender_lent(batche
 @pytest.mark.parametrize("q_rebuildable", [True, False])
 def test_a_borrower_ahead_in_the_step_doesnt_hold_off_a_request_turning_guaranteed(order, q_rebuildable):
     """p back from the host holds every page it grows into, and turns guaranteed once the room is at zero. q, ahead
-    of it in the step, borrows a lent page first, and the step ran short on p again and again with nothing moved."""
+    of it in the step, borrows a lent page first. Every request finishes, and the step never runs short on p twice
+    with nothing moved in between."""
     kv = _pool()
     kv._cpu_pool = host._HostPool(1 if q_rebuildable else 5)
     _running(kv, "g", 1, arrival=0, guaranteed=True, decodes=3 * PAGE_SIZE)
@@ -298,7 +299,8 @@ def test_a_reservation_given_back_after_a_wait_for_no_page_keeps_the_allotment()
     assert (allotment.pages, allotment.remaining, kv._unused, kv._borrowable) == before
 
 
-# configs that stalled on the over-ask or livelocked on an empty `Victims`, (pool, host, rows) with rows
+# configs from CPU sweeps that stalled in at least one mode while a request that may turn guaranteed borrowed lent
+# pages, (pool, host, rows) with rows
 # (rid, prompt pages, decode pages, guaranteed, rebuildable, arrival pass)
 _TABLE = [
     (11, 1, [("g", 1, 6, True, False, 0), ("p1", 1, 3, False, False, 0), ("p2", 1, 3, False, False, 0)]),

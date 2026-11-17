@@ -88,7 +88,7 @@ Rules:
 - **Asking again.** A request that moves to the host, is dropped, gives back a reservation it never wrote to, or waits for its shortage (§3.2) asks again at once and waits in no queue. Each pass tries these requests first, oldest first, once what each didn't fit has grown. While one of them is the oldest live request to have asked a pool it waits for, that pool's queue admits no newer prompt, other than one the pool has already allotted its room, as the moves a waiting request chose do once they land (§3.2). That prompt asks the pool for nothing more, and the request asking again may need the pages its allotment holds.
 - **Size.** A preemptible request reserves its prompt. A guaranteed one, and one admitted past the first request, also reserves its growth.
 - **Inside a reservation.** A grant always succeeds, except a guaranteed request's grant into pages it lent. Any other failure there is an accounting bug, and the manager raises.
-- **Lending.** A preemptible request may borrow the pages a guaranteed request was allotted and hasn't written, past its own reservation and for its admission or return, but never the room kept for a waiting request. Only a request a drop can always free borrows; any other may have to turn guaranteed, which takes room no one lends, so it is measured against that room alone. When a guaranteed request's grant needs pages it lent and none is free, it takes them back by moving preemptible requests (§3.2), and holds back from borrowers every page the moves free up to what it lent. While it waits for them, nothing more is lent. A pool on a node that rebuilds no request, and has no host pool or isn't the node's only KV cache, moves no request there, so it lends nothing.
+- **Lending.** A preemptible request may borrow the pages a guaranteed request was allotted and hasn't written, past its own reservation and for its admission or return, but never the room kept for a waiting request. Only a request a drop can always free borrows; any other may have to turn guaranteed, which takes room no one lends, so it is measured against that room alone. When a guaranteed request's grant needs pages it lent and none is free, it takes them back by moving preemptible requests (§3.2), and holds back from borrowers every page the moves free up to what it lent. While it waits for them, nothing more is lent. A pool on a node that rebuilds no request, and has no host pool or isn't the node's only KV cache, moves no request there, so it lends nothing. One on a node that rebuilds no request but has a host pool and is the node's only KV cache still lends, though nothing there borrows, since no request there is rebuildable.
 - **Past a reservation.** A grant takes only from the room its class sees, and fails with `AllocationFailed(pages_short=...)` when that room is short.
 - **Across pools.** A request takes its reservation in every pool its node asks, the recurrent pool's slot and the sampler's in-graph row included, or in none, and nothing is retrieved for it before then. A waiting request is asked again only after a pool it waits on has grown.
 
@@ -96,10 +96,11 @@ Rules:
 room = free + evictable - _unused
 lent = what guaranteed requests were allotted and haven't written, less what they took back
 
-a rebuildable request's room = room + lent, or room while a guaranteed request waits to take back
-a guaranteed request's room  = room + what moving every preemptible request frees, when it asks to be admitted
-                               and the pool lends
-                             = the smaller of room + lent and what it lends plus the room, once admitted
+a rebuildable preemptible request's room = room + lent, or room while a guaranteed request waits to take back
+any other preemptible request's room     = room
+a guaranteed request's room              = room + what moving every preemptible request frees, when it asks to be
+                                           admitted and the pool lends
+                                         = the smaller of room + lent and what it lends plus the room, once admitted
 
 invariant, after every grant, reservation, lease and release:
     _unused - lent <= free + evictable
