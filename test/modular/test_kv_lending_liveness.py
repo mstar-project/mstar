@@ -264,7 +264,7 @@ def test_requests_arriving_over_passes_all_finish(pool, host_pages, rows, batche
 
 @pytest.mark.parametrize("batched", [
     False,
-    pytest.param(True, marks=pytest.mark.xfail(strict=True, reason=(
+    pytest.param(True, marks=pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
         "open liveness gap, unreachable while no RebuildPolicy sets pad_ids: a borrower that loses its drops "
         "(`KVManager.refuse_drops`, world size 1) holding lent pages it can't turn guaranteed past waits on room "
         "only its lenders could give back"
