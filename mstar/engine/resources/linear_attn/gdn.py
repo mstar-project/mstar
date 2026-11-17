@@ -85,9 +85,10 @@ class GDNManager(LinearAttnManager):
     # the state is the recurrent pool's, which a drop zeroes
     supports_drop = True
     # Speculative decoding: walk -> its verify block (k + 1), and the block of the step planned
-    # (None for any other step). A verify step keeps, per layer, what `correct_verify_state` reruns.
-    # Class defaults a node that never verifies keeps: the walks and the block are rebound, never mutated, and
-    # only a verify step's plan gives the instance lists of its own to keep its reruns in.
+    # (None for any other step; a plan writes it on a node that never verifies too). A verify step keeps,
+    # per layer, what `correct_verify_state` reruns. The walks and the block are rebound, never mutated, so
+    # their class defaults are safe to share; only a verify step's plan gives the instance lists of its own
+    # to keep its reruns in.
     _verify_walks: Mapping[str, int] = MappingProxyType({})
     _verify_block: int | None = None
     _cached_verify_block: int | None = None
