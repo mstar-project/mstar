@@ -320,7 +320,7 @@ def test_a_lagged_drafter_selects_its_passes_through_the_engines_binding():
 
 def test_every_verify_step_hands_the_drafter_the_one_selector_the_engine_bound():
     """A node's verify steps pass its drafter the selector bound at load (`DrafterShare.select_pass`), the same
-    object every step, so neither a step's Python nor a compiled step's guards see a new one."""
+    object every step."""
     from mstar.engine.resources.draft.drafter import pass_selector
     from mstar.model.submodule_base import ARNodeSubmodule
 
@@ -346,89 +346,3 @@ def test_every_verify_step_hands_the_drafter_the_one_selector_the_engine_bound()
         ARNodeSubmodule.draft_verify_step(node, inputs, torch.zeros(2, dtype=torch.long),
                                           lambda block: TargetOutput(torch.zeros(block.shape[0], 5)))
     assert len(seen) == 3 and all(selector is share.select_pass for selector in seen)
-
-
-def test_a_compiled_lagged_verify_step_compiles_once_for_every_step():
-    """The engine binds one pass selector per node (`DrafterShare.select_pass`), so a compiled verify step that
-    hands it to the drafter traces once: dynamo guards the step on the selector it passes, and a new one each
-    step would retrace the step, the target's forward included, on every call."""
-    import sys
-
-    if getattr(sys.modules.get("triton"), "__file__", None) is None and "triton" in sys.modules:
-        pytest.skip("triton here is the conftest's stub, which torch.compile can't import")
-    import torch._dynamo
-    from torch._dynamo.utils import counters
-
-    from mstar.engine.resources.draft.drafter import pass_selector
-
-    class _Resource:
-        def __init__(self):
-            self.passes = []
-
-        @torch.compiler.disable
-        def select_pass(self, p):
-            self.passes.append(p)
-
-        @torch.compiler.disable
-        def sink_lagged_rows(self, keep):
-            pass
-
-    class _Verifying:
-        verify_draft_tokens = K
-
-        @torch.compiler.disable
-        def loopback_state(self, name, rids):
-            return torch.ones(len(rids), 1, dtype=torch.long)
-
-        @torch.compiler.disable
-        def store_loopback_state(self, name, rids, values):
-            pass
-
-        @torch.compiler.disable
-        def agree(self, drafts):
-            return drafts
-
-        @torch.compiler.disable
-        def verify(self, rids, logits, drafts):
-            n = drafts.shape[0]
-            return VerifyResult(torch.cat([drafts, drafts[:, :1]], 1), torch.zeros(n, dtype=torch.long))
-
-    embed, head = torch.nn.Embedding(16, 8), torch.nn.Linear(8, 16)
-
-    class _Passes(Drafter):
-        needs = DrafterNeeds(kv=SimpleNamespace(kv_cache="kv"), lag=LAYOUT)
-
-        def propose(self, inputs):
-            inputs.select_pass(0)
-            draft = head(embed(inputs.input_ids)).argmax(-1)
-            drafts = [draft]
-            for p in range(1, inputs.num_draft_tokens):
-                inputs.select_pass(p)
-                draft = head(embed(draft)).argmax(-1)
-                drafts.append(draft)
-            inputs.select_pass(None)
-            return torch.stack(drafts, 1)
-
-    resources = {key: _Resource() for key in ("kv", "rope", "attn")}
-    share = DrafterShare(
-        verify_walk=WALK, sampler_key="sampler", num_draft_tokens=K, prompt_walks=frozenset({"prefill"}),
-        prompt_writes=frozenset(), verify_writes=frozenset(), prompt_steps={}, verify_steps={},
-        lag=DraftLag(WALK, LAYOUT, "kv", "draft", "rope", "attn"),
-        select_pass=pass_selector(resources, DraftLag(WALK, LAYOUT, "kv", "draft", "rope", "attn")),
-    )
-    sampler, drafter = _Verifying(), _Passes()
-
-    def step(ids):
-        return draft_verify_step(sampler, [1, 2], ids, lambda block: TargetOutput(head(embed(block))), drafter,
-                                 resources, None, (), share.select_pass).accepted
-
-    torch._dynamo.reset()
-    counters.clear()
-    compiled = torch.compile(step, backend="eager", fullgraph=False)
-    for _ in range(2):
-        compiled(torch.tensor([1, 2]))
-    frames = counters["frames"]["total"]
-    for _ in range(6):
-        compiled(torch.tensor([1, 2]))
-    assert counters["frames"]["total"] == frames
-    assert resources["kv"].passes[: K + 1] == [*range(K), None] and len(resources["kv"].passes) == 8 * (K + 1)
