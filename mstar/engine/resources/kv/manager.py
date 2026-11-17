@@ -4817,7 +4817,7 @@ class KVManager(AttentionResource):
         room = self._room()
         return min(room + self._borrowable, allotment.lends + max(0, room)) - (self._kept if passing else 0)
 
-    def _class_room(self, guaranteed: bool, passing: bool, reclaim: bool = True, borrows: bool = True) -> int:
+    def _class_room(self, guaranteed: bool, passing: bool, reclaim: bool = True, *, borrows: bool) -> int:
         """`_room_for` a request that holds no guaranteed allotment. A preemptible request that ``borrows`` (`_borrows`)
         also borrows what guaranteed requests lend, unless one of them waits to take pages back. Where moves happen, a
         guaranteed request that asks to be admitted counts what moving every preemptible request would free, since it
