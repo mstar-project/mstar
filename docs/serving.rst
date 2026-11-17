@@ -1005,6 +1005,17 @@ refuses unknown keys, and a block on a model that serves none. Requests on such 
 deployment can't ask for ``repetition_penalty`` other than 1, ``repetition_window``,
 ``min_tokens``, ``return_logprobs`` or ``penalize_prompt: false`` (see :doc:`clients`).
 
+A drafting node can run arriving prompts inside its verify steps (a mixed step; the model
+declares it). Run asynchronously, a mixed step runs only on a capture, so at startup the
+engine caps the mixed walk's rows and token budget at the widest captured mixed bucket that
+holds the worst step: every verify row's block plus a prompt chunk of ``min_chunk_tokens``.
+It logs the cap when it lowers either. The cap covers every step under that combined walk,
+prompt-only ones included, and a node-level ``max_batch_tokens`` override above it. Startup
+refuses an asynchronous mixed walk with no token budget, or one no captured bucket holds
+(the message says whether ``min_chunk_tokens`` or the memory capture left is what doesn't
+fit), and a mixed walk over a KV pool the model writes under more than one label, since a
+mixed step plans one.
+
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
 client instead — see :doc:`clients`, and :ref:`generation-parameters` for what each
 sampling knob means.
