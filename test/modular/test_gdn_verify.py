@@ -100,14 +100,20 @@ def _split(qkv: torch.Tensor):
             v.reshape(n, g.num_v_heads, g.head_v_dim))
 
 
-def _step(pool, manager, rows: dict[int, int], walk: str, inputs) -> None:
-    """One step over ``rows`` (rid -> span), the layers driven as GatedDeltaNet drives them."""
+def _step(pool, manager, rows: dict[int, int], walk: str, inputs, preplan: bool = False) -> None:
+    """One step over ``rows`` (rid -> span), the layers driven as GatedDeltaNet drives them. ``preplan``: the
+    manager plans the step ahead, as the async worker's plan thread does, and the step takes that plan."""
     rids = list(rows)
     ctx = StepContext(request_ids=rids, graph_walk=walk, slot=0, capture=False)
     segments = tuple(Segment(rid, "main", span) for rid, span in rows.items())
     rstep = RecurrentStep(segments=segments)
     assert pool.admit(rstep, ctx).ok
     ctx.plan_results[POOL] = pool.plan(rstep, ctx)
+    if preplan:
+        ahead = StepContext(request_ids=rids, graph_walk=walk, slot=0, capture=False, is_preplan=True)
+        ahead.plan_results[POOL] = ctx.plan_results[POOL]
+        manager.plan(LinearAttnStep(segments=segments), ahead)
+        assert manager._preplanned
     manager.plan(LinearAttnStep(segments=segments), ctx)
     for layer, (x, a, b) in enumerate(inputs):
         w = WEIGHTS[layer]
@@ -249,6 +255,21 @@ def test_a_prompt_step_records_nothing_and_settles_nothing():
     before = pool.block("state", 0).clone()
     manager.correct_verify_state(SimpleNamespace(accepted=torch.tensor([0])))
     assert torch.equal(pool.block("state", 0), before)
+
+
+@pytest.mark.parametrize("preplan", [False, True], ids=["planned", "preplanned"])
+@pytest.mark.parametrize("verifying", [False, True], ids=["plain", "verifying"])
+def test_a_step_that_doesnt_verify_keeps_nothing_for_a_rerun(verifying, preplan):
+    """Only a verify step's plan gives the layers lists of their own to keep their reruns in: a node that never
+    verifies, and a verifying node's prompt step, leave the class's empty defaults in place, whether the step
+    took a plan made ahead of it or planned when it ran."""
+    pool, manager = _build(verifying)
+    _add(pool, 1)
+    for walk, span in ((PREFILL, 5), (VERIFY, K + 1)):
+        _step(pool, manager, {1: span}, walk, _inputs(span, seed=span), preplan=preplan)
+        kept = verifying and walk == VERIFY
+        assert ("_kept_conv" in vars(manager)) == kept and ("_kept_delta" in vars(manager)) == kept
+    assert len(manager._kept_conv) == len(manager._kept_delta) == (LAYERS if verifying else 0)
 
 
 def test_the_settle_kernel_matches_its_reference_on_the_cpu_path():

@@ -389,31 +389,6 @@ def _rel(got, want) -> float:
 STATE_REL = 5e-3
 
 
-def test_a_step_that_doesnt_verify_keeps_nothing_for_a_rerun(monkeypatch):
-    """Only a verify step's plan gives the layers somewhere to keep their reruns: a node that never verifies,
-    and a verifying node's prompt step, leave the class's empty defaults in place."""
-    import gdn_cpu
-
-    gdn_cpu.install(monkeypatch)
-    geometry, ((vpool, verifier), (pool, plain)) = _state_pair(False, monkeypatch, "cpu")
-    gen = torch.Generator().manual_seed(0)
-    hv = geometry.num_v_heads
-    weights = (torch.randn(geometry.conv_dim, geometry.conv_kernel_size, generator=gen) * 0.3,
-               torch.randn(hv, generator=gen) * 0.3, torch.randn(hv, generator=gen) * 0.3)
-
-    def step(p, manager, span, walk):
-        _gdn_step(p, manager, geometry, span, walk, torch.randn(span, geometry.conv_dim, generator=gen),
-                  torch.randn(span, hv, generator=gen), torch.randn(span, hv, generator=gen), weights)
-
-    step(pool, plain, 5, "prefill")
-    step(pool, plain, K + 1, "decode")
-    step(vpool, verifier, 5, "prefill")
-    for manager in (plain, verifier):
-        assert "_kept_conv" not in vars(manager) and "_kept_delta" not in vars(manager)
-    step(vpool, verifier, K + 1, "decode")
-    assert len(verifier._kept_conv) == len(verifier._kept_delta) == 1
-
-
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("accepted", range(K + 1))
 def test_the_rerun_leaves_the_state_of_the_kept_tokens_alone(monkeypatch, device, accepted):
