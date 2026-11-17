@@ -217,8 +217,8 @@ class ToyLM(ARNodeSubmodule):
         if graph_walk == "prefill":
             logits = self._target(engine_inputs, ids)
             ends = torch.tensor([v.to_compute for v in _views(kv)]).cumsum(0) - 1
-            # main's sampler draws on an accelerator only; the prompt step is greedy here
-            tokens = logits[ends].argmax(-1)
+            # a verifying sampler draws a prompt's token as a mixed step's prompt row (`first_draw`), on any device
+            tokens = engine_inputs.resources["sampler"].sample(list(rids), logits[ends])
             return BatchedModelOutput(
                 per_rid_outputs={rid: {"new_token": [tokens[i: i + 1]]} for i, rid in enumerate(rids)},
             )

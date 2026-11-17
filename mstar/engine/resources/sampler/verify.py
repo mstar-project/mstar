@@ -187,13 +187,31 @@ def _chain_verify(dist, drafts, seed, offset, refuse=None):
     at = accepted.clamp(max=k - 1)
     q_at = torch.zeros_like(p_at).scatter_(1, drafts[rows, at][:, None], 1.0)
     residual = (p_at - torch.where(tested[:, None], q_at, 0.0)).clamp_min(0.0)
-    last = _inverse_cdf(residual, uniforms[:, k])
     # an empty residual: the refused draft held all of p (rounding), or the bonus row's p is empty
-    fallback = torch.where(tested, drafts[rows, at], p_at.argmax(-1))
-    last = torch.where(residual.sum(-1) > 0, last, fallback)
+    last = _draw(residual, uniforms[:, k], torch.where(tested, drafts[rows, at], p_at.argmax(-1)))
     keep = torch.arange(block, device=probs.device)[None, :] < accepted[:, None]
     tokens = torch.where(keep, F.pad(drafts, (0, 1)), last[:, None])
     return tokens, accepted
+
+
+def first_draw(
+    dist: "torch.Tensor | _TwoFilters", seed: torch.Tensor, offset: torch.Tensor, num_draft_tokens: int,
+) -> torch.Tensor:
+    """``[n]``: each row's one token from `verify_probs` over ``[n, V]`` logits, drawn exactly as
+    `chain_verify_rows` draws a refused row's (``refuse``): from its filtered distribution, at the bonus
+    draw's number ``offset + k``. A drafting node's prompt step draws this way, so a request's first
+    token is the same whether its prompt ran alone or in a mixed step. Capturable."""
+    if isinstance(dist, _TwoFilters):
+        p = torch.where(dist.use_then[:, None], dist.then, dist.first)
+    else:
+        p = dist
+    u = _uniforms(seed, offset + num_draft_tokens, 1, p.dtype)[:, 0]
+    return _draw(p.clamp_min(0.0), u, p.argmax(-1))
+
+
+def _draw(weights: torch.Tensor, u: torch.Tensor, fallback: torch.Tensor) -> torch.Tensor:
+    """`_inverse_cdf` of each row's ``weights`` at ``u``, or ``fallback`` where a row has no weight."""
+    return torch.where(weights.sum(-1) > 0, _inverse_cdf(weights, u), fallback)
 
 
 def _filtered_probs_torch(logits, temperature, top_k, top_p, min_p):

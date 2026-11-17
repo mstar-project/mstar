@@ -104,30 +104,35 @@ def test_a_mixed_step_hides_its_verify_rows_last_keys_alone():
 # ── through the engine ──
 
 
-def _separate(prompts, late, drafter=oracle, steps_before=2):
+def _verified(driver, prompts, steps_before, temperature, seed):
+    """``prompts`` prefilled and verified ``steps_before`` steps; the rows still running."""
+    for rid, prompt in prompts.items():
+        driver.add(rid, prompt, MAX, temperature=temperature, seed=seed + rid)
+    live = list(prompts)
+    for _ in range(steps_before):
+        stopped = driver.step(live)
+        live = [rid for rid in live if not stopped[rid]]
+    return live
+
+
+def _separate(prompts, late, drafter=oracle, steps_before=2, temperature=0.0, seed=0):
     """``prompts`` prefilled and verified ``steps_before`` steps, then ``late``'s prompt steps on their own."""
     driver = Driver(engine(K, drafter))
-    for rid, prompt in prompts.items():
-        driver.add(rid, prompt, MAX)
-    for _ in range(steps_before):
-        driver.step(list(prompts))
+    live = _verified(driver, prompts, steps_before, temperature, seed)
     for rid, prompt in late.items():
-        driver.add(rid, prompt, MAX)
-    driver.run(list(prompts) + list(late))
+        driver.add(rid, prompt, MAX, temperature=temperature, seed=seed + rid)
+    driver.run(live + list(late))
     return driver.out
 
 
-def _mixed(prompts, late, drafter=oracle, steps_before=2):
+def _mixed(prompts, late, drafter=oracle, steps_before=2, temperature=0.0, seed=0):
     """The same, ``late``'s prompts riding in one mixed step with ``prompts``' verify rows."""
     driver = Driver(engine(K, drafter, mixed=True))
-    for rid, prompt in prompts.items():
-        driver.add(rid, prompt, MAX)
-    for _ in range(steps_before):
-        driver.step(list(prompts))
+    live = _verified(driver, prompts, steps_before, temperature, seed)
     for rid in late:
-        driver.add(rid, None, MAX)
-    stopped = driver.mixed_step(list(prompts), late)
-    driver.run([rid for rid in list(prompts) + list(late) if not stopped[rid]])
+        driver.add(rid, None, MAX, temperature=temperature, seed=seed + rid)
+    stopped = driver.mixed_step(live, late)
+    driver.run([rid for rid in live + list(late) if not stopped[rid]])
     return driver, stopped
 
 
@@ -139,6 +144,16 @@ def test_a_mixed_steps_rows_decode_as_in_steps_of_their_own(drafter):
     want = {rid: reference(prompt, MAX) for rid, prompt in {**PROMPTS, **LATE}.items()}
     assert driver.out == want
     assert driver.out == _separate(PROMPTS, LATE, drafter)
+
+
+@pytest.mark.parametrize("seed", range(8))
+@pytest.mark.parametrize("drafter", [oracle, every(2)], ids=["oracle", "every-2nd-wrong"])
+def test_a_seeded_reply_is_the_same_whether_its_prompt_rode_a_mixed_step(drafter, seed):
+    """A prompt step's token is drawn as a mixed step's prompt row draws it, from the request's own stream at
+    the same number, so a seeded reply is the same whichever its prompt rode. At T=20 the toy's one-hot logits
+    leave every token a few percent, so a different draw shows."""
+    driver, _ = _mixed(PROMPTS, LATE, drafter, temperature=20.0, seed=seed)
+    assert driver.out == _separate(PROMPTS, LATE, drafter, temperature=20.0, seed=seed)
 
 
 def test_a_prompt_row_leaves_with_its_first_token_and_counts_no_verify_row():

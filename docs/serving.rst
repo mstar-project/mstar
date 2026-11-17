@@ -1017,7 +1017,10 @@ log-probs enabled on its node, on eager and captured steps alike. Every other sa
 text LLM, and Fish S2 Pro's 4,097-token semantic head) draws through FlashInfer, which
 reads the first row's seed for the whole batch and folds each row's batch position into
 its random stream, so there the same seed and settings sample the same tokens only in the
-same batch, such as a request sent alone.
+same batch, such as a request sent alone. On a node that drafts (``model_kwargs.draft``),
+every token, the first included, is drawn from a stream keyed by the request's seed and its
+own row, so a seed fixes the reply whatever the request is batched with, up to rounding
+differences in the target's and drafter's logits between batch shapes.
 
 Restarts and the compile cache
 ------------------------------

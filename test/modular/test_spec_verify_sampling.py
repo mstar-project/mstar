@@ -124,15 +124,15 @@ def test_consecutive_steps_never_share_a_number():
     assert all(x != y for x, y in itertools.pairwise(values))
 
 
-def test_an_eager_verify_moves_only_the_kept_rows_offsets():
-    """As `sample` does: a dropped row (``SamplerStep.kept_rids``) still draws, but its offset stays."""
+def _eager_verify_sampler(temperature: float, rids=(1, 2), kept=None, k: int = 0):
+    """A `SamplerResource` on the eager path over the real settings gather, verifying ``k`` drafts a step."""
     from types import SimpleNamespace
 
     from mstar.engine.resources.sampler.resource import SamplerResource
     from mstar.engine.resources.sampler.utils import Sampler
 
     sampler = SamplerResource.__new__(SamplerResource)
-    configs = {rid: SimpleNamespace(temperature=0.0, top_k=0, top_p=1.0, min_p=0.0, seed=rid) for rid in (1, 2)}
+    configs = {rid: SimpleNamespace(temperature=temperature, top_k=0, top_p=1.0, min_p=0.0, seed=rid) for rid in rids}
     eager = sampler._sampler = SimpleNamespace(
         _sampling_config=configs, _step_offset={}, _gather_filter=lambda configs: None,
     )
@@ -143,11 +143,36 @@ def test_an_eager_verify_moves_only_the_kept_rows_offsets():
     sampler._apply_filters_this_step = True
     sampler._greedy_this_step = False
     sampler._keep_last_token = False
-    sampler._kept_rids = frozenset({1})
+    sampler._enable_logprobs = False
+    sampler._kept_rids = kept
+    if k:
+        sampler.bind_verify(k)
+    return sampler
+
+
+def test_an_eager_verify_moves_only_the_kept_rows_offsets():
+    """As `sample` does: a dropped row (``SamplerStep.kept_rids``) still draws, but its offset stays."""
+    sampler = _eager_verify_sampler(0.0, kept=frozenset({1}))
     k, vocab = 3, 8
     result = sampler.verify([1, 2], torch.randn(2, k + 1, vocab), torch.zeros(2, k, dtype=torch.long))
     assert result.tokens.shape == (2, k + 1)
     assert sampler._sampler._step_offset == {1: k + 1}
+
+
+def test_a_verifying_samplers_prompt_token_is_a_refused_verify_rows_token():
+    """On a verifying node `sample` draws each row's token as `verify` draws a row that tests no draft (a
+    mixed step's prompt row): the same tokens, and the same offsets after, step after step."""
+    k, vocab, rids = 3, 50, list(range(1, 9))
+    plain, refused = (_eager_verify_sampler(20.0, rids, k=k) for _ in range(2))
+    generator = torch.Generator().manual_seed(0)
+    for _ in range(3):
+        logits = torch.randn(len(rids), vocab, generator=generator)
+        drafts = torch.randint(vocab, (len(rids), k), generator=generator)
+        got = plain.sample(rids, logits)
+        want = refused.verify(rids, logits[:, None].expand(-1, k + 1, -1), drafts,
+                              refuse=torch.ones(len(rids), dtype=torch.bool))
+        assert torch.equal(got, want.tokens[:, 0]) and not want.accepted.any()
+        assert plain._sampler._step_offset == refused._sampler._step_offset
 
 
 # ---- the CUDA branch (GPU) ----
