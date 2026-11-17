@@ -20,6 +20,7 @@ from mstar.engine.resources.sampler.resident import SamplerCells
 from mstar.engine.resources.sampler.utils import (
     FUSED_SAMPLE_MAX_VOCAB,
     AcceleratorGraphableSampler,
+    FilterOrder,
     FusedDrawArgs,
     GenerationHistory,
     Sampler,
@@ -41,7 +42,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-
 class _VerifyParams(NamedTuple):
     """A verify draw's per-row settings and offsets (`SamplerResource._verify_params`); ``slots`` are the eager
     step's slots when it draws at their counters, else None."""
@@ -51,8 +51,9 @@ class _VerifyParams(NamedTuple):
     min_p: "torch.Tensor | None"
     seed: torch.Tensor
     offset: torch.Tensor
-    order: object
-    slots: object
+    order: "FilterOrder | None"
+    slots: "torch.Tensor | None"
+
 
 class SamplerResource(Resource):
     prefix_skip_safe = True
