@@ -339,6 +339,30 @@ def test_a_wait_for_no_page_is_logged_as_a_wait_to_turn_guaranteed(caplog, monke
     assert "shortage" not in caplog.text, "the line named a shortage no move was tried for"
 
 
+@pytest.mark.parametrize("waits", [(0, 3), (3, 0)], ids=["no_page_first", "pages_first"])
+def test_a_wait_to_turn_guaranteed_and_a_wait_for_pages_dont_hide_each_other(caplog, monkeypatch, waits):
+    """The two lines are throttled apart: whichever is logged first, the other right after it on the same node and
+    walk is still logged."""
+    kv = _pool()
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    reason = _step(kv, "r", 1).reason
+    w = _worker(kv)
+    w.engine_manager.get_engine(NODE).readmit_request = lambda node, rid: None
+    answers = iter([Victims([], [], [], waits=n, queued=True) for n in waits])
+    monkeypatch.setattr(kv, "preempt", lambda *args: next(answers))
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
+
+    with caplog.at_level(logging.WARNING, logger="mstar.worker.admission"):
+        for _ in waits:
+            assert w.preemption.preempt(_refused(batch, reason))
+
+    assert "r waits to turn guaranteed until borrowers give back the room" in caplog.text, (
+        "the wait for pages hid the wait to turn guaranteed"
+    )
+    assert "r waits for 3 pages past its allotment" in caplog.text, "the wait to turn guaranteed hid the wait for pages"
+
+
 def test_a_victim_in_the_refused_step_drops_in_the_same_call():
     kv, w = _preempting(in_flight=("r", "v"))
 

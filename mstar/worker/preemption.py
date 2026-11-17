@@ -41,7 +41,8 @@ class Preemption:
         self._rid_str = rid_str
         # `_keys`: node -> the keys of its paged KV caches, and `_caches`: key -> its cache.
         # `_preempted`: handle -> its `Preempted`. `counts`: node -> its counts for the metrics.
-        # `_waits_logged`: (node, walk) -> when its last wait was logged, and the waits since.
+        # `_waits_logged`: (node, walk) -> when its last wait for pages was logged, and the waits since.
+        # `_flip_waits_logged`: the same for a wait for no page, to turn guaranteed, so neither line hides the other.
         # `_moves_logged`: node -> when its last move was logged, and the moves since.
         # `_walked`: what the last walk of `make_room` that moved nothing read, or None.
         self._keys: dict[str, list[str]] = defaultdict(list)
@@ -55,6 +56,7 @@ class Preemption:
         self._preempted: dict[int, Preempted] = {}
         self.counts: dict[str, PreemptionCounts] = defaultdict(PreemptionCounts)
         self._waits_logged: dict[tuple[str, str], tuple[float, int]] = {}
+        self._flip_waits_logged: dict[tuple[str, str], tuple[float, int]] = {}
         self._moves_logged: dict[str, tuple[float, int]] = {}
         self._walked: tuple | None = None
 
@@ -87,7 +89,7 @@ class Preemption:
                 )
             else:
                 self._log(
-                    self._waits_logged, (node_name, node_batch.step_context.graph_walk),
+                    self._flip_waits_logged, (node_name, node_batch.step_context.graph_walk),
                     "KV short on node=%s walk=%s: %s waits to turn guaranteed until borrowers give back the room "
                     "(%d earlier waits not logged)",
                     node_name, node_batch.step_context.graph_walk, self._rid_str(reason.request_id),
