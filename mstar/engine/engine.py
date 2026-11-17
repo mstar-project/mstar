@@ -296,6 +296,7 @@ def rebuild_policies_of(model) -> "dict[str, RebuildPolicy]":
     verifying = {decl.node for decl in _verify_nodes(model)}
     return {node: policy for node, policy in model.rebuild_policies().items() if node not in verifying}
 
+
 @dataclass
 class SubmoduleManagement:
     submodule: NodeSubmodule
@@ -1084,6 +1085,7 @@ class Engine:
     def node_dtype(self, node_name: str) -> torch.dtype | None:
         """The dtype ``node_name`` was cast to and runs in, or None if it keeps its own (``disable_autocast``)."""
         return resolve_node_dtype(self._submodules[node_name].submodule, self._autocast_dtype)
+
     def _set_up_draft(
         self, decl: "VerifyNode", specs_by_key: Mapping[str, NodeResourceSpec], async_scheduling: tuple[bool, str],
         chunks: bool = False, combined: Mapping[tuple[str, str], str] | None = None,
