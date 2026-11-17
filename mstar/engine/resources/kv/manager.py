@@ -379,9 +379,10 @@ class Allotment:
     request on the host covers its reload, and ``returning`` is set while the request returns from the host: the
     pages it may take beyond its reload. ``passed`` is set for a request admitted past a head that doesn't fit,
     and its allotment then covers its growth too. ``kept`` is the count of `KVManager._kept` the last reservation
-    took, ``grown`` is the shortage `reserve` last granted an allotment its request waited holding,
-    ``grown_from`` the allotment's pages before and ``grown_took`` the pages of the shortage it took back from what it
-    lent. `unreserve` puts back ``kept``, ``grown_from`` and ``grown_took``. ``taken_back`` counts
+    took, ``grown`` is the shortage `reserve` last granted an allotment its request waited holding, 0 included, or
+    None unless the last reservation grew it, ``grown_from`` the allotment's pages before and ``grown_took`` the pages
+    of the shortage it took back from what it lent. `unreserve` puts back ``kept``, ``grown_from`` and ``grown_took``.
+    ``taken_back`` counts
     the pages of ``remaining`` a guaranteed request took back from borrowers, which it writes first and lends no
     more, and ``lends`` is its share of `KVManager._borrowable`: the rest of ``remaining`` for a guaranteed
     request in a pool whose requests the worker moves (`KVManager.moves`), and none otherwise. `KVManager._count`
@@ -392,7 +393,7 @@ class Allotment:
     returning: int | None = None
     passed: bool = False
     kept: int = 0
-    grown: int = 0
+    grown: int | None = None
     grown_from: int = 0
     grown_took: int = 0
     taken_back: int = 0
@@ -4675,7 +4676,7 @@ class KVManager(AttentionResource):
             self._kept += allotment.kept
             if allotment.kept and self._keeper not in self._asks:
                 self._keeper = rid
-            if allotment.grown:
+            if allotment.grown is not None:
                 # it waits holding its allotment again, for the same shortage
                 self._asks[rid], allotment.kept = allotment.grown, 0
                 self._stalled.add(rid)
@@ -5276,7 +5277,7 @@ class KVManager(AttentionResource):
         remaining = max(0, allotment.pages - self._held(rid))
         # not `_recount`, which would read the pages given back as pages written
         self._count(rid, allotment, remaining, allotment.taken_back - allotment.grown_took)
-        allotment.grown = allotment.grown_took = 0
+        allotment.grown, allotment.grown_took = None, 0
         if _DEBUG_ASSERTS:
             self.assert_pages_conserved()
 

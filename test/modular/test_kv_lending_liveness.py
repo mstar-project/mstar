@@ -16,14 +16,16 @@ sys.path.insert(0, ".")
 
 import pytest
 import test_kv_host_index as host
-from test_kv_admission import _remove, _runner
+from test_kv_admission import _RUNNERS, _remove, _runner
 from test_kv_preemption import _drop, _make_room, _offload, _pool, _preempt, _ready, _request, _running
 from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _manager, _StubTransfer
 
 from mstar.engine.resources.base import MoveKind
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVStep
-from mstar.engine.resources.step import Segment
+from mstar.engine.resources.runner import StepRunner
+from mstar.engine.resources.step import ASKS, Segment
+from mstar.testing_utils.resource import StubResource
 
 
 @pytest.fixture(autouse=True)
@@ -235,6 +237,46 @@ def test_a_follower_replays_the_guarantee_preempt_makes():
     assert all(_admit(kv, dict.fromkeys(["g", "q", "p"], PAGE_SIZE)).ok for kv in (leader, follower)), (
         "p ran short again once guaranteed"
     )
+
+
+class _Refuses(StubResource):
+    """A resource after the KV pool that asks for the requests in ``refuse`` and refuses each one's next reservation,
+    so admission gives back what the KV pool reserved."""
+
+    def __init__(self):
+        self.refuse: set[str] = set()
+
+    def ask(self, rid, node_name, graph_walk):
+        return ASKS if rid in self.refuse else None
+
+    def reserve(self, rid, node_name, graph_walk, published):
+        if rid in self.refuse:
+            self.refuse.discard(rid)
+            return 0
+        return None
+
+
+def test_a_reservation_given_back_after_a_wait_for_no_page_keeps_the_allotment():
+    """p waits holding its allotment for 0 pages, as `preempt` has a request wait that can't turn guaranteed until
+    borrowers give back the room. Its reservation grows the allotment by nothing, and another resource refuses it."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(8)
+    refuses = _Refuses()
+    _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv, "zz": refuses}, node_resources={NODE: ["kv", "zz"]}))
+    _running(kv, "g", 1, arrival=0, guaranteed=True, decodes=6 * PAGE_SIZE)
+    _running(kv, "p", 1, arrival=1, rebuildable=False, decodes=4 * PAGE_SIZE)
+    allotment = kv._allotments["p"]
+    before = (allotment.pages, allotment.remaining, kv._unused, kv._borrowable)
+    with kv._lock:
+        kv._wait("p", 0)
+    refuses.refuse.add("p")
+    _runner(kv).readmit("p", NODE)
+
+    assert not _ready(kv, "p")
+    assert kv._allotments.get("p") is allotment, "giving back a reservation of no page gave back p's whole allotment"
+    assert kv._asks["p"] == 0 and "p" in kv._stalled, "p no longer waits for the room borrowers took"
+    assert _ready(kv, "p")
+    assert (allotment.pages, allotment.remaining, kv._unused, kv._borrowable) == before
 
 
 # configs that stalled on the over-ask or livelocked on an empty `Victims`, (pool, host, rows) with rows
