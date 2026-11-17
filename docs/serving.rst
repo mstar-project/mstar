@@ -1011,10 +1011,13 @@ engine caps the mixed walk's rows and token budget at the widest captured mixed 
 holds the worst step: every verify row's block plus a prompt chunk of ``min_chunk_tokens``.
 It logs the cap when it lowers either. The cap covers every step under that combined walk,
 prompt-only ones included, and a node-level ``max_batch_tokens`` override above it. Startup
-refuses an asynchronous mixed walk with no token budget, or one no captured bucket holds
-(the message says whether ``min_chunk_tokens`` or the memory capture left is what doesn't
-fit), and a mixed walk over a KV pool the model writes under more than one label, since a
-mixed step plans one.
+refuses an asynchronous mixed walk with no token budget, or with a prompt walk in it whose
+chunking the serving config turned off (a null ``max_batch_tokens``), since either way a
+prompt runs whole, past every capture. It refuses one no captured bucket holds: the message
+gives the floor it fit, ``min_chunk_tokens`` capped at the budget and rounded to the node's
+chunk alignment, and the ways to start, ``mode: synchronous`` and, where they apply, a lower
+``min_chunk_tokens`` or memory for the buckets capture left out. It also refuses a mixed
+walk over a KV pool the model writes under more than one label, since a mixed step plans one.
 
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
 client instead — see :doc:`clients`, and :ref:`generation-parameters` for what each
