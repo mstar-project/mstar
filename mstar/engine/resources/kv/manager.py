@@ -53,6 +53,8 @@ from mstar.engine.resources.kv.plan import (
     group_by_plan_label,
 )
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
+from mstar.engine.resources.kv.store import KVStoreBackend, KVStoreConfig, StoreIO, make_store_backend, page_layout
+from mstar.engine.resources.kv.store.tier import StoreTier
 from mstar.engine.resources.kv.transfer import KVTransferInfo, KVTransferManager, TransferEngineInfo
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -79,6 +81,7 @@ from mstar.utils.profiler import PhaseLaps
 if TYPE_CHECKING:
     from mstar.engine.resources.context_parallel import ContextParallel
     from mstar.engine.resources.kv.resident import KVResidentTables
+    from mstar.engine.resources.kv.store.tier import StoreRead
     from mstar.engine.resources.recurrent.pool import RecurrentStatePool
     from mstar.engine.resources.resident import (
         CapturedResidentStep,
@@ -149,6 +152,8 @@ class PrefixChain:
     # again (a refused admit, a second partition) is still one line
     reported: bool = False
     from_host: int = 0
+    # set once the KV store has been asked for this prompt, so a readiness check asks it once
+    store_checked: bool = False
 
     @classmethod
     def seed(
@@ -286,6 +291,8 @@ class CacheStream:
     # kept only under `_DEBUG_ASSERTS`
     peak: int = 0
     host_copy: "HostCopy | None" = None
+    # the KV store read the stream waits on for its prompt (`StoreTier.ask`), until `_end_store_waits`
+    store_read: "StoreRead | None" = None
     # Its pages in each group of the pool past the first (`PagedKVConfig.groups`), the same
     # tokens in that group's layers and pages (`KVManager._new_stream`). It holds the first
     # group's itself, so that a pool of one group pays nothing for groups.
@@ -664,6 +671,11 @@ class KVManager(AttentionResource):
                 config=cfg, kv_cache=self.kv_cache,
                 arena=new_page_arena(cfg.units(cfg.cpu_offload_pages)),
             )
+        # a store shared by processes, under the host pool (`PagedKVConfig.store`)
+        self._store: StoreTier | None = None
+        if cfg.store is not None:
+            self._check_store(cfg, name, joint_comm_group)
+            self._open_store(make_store_backend(cfg.store), cfg.store)
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
         # dropped request -> what it returns with, until its rebuild lands
@@ -957,7 +969,38 @@ class KVManager(AttentionResource):
         )
         self._arena.writes = self._host_writes
 
+    @staticmethod
+    def _check_store(cfg: PagedKVConfig, name: str, joint_comm_group: JointGroups | None) -> None:
+        """Refuse, before connecting, a store this pool can't use yet."""
+        problems = []
+        if cfg.cpu_offload_pages <= 0:
+            problems.append("it needs a host pool (cpu_offload_pages above 0)")
+        if not cfg.prefix_cache:
+            problems.append("it needs the prefix cache (prefix_cache: true)")
+        if joint_comm_group is not None and joint_comm_group.world_size > 1:
+            problems.append("it runs at one rank only; above one the prefix cache can't use a host pool yet")
+        if len(cfg.groups) > 1:
+            problems.append("a pool that keeps a window has no prefix cache yet")
+        if not cfg.prefix_cache_salt:
+            problems.append(
+                "it needs prefix_cache_salt, changed whenever the weights change: the keys name the "
+                "checkpoint by its index and config, which two fine-tunes can share"
+            )
+        if problems:
+            raise ValueError(f"KV {name}: can't use the store: " + "; ".join(problems))
+
+    def _open_store(self, backend: KVStoreBackend, config: KVStoreConfig) -> None:
+        host = self._cpu_pool.cpu_kv_cache
+        backend.bind(host)
+        io = StoreIO(backend, config, page_layout(host, self.name), host[:, 0].numel() * host.element_size())
+        self._store = StoreTier(io, self._cpu_pool, self.config.tokens_per_page)
+
     def close_prefix_cache(self) -> None:
+        if self._store is not None:
+            raise ValueError(
+                f"KV {self.name}: the store needs the prefix cache, which this deployment keeps shut "
+                "(the log above says why); remove the store or open the cache"
+            )
         self._index = None
 
     def page_counts(self) -> KVPageCounts:
@@ -1380,8 +1423,16 @@ class KVManager(AttentionResource):
         return len(dropped)
 
     def after_output_copy(self, step: KVStep) -> None:
-        """Copy up to a step's share of the queued pages to the host. The worker has seen ``step`` finish on the
-        device, so every page queued by its commit or an earlier one is final. Nothing waits on the copy."""
+        """Copy up to a step's share of the queued pages to the host, and hand the KV store its next puts. The
+        worker has seen ``step`` finish on the device, so every page queued by its commit or an earlier one is
+        final. Nothing waits on the copy."""
+        store = self._store
+        if store is not None and store.busy:
+            with self._lock:
+                store.launch_puts()
+                # a read whose request went away lands here, and the next queued read starts, without waiting
+                # for a readiness check
+                self._end_store_waits(store.advance(store.io.clock()))
         writes = self._host_writes
         if writes is None or not writes.queued:
             return
@@ -1520,6 +1571,12 @@ class KVManager(AttentionResource):
 
     def bind_snapshots(self, pool: "RecurrentStatePool") -> None:
         """Count a prefill hit only as far as ``pool`` restores the recurrent state under it."""
+        if self._store is not None:
+            # its snapshots stay on the GPU, so pages read from the store would be cut to nothing
+            raise ValueError(
+                f"KV {self.name}: a store can't serve a pool whose hits need recurrent-state snapshots yet; "
+                "remove the store"
+            )
         self._snapshots.append(pool)
 
     def keyed_walks(self, label: str) -> frozenset[str]:
@@ -1902,6 +1959,10 @@ class KVManager(AttentionResource):
         if self._host_copies:
             with self._lock:
                 self._land_host_copies()
+        store = self._store
+        if store is not None and store.reads and store.due(store.io.clock()):
+            with self._lock:
+                self._end_store_waits(store.advance(store.io.clock()))
         fetching = self._fetch_from_host(rid, node_name, graph_walk, published)
         if published is None:
             if fetching is None:
@@ -2028,7 +2089,9 @@ class KVManager(AttentionResource):
         has no allotment to bound the copy, so the copy takes free pages only. The walk computes
         whatever isn't copied.
         """
-        if self._cpu_pool is None or self._index is None or not self._cpu_pool.index.num_pages():
+        if self._cpu_pool is None or self._index is None:
+            return None
+        if self._store is None and not self._cpu_pool.index.num_pages():
             return None
         if rid in self._looked_up:
             return None
@@ -2038,7 +2101,10 @@ class KVManager(AttentionResource):
         read_in = published.get(self._rank) if published is not None else {}
         if not any(
             label not in read_in
-            and ((stream.chain is not None and not stream.chain.looked_up) or stream.host_copy is not None)
+            and (
+                (stream.chain is not None and not stream.chain.looked_up)
+                or stream.host_copy is not None or stream.store_read is not None
+            )
             for label, stream in list(streams.items())
         ):
             return None
@@ -2047,7 +2113,7 @@ class KVManager(AttentionResource):
             if label is None or label in read_in:
                 return None
             stream = self._ensure_label(rid, label)
-            if stream.host_copy is not None and stream.read_pending:
+            if (stream.host_copy is not None and stream.read_pending) or stream.store_read is not None:
                 return label
             chain = stream.chain
             if (
@@ -2087,7 +2153,19 @@ class KVManager(AttentionResource):
                 evictable = self._index.evictable()
                 taken = sum(page in evictable for page in run)
                 budget = self._allowance(rid) - taken if taken <= self._hit_allowance(rid) else 0
-            host = self._cpu_pool.retain_run(rooted[at:min(cap, at + budget)])
+            end = min(cap, at + budget)
+            host = self._cpu_pool.retain_run(rooted[at:end])
+            past = at + len(host)
+            store = self._store
+            # the pages this read could take, as the budget cuts them; fewer than `min_tokens` isn't worth asking
+            if store is not None and not chain.store_checked and past < end and store.wants(end - past):
+                # Ask the store for the rest before copying anything. Once it answers, the next check looks
+                # the prompt up again and copies the whole run from the host in one go.
+                self._cpu_pool.arena.release(host)
+                parent = rooted[past - 1] if past else None
+                stream.store_read = store.ask(stream, rooted[past:end], parent, store.io.clock())
+                stream.read_pending = True
+                return label
             if not host:
                 self._note_looked_up(rid)
                 return None
@@ -2109,12 +2187,31 @@ class KVManager(AttentionResource):
         copy.event = self._cpu_pool.record()
         return label
 
+    def _land_host_writes(self) -> None:
+        """File the copies to the host that have landed, and queue them for the KV store. Callers hold the lock."""
+        filed = self._host_writes.land()
+        if filed and self._store is not None:
+            self._store.filed(filed)
+
+    def _end_store_waits(self, released: "list[tuple[CacheStream, StoreRead]]") -> None:
+        """Let each stream that stopped waiting on a store read go on: its next readiness check looks its prompt
+        up on the GPU and host again, now with whatever the read filed, and doesn't ask the store again.
+        Callers hold the lock."""
+        for stream, read in released:
+            if stream.store_read is not read:
+                continue
+            stream.store_read = None
+            stream.read_pending = stream.read_future is not None
+            if stream.chain is not None:
+                stream.chain.store_checked = True
+                stream.chain.looked_up = False
+
     def _note_looked_up(self, rid: str) -> None:
         """Add ``rid`` to `_looked_up` once each of its streams has been looked up for a copy from the
         host and none waits on one. Callers hold the lock."""
         streams = self._streams.get(rid)
         if streams and all(
-            (stream.chain is None or stream.chain.looked_up) and stream.host_copy is None
+            (stream.chain is None or stream.chain.looked_up) and stream.host_copy is None and stream.store_read is None
             for stream in streams.values()
         ):
             self._looked_up.add(rid)
@@ -2144,7 +2241,7 @@ class KVManager(AttentionResource):
                 self._land_host_copies()
             # once a step, never in a readiness check
             if self._host_writes is not None and self._host_writes.landing:
-                self._host_writes.land()
+                self._land_host_writes()
         if _DEBUG_ASSERTS and not step.commit:
             self._assert_scratch(step, ctx)
         # forks reserve here and copy later (plan for pre-, commit for post-),
@@ -4244,6 +4341,11 @@ class KVManager(AttentionResource):
             self._asks.pop(rid, None)
             self._stalled.discard(rid)
             if rid in self._streams:
+                if self._store is not None:
+                    for stream in self._streams[rid].values():
+                        if stream.store_read is not None:
+                            self._store.detach(stream, stream.store_read)
+                            stream.store_read = None
                 for stream in self._streams[rid].values():
                     self._release_lease(rid, stream)
                     self._release_hold(rid, stream)
@@ -4415,6 +4517,8 @@ class KVManager(AttentionResource):
             refs.update(copy.host_pages)
         if self._host_writes is not None:
             refs.update(self._host_writes.host_pages_held())
+        if self._store is not None:
+            refs.update(self._store.host_pages_held())
         counts = dict(zip(owned, host.owners_of(owned), strict=True))
         assert counts == dict(refs), (
             "host owner counts disagree with the index and requests naming the pages: "
@@ -4458,6 +4562,8 @@ class KVManager(AttentionResource):
 
     def cleanup(self):
         self._transfer.cleanup()
+        if self._store is not None:
+            self._store.close()
 
     def _ensure_label(self, rid: str, label: str) -> CacheStream:
             if label not in self._streams[rid]:

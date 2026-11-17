@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 import torch
 
 from mstar.engine.resources.base import StepAllowance
-from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
+from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, FiledPage, PageCopies
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 
 logger = logging.getLogger(__name__)
@@ -162,9 +162,10 @@ class HostWrites:
             if failed:
                 write.cancelled.update(write.keys)
 
-    def land(self) -> None:
-        """File each write that has landed on the host."""
+    def land(self) -> list[FiledPage]:
+        """File each write that has landed on the host, and return the pages filed."""
         in_flight = []
+        filed: list[FiledPage] = []
         for write in self._in_flight:
             if write.event is None or not write.event.query():
                 in_flight.append(write)
@@ -172,9 +173,10 @@ class HostWrites:
             for key in write.keys:
                 if self._writing.get(key) is write:
                     del self._writing[key]
-            self._pool.file_writes(write.keys, write.host_pages, write.parents, write.cancelled)
+            filed += self._pool.file_writes(write.keys, write.host_pages, write.parents, write.cancelled)
             self._pool.arena.release(write.anchors)
         self._in_flight = in_flight
+        return filed
 
     @property
     def landing(self) -> bool:
