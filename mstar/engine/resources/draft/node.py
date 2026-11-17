@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from typing import NamedTuple
 
@@ -56,6 +56,9 @@ class DrafterShare(NamedTuple):
     lag: DraftLag | None = None
     # the combined walk of mixed prompt-plus-verify steps (`VerifyNode.mixed_walk`), whose steps take both sets
     mixed_walk: str | None = None
+    # a lagged drafter's pass selector over the resources ``lag`` names (`pass_selector`), built once at load:
+    # every verify step passes the same one
+    select_pass: Callable[[int | None], None] | None = None
 
     @property
     def block(self) -> int:

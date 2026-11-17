@@ -1095,7 +1095,7 @@ class Engine:
         and bind what its verify steps read: the sampler's ``k``, the ledger, and
         the node's share (`NodeSubmodule.bind_draft`). Every rank of an instance
         picks the same."""
-        from mstar.engine.resources.draft.drafter import carry_writes, verify_writes
+        from mstar.engine.resources.draft.drafter import carry_writes, pass_selector, verify_writes
         from mstar.engine.resources.draft.node import DrafterShare, NodeDraft
         from mstar.engine.resources.draft.startup import log_mode, node_problems, submodule_problems
 
@@ -1156,6 +1156,7 @@ class Engine:
             decl.walk, stop.sampler, decl.config.num_draft_tokens, stop.prefill_walks,
             carry_writes(decl.needs), verify_writes(decl.needs), decl.prefill_steps, decl.verify_steps,
             correcting_keys, lag, mixed_walk=decl.mixed_walk,
+            select_pass=None if lag is None else pass_selector(mgmt.resources, lag),
         ))
         if decl.mixed_walk is not None:
             # a mixed step's verify rows lead, its prompt rows after them (`MixedRows`)
