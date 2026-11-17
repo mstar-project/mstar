@@ -321,6 +321,24 @@ def test_a_request_that_can_only_wait_waits_and_is_logged(caplog):
     assert "r waits for" in caplog.text, "a request that can only wait left no line"
 
 
+def test_a_wait_for_no_page_is_logged_as_a_wait_to_turn_guaranteed(caplog, monkeypatch):
+    """`KVManager.preempt` has a request that ran short turning guaranteed wait for 0 pages while borrowers hold the
+    room it needs, and tries no move for it. Its line said it waited because no move would cover its shortage."""
+    kv = _pool()
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    reason = _step(kv, "r", 1).reason
+    w = _worker(kv)
+    monkeypatch.setattr(kv, "preempt", lambda *args: Victims([], [], [], waits=0, queued=True))
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
+
+    with caplog.at_level(logging.WARNING, logger="mstar.worker.admission"):
+        w.pipeline._handle_admit_failure(batch, _refused(batch, reason))
+
+    assert "r waits to turn guaranteed until borrowers give back the room" in caplog.text
+    assert "shortage" not in caplog.text, "the line named a shortage no move was tried for"
+
+
 def test_a_victim_in_the_refused_step_drops_in_the_same_call():
     kv, w = _preempting(in_flight=("r", "v"))
 

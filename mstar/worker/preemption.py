@@ -77,17 +77,21 @@ class Preemption:
             for node in kv.nodes:
                 self._engine_manager.get_engine(node).readmit_request(node, reason.request_id)
             self.counts[node_name].take_back_waits += victims.takes_back
-            waits_for = (
-                f"{victims.waits} pages {'it lent' if victims.takes_back else 'past its allotment'}" if victims.waits
-                else "room borrowers took"
-            )
-            self._log(
-                self._waits_logged, (node_name, node_batch.step_context.graph_walk),
-                "KV short on node=%s walk=%s: %s waits for %s, since moving "
-                "what the pool can move wouldn't cover its shortage of %d (%d earlier waits not logged)",
-                node_name, node_batch.step_context.graph_walk, self._rid_str(reason.request_id), waits_for,
-                reason.pages_short,
-            )
+            if victims.waits:
+                self._log(
+                    self._waits_logged, (node_name, node_batch.step_context.graph_walk),
+                    "KV short on node=%s walk=%s: %s waits for %d pages %s, since moving "
+                    "what the pool can move wouldn't cover its shortage of %d (%d earlier waits not logged)",
+                    node_name, node_batch.step_context.graph_walk, self._rid_str(reason.request_id), victims.waits,
+                    "it lent" if victims.takes_back else "past its allotment", reason.pages_short,
+                )
+            else:
+                self._log(
+                    self._waits_logged, (node_name, node_batch.step_context.graph_walk),
+                    "KV short on node=%s walk=%s: %s waits to turn guaranteed until borrowers give back the room "
+                    "(%d earlier waits not logged)",
+                    node_name, node_batch.step_context.graph_walk, self._rid_str(reason.request_id),
+                )
         self._move(kv, self.counts[node_name], victims, reason.request_id)
         return True
 
