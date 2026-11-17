@@ -688,7 +688,10 @@ and why. :doc:`serving` covers the ``draft`` block for operators.
 (``RedHatAI/Qwen3-8B-speculator.eagle3``, ``k = 3``, its trained depth): one decoder layer reading
 the streams entering target layers 2, 18 and 33 (a checkpoint may name its own), chaining its
 passes (``chain_drafts``), over a 32,000-token vocabulary that its ``d2t`` table maps back to
-the target's. Its K/V is one more layer of the pool (36 + 1).
+the target's. Its K/V is one more layer of the pool (36 + 1). As with DSpark, in either mode
+its arrivals run inside its verify steps, so its prompts prefill in chunks under the mixed
+budget: 128 verify blocks plus 512 tokens, 1,024 at ``k = 3``, capped asynchronously at the
+widest captured mixed bucket.
 
 ``configs/qwen3_8b_draft_model.yaml`` drafts with Qwen3-0.6B (``k = 3``, at most 4): a separate
 draft model with its own 28 layers and 16 query heads. Its KV is a layer set of the target's pool
