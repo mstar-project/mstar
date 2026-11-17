@@ -52,6 +52,7 @@ def _one_fa3_label(plan_outputs, kind: str) -> None:
     if len(plan_outputs) > 1:
         raise RuntimeError(f"a {kind} step plans one KV label on FA3, not {sorted(plan_outputs)}")
 
+
 class FlashInferManager(PlacedAttention):
     supports_split_steps = True
     supports_drop = True
