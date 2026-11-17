@@ -412,7 +412,7 @@ def test_a_request_with_nothing_newer_to_move_waits_for_room(then):
 
     victims = _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True)
 
-    assert victims == Victims([], [], [], waits=1), "r moved itself"
+    assert victims == Victims([], [], [], waits=1, queued=True), "r moved itself"
     _runner(kv).readmit("r", NODE)
     assert _returns(kv) == ["r"] and not _admitted(kv, "r"), "r didn't wait for its shortage"
     if then == "waits, then is dropped":
@@ -450,7 +450,7 @@ def test_a_request_the_host_cant_take_whole_waits_holding_its_pages():
 
     victims = _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True)
 
-    assert victims == Victims([], [], [], waits=1), "r moved to a host that can't hold it"
+    assert victims == Victims([], [], [], waits=1, queued=True), "r moved to a host that can't hold it"
 
 
 def test_a_request_back_from_the_host_runs_the_grant_it_moved_for():
@@ -2318,4 +2318,6 @@ def test_a_request_short_of_its_guarantee_asks_for_every_page_it_grows_into():
 
     victims = _preempt(kv, "r", outcome.reason.pages_short, droppable=lambda rid: False)
 
-    assert victims == Victims([], [], [], waits=4), "r asked for its grant's page, not the 4 pages it grows into"
+    assert victims == Victims([], [], [], waits=4, queued=True), (
+        "r asked for its grant's page, not the 4 pages it grows into"
+    )

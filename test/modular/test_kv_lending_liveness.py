@@ -1,11 +1,10 @@
 """Every request finishes on a pool where guaranteed requests lend what they haven't written (`KVManager._borrowable`).
 
 A preemptible request that no drop can free and the host can't take whole may have to turn guaranteed
-(`KVManager._cover_move`), which takes room no one lends. One that had borrowed lent pages asked, once it ran short,
-for every lent page on top of what it grows into, moved itself to the host, and never fit again. Only a request a drop
-can always take off the device borrows now. The drivers here run requests the way the worker does: a readiness check
-for every row on every pass, one step for every ready row (or one per row), a refused step rolled back whole and its
-rows asked again, the refused row preempted and its moves made, then `make_room`.
+(`KVManager._cover_move`), which takes room no one lends, so only a request a drop can always take off the device
+borrows. The drivers here run requests the way the worker does: a readiness check for every row on every pass, one step
+for every ready row (or one per row), a refused step rolled back whole and its rows asked again, the refused row
+preempted and its moves made, then `make_room`.
 """
 
 from __future__ import annotations
@@ -60,9 +59,9 @@ def _move(kv, victims, owner: str, rows: dict[str, "_Row"]) -> bool:
         rows[rid].rebuilding = True
     for rid in victims.to_ask:
         _runner(kv).readmit(rid, NODE)
-    if victims.waits:
+    if victims.queued:
         _runner(kv).readmit(owner, NODE)
-    return bool(victims.to_host or victims.to_drop or victims.to_ask or victims.waits)
+    return bool(victims.to_host or victims.to_drop or victims.to_ask or victims.queued)
 
 
 class _Row:
@@ -121,7 +120,7 @@ def _drive(kv, rows: dict[str, _Row], arrivals=(), batched: bool = True, passes:
                 continue
             rid = outcome.reason.request_id
             victims = _preempt(kv, rid, outcome.reason.pages_short, _droppable(kv))
-            if victims is not None and not (victims.to_host or victims.to_drop or victims.to_ask or victims.waits):
+            if victims is not None and not (victims.to_host or victims.to_drop or victims.to_ask or victims.queued):
                 state = (rid, kv._room(), kv._borrowable, tuple((r, row.left) for r, row in rows.items()))
                 assert state != last_empty, (
                     f"pass {n}: {rid} ran short again with nothing moved since preempt answered that the room "
@@ -266,8 +265,9 @@ def test_requests_arriving_over_passes_all_finish(pool, host_pages, rows, batche
 @pytest.mark.parametrize("batched", [
     False,
     pytest.param(True, marks=pytest.mark.xfail(strict=True, reason=(
-        "known open (issue TBD): a borrower that loses its drops (`KVManager.refuse_drops`, world size 1) holding "
-        "lent pages it can't turn guaranteed past waits on room only its lenders could give back"
+        "open liveness gap, unreachable while no RebuildPolicy sets pad_ids: a borrower that loses its drops "
+        "(`KVManager.refuse_drops`, world size 1) holding lent pages it can't turn guaranteed past waits on room "
+        "only its lenders could give back"
     ))),
 ])
 def test_a_borrower_refused_its_drops_holding_lent_pages(batched):

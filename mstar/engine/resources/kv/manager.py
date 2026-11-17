@@ -409,15 +409,15 @@ class Dropped(NamedTuple):
 class Victims(NamedTuple):
     """The requests `KVManager.preempt` chose to move off the device: to the host, dropped, or, holding no page of
     their own, already given back their allotment to ask again. When no move covers the shortage, ``to_host``
-    holds the request that ran short if the host takes it whole, and otherwise ``waits`` is the pages it asks
-    the pool for instead, or 1 when it asks for none and waits only for room borrowers took. ``waits`` is 0
-    otherwise. ``takes_back`` is set when the request lends pages, so the
-    moves take back what it lent (`KVManager._takes_back`)."""
+    holds the request that ran short if the host takes it whole, and otherwise ``queued`` is set and ``waits`` is
+    the pages it asks the pool for instead: 0 when it waits only for room borrowers took. ``takes_back`` is set
+    when the request lends pages, so the moves take back what it lent (`KVManager._takes_back`)."""
     to_host: list[str]
     to_drop: list[str]
     to_ask: list[str]
     waits: int = 0
     takes_back: bool = False
+    queued: bool = False
 
 
 class StalledMoves(NamedTuple):
@@ -4699,7 +4699,8 @@ class KVManager(AttentionResource):
     def refuse_drops(self, rid: str) -> None:
         """Mark ``rid``, admitted as a request a drop here can free, as one no drop can free from now on. As for a
         request marked so at its arrival, the host sets aside room for the pages it holds, or it turns guaranteed
-        when the host has none (`_cover_move`)."""
+        when the host has none (`_cover_move`). Open liveness gap: a borrower marked so while it holds lent pages it
+        can't turn guaranteed past may wait on its lenders forever (see the xfail in test_kv_lending_liveness.py)."""
         assert self._world_size == 1, (
             f"KV {self.name}: {rid} lost its log above one rank, where no move tells the other ranks and no node keeps "
             "a log of a step that read more than its ids"
@@ -4932,9 +4933,9 @@ class KVManager(AttentionResource):
         Returns the victims, or none once the room covers its grant. In a pool that lends, a grant that ran short
         turning ``rid`` guaranteed (`_cover_move`) is covered only once ``rid`` is guaranteed, which happens here when
         the room covers it. When no move covers the shortage, ``rid`` asks for every page its grant needed past its
-        allotment. It moves itself to the host when the host takes it whole, as
-        main's offload-and-hold does, and returns once its history and those pages fit. Otherwise it keeps its
-        allotment and waits for them once the runner asks again.
+        allotment. It moves itself to the host when the host takes it whole, as main's offload-and-hold does, and
+        returns once its history and those pages fit. Otherwise it keeps its allotment and waits for them once the
+        runner asks again.
         None when the pool doesn't decide or ``newer`` is None, as it is for a request the conductor gave no number.
         """
         if not self._decides or newer is None:
@@ -4951,9 +4952,8 @@ class KVManager(AttentionResource):
                 self._claim(rid, claim)
                 if not (short.flip and self._borrowable):
                     return Victims([], [], [])
-                # A claim covers no flip, which counts the allotment and the room alike. What holds it up is room
-                # borrowers took, which they can take again ahead of it in the step the runner forms next. So it turns
-                # guaranteed here while the room covers it, and otherwise asks for no page, only for that room back.
+                # A claim can't cover a flip. Turn guaranteed here if the room covers it, otherwise wait for 0 pages,
+                # only for the room borrowers took.
                 grows = self._grows(rid)
                 if grows - self._allotments[rid].remaining <= self._room():
                     self._guarantee_allotted(rid, grows)
@@ -4971,8 +4971,7 @@ class KVManager(AttentionResource):
                 if pages is not None and pages <= self._cpu_pool.room() and self._movable(rid) and self._frees([rid]):
                     self._host(rid, [rid])
                     return Victims([rid], [], [], takes_back=self._takes_back(rid))
-                # a wait for no page still has the runner ask again
-                return Victims([], [], [], waits=max(asks, 1), takes_back=self._takes_back(rid))
+                return Victims([], [], [], waits=asks, takes_back=self._takes_back(rid), queued=True)
             self._claim(rid, claim)
             return self._earmark(Earmark(rid, max(pages_short, self._allotments[rid].lends), set()), victims)
 
