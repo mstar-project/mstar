@@ -1017,7 +1017,9 @@ gives the floor no kept bucket holds, ``min_chunk_tokens`` capped at the budget 
 to the node's chunk alignment, and the ways to start, ``mode: synchronous`` and, where they
 apply, a lower ``min_chunk_tokens`` or memory for a bucket capture left out that would hold the
 step. In either mode, it also refuses a mixed walk over a KV pool the model writes under more
-than one label, since a mixed step plans one.
+than one label, since a mixed step plans one, and one on a node with a resource that corrects
+a verify step's state in its graph (GDN's recurrent state), which reads every row as a verify
+block.
 
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
 client instead — see :doc:`clients`, and :ref:`generation-parameters` for what each
