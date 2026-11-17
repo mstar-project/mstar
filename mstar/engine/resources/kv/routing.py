@@ -134,8 +134,9 @@ class KVRoutingMirror:
             whole = total // self._page_size - self._names_ahead
             if layout.retention is not None:
                 whole = min(whole, layout.retention.protected_prefix // self._page_size)
-            # the names of the prompt's pages (`KVManager._names`)
-            keyed[label] = _Keyed(keys[self._names_ahead:], max(whole, 0), total, ends)
+            # the names of the prompt's pages (`KVManager._names`); no copy where pages are named by their own keys
+            names = keys[self._names_ahead:] if self._names_ahead else keys
+            keyed[label] = _Keyed(names, max(whole, 0), total, ends)
         return keyed
 
     def _image_end(self, keyed: _Keyed, held: int) -> tuple[int, bytes] | None:

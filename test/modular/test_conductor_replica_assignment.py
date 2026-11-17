@@ -614,3 +614,7 @@ def test_the_mirror_counts_the_pages_the_cache_files_in_the_caches_order(names_a
     filed = min(pages - names_ahead, protected if protected is not None else pages)
     keyed = KVRoutingMirror(1, 64, page, {"main"}, names_ahead=names_ahead)._keyed(config)["main"]
     assert keyed.whole == filed
+    keys = config.prefix_keys["main"]
+    assert list(keyed.keys) == list(keys[names_ahead:])
+    # pages named by their own keys: the request's key list, not a copy of it
+    assert (keyed.keys is keys) == (names_ahead == 0)
