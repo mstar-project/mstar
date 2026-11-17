@@ -136,8 +136,9 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     # verify rows' blocks and a prompt row's tokens past them each. Arrivals are mostly cached, so a step's
     # prompt tokens are a page or so, hence the short first rung. The rows reach the verify walk's widest
     # capture, since below it the mixed walk's cap would split a step's verify rows. Synchronously, a step past
-    # the top rung runs eagerly. Asynchronously, the walk's rows and token budget are capped at the widest kept
-    # bucket that holds its worst step (`Engine._fit_mixed_steps_to_captures`), which may sit below the top.
+    # the top rung, or whose bucket capture left out, runs eagerly. Asynchronously, the walk's rows and token
+    # budget are capped at the widest kept bucket that holds its worst step (`Engine._fit_mixed_steps_to_captures`),
+    # which may sit below the top, and a step that still finds no capture raises and fails its rows.
     MIXED_VERIFY_BATCH_SIZES = [4, 8, 16, 32, 48, 64, 96, 128]
     MIXED_VERIFY_PROMPT_TOKENS = [32, 128, 512]
     # Requests per media-walk step, of any medium: the largest caps every
