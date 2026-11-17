@@ -77,6 +77,17 @@ def without_tools(model_kwargs: dict, parts: list[PromptPart] | None) -> list[Pr
         model_kwargs.pop(name, None)
     if parts is None or all(p.extras is None for p in parts):
         return parts
-    # a message that held only calls or reasoning (its content null) was skipped then; one with
-    # text keeps it
-    return [p if p.extras is None else replace(p, extras=None) for p in parts if p.extras is None or p.text]
+    # a message that held only calls or reasoning (its content null) was skipped then, and one with
+    # text joined the text of its role around it, as `flatten_messages` joins it without tool turns
+    kept: list[PromptPart] = []
+    for p in parts:
+        if p.extras is not None:
+            if not p.text:
+                continue
+            p = replace(p, extras=None)
+        last = kept[-1] if kept else None
+        if last is not None and last.modality == p.modality == "text" and last.role == p.role:
+            kept[-1] = replace(last, text=f"{last.text}\n{p.text}")
+        else:
+            kept.append(p)
+    return kept

@@ -51,7 +51,9 @@ class PromptPart:
     messages. ``extras``, on a chat that serves tool calls, is the JSON of the
     message's fields a chat template reads besides its content (an assistant's
     ``tool_calls`` and ``reasoning_content``); such a part, and a ``tool``
-    message's, is a turn of its own.
+    message's, is a turn of its own. It is JSON text rather than typed fields
+    so both frontends hand the API server the same bytes, and a call's
+    ``arguments`` keep the order the client wrote them in.
     """
 
     modality: str

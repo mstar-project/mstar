@@ -40,6 +40,28 @@ def test_a_chat_to_a_model_without_a_tool_format_drops_the_rest():
     assert [(p.role, p.text, p.extras) for p in kept] == [("user", "hi", None), ("assistant", "Hi", None)]
 
 
+CALL = {"type": "function", "id": "c1", "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'}}
+
+
+@pytest.mark.parametrize("messages", [
+    [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "a", "tool_calls": [CALL]},
+     {"role": "assistant", "content": "b"}],
+    [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "a"},
+     {"role": "assistant", "content": None, "tool_calls": [CALL]}, {"role": "assistant", "content": "b"}],
+    [{"role": "assistant", "content": [{"type": "text", "text": "x"}, {"type": "text", "text": "y"}],
+      "reasoning_content": "think"}, {"role": "assistant", "content": "z", "reasoning": "more"},
+     {"role": "user", "content": "q"}],
+], ids=["calls-then-text", "text-null-calls-text", "reasoning-turns"])
+def test_a_chat_to_a_model_without_a_tool_format_flattens_as_without_tool_turns(messages, tmp_path):
+    """The parts that reach such a model are the ones its adapter made before it served tools,
+    adjacent messages of one role joined into one turn."""
+    from mstar.api_server.openai.adapters import flatten_messages
+
+    _, _, _, with_turns = flatten_messages(messages, tmp_path, tool_turns=True)
+    _, _, _, before = flatten_messages(messages, tmp_path)
+    assert APIServer._serve_tool_fields(_server(None), {}, with_turns, chat=True) == before
+
+
 def test_generate_on_a_model_without_a_tool_format_is_as_before():
     """Tool kwargs a model doesn't read: kept, and logged as ignored, as before tools were served."""
     kwargs = {"tools": TOOLS, "tool_choice": "required"}

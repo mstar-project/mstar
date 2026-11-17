@@ -694,3 +694,18 @@ def test_a_tool_grammar_is_the_requests_own_kind_and_a_bad_one_is_a_400():
         request_grammar({GRAMMAR_TOOLS_KWARG: '{"type": "structural_tag", "format": {"type": "nope"}}'})
     with pytest.raises(ValueError, match="at most"):
         request_grammar({GRAMMAR_TOOLS_KWARG: "x" * (MAX_GRAMMAR_CHARS + 1)})
+
+
+@pytest.mark.parametrize("schema", [
+    {"type": "object", "properties": {"a": {"$ref": "#/defs/missing"}}},
+    {"type": 5},
+    {"type": "object", "properties": {"a": {"type": "frob"}}},
+    {"type": "object", "properties": {"a": {"type": "string", "pattern": "(("}}},
+], ids=["missing-ref", "type-not-a-string", "unknown-type", "bad-pattern"])
+def test_a_forced_call_over_a_schema_xgrammar_cant_build_is_a_400(schema):
+    """The data worker builds the tag without reading the schemas; the conductor's compile is where
+    a bad one fails, as the client's 400 and not a 500."""
+    tools = [{"type": "function", "function": {"name": "f", "strict": True, "parameters": schema}}]
+    tag = tool_call_grammar("qwen_3_5", {"tools": tools, "tool_choice": "required"}, False)
+    with pytest.raises(ValueError, match="^tools: "):
+        request_grammar({GRAMMAR_TOOLS_KWARG: tag})
