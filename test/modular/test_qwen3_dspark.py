@@ -945,10 +945,15 @@ _ADOPTERS = [
 _ROUTED = {"OrpheusLLMSubmodule", "CommandAPlusLLMSubmodule", "CanaryQwenLLMSubmodule"}
 
 
+# packages a model's node may import that a CPU test environment needn't have
+_OPTIONAL_IMPORTS = {"diffusers", "flashinfer", "flash_attn_3", "misaki", "qwen_tts", "triton"}
+
+
 def test_every_scaffold_adopter_is_listed():
     """Every node a model package builds on the shared decoder (a `SampledTokenDecoder` outside
-    `mstar.model.components`) is in `_ADOPTERS`, so the two tests below check each one. A package
-    that can't be imported here is passed over, as the two tests skip it."""
+    `mstar.model.components`) is in `_ADOPTERS`, so the two tests below check each one. A package with
+    no ``submodules`` module has no node to list; one whose nodes need an optional dependency missing
+    here is passed over, as the two tests skip it. Any other import failure fails the test."""
     import importlib
     import inspect
     import pkgutil
@@ -958,14 +963,15 @@ def test_every_scaffold_adopter_is_listed():
 
     found = set()
     for package in pkgutil.iter_modules(mstar.model.__path__):
-        name = f"mstar.model.{package.name}.submodules"
-        if package.name == "components" or importlib.util.find_spec(f"mstar.model.{package.name}") is None:
+        if not package.ispkg or package.name == "components":
             continue
+        name = f"mstar.model.{package.name}.submodules"
         try:
             module = importlib.import_module(name)
-        except ImportError:
-            # no submodules module, or one that needs an optional dependency (as `_adopter` skips)
-            continue
+        except ModuleNotFoundError as e:
+            if e.name == name or (e.name or "").split(".")[0] in _OPTIONAL_IMPORTS:
+                continue
+            raise
         for cls_name, cls in inspect.getmembers(module, inspect.isclass):
             if cls.__module__ == name and issubclass(cls, SampledTokenDecoder) and not inspect.isabstract(cls):
                 found.add((name, cls_name))
