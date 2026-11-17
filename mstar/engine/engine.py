@@ -1229,7 +1229,8 @@ class Engine:
                     f"verify rows and a prompt chunk of min_chunk_tokens "
                     f"({self._chunking.min_chunk_tokens(budget, align)}); " + ", or ".join(ways)
                 )
-            rows, tokens, envelope = max(fits)
+            # BucketKey has no order: rank by (bs, tokens) alone
+            rows, tokens, envelope = max(fits, key=lambda fit: fit[:2])
             self._mixed_envelope[node_name] = envelope
             if tokens < budget:
                 self._chunking.cap_budget(node_name, mixed, tokens)

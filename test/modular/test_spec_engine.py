@@ -730,6 +730,18 @@ def test_an_async_mixed_refusal_names_a_min_chunk_tokens_no_kept_bucket_holds():
     assert "mixed steps off" not in message and "left out" not in message
 
 
+def test_two_mixed_buckets_of_one_size_pick_an_envelope_without_ordering_their_keys():
+    """Buckets that tie on (bs, tokens) and differ in their capture key: the envelope is one of them, and
+    picking it never compares two `BucketKey`s, which have no order."""
+    from mstar.engine.resources.step import BucketKey
+
+    eng = engine(3, oracle, mode="asynchronous", mixed=True)
+    _mixed_budget(eng, 1024)
+    a, b = BucketKey("mixed", 64, 1024, cg_key_info="a"), BucketKey("mixed", 64, 1024, cg_key_info="b")
+    eng._fit_mixed_steps_to_captures({NODE: _captured(a, b)})
+    assert eng._mixed_envelope[NODE] in (a, b) and eng.get_max_batch_size(NODE, "mixed") == 64
+
+
 def test_an_async_verify_walk_capture_left_empty_fails_startup():
     """A batch cap of 0 would hang every request after its prompt."""
     from mstar.engine.resources.step import BucketKey
