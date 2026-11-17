@@ -1189,7 +1189,8 @@ class Engine:
         Capture may leave the widest mixed buckets out, so cap the mixed walk's rows and token
         budget at the widest kept bucket that holds the worst step the scheduler builds under those
         caps: its verify rows of a block each, and a prompt row at the budget's `min_chunk_tokens`
-        floor. The captured buckets are agreed across the instance, so every rank fits alike.
+        floor. The captured buckets are agreed across the instance, so every rank fits alike. A
+        bucket's `cg_key_info` doesn't enter the fit: the envelope is read off (bs, tokens) alone.
 
         Refused: a mixed walk with no token budget (a prompt would run whole, past any capture),
         and one where no kept bucket holds that worst step."""
@@ -1207,20 +1208,26 @@ class Engine:
                 )
             runner = ag_runners.get(node_name)
             block, align = draft.decl.config.block, self.chunk_alignment(node_name)
-            fits = []
+            fits, room = [], 0
             for key in runner.captured_buckets(mixed) if runner is not None else ():
                 if key.lean:
                     continue
                 tokens = runner.token_capacity(key)
+                room = max(room, tokens - (key.bs - 1) * block)
                 if tokens >= (key.bs - 1) * block + self._chunking.min_chunk_tokens(min(budget, tokens), align):
                     fits.append((key.bs, tokens, key))
             dropped = [] if runner is None else [str(key) for key in runner.dropped_buckets if key.graph_walk == mixed]
             if not fits:
+                ways = ["set model_kwargs.draft.mode: synchronous"]
+                if room >= align:
+                    # a kept bucket holds the verify rows beside a shorter chunk
+                    ways.append(f"lower min_chunk_tokens to at most {room - room % align}")
+                if dropped:
+                    ways.append(f"free memory for the buckets capture left out, {dropped} (lower max_num_pages)")
                 raise RuntimeError(
                     f"speculative decoding on {node_name}: no captured {mixed!r} bucket holds a mixed step's "
-                    f"verify rows and a prompt chunk (dropped: {dropped}); set model_kwargs.draft.mode: "
-                    "synchronous, free memory for the mixed buckets (or lower max_num_pages), or turn the "
-                    "node's mixed steps off"
+                    f"verify rows and a prompt chunk of min_chunk_tokens "
+                    f"({self._chunking.min_chunk_tokens(budget, align)}); " + ", or ".join(ways)
                 )
             rows, tokens, envelope = max(fits)
             self._mixed_envelope[node_name] = envelope

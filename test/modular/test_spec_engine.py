@@ -714,6 +714,22 @@ def test_an_async_mixed_walk_is_capped_at_its_widest_captured_envelope(caplog):
     assert not sync._mixed_envelope and sync.get_max_batch_tokens(NODE, "mixed") == budget
 
 
+def test_an_async_mixed_refusal_names_a_min_chunk_tokens_no_kept_bucket_holds():
+    """Every ladder bucket kept, but a serving `min_chunk_tokens` past what the widest leaves beside its verify
+    rows: the refusal names the floor and the most it can be, and no knob that doesn't exist."""
+    from mstar.engine.resources.step import BucketKey
+
+    block, budget = 4, 1024
+    eng = engine(3, oracle, mode="asynchronous", mixed=True)
+    _mixed_budget(eng, budget)
+    eng.set_token_budgets({}, {"mixed"}, min_chunk_tokens=budget)
+    with pytest.raises(RuntimeError) as refused:
+        eng._fit_mixed_steps_to_captures({NODE: _captured(BucketKey("mixed", 128, budget))})
+    message = str(refused.value)
+    assert "min_chunk_tokens (1024)" in message and f"at most {budget - 127 * block}" in message
+    assert "mixed steps off" not in message and "left out" not in message
+
+
 def test_an_async_verify_walk_capture_left_empty_fails_startup():
     """A batch cap of 0 would hang every request after its prompt."""
     from mstar.engine.resources.step import BucketKey
