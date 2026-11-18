@@ -1732,7 +1732,7 @@ class ARNodeSubmodule(NodeSubmodule):
         return result
 
     def draft_mixed_step(
-        self, engine_inputs: ModelInputsFromEngine, ids: torch.Tensor, rows, target,
+        self, engine_inputs: ModelInputsFromEngine, ids: torch.Tensor, rows, target, tensors=None,
     ) -> "VerifyResult":
         """A mixed prompt-plus-verify step (`draft_mixed_step`): ``ids`` the step's ``[tokens]`` ids, ``rows``
         its `MixedRows`, and ``target`` maps the ids with the drafts in place and the rows' logit positions
@@ -1744,7 +1744,7 @@ class ARNodeSubmodule(NodeSubmodule):
             raise RuntimeError(f"{type(self).__name__}: a mixed step on a node bound no mixed walk (bind_draft)")
         result = draft_mixed_step(
             engine_inputs.resources[share.sampler_key], engine_inputs.request_ids, ids, rows, target,
-            self.drafter, engine_inputs.resources, resident=engine_inputs.resident,
+            self.drafter, engine_inputs.resources, tensors or {}, resident=engine_inputs.resident,
         )
         self._count_verify(share)
         return result

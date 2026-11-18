@@ -102,8 +102,12 @@ class KVRoutingMirror:
     """`RoutingMirror` of one paged KV resource, for the keyed ``labels`` whose
     walks run on these replicas."""
 
-    def __init__(self, num_replicas: int, num_pages: int, page_size: int, labels: Collection[str]):
+    def __init__(
+        self, num_replicas: int, num_pages: int, page_size: int, labels: Collection[str], names_ahead: int = 0,
+    ):
         self._page_size = page_size
+        # `PagedKVConfig.names_ahead`: page i is filed under key i + names_ahead
+        self._names_ahead = names_ahead
         self._labels = labels
         self._arenas = [PythonPageArena(num_pages, _FreePages(num_pages)) for _ in range(num_replicas)]
         self._indexes = [PrefixIndex(arena) for arena in self._arenas]
@@ -123,12 +127,17 @@ class KVRoutingMirror:
             total, ends = 0, []
             for span in layout.spans[:layout.keyed_spans]:
                 total += span.length
-                if span.end_key is not None:
+                # `KVManager._root`: no image ends where pages are named ahead
+                if span.end_key is not None and not self._names_ahead:
                     ends.append((total, span.end_key))
-            whole = total // self._page_size
+            # the whole pages the worker files, in its order: a page once the key naming it covers a whole
+            # page (`KVManager._index_filled_pages`), then the retention cap
+            whole = total // self._page_size - self._names_ahead
             if layout.retention is not None:
                 whole = min(whole, layout.retention.protected_prefix // self._page_size)
-            keyed[label] = _Keyed(keys, whole, total, ends)
+            # the names of the prompt's pages (`KVManager._names`); no copy where pages are named by their own keys
+            names = keys[self._names_ahead:] if self._names_ahead else keys
+            keyed[label] = _Keyed(names, max(whole, 0), total, ends)
         return keyed
 
     def _image_end(self, keyed: _Keyed, held: int) -> tuple[int, bytes] | None:
@@ -142,7 +151,7 @@ class KVRoutingMirror:
         """The positions `KVManager._lease` would hold: the matched pages but the
         prompt's last, so the walk has input left, then up to the end of an item
         cached inside the next page."""
-        held = min(len(index.pages_for(keyed.keys)), len(keyed.keys) - 1) * self._page_size
+        held = min(len(index.pages_for(keyed.keys)), len(keyed.keys) - 1 + self._names_ahead) * self._page_size
         end = self._image_end(keyed, held)
         return end[0] if end is not None and index.page_for(end[1]) is not None else held
 
@@ -170,7 +179,7 @@ class KVRoutingMirror:
             prompt = keyed.get(label, _Keyed((), 0, 0, []))
             keys = prompt.keys
             # `KVManager._lease`, then its `_alloc`, `_index_filled_pages` and `_cache_image_end`
-            leased = index.lookup(keys)[:len(keys) - 1] if keys else []
+            leased = index.lookup(keys)[:len(keys) - 1 + self._names_ahead] if keys else []
             end = self._image_end(prompt, len(leased) * self._page_size)
             if end is not None:
                 # the lease reads the cached item end, and copies it into a page of its own

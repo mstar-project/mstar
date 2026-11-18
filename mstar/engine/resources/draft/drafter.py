@@ -43,14 +43,20 @@ DRAFT_CARRY = "draft_carry"
 # target accepted every draft last step, so the drafter's row 0 (the token before the block, which
 # its last block never reached) writes its KV; 0 sends that write to the sink. The engine sets it.
 DRAFT_KEEP_FIRST = "draft_keep_first"
+# A prompt step's ``[tokens]`` input for a drafter whose rule is `ChunkBoundary.FOLLOWING`: each
+# row's following prompt token, -1 at a prompt's last row, which follows with the token the step samples
+DRAFT_FOLLOWING = "draft_following"
 
 
 class ChunkBoundary(Enum):
     """How a drafter's state at a prompt chunk's last row is built."""
     # not said: a chunked prompt is refused on the node
     UNDECLARED = "undeclared"
-    # its state at row ``p`` depends only on the target at ``p`` (DSpark)
+    # its state at row ``p`` depends only on rows up to ``p`` (DSpark: the target's at ``p``; a draft model)
     NONE = "none"
+    # its state at row ``p`` reads the prompt's token at ``p + 1`` (EAGLE-3): the prompt step brings
+    # each row's following token (`DRAFT_FOLLOWING`), so a chunk's last row reads the next chunk's first
+    FOLLOWING = "following"
 
 
 class CarrySpec(NamedTuple):
@@ -217,6 +223,7 @@ def drafter_resources(
     node's sampler as loop-back state `DRAFT_CARRY`. Anything a deployment
     chose is left for startup to refuse."""
     from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+    from mstar.engine.resources.recurrent.config import RecurrentStateSpec
     from mstar.engine.resources.sampler.config import LoopbackState, SamplerSpec
 
     needs = decl.needs
@@ -228,6 +235,15 @@ def drafter_resources(
         if not isinstance(pools[0].config, PagedKVConfig):
             raise ValueError(f"the drafter joins KV {needs.kv.kv_cache!r}, which is not a paged pool")
         pools[0].config.join(needs.kv)
+        if needs.chunk_boundary is ChunkBoundary.FOLLOWING:
+            # the drafter's K/V at a page's last slot reads the next page's first token, so the prefix index
+            # names each page by the next page's key, which covers that token
+            if any(isinstance(spec, RecurrentStateSpec) and spec.nodes & nodes for spec in out):
+                raise ValueError(
+                    "a drafter that reads each row's following token names the KV pool's pages a page ahead, "
+                    "which a recurrent pool's prefix snapshots, keyed by page, don't follow"
+                )
+            pools[0].config.names_ahead = 1
     kept = {}
     if needs.carry is not None:
         width, dtype = needs.carry
@@ -277,6 +293,9 @@ class ObserveInputs(NamedTuple):
     # is then over the step's tokens
     mixed: MixedRows | None = None
     ids: torch.Tensor | None = None
+    # the step's other preprocessed tensors (`PrefillInputs.tensors`): a mixed step's prompt rows' own
+    # inputs, such as `DRAFT_FOLLOWING`
+    tensors: Mapping[str, torch.Tensor] = MappingProxyType({})
 
 
 class PrefillInputs(NamedTuple):
@@ -418,6 +437,7 @@ def draft_mixed_step(
     target: Callable[[torch.Tensor, torch.Tensor], TargetOutput],
     drafter: Drafter,
     resources: dict[str, Any],
+    tensors: Mapping[str, torch.Tensor] = MappingProxyType({}),
     resident: CapturedResidentStep | None = None,
 ) -> VerifyResult:
     """`draft_verify_step` for a mixed prompt-plus-verify step: ``ids`` ``[tokens]`` the step's ids (a verify
@@ -450,7 +470,7 @@ def draft_mixed_step(
                            "target returned none")
     result = sampler.verify(request_ids, logits.view(n, k + 1, -1), drafts, refuse=rows.prompt)
     block = torch.cat([anchors.reshape(n, 1).long(), drafts], dim=1)
-    carry = drafter.observe(ObserveInputs(block, result, hidden, mixed=rows, ids=block_ids))
+    carry = drafter.observe(ObserveInputs(block, result, hidden, mixed=rows, ids=block_ids, tensors=tensors))
     if needs.carry is not None:
         if carry is None:
             raise RuntimeError("a drafter that declares a carry returned none from observe")

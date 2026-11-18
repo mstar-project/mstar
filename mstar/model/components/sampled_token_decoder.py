@@ -77,7 +77,15 @@ from mstar.engine.accelerator_graph_config import (
     distribute_tokens,
 )
 from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.draft.drafter import MIXED_KIND, Drafter, PrefillInputs, TargetOutput, mixed_rows
+from mstar.engine.resources.draft.drafter import (
+    DRAFT_FOLLOWING,
+    MIXED_KIND,
+    ChunkBoundary,
+    Drafter,
+    PrefillInputs,
+    TargetOutput,
+    mixed_rows,
+)
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.step import ResourceStep, Segment, SubmoduleStep
@@ -203,6 +211,17 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             self.drafter = drafter
             self._drafting = True
         self.token_stop = self.node_token_stop(config.stop_token_ids, self._encoders, text_prompts)
+
+    @property
+    def _reads_following(self) -> bool:
+        """Whether the drafter reads each prompt row's following token (`ChunkBoundary.FOLLOWING`)."""
+        return self._drafting and self.drafter.needs.chunk_boundary == ChunkBoundary.FOLLOWING
+
+    @property
+    def cuts_tensor_inputs(self) -> bool:
+        # a text prompt's one tensor input, `DRAFT_FOLLOWING`, is cut with its ids (`split_inputs`), so the
+        # engine still probes the prefix cache for it
+        return self._reads_following
 
     @property
     def _block(self) -> int:
@@ -380,13 +399,20 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 compile_mode=self.capture_compile_mode(self.DECODE_WALK),
             ),
         ]
+        def prompt(n: int) -> ARNodeInputs:
+            row = ids(n)
+            if self._reads_following:
+                row.tensor_inputs = {DRAFT_FOLLOWING: torch.zeros(n, dtype=torch.long, device=device)}
+            return row
+
         if self._text_prompts and self.CAPTURE_PREFILL:
             configs += [PackedAcceleratorGraphConfig(
                 capture_graph_walk=self.PREFILL_WALK,
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
-                make_node_input=ids,
+                make_node_input=prompt,
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
                 compile_mode=self.capture_compile_mode(self.PREFILL_WALK),
+                input_seq_dims={DRAFT_FOLLOWING: 0} if self._reads_following else None,
             )]
         if self._text_prompts and self.CAPTURE_PREFILL and self._mixes_verify:
             configs.append(self._mixed_verify_capture(device))
@@ -430,9 +456,11 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
 
         def row(n: int) -> ARNodeInputs:
             verify = n == block
+            following = {} if verify or not self._reads_following else {
+                DRAFT_FOLLOWING: torch.zeros(n, dtype=torch.long, device=device)}
             return ARNodeInputs(
                 input_ids=torch.zeros(1 if verify else n, dtype=torch.long, device=device), input_seq_len=n,
-                graph_walk=self.DECODE_WALK if verify else self.PREFILL_WALK,
+                graph_walk=self.DECODE_WALK if verify else self.PREFILL_WALK, tensor_inputs=following,
             )
 
         def layout(total_tokens: int, bs: int) -> list[int]:
@@ -450,7 +478,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             capture_batch_sizes=sizes,
             compile_mode=self.capture_compile_mode(MIXED),
             token_layout=layout,
-            input_seq_dims={MIXED_KIND: 0},
+            input_seq_dims={MIXED_KIND: 0, DRAFT_FOLLOWING: 0} if self._reads_following else {MIXED_KIND: 0},
         )
 
     @property
@@ -559,6 +587,12 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         if self._drafting and graph_walk == self.DECODE_WALK:
             # a row's first verify step brings its prompt's token routed
             return ARNodeInputs(input_seq_len=self._block, input_ids=input_ids.reshape(-1)[-1:])
+        if self._reads_following and graph_walk == self.PREFILL_WALK:
+            # cut with the ids (`split_inputs`), so a chunk's last row holds the next chunk's first token
+            following = torch.cat([input_ids[1:], input_ids.new_full((1,), -1)])
+            return ARNodeInputs(
+                input_seq_len=input_ids.shape[0], input_ids=input_ids, tensor_inputs={DRAFT_FOLLOWING: following},
+            )
         return ARNodeInputs(input_seq_len=input_ids.shape[0], input_ids=input_ids)
 
     def get_input_sequence_len(
@@ -584,7 +618,12 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         advance its tokens place: the advance through ``end`` less that
         through ``start``, so a row's chunks advance by the whole row's."""
         if graph_walk not in self._media_walks:
-            return super().split_inputs(graph_walk, fwd_info, inputs, start, end)
+            following = inputs.tensor_inputs.get(DRAFT_FOLLOWING)
+            if following is None:
+                return super().split_inputs(graph_walk, fwd_info, inputs, start, end)
+            cut = super().split_inputs(graph_walk, fwd_info, replace(inputs, tensor_inputs={}), start, end)
+            cut.tensor_inputs = {DRAFT_FOLLOWING: following[start:end]}
+            return cut
         cut = super().split_inputs(
             graph_walk, fwd_info, replace(inputs, tensor_inputs={}, resource_step_info=None), start, end,
         )
@@ -651,9 +690,11 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             if not decode:
                 # a mixed step's media prompt rows
                 self._pack_media(out, graph_walk, inputs)
+                self._pack_following(out, graph_walk, inputs)
             return out
         out = {"input_ids": torch.cat([inp.input_ids for inp in inputs], dim=0)}
         self._pack_media(out, graph_walk, inputs)
+        self._pack_following(out, graph_walk, inputs)
         return out
 
     def _mixed_verify_inputs(self, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs]) -> dict:
@@ -674,7 +715,24 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         ids = torch.cat([blocks.reshape(-1), *(to_device_nonblocking(p.long(), device) for p in prompt)])
         tokens = sum(p.numel() for p in prompt)
         kind = torch.cat([torch.arange(block).repeat(verify), torch.full((tokens,), -1)])
-        return {"input_ids": ids, MIXED_KIND: to_device_nonblocking(kind, device)}
+        out = {"input_ids": ids, MIXED_KIND: to_device_nonblocking(kind, device)}
+        if self._reads_following:
+            # the prompt rows' own (`prepare_inputs`), the verify rows' unread
+            following = [inp.tensor_inputs[DRAFT_FOLLOWING] for inp in inputs[verify:] if inp.input_seq_len]
+            out[DRAFT_FOLLOWING] = torch.cat([
+                torch.zeros(verify * block, dtype=torch.long, device=device),
+                *(to_device_nonblocking(f.long(), device) for f in following),
+            ])
+        return out
+
+    def _pack_following(self, out: dict, graph_walk: str, inputs: list[ARNodeInputs]) -> None:
+        """A prompt step's `DRAFT_FOLLOWING`, its rows' in row order, for a drafter that reads it."""
+        if not self._reads_following or graph_walk != self.PREFILL_WALK:
+            return
+        rows = [inp.tensor_inputs[DRAFT_FOLLOWING] for inp in inputs]
+        out[DRAFT_FOLLOWING] = to_device_nonblocking(
+            rows[0] if len(rows) == 1 else torch.cat(rows), out["input_ids"].device,
+        )
 
     def _pack_media(self, out: dict, graph_walk: str, inputs: list[ARNodeInputs]) -> None:
         """A media step's ``MEDIA_EMBEDS``, its rows' in row order as the
@@ -853,7 +911,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             hidden = model(model.embed(ids), label="main", **decoder_kwargs)
             return TargetOutput(model.logits(hidden.index_select(0, at)), hidden if wants_hidden else None)
 
-        result = self.draft_mixed_step(engine_inputs, input_ids, rows, target)
+        result = self.draft_mixed_step(engine_inputs, input_ids, rows, target, tensors)
         out = self.verify_output(result)
         # a prompt row's first token extends its prompt's keys, as a prompt step's host copy does
         out.check_stop_buffers["text_inputs"] = result.tokens[:, 0]
