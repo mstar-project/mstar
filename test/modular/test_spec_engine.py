@@ -918,6 +918,8 @@ def test_a_verify_step_whose_stream_rows_span_less_than_the_block_is_refused():
     short = [Segment(1, "main", 4), Segment(2, "main", 1)]
     with pytest.raises(RuntimeError, match="k \\+ 1 = 4"):
         draft.refuse_step(SubmoduleStep(steps={"kv": KVStep(), "rope": PositionStep()}, segments=short))
+
+
 def test_the_engine_adds_a_drafters_own_steps_to_its_prompt_and_verify_steps():
     """`drafter_step`, from `engine_step`: a drafter's resource steps (`VerifyNode.prefill_steps` / `verify_steps`)
     join the node's prompt and verify steps, fresh each step, and a target that declares one itself is refused."""
@@ -1015,8 +1017,6 @@ def test_a_verify_row_declaring_another_span_fails_before_admit(monkeypatch, cap
     eng.prepare_inputs(batch)
     assert 1 in batch.failed_requests and "prepare_inputs declared 3" in caplog.text
     assert batch.verify_seq is None
-
-
 
 
 def test_a_verify_step_times_its_cut_take_back_and_commit_under_fixed_names(monkeypatch):
