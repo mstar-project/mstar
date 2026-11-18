@@ -735,8 +735,9 @@ def test_an_async_mixed_refusal_names_the_buckets_capture_left_out_and_a_floor_a
     monkeypatch, align,
 ):
     """No kept bucket holds the 128-token floor beside its verify rows: the refusal names the mixed buckets
-    capture left out (not another walk's), and a lower `min_chunk_tokens` only where a kept bucket leaves an
-    aligned chunk beside its verify rows, as a multiple of the alignment; the floor it names starts the node."""
+    capture left out that would hold one (not another walk's, nor one too narrow), and a lower
+    `min_chunk_tokens` only where a kept bucket leaves an aligned chunk beside its verify rows, as a multiple of
+    the alignment; the floor it names starts the node."""
     from mstar.engine.resources.step import BucketKey
 
     block, budget = 4, 1024
@@ -746,12 +747,14 @@ def test_an_async_mixed_refusal_names_the_buckets_capture_left_out_and_a_floor_a
         monkeypatch.setattr(eng, "chunk_alignment", lambda node_name: align)
         runner = _captured(BucketKey("mixed", 128, 127 * block + room))
         left_out = BucketKey("mixed", 128, budget)
-        runner.dropped_buckets = [left_out, BucketKey(eng._drafts[NODE].walk, 128, 128 * block)]
+        runner.dropped_buckets = [
+            left_out, BucketKey("mixed", 128, 127 * block + 64), BucketKey(eng._drafts[NODE].walk, 128, 128 * block),
+        ]
         with pytest.raises(RuntimeError) as refused:
             eng._fit_mixed_steps_to_captures({NODE: runner})
         message = str(refused.value)
         assert "min_chunk_tokens (128)" in message
-        assert f"free memory for the buckets capture left out, {[str(left_out)]}" in message
+        assert f"free memory for the buckets capture left out that would hold one, {[str(left_out)]}" in message
         if advised is None:
             assert "lower min_chunk_tokens" not in message
             continue
@@ -759,6 +762,24 @@ def test_an_async_mixed_refusal_names_the_buckets_capture_left_out_and_a_floor_a
         eng.set_token_budgets({}, {"mixed"}, min_chunk_tokens=advised)
         eng._fit_mixed_steps_to_captures({NODE: runner})
         assert eng.get_max_batch_tokens(NODE, "mixed") == 127 * block + room
+
+
+def test_an_async_mixed_refusal_offers_no_memory_where_no_bucket_capture_left_out_would_hold_the_step():
+    """A floor past every ladder bucket's room beside its verify rows, the widest left out: capturing it would be
+    refused the same, so the refusal doesn't advise freeing memory for it."""
+    from mstar.engine.resources.step import BucketKey
+
+    block, budget = 4, 1024
+    kept, left_out = BucketKey("mixed", 64, 64 * block + 512), BucketKey("mixed", 128, 128 * block + 512)
+    for buckets, dropped in [((kept,), [left_out]), ((kept, left_out), [])]:
+        eng = engine(3, oracle, mode="asynchronous", mixed=True)
+        _mixed_budget(eng, budget)
+        eng.set_token_budgets({}, {"mixed"}, min_chunk_tokens=budget)
+        runner = _captured(*buckets)
+        runner.dropped_buckets = dropped
+        with pytest.raises(RuntimeError, match="no captured 'mixed' bucket holds") as refused:
+            eng._fit_mixed_steps_to_captures({NODE: runner})
+        assert "free memory" not in str(refused.value)
 
 
 def test_two_mixed_buckets_of_one_size_pick_an_envelope_without_ordering_their_keys():

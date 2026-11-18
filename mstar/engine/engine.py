@@ -1194,8 +1194,9 @@ class Engine:
         floor. The captured buckets are agreed across the instance, so every rank fits alike. A
         bucket's `cg_key_info` doesn't enter the fit: the envelope is read off (bs, tokens) alone.
 
-        Refused: a mixed walk with no token budget (a prompt would run whole, past any capture),
-        and one where no kept bucket holds that worst step."""
+        Refused: a mixed walk with no token budget, or with a prompt walk whose chunking a serving
+        override turned off (either way a prompt would run whole, past any capture), and one where no
+        kept bucket holds that worst step."""
         for node_name, draft in self._drafts.items():
             mixed = draft.mixed_walk
             if not draft.asynchronous or mixed is None:
@@ -1216,16 +1217,24 @@ class Engine:
                     continue
                 tokens = runner.token_capacity(key)
                 room = max(room, tokens - (key.bs - 1) * block)
-                if tokens >= (key.bs - 1) * block + self._chunking.min_chunk_tokens(min(budget, tokens), align):
+                if self._holds_mixed_step(key.bs, tokens, block, budget, align):
                     fits.append((key.bs, tokens, key))
-            dropped = [] if runner is None else [str(key) for key in runner.dropped_buckets if key.graph_walk == mixed]
+            left_out = [] if runner is None else [key for key in runner.dropped_buckets if key.graph_walk == mixed]
+            dropped = [str(key) for key in left_out]
             if not fits:
                 ways = ["set model_kwargs.draft.mode: synchronous"]
                 if room >= align:
                     # a kept bucket holds the verify rows beside a shorter chunk
                     ways.append(f"lower min_chunk_tokens to at most {room - room % align}")
-                if dropped:
-                    ways.append(f"free memory for the buckets capture left out, {dropped} (lower max_num_pages)")
+                # a left-out bucket may not be registered: its key's token count bounds what it holds
+                freeable = [
+                    str(key) for key in left_out if self._holds_mixed_step(key.bs, key.num_tokens, block, budget, align)
+                ]
+                if freeable:
+                    ways.append(
+                        f"free memory for the buckets capture left out that would hold one, {freeable} "
+                        "(lower max_num_pages)"
+                    )
                 raise RuntimeError(
                     f"speculative decoding on {node_name}: no captured {mixed!r} bucket holds a mixed step's "
                     f"verify rows and a prompt chunk of min_chunk_tokens "
@@ -1247,6 +1256,11 @@ class Engine:
                     "(budget %d), the widest captured bucket that holds one (%s); capture left out %s",
                     node_name, rows, ladder, min(tokens, budget), budget, envelope, dropped or "none",
                 )
+
+    def _holds_mixed_step(self, bs: int, tokens: int, block: int, budget: int, align: int) -> bool:
+        """Whether a mixed bucket of ``bs`` rows and ``tokens`` holds the worst step under ``budget``: a verify
+        block on every row but one, and a prompt chunk at the `min_chunk_tokens` floor."""
+        return tokens >= (bs - 1) * block + self._chunking.min_chunk_tokens(min(budget, tokens), align)
 
     def _agreed_mode(
         self, decl: "VerifyNode", mgmt: SubmoduleManagement, specs_by_key: Mapping[str, NodeResourceSpec],
