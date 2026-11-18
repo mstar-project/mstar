@@ -270,13 +270,15 @@ def test_the_verify_wrapper_takes_the_managers_dtype(dtype):
     assert wrapper.dtype is dtype
 
 
-def test_a_verify_step_on_fa3_that_plans_two_labels_is_refused():
+@pytest.mark.parametrize("lagged", [False, True], ids=["verify", "lagged"])
+def test_a_verify_step_on_fa3_that_plans_two_labels_is_refused(lagged):
     """FA3 keeps one verify wrapper per (bucket, slot), whatever the label, so a second label's
-    plan would overwrite the first's under the same key."""
+    plan would overwrite the first's under the same key: a lagged pass's wrapper too."""
     from types import SimpleNamespace
 
     from mstar.engine.resources.attn.flashinfer import FlashInferManager
     from mstar.engine.resources.kv.plan import KVPlanOutputs
+    from mstar.engine.resources.step import Lag
 
     manager = FlashInferManager.__new__(FlashInferManager)
     manager._window_left, manager._preplanned, manager._group_idx = -1, False, 0
@@ -287,5 +289,6 @@ def test_a_verify_step_on_fa3_that_plans_two_labels_is_refused():
         plan_results={"kv": KVPlanOutputs({"main": object(), "uncond": object()})},
     )
 
+    step = AttentionStep(verify=True, causal=True, lag=Lag(1, (2, 1, 1)) if lagged else None)
     with pytest.raises(RuntimeError, match="plans one KV label"):
-        manager.plan(AttentionStep(verify=True), ctx)
+        manager.plan(step, ctx)

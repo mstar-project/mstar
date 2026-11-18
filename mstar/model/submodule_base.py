@@ -1726,7 +1726,7 @@ class ARNodeSubmodule(NodeSubmodule):
             raise RuntimeError(f"{type(self).__name__}: a verify step on a node the engine never bound a drafter to")
         result = draft_verify_step(
             engine_inputs.resources[share.sampler_key], engine_inputs.request_ids, input_ids, target,
-            self.drafter, engine_inputs.resources, engine_inputs.resident, share.correcting_keys,
+            self.drafter, engine_inputs.resources, engine_inputs.resident, share.correcting_keys, share.select_pass,
         )
         self._count_verify(share)
         return result

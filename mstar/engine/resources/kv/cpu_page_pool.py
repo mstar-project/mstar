@@ -72,15 +72,19 @@ class CPUPagePool:
         arena.index = self.index
 
         # same layout as the device cache, on pinned memory so the copies can
-        # be async
-        self.cpu_kv_cache = torch.empty(
-            kv_cache.tensor.shape[0],
-            arena.max_num_pages,
-            *kv_cache.tensor.shape[2:],  # one page: K/V axis under NHD, latent under MLA
-            dtype=kv_cache.dtype,
-            device="cpu",
-            pin_memory=True,
-        )
+        # be async: one tensor per storage (`KVCache.storages`), the primary first
+        self.cpu_storages = [
+            torch.empty(
+                tensor.shape[0],
+                arena.max_num_pages,
+                *tensor.shape[2:],  # one page: K/V axis under NHD, latent under MLA
+                dtype=kv_cache.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            for tensor in kv_cache.storages
+        ]
+        self.cpu_kv_cache = self.cpu_storages[0]
 
         # {request_id: {label: OffloadedStream}}
         self.offloaded: dict[str, dict[str, OffloadedStream]] = {}
@@ -103,6 +107,11 @@ class CPUPagePool:
         self._dropped_logged_at: float | None = None
         self.guaranteed = 0
         self._guaranteed_logged_at: float | None = None
+
+    def _paired(self, gpu) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Each host storage with its device one: ``gpu`` is the `KVCache`, or a pool's one tensor."""
+        devices = getattr(gpu, "storages", None) or [gpu]
+        return list(zip(self.cpu_storages, devices, strict=True))
 
     def _get_stream(self) -> torch.cuda.Stream:
         if self._stream is None:
@@ -251,7 +260,7 @@ class CPUPagePool:
             )
             self._dropped_logged_at = now
 
-    def copy_out(self, gpu_kv_cache: torch.Tensor, copies: PageCopies) -> None:
+    def copy_out(self, gpu_kv_cache: KVCache | torch.Tensor, copies: PageCopies) -> None:
         if not copies.gpu:
             return
         stream = self._get_stream()
@@ -260,9 +269,10 @@ class CPUPagePool:
         # the copies behind it, or they could read a page mid-write.
         stream.wait_stream(torch.cuda.current_stream())
         self._copied_since_write = True
-        self._copier.copy(self.cpu_kv_cache, copies.cpu, gpu_kv_cache, copies.gpu, stream)
+        for host, device in self._paired(gpu_kv_cache):
+            self._copier.copy(host, copies.cpu, device, copies.gpu, stream)
 
-    def copy_in(self, gpu_kv_cache: torch.Tensor, copies: PageCopies) -> None:
+    def copy_in(self, gpu_kv_cache: KVCache | torch.Tensor, copies: PageCopies) -> None:
         if not copies.gpu:
             return
         stream = self._get_stream()
@@ -270,14 +280,15 @@ class CPUPagePool:
         # been released by a commit whose kernels are still reading them.
         stream.wait_stream(torch.cuda.current_stream())
         self._copied_since_write = True
-        self._copier.copy(gpu_kv_cache, copies.gpu, self.cpu_kv_cache, copies.cpu, stream)
+        for host, device in self._paired(gpu_kv_cache):
+            self._copier.copy(device, copies.gpu, host, copies.cpu, stream)
 
     def _get_write_stream(self) -> torch.cuda.Stream:
         if self._write_stream is None:
             self._write_stream = torch.cuda.Stream()
         return self._write_stream
 
-    def write(self, gpu_kv_cache: torch.Tensor, copies: PageCopies) -> None:
+    def write(self, gpu_kv_cache: KVCache | torch.Tensor, copies: PageCopies) -> None:
         """Copy cached device pages here on a stream of their own, so `sync` never waits for them. The
         caller has seen the steps that wrote the pages finish, so the write adds no wait on the compute stream."""
         stream = self._get_write_stream()
@@ -286,7 +297,8 @@ class CPUPagePool:
         if self._copied_since_write:
             self._copied_since_write = False
             stream.wait_stream(self._stream)
-        self._copier.copy(self.cpu_kv_cache, copies.cpu, gpu_kv_cache, copies.gpu, stream)
+        for host, device in self._paired(gpu_kv_cache):
+            self._copier.copy(host, copies.cpu, device, copies.gpu, stream)
 
     def record_write(self) -> torch.cuda.Event:
         """An event that completes once every write queued so far has landed."""
