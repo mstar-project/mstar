@@ -573,3 +573,18 @@ def test_a_packed_replay_pads_each_label_s_spans_as_its_seq_lens():
     runner.run(static_inputs={}, request_ids=[7], seq_lens=[3, 2], real_bs=1,
                label_seq_lens={"window": [1, 2, 2], "full": [5]})
     assert declared == [([3, 2, 0], {"window": [1, 2, 2, 0], "full": [5, 0]})]
+
+
+def test_captured_buckets_are_a_walks_buckets_with_a_slot_to_replay():
+    """What the asynchronous verify checks read (`Engine._refuse_uncaptured_verify`):
+    one walk's buckets, less any capture left without a slot."""
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    kept, slotless = BucketKey("decode", 4, 16), BucketKey("decode", 8, 32)
+    other = BucketKey("prefill", 16, 256)
+    runner._buckets = {
+        kept: SimpleNamespace(slots=[object()]), slotless: SimpleNamespace(slots=[]),
+        other: SimpleNamespace(slots=[object()]),
+    }
+    assert runner.captured_buckets("decode") == [kept] and runner.max_captured_bs("decode") == 4
+    assert runner.captured_buckets("prefill") == [other] and runner.max_captured_bs("prefill") == 16
+    assert runner.captured_buckets("mixed") == [] and runner.max_captured_bs("mixed") == 0

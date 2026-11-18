@@ -61,6 +61,23 @@ SNAPSHOT = {
     "CausalConv": [
         ["activation", "KEYWORD_ONLY", "'silu'"],
     ],
+    "Draft": [
+        ["name", "POSITIONAL_OR_KEYWORD", None],
+        ["nodes", "KEYWORD_ONLY", None],
+        ["array", "KEYWORD_ONLY", None],
+        ["sampler", "KEYWORD_ONLY", None],
+        ["walk", "KEYWORD_ONLY", None],
+        ["method", "KEYWORD_ONLY", None],
+        ["model", "KEYWORD_ONLY", None],
+        ["checkpoint", "KEYWORD_ONLY", None],
+        ["num_draft_tokens", "KEYWORD_ONLY", None],
+        ["num_layers", "KEYWORD_ONLY", None],
+        ["hidden_size", "KEYWORD_ONLY", None],
+        ["dtype", "KEYWORD_ONLY", None],
+        ["mode", "KEYWORD_ONLY", "'auto'"],
+        ["mixed_walk", "KEYWORD_ONLY", 'None'],
+        ["input_kinds", "KEYWORD_ONLY", "frozenset({'text'})"],
+    ],
     "Entry": [
         ["tensors", "POSITIONAL_OR_KEYWORD", None],
         ["host", "KEYWORD_ONLY", '{}'],

@@ -22,6 +22,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.engine.resources.base import same_fingerprint
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.keys import chain
@@ -271,3 +272,25 @@ def test_a_request_that_opted_out_chains_nothing():
         "a request that turned the cache off left its generated pages behind"
     )
     kv.assert_pages_conserved()
+
+
+def test_the_reload_digest_names_a_keyed_page_by_its_key():
+    """`KVManager.debug_fingerprint` (the offload/reload check under MSTAR_KV_DEBUG_ASSERTS) digests a
+    stream's private pages and names its keyed ones by their keys: a reload may take a keyed page from the
+    prefix index, filed there from another request's identical prompt computed in another batch, whose
+    bytes differ in rounding though the page is the same."""
+    kv = _manager()
+    prompt = list(range(3 * PAGE_SIZE + 2))
+    _ingest(kv, "r0", prompt)
+    _prefill(kv, "r0", prompt)
+    stream = kv._streams["r0"]["main"]
+    keyed = len(kv._offload_keys(stream))
+    assert keyed == 3
+    before = kv.debug_fingerprint("r0")
+    assert {"kv/main", "kv/main/keys", "kv/main/len"} <= set(before)
+    pages = stream.pages()
+    kv.kv_cache.tensor[:, pages[0]] += 1e-3  # a keyed page's bytes, as another batch's would round
+    assert same_fingerprint(kv.debug_fingerprint("r0"), before)
+    kv.kv_cache.tensor[:, pages[keyed]] += 1e-3  # a private page's
+    after = kv.debug_fingerprint("r0")
+    assert not torch.equal(after["kv/main"], before["kv/main"]) and after["kv/main/keys"] == before["kv/main/keys"]

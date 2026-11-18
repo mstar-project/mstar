@@ -336,6 +336,21 @@ TP, SP or CFG instance count once: the instance's first rank reports.
    Counter. Waits by guaranteed requests to take back pages they lent, since no request
    holding them could move yet. Each wait holds up a stream that can't pause.
 
+``mstar_spec_draft_tokens_total{model_name, component}``
+   Counter, on a node that drafts and verifies tokens (speculative decoding): drafts
+   proposed.
+
+``mstar_spec_accepted_tokens_total{model_name, component}``
+   Counter. Drafts the target accepted, before a stop or the budget cuts the run.
+
+``mstar_spec_verify_rows_total{model_name, component}``
+   Counter. Verify rows, one per request per step. The acceptance length τ is
+   ``(accepted + rows) / rows``; near-zero acceptance with correct output means a
+   mismatched drafter.
+
+``mstar_spec_accepted_per_row{model_name, component}``
+   Histogram. Drafts one verify row accepted, 0 to ``num_draft_tokens``.
+
 ``mstar_component_pending_steps{model_name, component}``
    Gauge. Requests whose next step on the node is ready (its inputs arrived) and not
    running: waiting for room in a step, or for the worker to pick the node.

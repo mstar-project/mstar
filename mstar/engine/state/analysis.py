@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, get_origin
 
 import torch
 
-from mstar.engine.state.contract import EMPTY, Array, Block, Read, Sampler, SeqShard, is_value, read_layers
+from mstar.engine.state.contract import EMPTY, Array, Block, Draft, Read, Sampler, SeqShard, is_value, read_layers
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
@@ -49,6 +49,25 @@ def state_declaration_problems(model: "Model") -> list[str]:
             problems += _sampler_problems(declared)
         elif isinstance(declared, SeqShard):
             problems += _shard_problems(declared, arrays, walks, combined)
+        elif isinstance(declared, Draft):
+            problems += _draft_problems(declared, declarations, walks, combined)
+    return problems
+
+
+def _draft_problems(draft: Draft, declarations, walks: Mapping[str, set[str]], combined: set[str]) -> list[str]:
+    """A draft names a paged array and a sampler of its node, and walks the node steps on."""
+    where, (node,) = f"Draft {draft.name!r}", draft.nodes
+    by_name = {declared.name: declared for declared in declarations}
+    array, sampler = by_name.get(draft.array), by_name.get(draft.sampler)
+    problems = []
+    if not isinstance(array, Array) or node not in array.nodes or not array.layers or array.max_len == 0:
+        problems.append(f"{where}.array: {draft.array!r} is not an array of {node!r} that keeps entries by layer")
+    if not isinstance(sampler, Sampler) or node not in sampler.nodes:
+        problems.append(f"{where}.sampler: {draft.sampler!r} is not a sampler of {node!r}")
+    if node not in walks.get(draft.walk, ()):
+        problems.append(f"{where}.walk: {node!r} steps on no walk {draft.walk!r}")
+    if draft.mixed_walk is not None and draft.mixed_walk not in combined:
+        problems.append(f"{where}.mixed_walk: {draft.mixed_walk!r} is not a combined walk of the model")
     return problems
 
 

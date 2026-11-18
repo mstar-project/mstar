@@ -129,7 +129,10 @@ def make_worker(
     if unknown:
         raise TypeError(f"make_worker has no field {sorted(unknown)}")
     layout_fields = {name: named.pop(name) for name in named.keys() & _LAYOUT}
-    for name in ("parallel_nodes", "parallel_leader_nodes", "streaming_edge_names", "side_keys"):
+    for name in (
+        "parallel_nodes", "parallel_leader_nodes", "streaming_edge_names", "side_keys",
+        "verifying_nodes", "synchronous_verify_nodes",
+    ):
         if name in layout_fields:
             layout_fields[name] = frozenset(layout_fields[name])
     layout = WorkerLayout(**layout_fields)

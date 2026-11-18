@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from mstar.engine.resources.attn.workspace import WorkspacePool
     from mstar.engine.resources.context_parallel import ContextParallel
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
+    from mstar.engine.resources.spec import ResourceCapabilities
 
 
 @dataclass(frozen=True)
@@ -465,6 +466,38 @@ class Resource(ResidentHooks, ABC):
         """
         return
 
+    # Speculative decoding: a verify step commits its whole block of k + 1
+    # tokens a row, and the runner later takes the rejected ones back
+
+    def committed_spans(self, step, rids, label: str, span: int) -> list[int]:
+        """The span ``step``'s commit counted for each of ``rids``' ``label``
+        stream, which a take-back may give back at most."""
+        return [span] * len(rids)
+
+    def capabilities(self) -> "ResourceCapabilities":
+        """Its node verifies drafts: this worker's own refusals (its GPU, the
+        kernels installed, resolved dtypes), which the engine narrows the spec's
+        answer with (`ResourceCapabilities.narrowed`). Asked once at load,
+        before the node's mode is agreed. No side effects: what to run is
+        chosen in `bind_verify_walk`."""
+        from mstar.engine.resources.spec import ResourceCapabilities
+
+        return ResourceCapabilities.granting_all()
+
+    def take_back(self, rids, counts, label: str) -> None:
+        """Give back ``counts`` committed tokens of each of ``rids``' ``label``
+        stream: a verify step's rejected drafts, applied once, at the head of
+        a later admit (`StepRunner`). Only an override is called."""
+        return
+
+    def bind_verify_walk(self, walk: str, block: int, slack: int) -> None:
+        """Its node verifies drafts on ``walk``, ``block`` (``k + 1``) tokens a
+        row, and a request's reserved length runs up to ``slack`` past its
+        verified one. Called once at load on every resource of the node, after
+        its mode is agreed: pick kernels, size for the slack. A refusal belongs
+        in `capabilities`, which ran before."""
+        return
+
     def plan(self, step: ResourceStep, ctx: StepContext) -> Any:
         """ret is immutable and opaque to runner; only gives to `ctx.plan_results`"""
         return None
@@ -640,6 +673,15 @@ class Resource(ResidentHooks, ABC):
         check that the reload was successful."""
         return True
 
+    def debug_fingerprint(self, rid: str) -> "dict[str, bytes | torch.Tensor]":
+        """Digests of ``rid``'s device state that an offload and its reload must
+        bring back unchanged, by part (`Engine.offload_request` under
+        ``MSTAR_KV_DEBUG_ASSERTS``): the pages it moves, and the state it keeps
+        on device across the offload. A device part is a `tensor_digest`, queued on
+        the current stream and never read on the host; a host part is bytes. Debug
+        only. Nothing by default."""
+        return {}
+
     def reclaimable(self, rid: str) -> int:
         """What `offload` would free, in whatever this resource counts.
 
@@ -759,3 +801,64 @@ def build_resource(spec: NodeResourceSpec, info: EngineResourceInfo) -> Resource
     resource = spec.resource_class.build(spec, info)
     resource.resource_key = spec.resource_key
     return resource
+
+
+# 32-bit words a digest folds at a time: its int64 scratch (the words and their weights, the
+# product taken in place) is then about 16 MiB however large the tensor is
+DIGEST_CHUNK = 1 << 20
+
+
+class TensorDigest:
+    """`tensor_digest`'s two sums, fed the words in order a piece at a time, so a
+    digest of many pages never holds more than one piece and one chunk's int64
+    scratch. The sums wrap in int64, which makes them independent of how the words
+    are split; the weight of each word comes from its index in the whole sequence,
+    counted on the host, so every rank folds the same words to the same digest."""
+
+    def __init__(self, device: torch.device, chunk: int = DIGEST_CHUNK):
+        self._sums = torch.zeros(2, dtype=torch.int64, device=device)
+        self._chunk = chunk
+        self._at = 0
+
+    def add(self, t: torch.Tensor) -> None:
+        """The words of ``t``'s bytes, after those added before. Each piece must be
+        whole 32-bit words for its split to keep the whole sequence's digest."""
+        flat = t.detach().reshape(-1).contiguous()
+        if flat.numel() * flat.element_size() % 4:
+            raise ValueError(f"a digest piece of {flat.numel() * flat.element_size()} bytes isn't whole 32-bit words")
+        self._add_words(flat.view(torch.int32))
+
+    def _add_words(self, words: torch.Tensor) -> None:
+        for start in range(0, words.numel(), self._chunk):
+            part = words[start:start + self._chunk].to(torch.int64)
+            weights = torch.arange(self._at + 1, self._at + part.numel() + 1, device=part.device, dtype=torch.int64)
+            weights.remainder_(65521).add_(1)
+            weights.mul_(part)
+            self._sums[0] += part.sum()
+            self._sums[1] += weights.sum()
+            self._at += part.numel()
+
+    def value(self) -> torch.Tensor:
+        return self._sums.clone()
+
+
+def tensor_digest(t: torch.Tensor, chunk: int = DIGEST_CHUNK) -> torch.Tensor:
+    """A digest of ``t``'s bytes (`Resource.debug_fingerprint`), computed and kept where
+    ``t`` lives: its 32-bit words summed plain and position-weighted, in wrapping int64,
+    as a ``[2]`` tensor, folded ``chunk`` words at a time (`TensorDigest`). Nothing
+    reaches the host: the engine compares two on the device (`Engine._check_reload_prints`)."""
+    flat = t.detach().reshape(-1).contiguous()
+    digest = TensorDigest(flat.device, chunk)
+    if flat.numel() * flat.element_size() % 4:
+        digest._add_words(flat.view(torch.uint8))
+    else:
+        digest._add_words(flat.view(torch.int32))
+    return digest.value()
+
+
+def same_fingerprint(a: Mapping, b: Mapping) -> bool:
+    """Whether two `Resource.debug_fingerprint` results agree, part by part. Reads device
+    digests on the host: tests only (the engine compares them on the device)."""
+    if a.keys() != b.keys():
+        return False
+    return all(torch.equal(a[k], b[k]) if torch.is_tensor(a[k]) else a[k] == b[k] for k in a)
