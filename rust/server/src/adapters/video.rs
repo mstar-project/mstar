@@ -73,7 +73,7 @@ impl OpenAIAdapter for Cosmos3Edge {
         true
     }
     fn chat_args(&self, req: &ChatCompletionRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
-        template_kwargs_chat(req, upload_dir, allow_remote)
+        template_kwargs_chat(req, upload_dir, allow_remote, false)
     }
     fn image_to_request(&self, req: &ImageGenerationRequest) -> Result<SubmitArgs, String> {
         Cosmos3.image_to_request(req)

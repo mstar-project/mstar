@@ -58,6 +58,7 @@ from mstar.api_server.openai.serving_realtime import (
     response_object,
     server_event,
 )
+from mstar.api_server.tool_fields import asks_for_tools, without_tools
 from mstar.utils.generation_kwargs import offset_seed
 from mstar.utils.utf8_stream import Utf8Stream
 
@@ -89,6 +90,16 @@ _STRIP_KEYS = {
     # adapter refuses a chat that sets one of them on.
     "min_tokens", "eos_token_ids", *CHAT_ENVELOPE_KEYS,
 }
+
+def _refuse_tools(args) -> None:
+    """Tool calls aren't served through Dynamo yet: this bridge returns the raw reply, with no
+    ``tool_calls``. A chat asking for one, or carrying a tool turn, is refused; the rest of its tool
+    fields, and its assistant turns' reasoning, are dropped, as before the chat adapters served tools."""
+    mk = args.model_kwargs if args.model_kwargs is not None else {}
+    if asks_for_tools(mk, args.prompt_parts):
+        raise _BadRequestError("tool calling is not served through Dynamo")
+    args.prompt_parts = without_tools(mk, args.prompt_parts)
+
 
 # Image-request fields that ride nvext (mirrors Dynamo's NvCreateImageRequest);
 # flattened onto the adapter request so they pass through as model_kwargs.
@@ -228,6 +239,7 @@ class RequestBridge:
             args = self.adapter.chat_to_request(req, self.server.upload_dir)
         except ValueError as exc:
             raise _BadRequestError(str(exc)) from exc
+        _refuse_tools(args)
         rid = self._submit(args, prefix="chatcmpl")
         created = int(time.time())
 

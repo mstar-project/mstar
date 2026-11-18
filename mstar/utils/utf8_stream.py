@@ -29,6 +29,11 @@ class Utf8Stream:
     def flush(self) -> str:
         return self._decoder.decode(b"", final=True)
 
+    @property
+    def pending(self) -> bool:
+        """Whether it holds the first bytes of a character still to come."""
+        return bool(self._decoder.getstate()[0])
+
 
 def decode_joined(parts: Iterable[bytes]) -> str:
     """A whole response's text chunks as one string: join, then decode once."""

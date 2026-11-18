@@ -731,6 +731,7 @@ async fn chat_completions(
         }
     }
     args.report_usage = true;
+    args.parse_reply = true;
     schedule_upload_cleanup(&st.upload_dir, &args);
     let request_id = rid("chatcmpl");
 
@@ -873,11 +874,24 @@ fn chat_sse_payloads(
 fn chat_delta(c: &ResultChunk, text: &mut Utf8Stream) -> Option<Value> {
     Some(match c.modality.as_str() {
         "text" => {
+            // a reasoning model's thinking, split off its answer by the backend's reply parser
+            let reasoning = c.metadata.get("reasoning").and_then(Value::as_str).filter(|r| !r.is_empty());
             let content = text.feed(&c.data);
-            if content.is_empty() {
+            let mut delta = serde_json::Map::new();
+            if let Some(reasoning) = reasoning {
+                delta.insert("reasoning".to_string(), json!(reasoning));
+            }
+            if !content.is_empty() {
+                delta.insert("content".to_string(), json!(content));
+            }
+            // the reply's finished tool calls, each with its index, as the backend's parser wrote them
+            if let Some(calls) = c.metadata.get("tool_calls").filter(|v| v.as_array().is_some_and(|a| !a.is_empty())) {
+                delta.insert("tool_calls".to_string(), calls.clone());
+            }
+            if delta.is_empty() {
                 return None;
             }
-            json!({"content": content})
+            Value::Object(delta)
         }
         // Streaming audio deltas are base64 16-bit PCM at the model rate.
         "audio" => json!({"audio": {"id": rid("audio"), "data": media::b64(&c.data)}}),
@@ -942,12 +956,22 @@ fn build_chat_response(
     audio_format: &str,
 ) -> Result<Value, String> {
     let mut text_bytes: Vec<u8> = Vec::new();
+    let mut reasoning = String::new();
+    let mut calls: Vec<Value> = Vec::new();
     let mut audio_pcm: Vec<u8> = Vec::new();
     let mut images: Vec<Vec<u8>> = Vec::new();
     let mut usage: Option<&Value> = None;
     for c in &chunks {
         match c.modality.as_str() {
-            "text" => text_bytes.extend_from_slice(&c.data),
+            "text" => {
+                text_bytes.extend_from_slice(&c.data);
+                if let Some(r) = c.metadata.get("reasoning").and_then(Value::as_str) {
+                    reasoning.push_str(r);
+                }
+                if let Some(cs) = c.metadata.get("tool_calls").and_then(Value::as_array) {
+                    calls.extend(cs.iter().cloned());
+                }
+            }
             "audio" => audio_pcm.extend_from_slice(&c.data),
             "image" => images.push(c.data.clone()),
             "usage" => usage = Some(&c.metadata),
@@ -957,6 +981,22 @@ fn build_chat_response(
     // Joined before decoding: a token can end mid-character.
     let text = String::from_utf8_lossy(&text_bytes).into_owned();
     let mut message = json!({"role": "assistant", "content": text.clone()});
+    if !reasoning.is_empty() {
+        // a reasoning model's thinking, split off its answer by the backend's reply parser
+        message["reasoning"] = json!(reasoning);
+    }
+    if !calls.is_empty() {
+        // the reply's tool calls; a reply that is only calls has no content, as OpenAI's
+        for call in &mut calls {
+            if let Some(o) = call.as_object_mut() {
+                o.remove("index");
+            }
+        }
+        message["tool_calls"] = Value::Array(calls);
+        if text.is_empty() {
+            message["content"] = Value::Null;
+        }
+    }
 
     if !audio_pcm.is_empty() {
         let (audio, _) = media::pcm16_to_container(&audio_pcm, sample_rate, audio_format)?;
@@ -1805,7 +1845,7 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
                 return detail_error(500, &e.to_string());
             }
             let paths = uploads.paths.entry(modality.to_string()).or_default();
-            parts.push(Part { modality: modality.to_string(), text: None, index: paths.len(), role: None });
+            parts.push(Part { modality: modality.to_string(), text: None, index: paths.len(), role: None, extras: None });
             paths.push(save_path.to_string_lossy().into_owned());
         } else {
             // Propagate a field read failure (body-limit overrun, mid-upload
@@ -1904,7 +1944,7 @@ async fn generate_finish(
     // /generate lays it out.
     let has_text = text.is_some();
     if has_text {
-        parts.push(Part { modality: "text".to_string(), text: text.clone(), index: 0, role: None });
+        parts.push(Part { modality: "text".to_string(), text: text.clone(), index: 0, role: None, extras: None });
     }
     let input_modalities: Vec<String> = match in_mods_raw {
         // An explicit list is then the layout on its own, so the derived

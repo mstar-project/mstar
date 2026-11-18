@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from mstar.engine.resources.attn.workspace import WorkspacePool
     from mstar.engine.resources.context_parallel import ContextParallel
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
+    from mstar.model.utils import TextOutput
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,9 @@ class EngineResourceInfo:
     # nodes' pools place positions over the SP ranks (``PagedKVConfig.context_parallel``), or it is
     # a pool stored ``copied`` or a resource over such pools alone (``NodeResourceSpec.storage``)
     replicated_over_sp: bool = False
+    # the model's ``Model.text_output``, for a resource that reasons over its token
+    # vocabulary (the sampler's grammars): a call, as it may load the tokenizer
+    text_output: "Callable[[], TextOutput | None] | None" = None
     # what each step may still copy to the host once its outputs are sent, or on a pass that runs no step
     host_allowance: StepAllowance | None = None
 
@@ -229,6 +233,12 @@ class Resource(ResidentHooks, ABC):
     # Each rank makes the choice from its own state, so the resource's lean and
     # plain kernels must issue the same collectives.
     lean_capture: bool = False
+
+    # Whether this resource's step splits its node's captures: it calls `split_capture` once per
+    # capture, from inside its call (the grammar sampler, from its draw), and the runner records
+    # every capture of the node with the backend's ``capture_split``; any other node's capture
+    # is the runtime's own.
+    splits_capture: bool = False
 
     def lean_for(self, request_ids) -> bool:
         """Whether every one of ``request_ids`` lets this ``lean_capture`` resource
@@ -403,7 +413,8 @@ class Resource(ResidentHooks, ABC):
         """
         Takes the output of publish, possibly from another device, and kicks
         of a retrieval if needed (e.g., PD disaggregation KV transfer).
-        Returns whether the retrieve has completed.
+        Returns whether the retrieve has completed. Not ready also covers
+        per-request state the resource is still preparing (a grammar compiling).
         """
         return ADMIT_OK
 

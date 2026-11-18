@@ -364,6 +364,71 @@ def test_both_frontends_answer_a_chat_with_the_same_status_and_body(case, model,
     assert _normalized(*rust, stream) == _normalized(py.status_code, py.content, stream)
 
 
+_CALL = {"index": 0, "id": "call_0", "type": "function",
+         "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'}}
+PARSED_REPLIES = {
+    # a reply split by the backend's parser: the reasoning, then the answer or the calls
+    "answer": [_Chunk("text", b"", {"reasoning": "Simple"}), _Chunk("text", b"Paris", {"reasoning": " question."}),
+               _Chunk("text", b"!")],
+    "tool-calls": [_Chunk("text", b"", {"reasoning": "Check the weather."}),
+                   _Chunk("text", b"", {"tool_calls": [_CALL]}),
+                   _Chunk("text", b"", {"tool_calls": [{**_CALL, "index": 1, "id": "call_1"}]})],
+}
+
+
+class _ParsedPythonServer(_PythonServer):
+    def __init__(self, model_name, upload_dir, chunks, finish):
+        super().__init__(model_name, upload_dir)
+        self.parsed, self.finish = chunks, finish
+
+    def submit_request(self, **kwargs):
+        self.tail = [_Chunk("usage", b"", {**_USAGE, "finish_reason": self.finish})]
+        return kwargs["request_id"]
+
+    async def collect_results(self, request_id, raw_request=None):
+        return [*self.parsed, *self.tail]
+
+    async def iter_result_chunk_batches(self, request_id):
+        yield self.parsed[:1]
+        yield [*self.parsed[1:], *self.tail]
+
+
+class _ParsedStub(_StubAPIServer):
+    def __init__(self, chunks, finish):
+        super().__init__()
+        self.parsed, self.finish = chunks, finish
+
+    async def iter_result_chunks(self, request_id):
+        for chunk in [*self.parsed, _Chunk("usage", b"", {**_USAGE, "finish_reason": self.finish})]:
+            yield chunk
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["whole", "stream"])
+@pytest.mark.parametrize("reply", sorted(PARSED_REPLIES))
+def test_both_frontends_render_a_parsed_reply_alike(reply, stream, tmp_path, monkeypatch):
+    """The backend's parser splits a reply once; each frontend renders its pieces the same way:
+    ``reasoning`` (whole and as deltas), ``tool_calls`` (``content`` null when the reply is only
+    calls, each delta carrying its index) and ``finish_reason: tool_calls``."""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from mstar.api_server import entrypoint
+
+    finish = "tool_calls" if reply == "tool-calls" else "stop"
+    body = {"messages": [{"role": "user", "content": "Weather in Paris?"}], "stream": stream}
+    monkeypatch.setattr(entrypoint, "api_server",
+                        _ParsedPythonServer("qwen3_5_0.8b", tmp_path, PARSED_REPLIES[reply], finish))
+    py = TestClient(entrypoint.app).post("/v1/chat/completions", json=body)
+    with _model_stack("qwen3_5_0.8b", _ParsedStub(PARSED_REPLIES[reply], finish)) as (port, _upload):
+        rust = _post(port, "/v1/chat/completions", body, timeout=30)
+    ours = _normalized(py.status_code, py.content, stream)
+    assert _normalized(*rust, stream) == ours
+    if not stream:
+        message = ours[1]["choices"][0]["message"]
+        assert message.get("reasoning") and (message.get("tool_calls") or message["content"])
+        assert ours[1]["choices"][0]["finish_reason"] == finish
+
+
 # ── GET /v1/audio/voices ─────────────────────────────────────────────────────
 
 class _VoicedModel:
@@ -471,6 +536,114 @@ def test_a_text_only_chat_is_refused_or_submitted_as_python_does(case, tmp_path)
     assert normalize_generation_kwargs(sub["mk"]) == want.model_kwargs
     assert [asdict(p) for p in sub["parts"]] == [asdict(p) for p in want.prompt_parts]
     assert not sub["files"]
+
+
+# ── response_format and structured_outputs ───────────────────────────────────
+
+SCHEMA = {"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]}
+STRUCTURED_CASES = {
+    "json-object": {"response_format": {"type": "json_object"}},
+    "json-schema": {"response_format": {"type": "json_schema",
+                                        "json_schema": {"name": "n", "strict": True, "schema": SCHEMA}}},
+    "text": {"response_format": {"type": "text"}},
+    "null": {"response_format": None},
+    "unknown-type": {"response_format": {"type": "yaml"}},
+    "no-type": {"response_format": {}},
+    "numeric-type": {"response_format": {"type": 5}},
+    "schema-missing": {"response_format": {"type": "json_schema", "json_schema": {"name": "n"}}},
+    "not-an-object": {"response_format": "json_object"},
+    "both": {"response_format": {"type": "json_object"}, "structured_outputs": {"regex": "a+"}},
+    "structured-outputs": {"structured_outputs": {"choice": ["yes", "no"]}},
+}
+
+
+@pytest.mark.parametrize("case", sorted(STRUCTURED_CASES))
+@pytest.mark.parametrize("model", ["qwen3_5_0.8b", "glm52"])
+def test_both_frontends_turn_a_response_format_into_the_same_structured_outputs(model, case, tmp_path):
+    """A JSON ``response_format`` reaches the backend as the same ``structured_outputs``
+    from either frontend, and a bad one is the same 400, word for word."""
+    body = {"model": model, "messages": [{"role": "user", "content": "Reply in JSON."}], **STRUCTURED_CASES[case]}
+    try:
+        want, refusal = ADAPTER_REGISTRY[model].chat_to_request(_python_request(body), tmp_path), None
+    except ValueError as e:
+        want, refusal = None, str(e)
+    stub = _StubAPIServer()
+    with _model_stack(model, stub) as (port, _upload):
+        status, data = _post(port, ROUTES["chat"][0], body, timeout=30)
+    if refusal is not None:
+        assert (status, json.loads(data)["error"]["message"]) == (400, refusal)
+        assert not stub.submitted
+        return
+    assert status == 200, data
+    (sub,) = stub.submitted
+    assert sub["mk"].get("structured_outputs") == want.model_kwargs.get("structured_outputs")
+    assert "response_format" not in sub["mk"] and "response_format" not in want.model_kwargs
+
+
+# ── tools and tool turns (Qwen3.5) ──────────────────────────────────────────
+
+_TOOL = {"type": "function", "function": {"name": "get_weather", "parameters": {
+    "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}
+_LOOP = [
+    {"role": "user", "content": "Weather in Paris and Rome?"},
+    {"role": "assistant", "content": None, "reasoning": "Check both.", "tool_calls": [
+        {"id": "c0", "type": "function",
+         "function": {"name": "get_weather", "arguments": '{"units": "C",  "city": "Paris"}'}},
+        {"id": "c1", "type": "function",
+         "function": {"name": "get_weather", "arguments": {"units": "C", "city": "Rome"}}}]},
+    {"role": "tool", "tool_call_id": "c0", "content": "sunny"},
+    {"role": "tool", "tool_call_id": "c1", "content": [{"type": "text", "text": "rainy"}]},
+]
+_IMAGE_PART = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+TOOL_CASES = {
+    "auto": {"tools": [_TOOL], "tool_choice": "auto"},
+    "required": {"tools": [_TOOL], "tool_choice": "required", "parallel_tool_calls": False},
+    "named": {"tools": [_TOOL], "tool_choice": {"type": "function", "function": {"name": "get_weather"}}},
+    "none": {"tools": [_TOOL], "tool_choice": "none"},
+    "loop": {"tools": [_TOOL], "messages": _LOOP},
+    "required-without-tools": {"tool_choice": "required"},
+    "named-not-listed": {"tools": [_TOOL], "tool_choice": {"type": "function", "function": {"name": "other"}}},
+    "bad-tool": {"tools": [{"name": "get_weather"}]},
+    "bad-parallel": {"tools": [_TOOL], "parallel_tool_calls": 1},
+    "tools-and-json": {"tools": [_TOOL], "response_format": {"type": "json_object"}},
+    "tools-none-and-json": {"tools": [_TOOL], "tool_choice": "none", "response_format": {"type": "json_object"}},
+    "nan-arguments": {"tools": [_TOOL], "messages": [_LOOP[0], {"role": "assistant", "tool_calls": [
+        {"type": "function", "function": {"name": "get_weather", "arguments": '{"days": NaN}'}}]}]},
+    "functions": {"functions": [{"name": "get_weather"}]},
+    "bad-arguments": {"tools": [_TOOL], "messages": [_LOOP[0], {"role": "assistant", "tool_calls": [
+        {"type": "function", "function": {"name": "get_weather", "arguments": "[1]"}}]}]},
+    "reasoning-only-turn": {"messages": [_LOOP[0], {"role": "assistant", "content": "Hi", "reasoning_content": "r"},
+                                         {"role": "user", "content": "and Rome?"}]},
+    "tool-message-image": {"tools": [_TOOL], "messages": [
+        _LOOP[0], _LOOP[1], {"role": "tool", "tool_call_id": "c0", "content": [_IMAGE_PART]}]},
+    "tool-call-turn-image": {"tools": [_TOOL], "messages": [
+        _LOOP[0], {"role": "assistant", "content": [_IMAGE_PART], "tool_calls": _LOOP[1]["tool_calls"]}]},
+}
+
+
+@pytest.mark.parametrize("case", sorted(TOOL_CASES))
+def test_both_frontends_take_a_chats_tools_and_tool_turns_alike(case, tmp_path):
+    """Qwen3.5's adapter keeps a chat's tools and its tool turns, from either frontend alike: the
+    same tool fields and parts (the turn extras' JSON byte for byte) reach the backend, and a bad
+    shape is the same 400, word for word."""
+    body = {"model": "qwen3_5_0.8b", "messages": [{"role": "user", "content": "Weather in Paris?"}],
+            **TOOL_CASES[case]}
+    try:
+        want, refusal = ADAPTER_REGISTRY["qwen3_5_0.8b"].chat_to_request(_python_request(body), tmp_path), None
+    except ValueError as e:
+        want, refusal = None, str(e)
+    stub = _StubAPIServer()
+    with _model_stack("qwen3_5_0.8b", stub) as (port, _upload):
+        status, data = _post(port, ROUTES["chat"][0], body, timeout=30)
+    if refusal is not None:
+        assert (status, json.loads(data)["error"]["message"]) == (400, refusal)
+        assert not stub.submitted
+        return
+    assert status == 200, data
+    (sub,) = stub.submitted
+    for key in ("tools", "tool_choice", "parallel_tool_calls"):
+        assert sub["mk"].get(key) == want.model_kwargs.get(key), key
+    assert [asdict(p) for p in sub["parts"]] == [asdict(p) for p in want.prompt_parts]
 
 
 # ── an image request reaches the backend as the Python adapter builds it ────

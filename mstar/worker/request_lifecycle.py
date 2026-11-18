@@ -58,6 +58,8 @@ class RequestLifecycle:
         # Reported, or about to be: no new work, until the removal comes back.
         self.failed_rids: set[int] = set()
         self._unreported: dict[int, str] = {}
+        # the HTTP status of an unreported failure that isn't a 500
+        self._statuses: dict[int, int] = {}
 
         # rid -> the step its remove follows (-1 unstamped), waiting for no step
         # to hold the rid. No step that still needs an input is ahead of these,
@@ -111,15 +113,23 @@ class RequestLifecycle:
 
     # -- failure -------------------------------------------------------------
 
-    def fail(self, errors: dict[int, str]) -> None:
-        """Requests this worker can no longer serve. Rids already torn down are
-        dropped: the conductor answers a failure with the REMOVE that clears the
-        entry, and it sends none for a request it no longer knows."""
+    def fail(self, errors: dict[int, str], status: int = 500) -> None:
+        """Requests this worker can no longer serve, and the HTTP status they fail
+        with. Rids already torn down are dropped: the conductor answers a failure with
+        the REMOVE that clears the entry, and it sends none for a request it no longer knows."""
         for rid, msg in errors.items():
             if rid in self.arrivals:
                 self.failed_rids.add(rid)
                 # the first error is the specific one; a step's generic one can follow it
-                self._unreported.setdefault(rid, msg)
+                if rid not in self._unreported:
+                    self._unreported[rid] = msg
+                    if status != 500:
+                        self._statuses[rid] = status
+
+    def take_statuses(self, rids) -> dict[int, int]:
+        """The status of each of ``rids`` (just taken from `take_failures`) that isn't a 500."""
+        statuses = self._statuses
+        return {rid: statuses.pop(rid) for rid in rids if rid in statuses} if statuses else {}
 
     def take_failures(self) -> dict[int, str]:
         """The failures not yet reported to the conductor."""
@@ -172,6 +182,7 @@ class RequestLifecycle:
             self.failed_rids.discard(rid)
             self.pending_removes.pop(rid, None)
             self._unreported.pop(rid, None)
+            self._statuses.pop(rid, None)
             for seq, rids in list(self._removes_awaiting_step.items()):
                 if rid in rids:
                     rids[:] = [r for r in rids if r != rid]

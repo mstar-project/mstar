@@ -18,6 +18,7 @@ rendered prompt ever does.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple
@@ -47,13 +48,19 @@ class PromptPart:
     ``index`` is the position within its own modality's list, so a media part
     addresses ``tensors[f"{modality}_inputs"][index]``. ``role`` is the chat
     role of the message the part came from, ``None`` from entrypoints with no
-    messages.
+    messages. ``extras``, on a chat that serves tool calls, is the JSON of the
+    message's fields a chat template reads besides its content (an assistant's
+    ``tool_calls`` and ``reasoning_content``); such a part, and a ``tool``
+    message's, is a turn of its own. It is JSON text rather than typed fields
+    so both frontends hand the API server the same bytes, and a call's
+    ``arguments`` keep the order the client wrote them in.
     """
 
     modality: str
     text: str | None = None
     index: int = 0
     role: str | None = None
+    extras: str | None = None
 
 
 @dataclass(frozen=True)
@@ -74,24 +81,27 @@ def parts_from_modalities(
     input_modalities: list[str],
     texts: Iterable[str] | str | None = None,
     roles: Iterable[str | None] | None = None,
+    extras: Iterable[str | None] | None = None,
 ) -> list[PromptPart]:
     """Rebuild the parts for a layout, filling the text slots from ``texts``.
 
     ``input_modalities`` is one entry per part, in order, and is the layout
     every consumer plans from. Rebuilding from it beats carrying a second copy
     of the ordering that could drift. Unfilled text slots carry ``None``, which
-    is enough to plan with. ``roles`` is one per part, in the same order.
+    is enough to plan with. ``roles`` and ``extras`` are one per part, in the same order.
     """
     if isinstance(texts, str):
         texts = [texts]
     remaining = iter(texts or ())
     part_roles = iter(roles or ())
+    part_extras = iter(extras or ())
     parts: list[PromptPart] = []
     seen: dict[str, int] = {}
     for modality in input_modalities:
         role = next(part_roles, None)
+        extra = next(part_extras, None)
         if modality == TEXT:
-            parts.append(PromptPart(modality=TEXT, text=next(remaining, None), role=role))
+            parts.append(PromptPart(modality=TEXT, text=next(remaining, None), role=role, extras=extra))
         else:
             index = seen.get(modality, 0)
             parts.append(PromptPart(modality=modality, index=index, role=role))
@@ -107,7 +117,8 @@ class Turn(NamedTuple):
 
 
 def chat_turns(parts: list[PromptPart]) -> list[Turn]:
-    """Group ``parts`` into turns, starting a new one at every role change.
+    """Group ``parts`` into turns, starting a new one at every role change, and
+    at every tool message and message with ``extras`` (each its own turn).
 
     A part with no role is the user's, so a request from an entrypoint with no
     messages renders as the one user turn it always did.
@@ -115,7 +126,8 @@ def chat_turns(parts: list[PromptPart]) -> list[Turn]:
     turns: list[Turn] = []
     for part in parts:
         role = part.role or "user"
-        if not turns or turns[-1].role != role:
+        alone = role == "tool" or part.extras is not None
+        if not turns or turns[-1].role != role or alone or turns[-1].parts[-1].extras is not None:
             turns.append(Turn(role, []))
         turns[-1].parts.append(part)
     return turns
@@ -137,7 +149,7 @@ def messages_from_parts(
             {"type": TEXT, "text": part.text or ""} if part.modality == TEXT
             else {"type": part.modality, part.modality: ""}
             for part in turn.parts
-        ]}
+        ], **_turn_extras(turn.parts[0].extras)}
         for turn in chat_turns(parts)
     ]
     if default_system is not None and not any(m["role"] == "system" for m in messages):
@@ -618,3 +630,14 @@ def media_prefill_step(
             raise ValueError(f"{model_name} needs {needs}; it takes no text-only prompt")
         return WalkStep(PREFILL_TEXT, step_metadata={FINAL_PREFILL: True})
     return WalkStep(media_walk_name(present), step_metadata={MEDIA_LAYOUT: layout or {}, FINAL_PREFILL: True})
+
+
+def _turn_extras(extras: str | None) -> dict:
+    """A part's ``extras`` as the template reads them: each tool call's ``arguments``, kept as the
+    client's JSON text, parsed into an object in the order it was written."""
+    if extras is None:
+        return {}
+    fields = json.loads(extras)
+    for call in fields.get("tool_calls", ()):
+        call["function"]["arguments"] = json.loads(call["function"]["arguments"])
+    return fields

@@ -151,6 +151,9 @@ class MultimodalDecoderModel(Model):
     # ``text_prompts``, captures neither. The walk plan refuses a text-only
     # request.
     TEXT_PROMPTS = True
+    # `TextOutput.reasoning_start` and `reasoning_end`
+    REASONING_START: str | None = None
+    REASONING_END: str | None = None
     # the checkpoint's sampling defaults, under whatever a request sets (set
     # by `__init__`; a model built without it reads none)
     sampling_defaults: Mapping[str, object] = MappingProxyType({})
@@ -326,6 +329,7 @@ class MultimodalDecoderModel(Model):
             [p.text or "" for p in prompt_parts if p.modality == TEXT]
             if prompt_parts is not None else prompt,
             [p.role for p in prompt_parts or ()],
+            [p.extras for p in prompt_parts or ()],
         )
         unsupported = {p.modality for p in parts} - {TEXT, *media}
         if unsupported:
@@ -394,7 +398,10 @@ class MultimodalDecoderModel(Model):
     # -----------------------------------------------------------------------
 
     def text_output(self) -> TextOutput:
-        return TextOutput(self._chunk_detokenizer(), self.config.stop_token_ids)
+        return TextOutput(
+            self._chunk_detokenizer(), self.config.stop_token_ids,
+            reasoning_start=self.REASONING_START, reasoning_end=self.REASONING_END,
+        )
 
     def postprocess(
         self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None,

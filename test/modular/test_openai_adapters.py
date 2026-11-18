@@ -1,9 +1,12 @@
 """Unit tests for the OpenAI request adapters (pydantic + numpy; no fastapi)."""
 
 import base64
+import json
 from pathlib import Path
 
 import pytest
+
+from mstar.model.multimodal import messages_from_parts
 
 pytest.importorskip("pydantic")
 pytest.importorskip("numpy")
@@ -231,7 +234,7 @@ _FUNCTION = {"name": "get_weather"}
 _NAMED = {"type": "function", "function": _FUNCTION}
 
 
-@pytest.mark.parametrize("adapter", _CHAT_ADAPTERS, ids=lambda a: a.__name__)
+@pytest.mark.parametrize("adapter", [a for a in _CHAT_ADAPTERS if not a.serves_tools], ids=lambda a: a.__name__)
 @pytest.mark.parametrize("fields", [
     {"tools": [_NAMED]}, {"tool_choice": "required"}, {"tool_choice": _NAMED},
     {"functions": [_FUNCTION]}, {"function_call": _FUNCTION},
@@ -247,7 +250,7 @@ def test_a_chat_that_asks_for_a_tool_call_is_refused(tmp_path, adapter, fields):
 @pytest.mark.parametrize(("fields", "error"), [
     ({"n": 2}, "n=2"), ({"stop": "."}, "stop sequences"), ({"stop": ["END"]}, "stop sequences"),
     ({"logprobs": True}, "logprobs"), ({"presence_penalty": 1.5}, "presence_penalty"),
-    ({"best_of": 3}, "best_of"), ({"response_format": {"type": "json_object"}}, "response_format"),
+    ({"best_of": 3}, "best_of"), ({"response_format": {"type": "yaml"}}, "response_format"),
 ], ids=lambda f: str(f) if isinstance(f, dict) else "")
 def test_a_chat_asking_for_more_than_one_plain_reply_is_refused(tmp_path, adapter, fields, error):
     """Every chat adapter returns one choice of plain sampled text, ended at a
@@ -274,7 +277,73 @@ def test_the_tool_fields_clients_send_by_default_pass(tmp_path, adapter, fields)
     req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
     sa = adapter().chat_to_request(req, tmp_path)
     assert sa.text == "hi", "a client's default tool fields refused a plain chat"
-    assert set(fields).isdisjoint(sa.model_kwargs)
+    # an adapter that serves tools keeps listed ones (tool_choice none renders them)
+    kept = {"tools", "tool_choice"} if adapter.serves_tools and fields.get("tools") else set()
+    assert set(fields).intersection(sa.model_kwargs) == kept
+
+
+_TOOL = {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}
+
+
+@pytest.mark.parametrize("adapter", [a for a in _CHAT_ADAPTERS if a.serves_tools], ids=lambda a: a.__name__)
+def test_an_adapter_that_serves_tools_checks_and_keeps_them(tmp_path, adapter):
+    """Kept for the backend, which refuses a call for a model with no tool format; each bad
+    shape is a 400 naming it, the Rust frontend's text word for word."""
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], tools=[_TOOL],
+                                tool_choice="required", parallel_tool_calls=False)
+    mk = adapter().chat_to_request(req, tmp_path).model_kwargs
+    assert (mk["tools"], mk["tool_choice"], mk["parallel_tool_calls"]) == ([_TOOL], "required", False)
+    for fields, error in [
+        ({"tool_choice": "required"}, "tool_choice asks for a call, but tools lists none"),
+        ({"functions": [_FUNCTION]}, "functions and function_call are not supported; send tools and tool_choice"),
+        ({"tools": [_FUNCTION]}, 'each of tools must be {"type": "function", "function": {"name": ...}}'),
+        ({"tools": [_TOOL], "tool_choice": "some"},
+         'tool_choice must be none, auto, required or {"type": "function", "function": {"name": ...}}'),
+        ({"tools": [_TOOL], "tool_choice": {"type": "function", "function": {"name": "other"}}},
+         "tool_choice names 'other', which tools doesn't list"),
+        ({"tools": [_TOOL], "parallel_tool_calls": "yes"}, "parallel_tool_calls must be true or false"),
+        ({"tools": [_TOOL], "response_format": {"type": "json_object"}},
+         "tools with a JSON response_format (structured_outputs) need tool_choice none"),
+    ]:
+        req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
+        with pytest.raises(ValueError) as refused:
+            adapter().chat_to_request(req, tmp_path)
+        assert str(refused.value) == error, fields
+
+
+_TOOL_LOOP = [
+    {"role": "user", "content": "Weather in Paris and Rome?"},
+    {"role": "assistant", "content": None, "reasoning": "I should check both.", "tool_calls": [
+        {"id": "c0", "type": "function",
+         "function": {"name": "get_weather", "arguments": '{"days": 2, "city": "Paris"}'}},
+        {"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": {"days": 1, "city": "Rome"}}},
+    ]},
+    {"role": "tool", "tool_call_id": "c0", "content": "sunny"},
+    {"role": "tool", "tool_call_id": "c1", "content": [{"type": "text", "text": "rainy"}]},
+]
+
+
+def test_a_tool_loop_keeps_each_turn_for_an_adapter_that_serves_tools(tmp_path):
+    """The calls ride on their assistant turn, each call's arguments as the client's JSON text (an
+    object sent as one, keys sorted, as the Rust frontend holds it) and the reasoning as
+    ``reasoning_content``, and two tool results stay two turns. The template reads the arguments
+    as objects, in the order they were written."""
+    req = ChatCompletionRequest(messages=_TOOL_LOOP, tools=[_TOOL])
+    parts = adapters.Qwen3_5Adapter().chat_to_request(req, tmp_path).prompt_parts
+    assert [(p.role, p.text) for p in parts] == [
+        ("user", "Weather in Paris and Rome?"), ("assistant", ""), ("tool", "sunny"), ("tool", "rainy"),
+    ]
+    assert json.loads(parts[1].extras) == {"reasoning_content": "I should check both.", "tool_calls": [
+        {"function": {"arguments": '{"days": 2, "city": "Paris"}', "name": "get_weather"}, "type": "function"},
+        {"function": {"arguments": '{"city":"Rome","days":1}', "name": "get_weather"}, "type": "function"},
+    ]}
+    (assistant,) = [m for m in messages_from_parts(parts) if m["role"] == "assistant"]
+    assert [list(call["function"]["arguments"].items()) for call in assistant["tool_calls"]] == [
+        [("days", 2), ("city", "Paris")], [("city", "Rome"), ("days", 1)]]
+    assert parts[1].extras == json.dumps(json.loads(parts[1].extras), sort_keys=True, separators=(",", ":"))
+    for adapter in (a for a in _CHAT_ADAPTERS if not a.serves_tools):
+        with pytest.raises(ValueError, match="not 'tool'"):
+            adapter().chat_to_request(ChatCompletionRequest(messages=_TOOL_LOOP), tmp_path)
 
 
 def test_qwen3_chat_audio_url_input(tmp_path):
@@ -370,7 +439,7 @@ def test_text_chat_coerces_numeric_extra_body(tmp_path):
 @pytest.mark.parametrize("field", [
     {"n": 2}, {"stop": "\n"}, {"stop": ["END"]}, {"logprobs": True}, {"top_logprobs": 5},
     {"logit_bias": {"100": -100}}, {"presence_penalty": 1.5}, {"frequency_penalty": 0.5},
-    {"best_of": 2}, {"response_format": {"type": "json_object"}}, {"stop_token_ids": [2]},
+    {"best_of": 2}, {"response_format": {"type": "yaml"}}, {"stop_token_ids": [2]},
 ])
 def test_text_chat_refuses_what_it_would_ignore(field, tmp_path):
     req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **field)

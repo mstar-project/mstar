@@ -94,6 +94,17 @@ def test_fail_requests_reports_per_rid_errors_once():
     assert w.lifecycle.failed_rids == {"r1", "r2"}
 
 
+def test_a_failure_s_status_reaches_the_conductor():
+    """A request that failed by its own fault (a 400) says so; the rest stay 500s."""
+    w = _worker()
+    w.lifecycle.fail({"r1": "structured_outputs grammar failed to compile"}, status=400)
+    w.pipeline._fail_requests({"r2": "boom"})
+    (_, msg), = w.sent
+    assert msg.body == FailRequests(
+        errors={"r1": "structured_outputs grammar failed to compile", "r2": "boom"}, statuses={"r1": 400},
+    )
+
+
 def test_fail_requests_ignores_rids_the_worker_already_dropped():
     """The conductor answers a failure by tearing the request down. It won't
     start one for a request it no longer tracks, so reporting an unknown rid

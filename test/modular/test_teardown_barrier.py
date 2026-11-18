@@ -162,8 +162,18 @@ def test_fail_defers_client_notification_until_barrier_completes():
         if e == "api_server" and m.message_type == "request_failed"
     ]
     assert len(failures) == 1
-    assert failures[0].body.error_message == "boom"
+    assert failures[0].body.error_message == "boom" and failures[0].body.status == 500
     assert _remove_targets(c, "r1") == {"w0", PREPROCESS}
+
+
+def test_a_worker_failure_answers_with_its_status():
+    """A request the worker failed by the request's own fault is the client's 400."""
+    c = _conductor({"r1": _request_data()})
+    c._fail_requests(FailRequests(errors={"r1": "bad grammar"}, statuses={"r1": 400}))
+    c._handle_reads_done(ReadsDone(request_id="r1", entity_id="w0"))
+    c._handle_reads_done(ReadsDone(request_id="r1", entity_id=PREPROCESS))
+    (failure,) = [m for e, m in c.sent if e == "api_server" and m.message_type == "request_failed"]
+    assert (failure.body.error_message, failure.body.status) == ("bad grammar", 400)
 
 
 # ── happy path ──────────────────────────────────────────────────────────────

@@ -106,7 +106,7 @@ class Admission:
             )
             self._lifecycle.fail({
                 rid: f"resource {outcome.failed_resource} rejected the request: {outcome.reason.message}",
-            })
+            }, status=getattr(outcome.reason, "status", 500))
             return False
         return outcome.ok and outcome.ready
 
@@ -298,7 +298,9 @@ class Admission:
                 "%d requests", batch.node_name, batch.graph_walk,
                 reason.message, len(doomed), len(rids),
             )
-            self._lifecycle.fail(dict.fromkeys(doomed, f"Error in worker: {reason.message}"))
+            self._lifecycle.fail(
+                dict.fromkeys(doomed, f"Error in worker: {reason.message}"), status=getattr(reason, "status", 500),
+            )
         elif not reason.terminal and not isinstance(reason, AllocationFailed):
             logger.info(
                 "Admit refused node=%s walk=%s (%s): re-queued %d requests",

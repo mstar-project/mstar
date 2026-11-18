@@ -27,6 +27,7 @@ try:
 except (ImportError, RuntimeError, OSError):
     VideoDecoder = None
 
+from mstar.api_server.reply_parser import REPLY_IN_REASONING
 from mstar.api_server.request_types import (
     ClientAppend,
     DataWorkerProfile,
@@ -51,6 +52,13 @@ from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items, variant_root
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG
 from mstar.engine.resources.position.config import MAX_POSITION_KWARG
+from mstar.engine.resources.sampler.grammar import (
+    GRAMMAR_AFTER_KWARG,
+    GRAMMAR_TOOLS_KWARG,
+    STRUCTURED_OUTPUTS_KWARG,
+    after_reasoning,
+    tool_call_grammar,
+)
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.state.adapters import kv_layouts
 from mstar.engine.state.contract import Array
@@ -606,6 +614,41 @@ def warm_up_model(model) -> None:
         logger.exception("model.warmup_preprocess failed; the first request will do the work")
 
 
+class ReasoningStart:
+    """Whether a reply starts inside the reasoning block its prompt opened, as `after_reasoning`
+    reads it from the prompt's tail, asked of the model first (`Model.reply_starts_in_reasoning`):
+    a model that knows answers from its settings for a dict lookup, where the read costs about
+    20 µs a request on the data worker, which prepares requests one at a time. The first answer of
+    each kind is checked against the read, and an answer that disagrees stops the model being
+    asked. One lock, held briefly, so the prepare pool may call it too."""
+
+    def __init__(self, model: Model):
+        self._model = model
+        self._lock = threading.Lock()
+        self._checked: set[bool] = set()
+        self._asking = True
+
+    def after(self, model_kwargs: dict, prompt_ids: torch.Tensor) -> str | None:
+        """The model's ``reasoning_end`` when the reply starts inside its reasoning, else None."""
+        text_output = self._model.text_output()
+        answer = self._model.reply_starts_in_reasoning(model_kwargs) if self._asking else None
+        if answer is not None and answer in self._checked:
+            return text_output.reasoning_end if answer and text_output is not None else None
+        after = after_reasoning(text_output, prompt_ids)
+        if answer is not None:
+            with self._lock:
+                if (after is not None) == answer:
+                    self._checked.add(answer)
+                elif self._asking:
+                    self._asking = False
+                    logger.warning(
+                        "%s says a reply %s inside its reasoning, but its prompt says otherwise; "
+                        "reading the prompt from now on", type(self._model).__name__,
+                        "starts" if answer else "doesn't start",
+                    )
+        return after
+
+
 @dataclass
 class RequestOutputState:
     """One request's output ordering, held by the data worker.
@@ -619,6 +662,8 @@ class RequestOutputState:
     order: dict[str, tuple[int, NestedLoopIndices]] = field(default_factory=dict)
     next_sequence: int = 0
     next_emit: int = 0
+    # a parsed reply's, until its first text chunk carries it (`REPLY_IN_REASONING`)
+    reply_in_reasoning: bool | None = None
     # sequence -> completed chunk waiting on an earlier one
     pending: dict[int, ResultChunk] = field(default_factory=dict)
     # A video_frame chunk can carry several frames, so this advances by
@@ -679,6 +724,8 @@ class PreparedInput(NamedTuple):
     model_kwargs: dict
     # for the response's usage (``Model.prompt_tokens``)
     prompt_tokens: int
+    # a parsed reply's: whether it starts inside the reasoning its prompt opened (`after_reasoning`)
+    reply_in_reasoning: bool | None = None
 
 
 class PreparingInput(NamedTuple):
@@ -969,6 +1016,10 @@ class PreprocessWorkerThread:
         self._live_requests[input.request_id] = self._live_requests.get(input.request_id, 0) + 1
         self.in_flight_requests.add(input.request_id)
 
+    @cached_property
+    def _reasoning_start(self) -> ReasoningStart:
+        return ReasoningStart(self.model)
+
     def _prepare_input(self, input: PreprocessInput) -> PreparedInput:
         """Decode the request's media and run the model's prompt processing.
         Runs on the prepare pool when there is one, so it reads only what
@@ -999,15 +1050,18 @@ class PreprocessWorkerThread:
         # lead past the edge's context would raise in the worker's ingest.
         # Likewise only process_prompt sets the model's INTERNAL_KWARGS and the
         # LongRoPE ceiling (which picks the request's table and prefix variant),
-        # and only this worker knows which client streams the opening leaves open.
+        # and only this worker knows which client streams the opening leaves open,
+        # and where a reply's grammar starts (`after_reasoning`), and a forced tool call's grammar.
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
         for name in (
             "prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "state_layout", "keyed_spans", "prefix_root",
-            "stream_lead_items", "open_streams", MAX_POSITION_KWARG, *internal,
+            "stream_lead_items", "open_streams", MAX_POSITION_KWARG, GRAMMAR_AFTER_KWARG, GRAMMAR_TOOLS_KWARG,
+            *internal,
         ):
             model_kwargs.pop(name, None)
         open_streams = self._client_edges - input.ends
         num_prompt_tokens = 0
+        reply_in_reasoning = None
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
                 input.text,
@@ -1030,6 +1084,19 @@ class PreprocessWorkerThread:
                 prompt_tensors = prompt_tensors.new_input_tensors
             if prompt_tensors:
                 tensors.update(prompt_tensors)
+            tools = model_kwargs.get("tools")
+            if (input.parse_reply or tools or model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None) \
+                    and tensors.get("text_inputs"):
+                # one answer for the grammars and the reply's parser
+                after = self._reasoning_start.after(model_kwargs, tensors["text_inputs"][0])
+                if input.parse_reply:
+                    reply_in_reasoning = after is not None
+                if after is not None and model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None:
+                    model_kwargs[GRAMMAR_AFTER_KWARG] = after
+                if tools:
+                    tag = tool_call_grammar(getattr(self.model, "TOOL_FORMAT", None), model_kwargs, after is not None)
+                    if tag is not None:
+                        model_kwargs[GRAMMAR_TOOLS_KWARG] = tag
             state_layout = model_kwargs.pop("state_layout", None)
             keyed_spans = model_kwargs.pop("keyed_spans", {})
             layouts = (
@@ -1062,7 +1129,7 @@ class PreprocessWorkerThread:
             tensors["text_inputs"] = [torch.tensor(
                 list(byte_data), dtype=torch.uint8, device=self.device
             )]
-        return PreparedInput(tensors, input_metadata, model_kwargs, num_prompt_tokens)
+        return PreparedInput(tensors, input_metadata, model_kwargs, num_prompt_tokens, reply_in_reasoning)
 
     def _model_chose(
         self, output: ProcessPromptOutput, model_kwargs: dict, selected: dict, root: bytes,
@@ -1099,7 +1166,7 @@ class PreprocessWorkerThread:
         self, input: PreprocessInput, prepared: PreparedInput, profile: DataWorkerProfile | None,
     ) -> None:
         """Store a prepared request's tensors and hand it to the conductor."""
-        tensors, input_metadata, model_kwargs, num_prompt_tokens = prepared
+        tensors, input_metadata, model_kwargs, num_prompt_tokens, _ = prepared
 
         # A client stream's first chunk, not a prompt signal: a one-shot upload
         # is a stream of one chunk. Stored before the request reaches the
@@ -1117,7 +1184,7 @@ class PreprocessWorkerThread:
             call.held.append(HeldItems(self._store_held(input.request_id, stream_items), None))
 
         self.request_model_kwargs[input.request_id] = model_kwargs
-        self.request_output_state[input.request_id] = RequestOutputState()
+        self.request_output_state[input.request_id] = RequestOutputState(reply_in_reasoning=prepared.reply_in_reasoning)
         preprocess_only = getattr(self.model, "PREPROCESS_ONLY_KWARGS", ())
         conductor_kwargs = {k: v for k, v in model_kwargs.items() if k not in preprocess_only}
         msg = ConductorMessage(
@@ -1866,6 +1933,9 @@ class PreprocessWorkerThread:
 
         while state.next_emit in state.pending:
             ready = state.pending.pop(state.next_emit)
+            if ready.modality == "text" and state.reply_in_reasoning is not None:
+                # the reply's first text, whichever path made it, tells the API server's parser
+                ready.metadata[REPLY_IN_REASONING], state.reply_in_reasoning = state.reply_in_reasoning, None
             if ready.modality == "video_frame":
                 ready.metadata["frame_index"] = state.frame_index
                 state.frame_index += ready.metadata["frame_count"]

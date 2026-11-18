@@ -25,16 +25,19 @@ OpenAI-capable models opt in by adding an adapter and registering it in
 from __future__ import annotations
 
 import http.client
+import json
 import logging
 import re
 import ssl
 import urllib.error
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from mstar.api_server import media_io
 from mstar.api_server.openai.speech_chunking import _cut_evenly, split_sentences
+from mstar.api_server.tool_fields import check_tools
+from mstar.engine.resources.sampler.grammar import STRUCTURED_OUTPUTS_KWARG
 from mstar.model.multimodal import PromptPart
 from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG
 from mstar.model.registry import qwen_3_5_dense_sizes as QWEN_3_5_DENSE_SIZES
@@ -85,7 +88,7 @@ class Transcript:
 
 
 def flatten_messages(
-    messages: list, upload_dir: Path, allow_remote: bool = False
+    messages: list, upload_dir: Path, allow_remote: bool = False, tool_turns: bool = False,
 ) -> tuple[str | None, dict[str, list[str]], list[str], list[PromptPart]]:
     """Flatten OpenAI chat ``messages`` into (text, file_paths, input_modalities, parts).
 
@@ -94,6 +97,8 @@ def flatten_messages(
     grouped by modality, ``input_modalities`` the per-part modality sequence.
     So an attachment's position and a repeated modality both survive. Each
     text part carries its message's role, so a reply stays its own turn.
+    With ``tool_turns`` (an adapter whose models may call tools), a ``tool`` message and an
+    assistant message's ``tool_calls`` and ``reasoning`` stay their own turns (`turn_extras`).
     """
     parts: list[PromptPart] = []
     file_paths: dict[str, list[str]] = {}
@@ -112,8 +117,10 @@ def flatten_messages(
         # slot for the boundary between them), so only text an attachment or a
         # role change separates gets its own part, and the rendered prompt
         # keeps the separator it used to have.
-        if parts and parts[-1].modality == "text" and parts[-1].role == role:
-            parts[-1] = replace(parts[-1], text=f"{parts[-1].text}\n{text}")
+        last = parts[-1] if parts else None
+        if last is not None and last.modality == "text" and last.role == role and role != "tool" \
+                and last.extras is None:
+            parts[-1] = replace(last, text=f"{last.text}\n{text}")
             return
         parts.append(PromptPart(modality="text", text=text, role=role))
 
@@ -126,8 +133,18 @@ def flatten_messages(
                 role, content = getattr(msg, "role", None), getattr(msg, "content", None)
             if role == "developer":  # OpenAI's newer name for system
                 role = "system"
+            elif tool_turns and role == "tool":
+                parts.append(PromptPart(modality="text", text=_message_text(content), role="tool"))
+                continue
             elif role not in ("system", "user", "assistant"):
-                raise ValueError(f"a message's role must be system, developer, user or assistant, not {role!r}")
+                roles = "system, developer, user, assistant or tool" if tool_turns else \
+                    "system, developer, user or assistant"
+                raise ValueError(f"a message's role must be {roles}, not {role!r}")
+            extras = turn_extras(_field(msg, "tool_calls"), _field(msg, "reasoning")
+                                 or _field(msg, "reasoning_content")) if tool_turns and role == "assistant" else None
+            if extras is not None:
+                parts.append(PromptPart(modality="text", text=_message_text(content), role=role, extras=extras))
+                continue
             if content is None:
                 continue
             if isinstance(content, str):
@@ -177,9 +194,96 @@ def _passthrough(req) -> dict:
 CHAT_ENVELOPE_KEYS = ("stream_options", "parallel_tool_calls", "user", "store", "metadata", "service_tier")
 
 
-def _refuse_unserved_chat(req, mk: dict) -> None:
+def _field(msg, name: str):
+    """A message's field, from a dict or a pydantic message's extras."""
+    return msg.get(name) if isinstance(msg, dict) else getattr(msg, name, None)
+
+
+_TEXT_ONLY = "a tool message, or an assistant message with tool_calls or reasoning, takes text content only"
+
+
+def _message_text(content) -> str:
+    """A tool or tool-call message's text: its string, or its text parts joined. Anything else in
+    it (an image, audio) is the client's 400, not dropped: the turn renders as text only."""
+    if content is None or isinstance(content, str):
+        return content or ""
+    if not isinstance(content, list) or any(not isinstance(p, dict) or p.get("type") != "text" for p in content):
+        raise ValueError(_TEXT_ONLY)
+    return "\n".join(p["text"] for p in content if p.get("text"))
+
+
+def _strict_json(constant: str):
+    raise ValueError(f"{constant} is not JSON")
+
+
+def _finite_json(text: str) -> float:
+    value = float(text)
+    if value in (float("inf"), float("-inf")):
+        raise ValueError(f"{text} overflows")
+    return value
+
+
+def turn_extras(tool_calls, reasoning) -> str | None:
+    """An assistant message's ``tool_calls`` and reasoning, for the chat template
+    (``PromptPart.extras``, read back by `messages_from_parts`): each call's name and its
+    ``arguments`` as the client's JSON text, checked to be an object and kept as sent, so the
+    template writes the parameters in the order the model wrote them; and ``reasoning_content``.
+    Canonical JSON, as the Rust frontend writes it (arguments sent as an object are written with
+    sorted keys, as Rust holds them). None when it has neither."""
+    extras: dict = {}
+    if tool_calls not in (None, []):
+        if not isinstance(tool_calls, list):
+            raise ValueError("an assistant message's tool_calls must be a list")
+        calls = []
+        for call in tool_calls:
+            fn = call.get("function") if isinstance(call, dict) else None
+            if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
+                raise ValueError("each of an assistant message's tool_calls needs a function name")
+            args = fn.get("arguments")
+            if args is None or (isinstance(args, str) and not args.strip()):
+                text, args = "{}", {}
+            elif isinstance(args, str):
+                text = args
+                try:
+                    args = json.loads(args, parse_constant=_strict_json, parse_float=_finite_json)
+                except ValueError:  # not JSON, or not strict JSON (NaN, an overflow), as Rust reads it
+                    args = None
+            else:
+                text = json.dumps(args, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            if not isinstance(args, dict):
+                raise ValueError(f"tool call {fn['name']!r}'s arguments must be a JSON object")
+            calls.append({"function": {"arguments": text, "name": fn["name"]}, "type": "function"})
+        extras["tool_calls"] = calls
+    if isinstance(reasoning, str) and reasoning:
+        extras["reasoning_content"] = reasoning
+    return json.dumps(extras, sort_keys=True, separators=(",", ":"), ensure_ascii=False) if extras else None
+
+
+def response_format_request(response_format: Any) -> dict | None:
+    """OpenAI ``response_format`` as a ``structured_outputs`` value; None for
+    text. ``ValueError`` for another type."""
+    if response_format is None:
+        return None
+    if not isinstance(response_format, dict):
+        raise ValueError(f"response_format must be an object; got {response_format!r}")
+    kind = response_format.get("type")
+    if kind == "text":
+        return None
+    if kind == "json_object":
+        return {"json_object": True}
+    if kind == "json_schema":
+        spec = response_format.get("json_schema")
+        if not isinstance(spec, dict) or spec.get("schema") is None:
+            raise ValueError("response_format json_schema needs json_schema.schema")
+        return {"json": spec["schema"]}
+    raise ValueError(f"response_format type must be text, json_object or json_schema; got {kind!r}")
+
+
+def _refuse_unserved_chat(req, mk: dict, tools: bool = False) -> None:
     """Refuse a chat that asks for more than one plain reply: more choices, stop
-    sequences, log probs, sampling penalties, a response format, or a tool call.
+    sequences, log probs, sampling penalties, or a tool call. A JSON
+    ``response_format`` becomes ``structured_outputs``, which the deployment's
+    text sampler serves or the conductor refuses.
     ``mk`` is the request's :func:`_passthrough`; an off value of one of these
     fields (``logprobs: false``, ``tools: []``) is dropped from it, before any
     ``chat_template_kwargs`` key is merged in.
@@ -192,7 +296,8 @@ def _refuse_unserved_chat(req, mk: dict) -> None:
     ``tool_choice`` of ``none`` or ``auto`` ask for no call; clients send them
     by default. A ``tool_choice`` of ``none`` asks for no call even when
     ``tools`` lists some. Their older names, ``functions`` and
-    ``function_call``, follow the same rules.
+    ``function_call``, follow the same rules. With ``tools`` (an adapter whose models
+    may call tools), the tool fields are checked and kept instead (`check_tools`).
     """
     if req.n not in (None, 1):
         raise ValueError(f"n={req.n}: this model returns one choice")
@@ -204,8 +309,18 @@ def _refuse_unserved_chat(req, mk: dict) -> None:
             raise ValueError(f"{name} is not supported")
     if mk.pop("best_of", None) not in (None, 1):
         raise ValueError("best_of is not supported; this model returns one choice")
-    if mk.pop("response_format", None) not in (None, {"type": "text"}):
-        raise ValueError("response_format needs constrained decoding; only {'type': 'text'} is served")
+    # json_object / json_schema become the engine's grammar request (``structured_outputs``)
+    structured = response_format_request(mk.pop("response_format", None))
+    if structured is not None:
+        if mk.get(STRUCTURED_OUTPUTS_KWARG) is not None:
+            raise ValueError("send response_format or structured_outputs, not both")
+        mk[STRUCTURED_OUTPUTS_KWARG] = structured
+    if tools:
+        check_tools(mk)
+        for name in ("functions", "function_call", *CHAT_ENVELOPE_KEYS):
+            if name != "parallel_tool_calls":
+                mk.pop(name, None)
+        return
     choice = mk.get("tool_choice")
     function_call = mk.get("function_call")
     if (
@@ -284,6 +399,9 @@ class OpenAIAdapter:
 
     # Each flag gates exactly one OpenAI surface:
     supports_chat: bool = False     # POST /v1/chat/completions
+    # whether its models may call tools: its chat keeps ``tools`` and tool turns (`check_tools`),
+    # and `submit_request` refuses them for a model with no ``Model.TOOL_FORMAT``
+    serves_tools: bool = False
     supports_speech: bool = False   # POST /v1/audio/speech
     supports_images: bool = False   # POST /v1/images/generations and /v1/images/edits
     supports_videos: bool = False   # POST /v1/videos/generations
@@ -542,13 +660,15 @@ class Qwen3_5Adapter(OpenAIAdapter):
 
     supports_chat = True
 
+    serves_tools = True
+
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
         mk = _passthrough(req)
-        _refuse_unserved_chat(req, mk)
+        _refuse_unserved_chat(req, mk, tools=self.serves_tools)
         _apply_sampling(req, mk)
         # before the attachments are saved, since a malformed value refuses the request
         _flatten_template_kwargs(mk)
-        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
+        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir, tool_turns=self.serves_tools)
         return SubmitArgs(
             text=text,
             file_paths=file_paths or None,

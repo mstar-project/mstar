@@ -9,8 +9,11 @@ impl OpenAIAdapter for Qwen3_5 {
     fn supports_chat(&self) -> bool {
         true
     }
+    fn serves_tools(&self) -> bool {
+        true
+    }
     fn chat_args(&self, req: &ChatCompletionRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
-        template_kwargs_chat(req, upload_dir, allow_remote)
+        template_kwargs_chat(req, upload_dir, allow_remote, true)
     }
 }
 
@@ -26,7 +29,7 @@ impl OpenAIAdapter for Qwen3Omni {
         true
     }
     fn chat_args(&self, req: &ChatCompletionRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
-        let (text, file_paths, in_mods, parts) = flatten_messages(&req.messages, upload_dir, allow_remote)?;
+        let (text, file_paths, in_mods, parts) = flatten_messages(&req.messages, upload_dir, allow_remote, false)?;
         let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
         // Speech output also emits text, so request both when audio asked.
         let want_audio = req.modalities.as_ref().is_some_and(|m| m.iter().any(|x| x == "audio"));

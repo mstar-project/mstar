@@ -363,6 +363,9 @@ class AdmitRuntimeError(AdmitFailedReason):
     """
     terminal: ClassVar[bool] = True
     request_ids: frozenset[str] = frozenset()
+    # the HTTP status the requests fail with: 400 when the request itself is
+    # what can't be served (a grammar that doesn't compile, say)
+    status: int = 500
 
 
 class AdmitOutcome(NamedTuple):

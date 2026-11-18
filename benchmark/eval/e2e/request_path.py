@@ -310,14 +310,20 @@ def _chat(url: str, stream: bool = False, **kw) -> tuple[int, str, dict]:
     r = requests.post(f"{url}/v1/chat/completions", json=body, timeout=600, stream=stream)
     if r.status_code != 200:
         return r.status_code, "", {}
+    # the whole generated text: a reasoning model's ``reasoning`` (Qwen3.5 with thinking on, its
+    # default), then its ``content``
     if not stream:
         js = r.json()
-        return 200, js["choices"][0]["message"].get("content") or "", js.get("usage") or {}
-    text = []
+        message = js["choices"][0]["message"]
+        return 200, (message.get("reasoning") or "") + (message.get("content") or ""), js.get("usage") or {}
+    reasoning, content = [], []
     for line in r.iter_lines():
         if line.startswith(b"data:") and line[5:].strip() != b"[DONE]":
-            text += [(ch.get("delta") or {}).get("content") or "" for ch in json.loads(line[5:]).get("choices", [])]
-    return 200, "".join(text), {}
+            for ch in json.loads(line[5:]).get("choices", []):
+                delta = ch.get("delta") or {}
+                reasoning.append(delta.get("reasoning") or "")
+                content.append(delta.get("content") or "")
+    return 200, "".join(reasoning) + "".join(content), {}
 
 
 def chat_invariants(url: str, inputs: Path, scratch: Path) -> dict:  # noqa: ARG001

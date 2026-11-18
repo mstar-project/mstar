@@ -16,6 +16,8 @@ from mstar.engine import recompile_limit, with_recompile_limit
 from mstar.engine.accelerator_graph_backend import (
     AcceleratorGraphPool,
     CapturedGraph,
+    SplitGraph,
+    replay_graph,
 )
 from mstar.engine.accelerator_graph_config import (
     DEFAULT_CAPTURE_BATCH_SIZES,
@@ -187,17 +189,19 @@ def capture_into_graph(
     run, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False,
     node_name: str | None = None,
     stream: Any = None,
+    splittable: bool = False,
 ):
     """Capture ``run`` into a new CUDA graph allocated from ``pool``.
 
-    Returns the graph and what ``run`` returned. A capture that fails part
+    Returns the graph and what ``run`` returned. With ``splittable`` the capture
+    is the backend's `capture_split`, and the graph is a `SplitGraph` if ``run``
+    called `split_capture`; otherwise it is the runtime's own. A capture that fails part
     way leaves two things behind that would sink every later capture on the
     same pool: the caching allocator keeps routing this thread's allocations
     into the pool (the next capture_begin fails with "already recording to
-    mempool_id"), and torch.cuda.graph never switches the thread back off its
-    capture stream. Undo both before re-raising, so the buckets after a
-    failed one still capture and the thread keeps running on the stream it
-    came in on.
+    mempool_id"), and the thread may be left on its capture stream. Undo both
+    before re-raising, so the buckets after a failed one still capture and
+    the thread keeps running on the stream it came in on.
 
     A torch.compile'd forward that would recompile inside the capture is
     failed up front with the guard that broke: dynamo saves the CUDA RNG state
@@ -214,20 +218,26 @@ def capture_into_graph(
     # candidates and emptying the allocator's cache, which fails the capture
     benchmark = torch.backends.cudnn.benchmark
     torch.backends.cudnn.benchmark = False
+    capture = None
     try:
         with torch.compiler.set_stance("fail_on_recompile"), \
                 autocast_scope(autocast_dtype, backend.device_type, node_name):
-            with backend.capture(graph, pool=pool, stream=stream):
-                output = run()
+            if splittable:
+                with backend.capture_split(graph, pool=pool, stream=stream, keep_graph=keep_graph) as capture:
+                    output = run()
+            else:
+                with backend.capture(graph, pool=pool, stream=stream):
+                    output = run()
     except BaseException:
-        pool.on_failure(graph)
+        # every piece of a split capture
+        pool.on_failure(graph if capture is None else capture.graph())
         backend.recover_failed_capture(pool, prev_stream)
         raise
     finally:
         torch.backends.cudnn.benchmark = benchmark
     backend.synchronize()
     pool.on_success()
-    return graph, output
+    return (graph if capture is None else capture.graph()), output
 
 
 def capture_with_static_outputs(
@@ -462,7 +472,9 @@ def _capture_thrown_away(
         if counted:
             nodes = _graph_nodes(graph)
             if nodes and executable.per_node is None:
-                executable.measure(graph, nodes)
+                # a split graph's rate is its first part's, which holds the forward
+                first = graph.graphs[0] if isinstance(graph, SplitGraph) else graph
+                executable.measure(first, _graph_nodes(first))
                 if executable.per_node is None:
                     # Leave the graph unsized. Counted as zero, its executable memory would go unplanned.
                     logger.warning("Could not measure the executable memory of %s", what)
@@ -498,6 +510,8 @@ def _pool_bytes(pool_id) -> int:
 
 def _graph_nodes(graph) -> int:
     """``graph`` must be captured with ``keep_graph=True``, so the driver still holds it to count."""
+    if isinstance(graph, SplitGraph):
+        return sum(_graph_nodes(part) for part in graph.graphs)
     count = ctypes.c_size_t(0)
     status = ctypes.CDLL("libcuda.so.1").cuGraphGetNodes(
         ctypes.c_void_p(graph.raw_cuda_graph()), None, ctypes.byref(count),
@@ -1024,7 +1038,7 @@ class AcceleratorGraphRunner:
                             partial(
                                 capture_into_graph, warmed.run, device=self._device,
                                 autocast_dtype=self._autocast_dtype, node_name=self._submodule_name,
-                                stream=self._capture_stream,
+                                stream=self._capture_stream, splittable=self._splittable,
                             ),
                             f"{self._submodule_name} {spec}", self._executables.setdefault(walk, ExecutableMemory()),
                         )
@@ -1061,7 +1075,7 @@ class AcceleratorGraphRunner:
                         partial(
                             capture_into_graph, warmed.run, device=self._device,
                             autocast_dtype=self._autocast_dtype, node_name=self._submodule_name,
-                            stream=self._capture_stream,
+                            stream=self._capture_stream, splittable=self._splittable,
                         ),
                         f"{self._submodule_name} {spec}",
                         self._executables[(spec.bucket.graph_walk, spec.bucket.cg_key_info, spec.bucket.lean)],
@@ -1254,6 +1268,12 @@ class AcceleratorGraphRunner:
             (mem_after - mem_before) / (1024 ** 2),
         )
 
+    @property
+    def _splittable(self) -> bool:
+        """Whether this node's captures may split: only with a resource that splits them (the grammar
+        sampler). Every capture of the node, the sizing ones included, records the same way."""
+        return any(r.splits_capture for r in self._resources.values())
+
     def _capture_one(self, spec: CGSlotSpec, forwards: int) -> AcceleratorGraphSlot:
         # no forward after sizing, which already ran this spec's
         with self._warmed(spec, forwards) as warmed:
@@ -1262,7 +1282,7 @@ class AcceleratorGraphRunner:
             torch.accelerator.empty_cache()
             graph, output = capture_into_graph(
                 warmed.run, self._memory_pool, self._device, self._autocast_dtype,
-                node_name=self._submodule_name, stream=self._capture_stream,
+                node_name=self._submodule_name, stream=self._capture_stream, splittable=self._splittable,
             )
             return self._build_slot_from_capture(
                 output=BatchedModelOutput.coerce(output),
@@ -1749,13 +1769,14 @@ class AcceleratorGraphRunner:
                 )
             target.copy_(value)
 
-    def _replay(self, lease: SlotLease) -> dict:
+    def _replay(self, lease: SlotLease, launching: Callable[[], None] | None = None) -> dict:
+        """Replay ``lease``'s slot; ``launching`` runs just before its last launch."""
         slot = self.slot_for(lease)
         # The launch, not the GPU work: replay is async, so this range measures
         # enqueue cost only. GPU-side duration comes from --cuda-graph-trace.
         if self._enable_nvtx:
             profiler.range_push(f"cg.replay.slot[{lease.slot}]")
-        slot.graph.replay()
+        replay_graph(slot.graph, launching)
         if self._enable_nvtx:
             profiler.range_pop()
         return slot.static_outputs
@@ -1828,16 +1849,19 @@ class AcceleratorGraphRunner:
         rather than before the forward: staging copies each preprocessed tensor
         into its static buffer and holds the GIL while doing so, so releasing
         earlier hands the main thread a GIL the GPU thread still needs. Only
-        `graph.replay()` below drops it in C++.
+        `graph.replay()` below drops it in C++. A `SplitGraph`'s host call holds
+        the GIL between its launches too, so a split step sets it just before its
+        last launch instead.
         """
         laps = profiler.PhaseLaps("engine.forward.")
         self._stage(lease, preprocessed)
         if plan_done_event is not None:
             self._graph_backend.current_stream().wait_event(plan_done_event)
-        if launch_started_event is not None:
+        split = launch_started_event is not None and isinstance(self.slot_for(lease).graph, SplitGraph)
+        if launch_started_event is not None and not split:
             launch_started_event.set()
         laps.lap("stage")
-        out = self._replay(lease)
+        out = self._replay(lease, launch_started_event.set if split else None)
         laps.lap("replay")
         return out
 

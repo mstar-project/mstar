@@ -531,8 +531,8 @@ TOOLS_REFUSED = "tool calling is not supported for this model"
     ({"tool_choice": "required"}, TOOLS_REFUSED),
     ({"tool_choice": {"type": "function", "function": {"name": "get_weather"}}}, TOOLS_REFUSED),
     ({"presence_penalty": 0.5}, "presence_penalty is not supported"),
-    ({"response_format": {"type": "json_object"}},
-     "response_format needs constrained decoding; only {'type': 'text'} is served"),
+    ({"response_format": {"type": "yaml"}},
+     "response_format type must be text, json_object or json_schema; got 'yaml'"),
 ], ids=["tools", "required", "named", "penalty", "json"])
 def test_a_chat_that_asks_for_an_unserved_field_is_a_400_with_the_adapters_message(tmp_path, fields, message):
     """Stripped before the adapter, the fields left a chat that ran and ignored them.
@@ -546,6 +546,46 @@ def test_a_chat_that_asks_for_an_unserved_field_is_a_400_with_the_adapters_messa
         "the client gets a 400 without the adapter's own message"
     )
     assert not server.submitted, "the chat reached the model, which ignores the field"
+
+
+@pytest.mark.parametrize("fields", [
+    {"tools": [{"type": "function", "function": {"name": "get_weather"}}]},
+    {"tools": [{"type": "function", "function": {"name": "get_weather"}}], "tool_choice": "required"},
+    {"messages": [{"role": "user", "content": "hi"}, {"role": "tool", "content": "sunny"}]},
+], ids=["tools", "required", "tool-turn"])
+def test_tool_calls_are_not_served_through_dynamo_yet(tmp_path, fields):
+    """Qwen3.5's chat adapter keeps a chat's tools, but this bridge returns the raw reply, with no
+    tool_calls: a chat asking for one, or carrying a tool turn, is refused, never submitted."""
+    server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
+    with pytest.raises(ValueError) as refused:
+        _chat_through_bridge(server, fields, ADAPTER_REGISTRY["qwen3_5_0.8b"])
+    assert (refused.value.code, refused.value.message) == (400, "tool calling is not served through Dynamo")
+    assert not server.submitted
+
+
+def test_tools_with_tool_choice_none_are_dropped_through_dynamo(tmp_path):
+    server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
+    _chat_through_bridge(server, {"tools": [{"type": "function", "function": {"name": "get_weather"}}],
+                                  "tool_choice": "none"}, ADAPTER_REGISTRY["qwen3_5_0.8b"])
+    (sub,) = server.submitted
+    assert not {"tools", "tool_choice", "parallel_tool_calls"} & set(sub["model_kwargs"])
+
+
+@pytest.mark.parametrize("fields", [
+    {"reasoning_content": "Greet them."},
+    {"tool_calls": [{"type": "function", "function": {"name": "get_weather", "arguments": "{}"}}]},
+], ids=["reasoning", "tool-calls"])
+def test_an_assistant_turn_that_asks_for_no_call_is_served_through_dynamo(tmp_path, fields):
+    """A client that sends a reply back with its reasoning or its calls asks for no new call:
+    served, those fields dropped, as before the chat adapter kept them."""
+    server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
+    _chat_through_bridge(server, {"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "Hello!", **fields},
+        {"role": "user", "content": "how are you?"},
+    ]}, ADAPTER_REGISTRY["qwen3_5_0.8b"])
+    (sub,) = server.submitted
+    assert all(p.extras is None for p in sub["prompt_parts"])
 
 
 def test_the_chat_fields_clients_send_by_default_reach_the_model(tmp_path):

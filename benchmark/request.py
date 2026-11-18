@@ -948,7 +948,9 @@ def _record_vllm_omni_chunk(chunk: dict, metrics: "RequestMetrics") -> None:
     chunk_modality = chunk.get("modality")
     for choice in chunk.get("choices", []):
         delta = choice.get("delta") or {}
-        content = delta.get("content")
+        # a reasoning model's thinking streams beside the answer (M*'s and vLLM's ``reasoning``,
+        # SGLang's ``reasoning_content``): generated text all the same, as vLLM's own bench counts it
+        content = delta.get("content") or delta.get("reasoning") or delta.get("reasoning_content")
         audio_obj = delta.get("audio") if isinstance(delta.get("audio"), dict) else None
         audio_b64_field = audio_obj.get("data") if audio_obj else None
 
@@ -1135,7 +1137,9 @@ class VLLMOmni(InferenceSystem):
                     response_json = await resp.json()
                     arrival_time = time.monotonic()
                     for choice in response_json.get("choices", []):
-                        text = _extract_chat_text(choice.get("message", {}).get("content"))
+                        message = choice.get("message", {})
+                        reasoning = message.get("reasoning") or message.get("reasoning_content") or ""
+                        text = reasoning + _extract_chat_text(message.get("content"))
                         if text:
                             metrics.record_output_chunk(
                                 modality="text",

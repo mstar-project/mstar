@@ -42,10 +42,11 @@ import torch
 
 from mstar.api_server import data_worker as dw
 from mstar.api_server import entrypoint as ep
-from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
 from mstar.api_server.openai import serving_chat
 from mstar.api_server.request_types import APIServerMessage, ResultTokens
 from mstar.communication import wire
+from mstar.communication.event import EventWakeup
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.utils.gc_freeze import freeze_after_setup
 
@@ -81,6 +82,9 @@ class _StubTensorManager:
 
     def get_ready_tensors(self):
         return {}
+
+    def take_failed_reads(self):
+        return []
 
     def has_inflight_reads(self, request_id):
         return False
@@ -147,8 +151,9 @@ def build_server(model, data_worker_comm=None, wakeup=None):
     facade.abort_request_queue = queue.Queue()
     facade.reads_done_queue = queue.Queue()
     facade.discard_tensor_queue = queue.Queue()
-    facade.output_queue = queue.Queue()
-    facade.profile_queue = queue.Queue()
+    facade.results_wakeup = EventWakeup()
+    facade.output_queue = ResultQueue(facade.results_wakeup)
+    facade.profile_queue = ResultQueue(facade.results_wakeup)
     facade.per_request_reading_tensors = {}
     facade.received_chunk_counts = {}
     facade.wakeup = wakeup

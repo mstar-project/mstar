@@ -10,7 +10,7 @@ be purged on the same REMOVE_REQUEST that releases it. A leaked string key was
 harmless -- the string never recurred -- but a leaked handle silently attaches
 to whichever request gets that handle next. Known handle-keyed state:
 RequestLifecycle.{failed_rids, arrivals, pending_removes, _removes_awaiting_step,
-_unreported} (purged by removed), MicroScheduler.{backlog, last_ran, chunk_started,
+_unreported, _statuses} (purged by removed), MicroScheduler.{backlog, last_ran, chunk_started,
 cached_prefix} (purged by clear_rid), Admission.{held_until, parked} (purged by clear),
 Lockstep.read_failed_rids (purged by clear), Rebuilds.{_kept, _keeps_ids, _prefilling,
 _writes, _cursors}, Preemption._preempted, RequestStateManager.{per_request_info,
@@ -23,10 +23,10 @@ _decode, _unkeyed, _chunk_ends, _admit_restores, _admit_snaps, _admit_taken,
 _preplan_taken, _reserved}, KDAManager._verifying and RollingKVManager.{_requests,
 _admit_taken, _wants, _reserved}
 (purged by remove_request), ResidentPlanner.{_slot_of, _stale, _moved} (purged by
-release), SamplerCells._cells and SamplerResource._sampled_rids (purged by the
-sampler's remove_request), HostFields._fields (purged by the engine's
-remove_request), RopeManager._counters and LongRopeManager._long_rids (purged by their
-remove_request), and WorkerProfileInfo.
+release), SamplerCells._cells, SamplerResource._sampled_rids and GrammarRows._rows (purged by the
+sampler's remove_request; GrammarRows._pending holds rows, not handles), HostFields._fields (purged
+by the engine's remove_request), RopeManager._counters and LongRopeManager._long_rids (purged by
+their remove_request), and WorkerProfileInfo.
 
 Lockstep's follow count is the one deliberate exception: a
 ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it

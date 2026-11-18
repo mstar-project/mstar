@@ -46,6 +46,7 @@ from mstar.api_server.body_limit import BodyLimitMiddleware, max_body_bytes
 from mstar.api_server.data_worker import PreprocessWorker, unlink_files
 from mstar.api_server.lora_admin import LoraAdmin
 from mstar.api_server.openpi import OpenpiPolicy, serve_connection
+from mstar.api_server.reply_parser import REASONING, REPLY_IN_REASONING, TOOL_CALLS, TOOL_FORMATS, ReplyParser
 from mstar.api_server.request_types import (
     USAGE,
     APIServerMessage,
@@ -56,6 +57,7 @@ from mstar.api_server.request_types import (
 )
 from mstar.api_server.served_models import Selected, ServedModels
 from mstar.api_server.streaming_response import ReleasingStreamingResponse, errors_in_band
+from mstar.api_server.tool_fields import asks_for_tools, check_tools, without_tools
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.tensors import ensure_deployment_token
 from mstar.conductor.workers import accelerator_type, deployment_workers
@@ -373,6 +375,11 @@ class PendingRequest:
     stopped: bool = False
     prompt_tokens: int | None = None
     max_output_tokens: int | None = None
+    # submit_request's parse_reply, the tools its parser finds calls to (None: it finds none), and
+    # the parser, built on the reply's first text chunk; only the message thread touches it
+    parse_reply: bool = False
+    reply_tools: list | None = None
+    parser: ReplyParser | None = None
 
     def notify(self) -> None:
         """Wake the streaming handler, from any thread."""
@@ -407,19 +414,34 @@ def _set_events(wakes: list) -> None:
         wake.set()
 
 
+_REPLY_PARSE_FAILED = "the reply could not be parsed"
+
+
+def _split_chunk(chunk: ResultChunk, reasoning: str, answer: str, calls: list[dict]) -> None:
+    """A parsed reply's text chunk as the parser split it: its answer as the text, its reasoning and
+    finished calls in its metadata. `APIServer._parse_reply_chunk` repeats this inline."""
+    chunk.data = answer.encode() if answer else b""
+    if reasoning:
+        chunk.metadata[REASONING] = reasoning
+    if calls:
+        chunk.metadata[TOOL_CALLS] = calls
+
+
 def usage_chunk(request_id: str, req: PendingRequest) -> ResultChunk:
     """The chunk that ends a successful request submitted with ``report_usage``.
     Its ``finish_reason`` is ``length`` when the reply used all of the
     ``max_output_tokens`` the conductor resolved for it without sampling a stop
     token, and ``stop`` otherwise. A stop token in the last allowed slot is
     ``stop``, as OpenAI and vLLM report it. Only a model that declares
-    ``text_output`` has its stop tokens seen; any other is ``length`` at the cap."""
+    ``text_output`` has its stop tokens seen; any other is ``length`` at the cap. A reply whose
+    parser found a call, and that wasn't cut at the cap, is ``tool_calls``."""
     cap = req.max_output_tokens
     at_cap = cap is not None and req.completion_tokens >= cap
+    called = req.parser is not None and req.parser.calls > 0
     return ResultChunk(request_id=request_id, modality=USAGE, data=b"", metadata={
         "prompt_tokens": req.prompt_tokens or 0,
         "completion_tokens": req.completion_tokens,
-        "finish_reason": "length" if at_cap and not req.stopped else "stop",
+        "finish_reason": "length" if at_cap and not req.stopped else "tool_calls" if called else "stop",
     })
 
 
@@ -817,6 +839,84 @@ class APIServer:
     # Submitting a request
     # ----------------------------------------------------------
 
+    def _serve_tool_fields(
+        self, model_kwargs: dict, prompt_parts: list[PromptPart] | None, chat: bool,
+    ) -> list[PromptPart] | None:
+        """A request's tool fields, on every path: checked for a model that calls tools
+        (``Model.TOOL_FORMAT``), since ``chat_template_kwargs`` and ``/generate`` reach it past the
+        chat adapter's check. On a chat to a model that calls none, a call or a tool turn is refused
+        (an adapter serves several models, and a frontend can't tell them apart), and the rest is
+        dropped, an assistant turn's reasoning included, as before tools were served. ``/generate``
+        on such a model is as before: tool kwargs it doesn't read."""
+        if getattr(getattr(self, "model", None), "TOOL_FORMAT", None) is not None:
+            check_tools(model_kwargs)
+            return prompt_parts
+        if not chat:
+            return prompt_parts
+        if asks_for_tools(model_kwargs, prompt_parts):
+            raise ValueError("tool calling is not supported for this model")
+        return without_tools(model_kwargs, prompt_parts)
+
+    def _reply_reasoning_end(self) -> str | None:
+        """The text that ends the model's reasoning (`TextOutput.reasoning_end`), read once; None
+        for a model that doesn't reason, whose replies aren't parsed."""
+        try:
+            return self._reasoning_end
+        except AttributeError:
+            model = getattr(self, "model", None)
+            text = model.text_output() if model is not None else None
+            self._reasoning_end = None if text is None else text.reasoning_end
+            return self._reasoning_end
+
+    def _parse_reply_chunk(self, req: PendingRequest, chunk: ResultChunk, rid: str) -> ResultChunk:
+        """A parsed chat reply's text chunk, split: its answer stays the chunk's text, its reasoning
+        moves to ``metadata["reasoning"]``, its closed calls to ``metadata["tool_calls"]``. On the
+        message thread, in the request's chunk order. The thread carries every request's chunks, so
+        a parser error fails only its own request: the chunk becomes the error that ends it, and the
+        engine stops generating it."""
+        try:
+            parser = req.parser
+            if parser is None:
+                starts = bool(chunk.metadata.pop(REPLY_IN_REASONING, False))
+                tool_format = TOOL_FORMATS.get(getattr(self.model, "TOOL_FORMAT", None)) if req.reply_tools else None
+                if not starts and tool_format is None:
+                    # all answer (thinking off, no tools): its chunks pass through unparsed
+                    req.parse_reply = False
+                    return chunk
+                parser = req.parser = ReplyParser(self._reply_reasoning_end(), starts, tool_format, req.reply_tools)
+            # `_split_chunk`, inline: on every token of a parsed reply the call cost 0.14 us of 0.84
+            reasoning, answer, calls = parser.feed(chunk.data)
+            chunk.data = answer.encode() if answer else b""
+            if reasoning:
+                chunk.metadata[REASONING] = reasoning
+            if calls:
+                chunk.metadata[TOOL_CALLS] = calls
+            if parser.passes_through:
+                # the rest is answer text as it comes: no more parsing
+                req.parse_reply = False
+            return chunk
+        except Exception:  # noqa: BLE001 - one request's reply, never the thread
+            logger.exception("Parsing the reply of %s failed", chunk.request_id)
+            req.parse_reply, req.parser = False, None
+            self.preprocess_worker.forward_abort(rid)
+            return ResultChunk(request_id=chunk.request_id, modality="error", data=_REPLY_PARSE_FAILED.encode(),
+                               metadata={"status": 500})
+
+    @staticmethod
+    def _finish_reply(req: PendingRequest, rid: str) -> None:
+        """What a parsed reply's parser still holds, as its last text chunk; a parser error fails
+        the request instead."""
+        try:
+            reasoning, answer, calls = req.parser.finish()
+        except Exception:  # noqa: BLE001 - one request's reply, never the thread
+            logger.exception("Parsing the reply of %s failed", req.request_id or rid)
+            req.error, req.error_status = _REPLY_PARSE_FAILED, 500
+            return
+        if reasoning or answer or calls:
+            chunk = ResultChunk(request_id=req.request_id or rid, modality="text", data=b"")
+            _split_chunk(chunk, reasoning, answer, calls)
+            req.chunks.append(chunk)
+
     def _report_ignored_params(self, model_kwargs: dict) -> None:
         """Log the keys the model does not read, once per set of keys; the
         request is served regardless."""
@@ -846,6 +946,7 @@ class APIServer:
         file_streams: dict[str, list[str | None]] | None = None,
         raw_inputs: dict[str, list[torch.Tensor]] | None = None,
         report_usage: bool = False,
+        parse_reply: bool = False,
     ) -> str:
         """Build a :class:`NewRequestConductor` and send it to the conductor.
 
@@ -882,7 +983,9 @@ class APIServer:
         is written or decoded.
 
         ``report_usage`` ends a successful request's chunks with a ``usage``
-        chunk (:func:`usage_chunk`).
+        chunk (:func:`usage_chunk`). ``parse_reply`` (a chat reply) splits its text, on a model
+        that reasons or calls tools, into the answer, ``metadata["reasoning"]`` and
+        ``metadata["tool_calls"]`` (`ReplyParser`).
         """
         if raw_inputs is not None:
             _check_raw_inputs(raw_inputs, file_paths)
@@ -905,6 +1008,12 @@ class APIServer:
         # here, before anything is queued: null is unset, types and ranges are
         # checked once for every endpoint, and an over-wide seed cannot be packed
         model_kwargs = normalize_generation_kwargs(model_kwargs)
+        prompt_parts = self._serve_tool_fields(model_kwargs, prompt_parts, parse_reply)
+        reply_tools = None
+        if parse_reply and getattr(getattr(self, "model", None), "TOOL_FORMAT", None) in TOOL_FORMATS \
+                and model_kwargs.get("tool_choice") != "none":
+            reply_tools = model_kwargs.get("tools") or None
+        parse_reply = parse_reply and (self._reply_reasoning_end() is not None or reply_tools is not None)
         model_kwargs, prefix_root = self.lora_kwargs(model, model_kwargs)
         self._report_ignored_params(model_kwargs)
 
@@ -945,6 +1054,8 @@ class APIServer:
                 open_streams=open_streams,
                 input_bytes=input_bytes,
                 report_usage=report_usage,
+                parse_reply=parse_reply,
+                reply_tools=reply_tools,
             )
         if self.metrics is not None:
             mark_submitted()
@@ -962,6 +1073,7 @@ class APIServer:
             ends=ending,
             streaming=streaming,
             raw_inputs=raw_inputs,
+            parse_reply=parse_reply,
         ))
 
         request_log.debug(
@@ -1188,6 +1300,8 @@ class APIServer:
                             "result delivery timed out; response is incomplete"
                         )
                         req.error_status = 500
+                elif req.parser is not None and req.error is None:
+                    self._finish_reply(req, rid)
                 req.event.set()
                 req.notify()
                 # Snapshot the data worker's tx/rx now: the request is done (all
@@ -1432,6 +1546,11 @@ class APIServer:
                                 result_chunk.data.decode("utf-8", "replace"),
                                 rid, req.request_id,
                             ).encode("utf-8")
+                        # the bytes that arrived, which the counts below report; a parsed reply's
+                        # chunk keeps only its answer as its data
+                        received = result_chunk.data
+                        if req.parse_reply and result_chunk.modality == "text":
+                            result_chunk = self._parse_reply_chunk(req, result_chunk, rid)
                         req.chunks.append(result_chunk)
                         if self.log_stats:
                             info = req.output_totals.get(result_chunk.modality)
@@ -1439,7 +1558,7 @@ class APIServer:
                                 info = OutputInfo(modality=result_chunk.modality, count=0, total_bytes=0)
                                 req.output_totals[result_chunk.modality] = info
                             info.count += 1
-                            info.total_bytes += len(result_chunk.data)
+                            info.total_bytes += len(received)
                         sink = req.sink
                         if sink is not None and result_chunk.modality != "error":
                             batch = to_relay.get(id(sink))
@@ -1466,7 +1585,7 @@ class APIServer:
                             self.recently_completed[rid] = time.time()
                     if metrics is not None and result_chunk.modality != "error":
                         metrics.record_chunk(
-                            result_chunk.modality, result_chunk.data, result_chunk.metadata,
+                            result_chunk.modality, received, result_chunk.metadata,
                         )
                 if to_wake:
                     notify_many(to_wake.values())

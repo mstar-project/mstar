@@ -689,7 +689,16 @@ class Model(ABC):
     # Request keys the conductor or data worker reads for every model, never logged as ignored.
     ENGINE_KWARGS: tuple[str, ...] = (
         "seed", "prefix_cache", "return_token_ids", "return_logprobs", LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG,
+        "structured_outputs", "structured_outputs_after", "structured_outputs_tools",
     )
+    # Whether a deployment may turn on ``enable_grammar`` (structured outputs) for this model. A model
+    # declares it once its reasoning end, stop tokens and tests are in place; on any other, the switch is
+    # refused at startup rather than served half right.
+    STRUCTURED_OUTPUTS: bool = False
+    # The model's tool-call format, as xgrammar names it (``get_model_structural_tag``), for a model
+    # that serves OpenAI ``tools``: its chat template renders them, the reply parser finds its calls,
+    # and a forced call's grammar holds to it. None: a chat with tools is refused (`submit_request`).
+    TOOL_FORMAT: str | None = None
     # Output modalities a client plays as they stream, where a pause is a gap. A streamed request with one of
     # them reserves its whole KV footprint and is never preempted. ``unpausable_outputs`` in the serving config
     # overrides it.
@@ -1210,6 +1219,14 @@ class Model(ABC):
         """How this model's text output, token ids, becomes bytes, or None for a
         model that encodes text in its own ``postprocess``. ``postprocess`` and
         ``postprocess_inline`` derive their text paths from it."""
+        return None
+
+    def reply_starts_in_reasoning(self, model_kwargs: dict) -> bool | None:
+        """Whether a reply to a prompt built with ``model_kwargs`` starts inside the reasoning block
+        the prompt opened (`TextOutput.reasoning_start`), for a model that knows it from its own
+        settings; None (the default) to have the data worker read the prompt's tail instead
+        (`after_reasoning`). The data worker checks the first answer of each kind against that read,
+        and stops asking a model whose answer disagreed."""
         return None
 
     _text_detokenizer: TextChunkDetokenizer | None = None

@@ -63,6 +63,8 @@ mstar = "mstar.cli.main:main"
 mstar-serve = "mstar.api_server.entrypoint:main"
 
 [project.optional-dependencies]
+# grammar-constrained sampling (`structured_outputs`, `response_format`, a sampler's enable_grammar)
+grammar = ["xgrammar>=0.2.9,<0.3"]
 # OmniVoice reuses the reference package for weight loading, the rule-based
 # duration estimator, language/instruct validation and the pydub silence
 # trim; mstar owns the graph.
@@ -84,6 +86,7 @@ command_a_plus = [
 
 dev = [
     "ruff<=0.16",
+    "xgrammar>=0.2.9,<0.3",  # the `grammar` extra, so the structured-output tests run
     "pytest>=9.0.3",
     "pytest-timeout",  # a per-test limit, so a stuck test is named rather than holding the suite
     "pydub",  # the OmniVoice silence trim's test oracle
@@ -486,6 +489,7 @@ all = [
     "num2words",
     "audioseal>=0.2,<0.3",  # see the audioseal extra
     "soxr",  # see the voxcpm2 extra
+    "xgrammar>=0.2.9,<0.3",  # see the grammar extra
     # omnivoice is intentionally omitted for the same reason as flash-attn: it
     # has to come from git, which PyPI will not accept in requires_dist.
     # See docs/installation.rst.

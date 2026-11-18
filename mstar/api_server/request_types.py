@@ -175,6 +175,9 @@ class PreprocessInput:
 
     # Ordered text/attachment sequence, when the entrypoint preserved it.
     prompt_parts: list[PromptPart] | None = None
+    # a chat reply the API server splits (`reply_parser`): the data worker says, on its first
+    # text chunk, whether the reply starts inside its reasoning
+    parse_reply: bool = False
     # The id the client knows the request by; ``request_id`` is the API
     # server's key for this one submission.
     client_request_id: str | None = None

@@ -1,4 +1,5 @@
 import logging
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -18,9 +19,11 @@ from mstar.engine.state import (
     Positions,
     Read,
     Sampler,
+    SampleSettings,
     SeqShard,
     TensorType,
     Value,
+    request_grammar,
 )
 from mstar.model.base import ProcessPromptOutput, TensorAndMetadata
 from mstar.model.components.lora.modules import LoraRoot
@@ -69,6 +72,13 @@ logger = logging.getLogger(__name__)
 # TODO: implement MoE variants
 class Qwen3_5DenseModel(DeclaredDecoderModel):
     NAME = "Qwen3.5"
+    REASONING_START = "<think>"
+    REASONING_END = "</think>"
+    STRUCTURED_OUTPUTS = True
+    TOOL_FORMAT = "qwen_3_5"
+    # the tool fields reach the prompt (and a forced call's grammar) in the data worker, and stay
+    # there: a tool's schema can hold numbers the conductor's wire doesn't carry
+    PREPROCESS_ONLY_KWARGS = ("tools", "tool_choice", "parallel_tool_calls")
     METADATA_FILES = (
         "config.json",
         "preprocessor_config.json",
@@ -189,6 +199,12 @@ class Qwen3_5DenseModel(DeclaredDecoderModel):
         processor = self.image_processor
         min_patches = processor.size["shortest_edge"] // processor.patch_size ** 2
         return VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // min_patches
+
+    def get_request_resource_configs(
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
+    ) -> dict[str, SampleSettings]:
+        settings = super().get_request_resource_configs(input_modalities, output_modalities, model_kwargs)[SAMPLER]
+        return {SAMPLER: replace(settings, grammar=request_grammar(model_kwargs))}
 
     # -----------------------------------------------------------------------
     # Chunked prefill
@@ -346,6 +362,8 @@ class Qwen3_5DenseModel(DeclaredDecoderModel):
         try:
             text = self.tokenizer.apply_chat_template(
                 messages_from_parts(parts),
+                # with tool_choice none too, as vLLM renders them by default
+                tools=kwargs.get("tools") or None,
                 tokenize=False,
                 add_generation_prompt=True,
                 enable_thinking=enable_thinking,
@@ -396,7 +414,13 @@ class Qwen3_5DenseModel(DeclaredDecoderModel):
         return image_position_advance(torch.tensor(grid), self._merge())
 
     def request_kwargs(self) -> frozenset[str]:
-        return super().request_kwargs() | {"enable_thinking"}
+        return super().request_kwargs() | {"enable_thinking", *self.PREPROCESS_ONLY_KWARGS}
+
+    def reply_starts_in_reasoning(self, model_kwargs: dict) -> bool | None:
+        # the template opens a `<think>` block for the reply exactly when enable_thinking is true,
+        # the default `_prompt_ids` renders with (and a non-boolean is refused there first)
+        thinking = model_kwargs.get("enable_thinking", True)
+        return thinking if isinstance(thinking, bool) else None
 
     def process_prompt(self, *args: Any, **kwargs: Any) -> ProcessPromptOutput:
         out = super().process_prompt(*args, **kwargs)
