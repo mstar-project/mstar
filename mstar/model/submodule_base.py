@@ -1723,10 +1723,12 @@ class ARNodeSubmodule(NodeSubmodule):
         share = self.drafter_share
         if share is None:
             raise RuntimeError(f"{type(self).__name__}: a verify step on a node the engine never bound a drafter to")
-        return draft_verify_step(
+        result = draft_verify_step(
             engine_inputs.resources[share.sampler_key], engine_inputs.request_ids, input_ids, target,
             self.drafter, engine_inputs.resources, engine_inputs.resident,
         )
+        self._count_verify(share)
+        return result
 
     def draft_mixed_step(
         self, engine_inputs: ModelInputsFromEngine, ids: torch.Tensor, rows, target,
@@ -1739,10 +1741,20 @@ class ARNodeSubmodule(NodeSubmodule):
         share = self.drafter_share
         if share is None or share.mixed_walk is None:
             raise RuntimeError(f"{type(self).__name__}: a mixed step on a node bound no mixed walk (bind_draft)")
-        return draft_mixed_step(
+        result = draft_mixed_step(
             engine_inputs.resources[share.sampler_key], engine_inputs.request_ids, ids, rows, target,
             self.drafter, engine_inputs.resources, resident=engine_inputs.resident,
         )
+        self._count_verify(share)
+        return result
+
+    def _count_verify(self, share) -> None:
+        """On a node on the state contract, the verify is the step's draw on its sampler's handle."""
+        handle = getattr(self, "state_handles", {}).get(share.sampler_key)
+        if handle is not None:
+            from mstar.engine.state.calls import verified
+
+            verified(handle)
 
     def verify_output(self, result: "VerifyResult", **row_outputs: torch.Tensor) -> "BatchedModelOutput":
         """What a verify step's forward returns: each row's block under the

@@ -1,6 +1,7 @@
 model: "qwen3_8b"
-# Qwen/Qwen3-8B, bf16. The serving config requires max_seq_len but nothing reads it
-# (docs/serving.rst); a request is bounded by the checkpoint's max_position_embeddings.
+# Qwen/Qwen3-8B, bf16, plain decoding. configs/qwen3_8b_dspark.yaml adds a DSpark drafter.
+# The serving config requires max_seq_len but nothing reads it (docs/serving.rst); a
+# request is bounded by the checkpoint's max_position_embeddings.
 max_seq_len: 40960
 resources:
   kv_cache:
