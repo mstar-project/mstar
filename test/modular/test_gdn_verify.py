@@ -103,18 +103,39 @@ def _split(qkv: torch.Tensor):
 def _step(pool, manager, rows: dict[int, int], walk: str, inputs, preplan: bool = False) -> None:
     """One step over ``rows`` (rid -> span), the layers driven as GatedDeltaNet drives them. ``preplan``: the
     manager plans the step ahead, as the async worker's plan thread does, and the step takes that plan."""
+    rstep, ctx = _plan(pool, manager, rows, walk, preplan=preplan)
+    _run(pool, manager, rstep, ctx, inputs)
+
+
+def _plan(pool, manager, rows: dict[int, int], walk: str, preplan: bool = False, ahead: bool = False):
+    """Admit and plan a step over ``rows``; ``preplan``: plan it ahead first, then take that plan. ``ahead``:
+    only plan it ahead, as the plan thread does once the step before commits (`_take` takes it)."""
     rids = list(rows)
-    ctx = StepContext(request_ids=rids, graph_walk=walk, slot=0, capture=False)
+    ctx = StepContext(request_ids=rids, graph_walk=walk, slot=0, capture=False, is_preplan=ahead)
     segments = tuple(Segment(rid, "main", span) for rid, span in rows.items())
     rstep = RecurrentStep(segments=segments)
     assert pool.admit(rstep, ctx).ok
     ctx.plan_results[POOL] = pool.plan(rstep, ctx)
     if preplan:
-        ahead = StepContext(request_ids=rids, graph_walk=walk, slot=0, capture=False, is_preplan=True)
-        ahead.plan_results[POOL] = ctx.plan_results[POOL]
-        manager.plan(LinearAttnStep(segments=segments), ahead)
+        early = StepContext(request_ids=rids, graph_walk=walk, slot=0, capture=False, is_preplan=True)
+        early.plan_results[POOL] = ctx.plan_results[POOL]
+        manager.plan(LinearAttnStep(segments=segments), early)
         assert manager._preplanned
     manager.plan(LinearAttnStep(segments=segments), ctx)
+    assert manager._preplanned == ahead
+    return rstep, ctx
+
+
+def _take(pool, manager, rstep, ahead):
+    """The step planned ``ahead`` runs: it takes its plan."""
+    ctx = StepContext(request_ids=ahead.request_ids, graph_walk=ahead.graph_walk, slot=0, capture=False)
+    assert pool.admit(rstep, ctx).ok
+    ctx.plan_results[POOL] = pool.plan(rstep, ctx)
+    manager.plan(LinearAttnStep(segments=rstep.segments), ctx)
+    return ctx
+
+
+def _run(pool, manager, rstep, ctx, inputs) -> None:
     for layer, (x, a, b) in enumerate(inputs):
         w = WEIGHTS[layer]
         qkv = manager.run_conv(x, pool.block("conv", layer), w.conv_w, w.conv_b)
@@ -273,6 +294,39 @@ def test_a_step_that_doesnt_verify_keeps_nothing_for_a_rerun(verifying, preplan)
         assert ("_verify_block" in vars(manager)) == verifying
         assert ("_cached_verify_block" in vars(manager)) == (verifying and preplan)
     assert len(manager._kept_conv) == len(manager._kept_delta) == (LAYERS if verifying else 0)
+
+
+@pytest.mark.parametrize("running,next_walk", [(VERIFY, PREFILL), (PREFILL, VERIFY)], ids=[
+    "verify-then-prompt", "prompt-then-verify",
+])
+@pytest.mark.parametrize("verifying", [False, True], ids=["plain", "verifying"])
+def test_a_step_planned_ahead_writes_no_verify_state_until_it_runs(verifying, running, next_walk):
+    """The plan thread plans the next step once the running one commits (`StepExecutor.arm_preplan`), its kernels
+    still running. That plan only caches the next step's verify block: the verify block and the rerun lists stay
+    the running step's until the next step takes its plan, and then keep and correct as its own plan says."""
+    pool, manager = _build(verifying)
+    for rid in (1, 2):
+        _add(pool, rid)
+    _step(pool, manager, {1: 5}, PREFILL, _inputs(5, seed=5))
+    # request 1 verifies, request 2 sends its prompt
+    rows, spans = {VERIFY: {1: K + 1}, PREFILL: {2: 5}}, {VERIFY: K + 1, PREFILL: 5}
+
+    def kept_and_corrected(walk):
+        keeps = verifying and walk == VERIFY
+        assert manager._verify_block == (K + 1 if keeps else None)
+        assert len(manager._kept_conv) == len(manager._kept_delta) == (LAYERS if keeps else 0)
+        manager.correct_verify_state(SimpleNamespace(accepted=torch.tensor([1])))
+        assert not manager._kept_conv and not manager._kept_delta
+
+    _run(pool, manager, *_plan(pool, manager, rows[running], running), _inputs(spans[running], seed=7))
+    kept_and_corrected(running)
+    live = manager._verify_block, manager._kept_conv, manager._kept_delta
+    later, ahead = _plan(pool, manager, rows[next_walk], next_walk, ahead=True)
+    assert manager._verify_block == live[0] and manager._kept_conv is live[1] and manager._kept_delta is live[2]
+    _run(pool, manager, later, _take(pool, manager, later, ahead), _inputs(spans[next_walk], seed=8))
+    kept_and_corrected(next_walk)
+    if not verifying:
+        assert not {"_verify_block", "_cached_verify_block", "_kept_conv", "_kept_delta"} & set(vars(manager))
 
 
 def test_the_settle_kernel_matches_its_reference_on_the_cpu_path():
