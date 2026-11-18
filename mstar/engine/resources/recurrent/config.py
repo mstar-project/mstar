@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, check_sizes
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceCapabilities, ResourceReqConfig, check_sizes
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -344,6 +344,16 @@ class RecurrentStateConfig:
 @dataclass
 class RecurrentStateSpec(NodeResourceSpec):
     config: RecurrentStateConfig
+
+    def resource_capabilities(self, ctx) -> ResourceCapabilities:
+        verify = None
+        if self.config.disable_sink_slot:
+            verify = "a verify step's padding rows rerun into the sink slot, which disable_sink_slot removes"
+        elif len(self.config.labels) != 1:
+            # the undo keeps one label's inputs and maps its rows to the sampler's
+            verify = f"a verify step corrects one label's state, and this pool declares {list(self.config.labels)}"
+        # its linear-attention resource's rerun, in the graph, needs nothing of the host
+        return ResourceCapabilities(verify_refusal=verify, async_verify_refusal=None)
 
     @property
     def storage(self) -> "Storage":
