@@ -340,7 +340,7 @@ def _sink_first_rows(kv, keep: torch.Tensor) -> None:
 def pass_selector(resources: dict[str, Any], lag) -> Callable[[int | None], None]:
     """`DraftInputs.select_pass` over the resources a `DraftLag` names, built once per node at load
     (`DrafterShare.select_pass`), so a verify step allocates no selector of its own. A new one each step
-    re-traced a compiled verify step on torch 2.7.1; that wasn't seen on 2.10 or 2.12."""
+    re-traced a compiled verify step on torch 2.7.1; on 2.10 (CPU) it compiled once, in more frames."""
     chosen = [resources[lag.kv_key], resources[lag.pos_key], resources[lag.attn_key]]
 
     @torch.compiler.disable
