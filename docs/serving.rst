@@ -1014,10 +1014,11 @@ prompt-only ones included, and a node-level ``max_batch_tokens`` override above 
 refuses an asynchronous mixed walk with no token budget, or with a prompt walk in it whose
 chunking the serving config turned off (a null ``max_batch_tokens``), since either way a
 prompt runs whole, past every capture. It refuses one no captured bucket holds: the message
-gives the floor it fit, ``min_chunk_tokens`` capped at the budget and rounded to the node's
-chunk alignment, and the ways to start, ``mode: synchronous`` and, where they apply, a lower
-``min_chunk_tokens`` or memory for the buckets capture left out. It also refuses a mixed
-walk over a KV pool the model writes under more than one label, since a mixed step plans one.
+gives the floor no kept bucket holds, ``min_chunk_tokens`` capped at the budget and rounded up
+to the node's chunk alignment, and the ways to start, ``mode: synchronous`` and, where they
+apply, a lower ``min_chunk_tokens`` or memory for a bucket capture left out that would hold the
+step. In either mode, it also refuses a mixed walk over a KV pool the model writes under more
+than one label, since a mixed step plans one.
 
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
 client instead — see :doc:`clients`, and :ref:`generation-parameters` for what each
