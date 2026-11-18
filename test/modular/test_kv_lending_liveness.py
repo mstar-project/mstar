@@ -11,19 +11,21 @@ from __future__ import annotations
 
 import sys
 from dataclasses import replace
+from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
 import pytest
 import test_kv_host_index as host
 from test_kv_admission import _RUNNERS, _remove, _runner
-from test_kv_preemption import _drop, _make_room, _offload, _pool, _preempt, _ready, _request, _running
+from test_kv_preemption import _drop, _make_room, _offload, _pool, _preempt, _ready, _request, _running, _step
 from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _manager, _StubTransfer
+from test_resident_delta import _admits, _ingest, _pool_rank, _rebuilds_none
 
 from mstar.engine.resources.base import MoveKind
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVStep
-from mstar.engine.resources.kv.manager import Victims
+from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
+from mstar.engine.resources.kv.manager import ShortGrant, Victims
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import ASKS, Segment
 from mstar.testing_utils.resource import StubResource
@@ -309,16 +311,17 @@ def test_a_follower_stops_on_a_guarantee_for_a_request_it_already_guarantees(all
 
 class _Refuses(StubResource):
     """A resource after the KV pool that asks for the requests in ``refuse`` and refuses each one's next reservation,
-    so admission gives back what the KV pool reserved."""
+    and every reservation of those in ``hold``, so admission gives back what the KV pool reserved."""
 
     def __init__(self):
         self.refuse: set[str] = set()
+        self.hold: set[str] = set()
 
     def ask(self, rid, node_name, graph_walk):
-        return ASKS if rid in self.refuse else None
+        return ASKS if rid in self.refuse or rid in self.hold else None
 
     def reserve(self, rid, node_name, graph_walk, published):
-        if rid in self.refuse:
+        if rid in self.refuse or rid in self.hold:
             self.refuse.discard(rid)
             return 0
         return None
@@ -345,6 +348,89 @@ def test_a_reservation_given_back_after_a_wait_for_no_page_keeps_the_allotment()
     assert kv._asks["p"] == 0 and "p" in kv._stalled, "p no longer waits for the room borrowers took"
     assert _ready(kv, "p")
     assert (allotment.pages, allotment.remaining, kv._unused, kv._borrowable) == before
+
+
+@pytest.mark.parametrize("drop", [False, True], ids=["alone", "a drop between"])
+@pytest.mark.parametrize("to_host", [False, True], ids=["queued", "moved to the host"])
+def test_a_follower_replays_a_wait_for_no_page_and_the_reservation_given_back(monkeypatch, to_host, drop):
+    """Rank 0's preempt has p, whose grant ran short turning guaranteed while borrowers hold the room that takes, claim
+    the room the grant counted and wait for 0 pages, or move itself to the host when the host takes it whole. Another
+    resource refuses p's next reservation: one of no page for p waiting holding its allotment, which p keeps, or p's
+    return from the host. The one after admits p. With ``drop``, rank 0 drops v for r's shortage in between. A
+    follower replays every move, and its counts are rank 0's after each replay. p's short grant is set by hand to one
+    `_alloc` doesn't record here (it would send preempt to choose victims), to force the flip site's claim before a
+    0-page wait, which is defensive and no natural run reached, and the reservation of no page after it, which no
+    sweep reached."""
+    cfg = PagedKVConfig(num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=4096, max_num_pages=12,
+                        page_size=PAGE_SIZE)
+    ranks = [_pool_rank(monkeypatch, rank, cfg) for rank in (0, 1)]
+    (leader, lead), (follower, follow) = ranks
+    refuses = _Refuses()
+    for kv, engine in ranks:
+        kv._cpu_pool = host._HostPool(1)
+        engine._runner = StepRunner(
+            {"kv": kv, "zz": refuses if kv is leader else _Refuses()}, node_resources={NODE: ["kv", "zz"]},
+        )
+
+    def ready(rid: str) -> bool:
+        """Rank 0's readiness check, as the worker makes it: admission, then a reload for a request on the host."""
+        lead.admit_waiting(lambda other, node: None)
+        return lead.check_ready(NODE, rid, SimpleNamespace(graph_walk="decode", resource_publish_info=None)).ready
+
+    def replay() -> list[tuple]:
+        delta = lead.take_resident_delta()
+        moves = list(zip(delta.kinds, delta.rids, delta.counts, strict=True))
+        assert follow.apply_resident_delta(delta, _rebuilds_none)
+        assert _state(follower) == _state(leader), f"the follower's counts left rank 0's on {moves}"
+        return moves
+
+    rows = {"g": 1, "p": 1, "r": 1, "v": 3}
+    for arrival, (rid, pages) in enumerate(rows.items()):
+        _ingest((leader, follower), rid, pages, arrival, rebuildable=rid != "p", guaranteed=rid == "g")
+        assert _admits(leader, rid)
+    replay()
+    for rid, pages in rows.items():
+        assert _step(leader, rid, pages * PAGE_SIZE).ok and _step(follower, rid, pages * PAGE_SIZE).ok
+    room = leader._room_for("p")
+    assert room > 0 and leader._borrowable, "nothing for p to claim, or nothing lent"
+
+    # a step of p's own in flight on another node keeps it off the host
+    leader._streams["p"]["main"].step_in_flight = not to_host
+    leader._ran_short["p"] = ShortGrant(room - 1, room, flip=True)
+    victims = leader.preempt("p", 1, lead._runner.newer_than("p"), lead._runner.older_than("p"), lambda rid: False)
+    leader._streams["p"]["main"].step_in_flight = False
+    refuses.refuse.add("p")
+    if to_host:
+        assert victims == Victims(["p"], [], [])
+        lead.offload_request(NODE, "p")
+    else:
+        assert victims == Victims([], [], [], queued=True)
+        lead.readmit_request(NODE, "p")
+    moves = replay()
+    assert moves[:2] == [(MoveKind.ALLOT, "p", room), (MoveKind.WAIT, "p", 0)]
+    # the move to the host gives back the allotment p waited holding, and p asks to return
+    assert ((MoveKind.OFFLOAD, "p", 0) in moves) == to_host and ("p" in leader._allotments) != to_host
+
+    if drop:
+        victims = leader.preempt("r", 1, lead._runner.newer_than("r"), lead._runner.older_than("r"),
+                                 lambda rid: rid == "v")
+        assert victims.to_drop == ["v"]
+        # v's return waits on the other resource, or it borrows the room p waits for
+        refuses.hold.add("v")
+        lead.drop_request(NODE, "v", leader._laid_out_tokens("v"))
+        assert {(kind, rid) for kind, rid, _ in replay()} >= {(MoveKind.EARMARK, "r"), (MoveKind.DROP, "v")}
+
+    held = None if to_host else replace(leader._allotments["p"])
+    assert not ready("p")
+    moves = replay()
+    if not to_host:
+        allotment = leader._allotments.get("p")
+        assert moves[:2] == [(MoveKind.RESERVE, "p", 0), (MoveKind.UNRESERVE, "p", 0)]
+        assert allotment is not None, "giving back a reservation of no page gave back p's allotment"
+        assert (allotment.pages, allotment.remaining, leader._asks["p"]) == (held.pages, held.remaining, 0)
+
+    assert ready("p")
+    replay()
 
 
 # configs from CPU sweeps that stalled in at least one mode while a request that may turn guaranteed borrowed lent
