@@ -299,7 +299,7 @@ class _ToyDecl(DrafterDecl):
         return []
 
 
-def specs(k: int, max_num_pages: int = 256, greedy_capture: bool | None = None):
+def specs(k: int, max_num_pages: int = 256, greedy_capture: bool | None = None, hf_filters: bool = False):
     """The node's specs as a model declares them, then through `drafter_resources`, which
     holds the KV slack past the 256-token limit and makes the sampler a verifying one."""
     declared = [
@@ -308,7 +308,10 @@ def specs(k: int, max_num_pages: int = 256, greedy_capture: bool | None = None):
             max_num_pages=max_num_pages, page_size=PAGE, prefix_cache_salt="toy",
         )),
         PositionSpec("rope", {NODE}, PositionConfig(kv_cache="kv")),
-        SamplerSpec("sampler", {NODE}, vocab_size=VOCAB, greedy_capture=greedy_capture),
+        SamplerSpec(
+            "sampler", {NODE}, vocab_size=VOCAB, greedy_capture=greedy_capture,
+            enable_min_p=hf_filters, enable_top_p_first=hf_filters,
+        ),
     ]
     config = DraftConfig.parse({"method": "dspark", "model": "toy", "num_draft_tokens": k})
     return drafter_resources(declared, _ToyDecl(), {NODE}, config)
@@ -316,15 +319,17 @@ def specs(k: int, max_num_pages: int = 256, greedy_capture: bool | None = None):
 
 def engine(
     k: int, drafter_factory=oracle, mode: str = "synchronous", greedy_capture: bool | None = None,
-    max_num_pages: int = 256, mixed: bool = False,
+    max_num_pages: int = 256, mixed: bool = False, hf_filters: bool = False,
 ) -> Engine:
     """``greedy_capture``: the sampler's lean switch, which its narrow vocabulary leaves off. ``mixed``: the
-    node runs mixed prompt-plus-verify steps (`Driver.mixed_step`)."""
+    node runs mixed prompt-plus-verify steps (`Driver.mixed_step`). ``hf_filters``: the sampler takes min_p and
+    top_p_first."""
     sub = ToyLM(k, drafter_factory)
     eng = Engine(graph_runtime=None)
     eng.load_model(
-        {NODE: sub}, specs(k, max_num_pages, greedy_capture), WorkerParallelGroups(num_workers=1, global_rank=0),
-        torch.device("cpu"), transfer_engine_info=None, kv_cache_type=torch.float32,
+        {NODE: sub}, specs(k, max_num_pages, greedy_capture, hf_filters),
+        WorkerParallelGroups(num_workers=1, global_rank=0), torch.device("cpu"), transfer_engine_info=None,
+        kv_cache_type=torch.float32,
         model=ToyModel(k, mode, sub.token_stop, sub.drafter.needs, mixed=mixed),
     )
     # what a capture's buffers would build: the sampler's slot masters, the loop-back slots
@@ -360,11 +365,11 @@ class Driver:
 
     def add(
         self, rid: int, prompt: list[int], max_tokens: int, temperature: float = 0.0, seed: int = 0,
-        arrival: int | None = None, top_k: int = 0, top_p: float = 1.0,
+        arrival: int | None = None, top_k: int = 0, top_p: float = 1.0, min_p: float = 0.0, top_p_first: bool = False,
     ):
         """``arrival``: the conductor's number for the request, which preemption chooses victims by. A numbered
         request is admitted as a readiness scan admits it, so its pool allots it pages."""
-        cfg = SamplingReqConfig(temperature=temperature, top_k=top_k, top_p=top_p)
+        cfg = SamplingReqConfig(temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p, top_p_first=top_p_first)
         cfg.apply_conductor_config(seed=seed)
         info = None if arrival is None else CurrentForwardPassInfo(
             str(rid), "prefill", 0, seed, max_tokens, arrival=arrival,

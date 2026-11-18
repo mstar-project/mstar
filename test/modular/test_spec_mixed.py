@@ -117,9 +117,9 @@ def _verified(driver, prompts, steps_before, temperature, seed, filters):
 
 def _separate(prompts, late, drafter=oracle, steps_before=2, temperature=0.0, seed=0, filters=None):
     """``prompts`` prefilled and verified ``steps_before`` steps, then ``late``'s prompt steps on their own.
-    ``filters``: every request's top_k and top_p."""
+    ``filters``: every request's top_k, top_p, min_p and top_p_first."""
     filters = filters or {}
-    driver = Driver(engine(K, drafter))
+    driver = Driver(engine(K, drafter, hf_filters=_hf(filters)))
     live = _verified(driver, prompts, steps_before, temperature, seed, filters)
     for rid, prompt in late.items():
         driver.add(rid, prompt, MAX, temperature=temperature, seed=seed + rid, **filters)
@@ -130,7 +130,7 @@ def _separate(prompts, late, drafter=oracle, steps_before=2, temperature=0.0, se
 def _mixed(prompts, late, drafter=oracle, steps_before=2, temperature=0.0, seed=0, filters=None):
     """The same, ``late``'s prompts riding in one mixed step with ``prompts``' verify rows."""
     filters = filters or {}
-    driver = Driver(engine(K, drafter, mixed=True))
+    driver = Driver(engine(K, drafter, mixed=True, hf_filters=_hf(filters)))
     live = _verified(driver, prompts, steps_before, temperature, seed, filters)
     for rid in late:
         driver.add(rid, None, MAX, temperature=temperature, seed=seed + rid, **filters)
@@ -149,15 +149,69 @@ def test_a_mixed_steps_rows_decode_as_in_steps_of_their_own(drafter):
     assert driver.out == _separate(PROMPTS, LATE, drafter)
 
 
+def _hf(filters: dict) -> bool:
+    # by name, so a request that sets top_p_first False runs on the sampler one that sets it True does
+    return "min_p" in filters or "top_p_first" in filters
+
+
+def _top_p_first_on_the_cpu(monkeypatch):
+    """top_p_first is CUDA-only: the sampler refuses it on the CPU, and the verify filter raises on an order.
+    Lift the refusal, and stand in for the CUDA filter with torch on the rows that ask: top-p, then top-k."""
+    from mstar.engine.resources.sampler import verify
+    from mstar.engine.resources.sampler.resource import SamplerResource
+
+    plain, problem = verify.filtered_probs, SamplerResource._generation_controls_problem
+
+    def ordered(logits, temperature, top_k, top_p, min_p=None, order=None):
+        k_first = plain(logits, temperature, top_k, top_p, min_p)
+        if order is None:
+            return k_first
+        p_first = plain(logits, temperature, torch.zeros_like(top_k), top_p, min_p)
+        ranked, at = p_first.sort(dim=-1, descending=True, stable=True)
+        k = torch.where(top_k > 0, top_k, logits.shape[-1])
+        ranked = torch.where(torch.arange(logits.shape[-1])[None, :] < k[:, None], ranked, 0.0)
+        p_first = torch.zeros_like(ranked).scatter(-1, at, ranked)
+        p_first = p_first / p_first.sum(-1, keepdim=True)
+        return torch.where(order.top_p_first[:, None], p_first, k_first)
+
+    monkeypatch.setattr(verify, "filtered_probs", ordered)
+    monkeypatch.setattr(
+        SamplerResource, "_generation_controls_problem",
+        lambda self, cfg: None if "CUDA-only" in (why := problem(self, cfg) or "CUDA-only") else why,
+    )
+
+
 @pytest.mark.parametrize("seed", range(8))
-@pytest.mark.parametrize("filters", [{}, {"top_k": 20, "top_p": 0.7}], ids=["unfiltered", "top-k-top-p"])
+@pytest.mark.parametrize("filters", [
+    {}, {"top_k": 20, "top_p": 0.7}, {"min_p": 0.5}, {"top_k": 20, "top_p": 0.7, "top_p_first": True},
+], ids=["unfiltered", "top-k-top-p", "min-p", "top-p-first"])
 @pytest.mark.parametrize("drafter", [oracle, every(2)], ids=["oracle", "every-2nd-wrong"])
-def test_a_seeded_reply_is_the_same_whether_its_prompt_rode_a_mixed_step(drafter, filters, seed):
+def test_a_seeded_reply_is_the_same_whether_its_prompt_rode_a_mixed_step(monkeypatch, drafter, filters, seed):
     """A prompt step's token is drawn as a mixed step's prompt row draws it, from the request's own stream at
-    the same number and through the request's own top-k and top-p, so a seeded reply is the same whichever its
-    prompt rode. At T=20 the toy's one-hot logits leave every token a few percent, so a different draw shows."""
+    the same number and through the request's own filters (top-k, top-p, min-p and their order), so a seeded
+    reply is the same whichever its prompt rode. At T=20 the toy's one-hot logits leave every token a few
+    percent, so a different draw shows: top-p first keeps 20 tokens here where top-k first keeps 14, and
+    min-p 0.5 keeps the argmax alone."""
+    if filters.get("top_p_first"):
+        _top_p_first_on_the_cpu(monkeypatch)
     driver, _ = _mixed(PROMPTS, LATE, drafter, temperature=20.0, seed=seed, filters=filters)
     assert driver.out == _separate(PROMPTS, LATE, drafter, temperature=20.0, seed=seed, filters=filters)
+
+
+@pytest.mark.parametrize("path", ["mixed", "separate"])
+def test_top_p_first_changes_some_seeded_reply_on_a_verifying_node(monkeypatch, path):
+    """The case above compares the two paths with each other, so a verifying node that dropped the filter
+    order on both would pass it. Over its seeds, some reply with top-p first differs from the same request's
+    with top-k first, on either path."""
+    _top_p_first_on_the_cpu(monkeypatch)
+    run = _mixed if path == "mixed" else _separate
+
+    def replies(top_p_first: bool) -> list:
+        filters = {"top_k": 20, "top_p": 0.7, "top_p_first": top_p_first}
+        outs = [run(PROMPTS, LATE, oracle, temperature=20.0, seed=seed, filters=filters) for seed in range(8)]
+        return [out[0].out if path == "mixed" else out for out in outs]
+
+    assert replies(True) != replies(False)
 
 
 def test_a_prompt_row_leaves_with_its_first_token_and_counts_no_verify_row():
