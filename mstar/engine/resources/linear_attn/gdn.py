@@ -85,10 +85,10 @@ class GDNManager(LinearAttnManager):
     # the state is the recurrent pool's, which a drop zeroes
     supports_drop = True
     # Speculative decoding: walk -> its verify block (k + 1), and the block of the step planned
-    # (None for any other step; a plan writes it on a node that never verifies too). A verify step keeps,
-    # per layer, what `correct_verify_state` reruns. The walks and the block are rebound, never mutated, so
-    # their class defaults are safe to share; only a verify step's plan gives the instance lists of its own
-    # to keep its reruns in.
+    # (None for any other step). A manager bound no verify walk never writes the block, so a node that
+    # doesn't verify plans without it. A verify step keeps, per layer, what `correct_verify_state` reruns.
+    # The walks and the block are rebound, never mutated, so their class defaults are safe to share; only a
+    # verify step's plan gives the instance lists of its own to keep its reruns in.
     _verify_walks: Mapping[str, int] = MappingProxyType({})
     _verify_block: int | None = None
     _cached_verify_block: int | None = None
@@ -227,9 +227,8 @@ class GDNManager(LinearAttnManager):
         self.reset_default_cursors()
         if self._preplanned:
             self._current, self._split_rows = self._cached_plan_output
-            self._verify_block = self._cached_verify_block
-            if self._verify_block is not None:
-                self._kept_conv, self._kept_delta = [], []
+            if self._verify_walks:
+                self._start_verify_block(self._cached_verify_block)
             self.clear_preplan()
             return self._current
 
@@ -245,7 +244,7 @@ class GDNManager(LinearAttnManager):
             split = self._plan_split(label, [seg.span for seg in segments], addressing[label], ctx, run)
             if split is not None:
                 self._split_rows[label] = split
-        block = self._verify_walks.get(ctx.graph_walk)
+        block = self._verify_walks.get(ctx.graph_walk) if self._verify_walks else None
         if block is not None and any(seg.span != block for seg in step.segments or ()):
             raise ValueError(f"gdn: a verify step's rows run {block} tokens each")
         if block is not None and len(self._current) != 1:
@@ -254,12 +253,17 @@ class GDNManager(LinearAttnManager):
         if ctx.is_preplan:
             self._preplanned = True
             self._cached_plan_output = self._current, self._split_rows
-            self._cached_verify_block = block
-        else:
-            self._verify_block = block
-            if block is not None:
-                self._kept_conv, self._kept_delta = [], []
+            if self._verify_walks:
+                self._cached_verify_block = block
+        elif self._verify_walks:
+            self._start_verify_block(block)
         return self._current
+
+    def _start_verify_block(self, block: int | None) -> None:
+        """The planned step's verify block, and fresh lists for its reruns when it verifies."""
+        self._verify_block = block
+        if block is not None:
+            self._kept_conv, self._kept_delta = [], []
 
     def clear_preplan(self):
         # The wrappers' plan state is overwritten by whatever plans next, so

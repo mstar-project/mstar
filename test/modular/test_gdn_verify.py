@@ -262,13 +262,16 @@ def test_a_prompt_step_records_nothing_and_settles_nothing():
 def test_a_step_that_doesnt_verify_keeps_nothing_for_a_rerun(verifying, preplan):
     """Only a verify step's plan gives the layers lists of their own to keep their reruns in: a node that never
     verifies, and a verifying node's prompt step, leave the class's empty defaults in place, whether the step
-    took a plan made ahead of it or planned when it ran."""
+    took a plan made ahead of it or planned when it ran. A node that never verifies writes no verify state at
+    all."""
     pool, manager = _build(verifying)
     _add(pool, 1)
     for walk, span in ((PREFILL, 5), (VERIFY, K + 1)):
         _step(pool, manager, {1: span}, walk, _inputs(span, seed=span), preplan=preplan)
         kept = verifying and walk == VERIFY
         assert ("_kept_conv" in vars(manager)) == kept and ("_kept_delta" in vars(manager)) == kept
+        assert ("_verify_block" in vars(manager)) == verifying
+        assert ("_cached_verify_block" in vars(manager)) == (verifying and preplan)
     assert len(manager._kept_conv) == len(manager._kept_delta) == (LAYERS if verifying else 0)
 
 
