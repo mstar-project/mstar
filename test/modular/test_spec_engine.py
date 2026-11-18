@@ -782,6 +782,49 @@ def test_an_async_mixed_refusal_offers_no_memory_where_no_bucket_capture_left_ou
         assert "free memory" not in str(refused.value)
 
 
+def test_an_async_mixed_walk_whose_prompt_walk_turns_chunking_off_is_refused():
+    """A serving override of null `max_batch_tokens` on a prompt walk inside the mixed walk turns its chunking
+    off, so a prompt would run whole past every capture: refused, though the mixed walk itself has a budget."""
+    from mstar.engine.resources.step import BucketKey
+    from mstar.model.submodule_base import ChunkingPolicy
+
+    for override, refused in [(None, True), (1024, False)]:
+        eng = engine(3, oracle, mode="asynchronous", mixed=True)
+        eng.set_chunking_policies({
+            (NODE, "mixed"): ChunkingPolicy(walks=("mixed",), max_batch_tokens=1024),
+            (NODE, "prefill"): ChunkingPolicy(walks=("prefill",), chunkable=True, max_batch_tokens=1024),
+        })
+        eng.set_token_budgets(
+            {NODE: {"prefill": override}}, {"prefill", "decode", "mixed"},
+            combined_walk_of={(NODE, "prefill"): "mixed", (NODE, "decode"): "mixed"}, override_mixed={NODE},
+        )
+        assert eng.get_max_batch_tokens(NODE, "mixed") == 1024
+        runner = _captured(BucketKey("mixed", 128, 1024), BucketKey("mixed", 64, 768))
+        if not refused:
+            eng._fit_mixed_steps_to_captures({NODE: runner})
+            continue
+        with pytest.raises(RuntimeError, match="chunking turned off"):
+            eng._fit_mixed_steps_to_captures({NODE: runner})
+
+
+@pytest.mark.parametrize("configured,align,tokens,floor", [
+    (130, 8, 127 * 4 + 100, 136),  # rounded up to the alignment
+    (2000, 1, 1024, 1024),  # capped at the budget
+])
+def test_an_async_mixed_refusal_names_the_floor_no_kept_bucket_holds_not_the_configured_one(
+    monkeypatch, configured, align, tokens, floor,
+):
+    from mstar.engine.resources.step import BucketKey
+
+    eng = engine(3, oracle, mode="asynchronous", mixed=True)
+    _mixed_budget(eng, 1024)
+    monkeypatch.setattr(eng, "chunk_alignment", lambda node_name: align)
+    eng.set_token_budgets({}, {"mixed"}, min_chunk_tokens=configured)
+    with pytest.raises(RuntimeError) as refused:
+        eng._fit_mixed_steps_to_captures({NODE: _captured(BucketKey("mixed", 128, tokens))})
+    assert f"min_chunk_tokens ({floor})" in str(refused.value)
+
+
 def test_two_mixed_buckets_of_one_size_pick_an_envelope_without_ordering_their_keys():
     """Buckets that tie on (bs, tokens) and differ in their capture key: the envelope is one of them, and
     picking it never compares two `BucketKey`s, which have no order."""
