@@ -321,6 +321,48 @@ def test_a_request_that_can_only_wait_waits_and_is_logged(caplog):
     assert "r waits for" in caplog.text, "a request that can only wait left no line"
 
 
+def test_a_wait_for_no_page_is_logged_as_a_wait_to_turn_guaranteed(caplog, monkeypatch):
+    """`KVManager.preempt` has a request that ran short turning guaranteed wait for 0 pages while borrowers hold the
+    room it needs, and tries no move for it. Its line said it waited because no move would cover its shortage."""
+    kv = _pool()
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    reason = _step(kv, "r", 1).reason
+    w = _worker(kv)
+    monkeypatch.setattr(kv, "preempt", lambda *args: Victims([], [], [], waits=0, queued=True))
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
+
+    with caplog.at_level(logging.WARNING, logger="mstar.worker.admission"):
+        w.pipeline._handle_admit_failure(batch, _refused(batch, reason))
+
+    assert "r waits to turn guaranteed until borrowers give back the room" in caplog.text
+    assert "shortage" not in caplog.text, "the line named a shortage no move was tried for"
+
+
+@pytest.mark.parametrize("waits", [(0, 3), (3, 0)], ids=["no_page_first", "pages_first"])
+def test_a_wait_to_turn_guaranteed_and_a_wait_for_pages_dont_hide_each_other(caplog, monkeypatch, waits):
+    """The two lines are throttled apart: whichever is logged first, the other right after it on the same node and
+    walk is still logged."""
+    kv = _pool()
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    reason = _step(kv, "r", 1).reason
+    w = _worker(kv)
+    w.engine_manager.get_engine(NODE).readmit_request = lambda node, rid: None
+    answers = iter([Victims([], [], [], waits=n, queued=True) for n in waits])
+    monkeypatch.setattr(kv, "preempt", lambda *args: next(answers))
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
+
+    with caplog.at_level(logging.WARNING, logger="mstar.worker.admission"):
+        for _ in waits:
+            assert w.preemption.preempt(_refused(batch, reason))
+
+    assert "r waits to turn guaranteed until borrowers give back the room" in caplog.text, (
+        "the wait for pages hid the wait to turn guaranteed"
+    )
+    assert "r waits for 3 pages past its allotment" in caplog.text, "the wait to turn guaranteed hid the wait for pages"
+
+
 def test_a_victim_in_the_refused_step_drops_in_the_same_call():
     kv, w = _preempting(in_flight=("r", "v"))
 
