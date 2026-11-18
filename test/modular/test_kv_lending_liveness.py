@@ -23,6 +23,7 @@ from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _manager, _StubTra
 from mstar.engine.resources.base import MoveKind
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVStep
+from mstar.engine.resources.kv.manager import Victims
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import ASKS, Segment
 from mstar.testing_utils.resource import StubResource
@@ -239,6 +240,52 @@ def test_a_follower_replays_the_guarantee_preempt_makes():
     assert all(_admit(kv, dict.fromkeys(["g", "q", "p"], PAGE_SIZE)).ok for kv in (leader, follower)), (
         "p ran short again once guaranteed"
     )
+
+
+def _state(kv) -> tuple:
+    """Every count a rank's next admit, preempt or replay reads, raw. A stalled request counts only while it asks
+    again: rank 0 alone sets aside a request its moves made room for."""
+    return (
+        {rid: replace(allotment) for rid, allotment in kv._allotments.items()},
+        kv._unused, kv._borrowable, kv._room(), kv._kept, dict(kv._asks), kv._stalled & kv._asks.keys(),
+        set(kv._guaranteed), set(kv._hosted), dict(kv._cpu_pool.reserved),
+        {rid: (earmark.pages, set(earmark.victims), earmark.granted) for rid, earmark in kv._earmarks.items()},
+        {rid for rid, earmark in kv._victims.items() if earmark is not None}, set(kv._dropped),
+        {rid: kv._held(rid) for rid in kv._streams}, kv._arena.free_pages(),
+    )
+
+
+def test_a_flip_after_a_teardown_journals_only_the_guarantee():
+    """p, first in the step, runs short turning guaranteed. x, finished outside the step, is torn down before preempt,
+    as the worker runs held teardowns first (`StepPipeline._handle_admit_failure`), so preempt finds more room than p's
+    grant counted. Rank 0 claimed that room and journaled the claim, then turned p guaranteed, which sets the allotment
+    the claim grew."""
+    leader, follower = _pool(), _pool()
+    for kv in (leader, follower):
+        kv._cpu_pool = host._HostPool(1)
+        _running(kv, "g", 1, arrival=0, guaranteed=True, decodes=3 * PAGE_SIZE)
+        _running(kv, "q", 1, arrival=1, decodes=2 * PAGE_SIZE)
+        _running(kv, "x", 4, arrival=2, decodes=PAGE_SIZE)
+        _running(kv, "p", 1, arrival=3, rebuildable=False, decodes=4 * PAGE_SIZE)
+    moves = []
+    leader.journal = lambda kind, rid, count=0, victims=(): moves.append((kind, rid, count, list(victims)))
+    rows = dict.fromkeys(["p", "g", "q"], PAGE_SIZE)
+    outcomes = [_admit(kv, rows) for kv in (leader, follower)]
+    assert not outcomes[0].ok and not outcomes[1].ok
+    reason = outcomes[0].reason
+    assert reason.request_id == "p" and leader._ran_short["p"].flip
+    for kv in (leader, follower):
+        _remove(kv, "x")
+    assert leader._room_for("p") > max(0, leader._ran_short["p"].room), "no room for preempt to claim"
+
+    assert _preempt(leader, "p", reason.pages_short, lambda rid: False) == Victims([], [], [])
+    for kind, rid, count, victims in moves:
+        follower.replay(kind, rid, count, victims)
+
+    assert "p" in leader._guaranteed
+    assert _state(follower) == _state(leader)
+    assert all(_admit(kv, rows).ok for kv in (leader, follower)), "p ran short again once guaranteed"
+    assert [kind for kind, *_ in moves] == [MoveKind.GUARANTEE], f"rank 0 journaled a claim it then overwrote: {moves}"
 
 
 @pytest.mark.parametrize("allotted", [True, False], ids=["holding an allotment", "asking for one"])
