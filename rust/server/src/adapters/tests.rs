@@ -279,7 +279,7 @@ fn a_chat_asking_for_more_than_one_plain_reply_is_refused() {
         (r#""n":2"#, "n=2: this model returns one choice"),
         (r#""stop":".""#, "stop sequences are not supported"),
         (r#""stop":["END"]"#, "stop sequences are not supported"),
-        (r#""logprobs":true"#, "logprobs is not supported"),
+        (r#""logprobs":true,"top_logprobs":2"#, "top_logprobs is not supported"),
         (r#""presence_penalty":1.5"#, "presence_penalty is not supported"),
         (r#""best_of":3"#, "best_of is not supported"),
         (r#""response_format":{"type":"json_object"}"#, "response_format needs constrained decoding"),
@@ -287,6 +287,26 @@ fn a_chat_asking_for_more_than_one_plain_reply_is_refused() {
         for (name, adapter) in ADAPTERS.iter().filter(|(_, a)| a.supports_chat()) {
             let got = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false).unwrap_err();
             assert!(got.starts_with(err), "{fields} on {name}: {got}");
+        }
+    }
+}
+
+#[test]
+fn a_chat_asking_for_its_tokens_asks_the_sampler() {
+    for (fields, want) in [
+        (r#""logprobs":true"#, serde_json::json!({"return_logprobs": true})),
+        (r#""logprobs":true,"top_logprobs":0"#, serde_json::json!({"return_logprobs": true})),
+        (r#""logprobs":false,"top_logprobs":null"#, serde_json::json!({})),
+        (r#""return_token_ids":true"#, serde_json::json!({"return_token_ids": true})),
+    ] {
+        for (name, adapter) in ADAPTERS.iter().filter(|(_, a)| a.supports_chat()) {
+            let args = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false).unwrap();
+            let got: serde_json::Map<String, Value> = args
+                .model_kwargs
+                .into_iter()
+                .filter(|(k, _)| ["return_logprobs", "return_token_ids", "logprobs", "top_logprobs"].contains(&k.as_str()))
+                .collect();
+            assert_eq!(Value::Object(got), want, "{fields} on {name}");
         }
     }
 }

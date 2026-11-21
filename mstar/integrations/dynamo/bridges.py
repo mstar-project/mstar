@@ -85,8 +85,9 @@ _STRIP_KEYS = {
     "nvext", "extra_args", "annotations", "trace", "disaggregated_params",
     "backend_instance_id",
     # OpenAI-standard, no M* mapping today. Not tools, tool_choice, the
-    # penalties, logit_bias, logprobs, top_logprobs or response_format: the chat
-    # adapter refuses a chat that sets one of them on.
+    # penalties, logit_bias, logprobs, top_logprobs, return_token_ids or
+    # response_format: the chat adapter, or ``_chat`` below, refuses a chat that
+    # sets one of them on.
     "min_tokens", "eos_token_ids", *CHAT_ENVELOPE_KEYS,
 }
 
@@ -228,6 +229,15 @@ class RequestBridge:
             args = self.adapter.chat_to_request(req, self.server.upload_dir)
         except ValueError as exc:
             raise _BadRequestError(str(exc)) from exc
+        # Dropped from these chunks, they would answer another request. Read from
+        # what reached the model (OpenAI's logprobs, extra_body, chat_template_kwargs);
+        # only a submitted chat's attachments are cleaned up, so these go now.
+        for key, name in (("return_logprobs", "logprobs"), ("return_token_ids", "return_token_ids")):
+            if (args.model_kwargs or {}).get(key):
+                from mstar.api_server import media_io
+
+                media_io.remove_uploads(args.file_paths, self.server.upload_dir)
+                raise _BadRequestError(f"{name} is not supported")
         rid = self._submit(args, prefix="chatcmpl")
         created = int(time.time())
 

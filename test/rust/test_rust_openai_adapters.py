@@ -364,6 +364,84 @@ def test_both_frontends_answer_a_chat_with_the_same_status_and_body(case, model,
     assert _normalized(*rust, stream) == _normalized(py.status_code, py.content, stream)
 
 
+# "café" split inside the "é", then the stop token (empty text): each chunk's
+# log-prob and id, and the prompt's ids on the first, as the data worker sends them
+_TOKEN_REPLY = [
+    (b"caf\xc3", {"logprobs": [-0.5], "token_ids": [10], "prompt_token_ids": [1, 2, 3]}),
+    (b"\xa9", {"logprobs": [-0.25], "token_ids": [11]}),
+    (b"", {"logprobs": [-0.125], "token_ids": [12]}),
+]
+
+
+def _token_chunks(mk):
+    """The scripted reply, each chunk's metadata cut to what ``mk`` asked for."""
+    keep = ({"logprobs"} if (mk or {}).get("return_logprobs") else set()) | (
+        {"token_ids", "prompt_token_ids"} if (mk or {}).get("return_token_ids") else set())
+    return [_Chunk("text", data, {k: v for k, v in md.items() if k in keep}) for data, md in _TOKEN_REPLY]
+
+
+class _TokenPythonServer(_PythonServer):
+    def submit_request(self, **kwargs):
+        self.mk = kwargs.get("model_kwargs")
+        return super().submit_request(**kwargs)
+
+    async def collect_results(self, request_id, raw_request=None):
+        return [*_token_chunks(self.mk), *self.tail]
+
+    async def iter_result_chunk_batches(self, request_id):
+        for c in _token_chunks(self.mk):
+            yield [c]
+        yield list(self.tail)
+
+
+class _TokenStub(_StubAPIServer):
+    async def iter_result_chunks(self, request_id):
+        sub = next(s for s in self.submitted if s["rid"] == request_id)
+        for c in _token_chunks(sub["mk"]):
+            yield c
+        if sub["report_usage"]:
+            yield _Chunk("usage", b"", _USAGE)
+
+
+def _token_chat(**fields):
+    return {"messages": [{"role": "user", "content": "hi"}], **fields}
+
+
+TOKEN_CASES = {
+    "logprobs": (_token_chat(logprobs=True, top_logprobs=0), False),
+    "logprobs-stream": (_token_chat(logprobs=True, stream=True), True),
+    "token-ids": (_token_chat(return_token_ids=True), False),
+    "token-ids-stream": (_token_chat(return_token_ids=True, stream=True), True),
+    "both-stream-usage": (_token_chat(logprobs=True, return_token_ids=True, stream=True,
+                                      stream_options={"include_usage": True}), True),
+    "neither": (_token_chat(logprobs=False), False),
+    "top-logprobs": (_token_chat(logprobs=True, top_logprobs=3), False),
+}
+
+
+@pytest.mark.parametrize("case", sorted(TOKEN_CASES))
+def test_both_frontends_return_a_chat_s_tokens_alike(case, tmp_path):
+    """OpenAI's ``logprobs`` and vLLM's ``return_token_ids``: each sampled token's
+    entry and id, held-back ones riding on the next chunk sent, and the prompt's
+    ids, in the same places in both frontends' bodies and streams."""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from mstar.api_server import entrypoint
+
+    body, stream = TOKEN_CASES[case]
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(entrypoint, "api_server", _TokenPythonServer("qwen3_5_0.8b", tmp_path))
+        py = TestClient(entrypoint.app).post("/v1/chat/completions", json=body)
+    with _model_stack("qwen3_5_0.8b", _TokenStub()) as (port, _upload):
+        rust = _post(port, "/v1/chat/completions", body, timeout=30)
+    assert _normalized(*rust, stream) == _normalized(py.status_code, py.content, stream)
+    if case == "logprobs":
+        choice = json.loads(py.content)["choices"][0]
+        assert [e["logprob"] for e in choice["logprobs"]["content"]] == [-0.5, -0.25, -0.125]
+        assert choice["logprobs"]["content"][-1]["bytes"] == []
+
+
 # ── GET /v1/audio/voices ─────────────────────────────────────────────────────
 
 class _VoicedModel:
@@ -436,6 +514,9 @@ TEXT_CHAT_CASES = {
     "n": _text(n=2),
     "stop": _text(stop=["\n"]),
     "logprobs": _text(logprobs=True),
+    "top-logprobs": _text(logprobs=True, top_logprobs=2),
+    "top-logprobs-zero": _text(logprobs=True, top_logprobs=0),
+    "return-token-ids": _text(return_token_ids=True),
     "logit-bias": _text(logit_bias={"50256": -100}),
     "presence-penalty": _text(presence_penalty=0.5),
     "tiny-penalty": _text(frequency_penalty=1e-05),

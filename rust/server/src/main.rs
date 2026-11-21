@@ -723,9 +723,11 @@ async fn chat_completions(
             return r;
         }
     };
+    let record = TokenRecord::new(&args.model_kwargs);
     // Frontend-tokenizes fast path: flagged adapters with a loaded tokenizer
-    // submit token ids and detokenize the reply in Rust, off the GIL.
-    if adapter.frontend_tokenizes() {
+    // submit token ids and detokenize the reply in Rust, off the GIL. Not for a
+    // chat that asked for its tokens: the Rust detokenizer keeps no per-token metadata.
+    if adapter.frontend_tokenizes() && !record.on() {
         if let (Some(tok), Some(text)) = (&st.tok, args.text.take()) {
             args.tokens = Some(tok.encode(&text));
         }
@@ -740,12 +742,12 @@ async fn chat_completions(
             Err((status, msg)) => return error(status, &msg, error_type(status)),
         };
         let include_usage = req.stream_options.as_ref().and_then(|o| o.include_usage).unwrap_or(false);
-        return chat_sse(base, request_id, model_name, include_usage).into_response();
+        return chat_sse(base, request_id, model_name, include_usage, record).into_response();
     }
     match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => {
             let rate = st.sample_rate;
-            match blocking(move || build_chat_response(&model_name, &request_id, chunks, rate, audio_format)).await {
+            match blocking(move || build_chat_response(&model_name, &request_id, chunks, rate, audio_format, record)).await {
                 Ok(body) => Json(body).into_response(),
                 Err(e) => error(500, &e, "server_error"),
             }
@@ -772,8 +774,9 @@ fn chat_sse(
     request_id: String,
     model_name: String,
     include_usage: bool,
+    record: TokenRecord,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
-    let payloads = chat_sse_payloads(base, request_id, now(), model_name, include_usage);
+    let payloads = chat_sse_payloads(base, request_id, now(), model_name, include_usage, record);
     Sse::new(payloads.map(|s| Ok(Event::default().data(s)))).keep_alive(KeepAlive::default())
 }
 
@@ -788,6 +791,70 @@ fn finish_reason(reported: Option<&Value>) -> &str {
     reported.and_then(|r| r.get("finish_reason")).and_then(Value::as_str).unwrap_or("stop")
 }
 
+/// A reply's sampled tokens, for a chat that set `return_logprobs` (OpenAI
+/// `logprobs`) or `return_token_ids`, from its text chunks' metadata: the rules
+/// of `_TokenRecord` in `serving_chat.py`. A chunk with a log-prob carries one
+/// sampled token (one sampler draw per step), so its bytes are that token's.
+#[derive(Debug, Default)]
+struct TokenRecord {
+    logprobs: bool,
+    token_ids: bool,
+    entries: Vec<Value>,
+    ids: Vec<Value>,
+    prompt_ids: Option<Value>,
+}
+
+impl TokenRecord {
+    fn new(model_kwargs: &serde_json::Map<String, Value>) -> Self {
+        let on = |key: &str| model_kwargs.get(key).is_some_and(adapters::truthy);
+        Self { logprobs: on("return_logprobs"), token_ids: on("return_token_ids"), ..Self::default() }
+    }
+
+    fn on(&self) -> bool {
+        self.logprobs || self.token_ids
+    }
+
+    fn add(&mut self, c: &ResultChunk) {
+        if self.logprobs {
+            if let Some(Value::Array(values)) = c.metadata.get("logprobs") {
+                for value in values {
+                    self.entries.push(json!({
+                        "token": String::from_utf8_lossy(&c.data),
+                        "logprob": value,
+                        "bytes": c.data,
+                        "top_logprobs": [],
+                    }));
+                }
+            }
+        }
+        if self.token_ids {
+            if let Some(Value::Array(ids)) = c.metadata.get("token_ids") {
+                self.ids.extend(ids.iter().cloned());
+            }
+            if let Some(prompt) = c.metadata.get("prompt_token_ids").filter(|p| !p.is_null()) {
+                self.prompt_ids = Some(prompt.clone());
+            }
+        }
+    }
+
+    /// A stream chunk's choice and top-level fields: what arrived since the last
+    /// chunk that carried any, so a token that completes no character (or an end
+    /// token) rides on the next chunk sent.
+    fn take(&mut self) -> (serde_json::Map<String, Value>, serde_json::Map<String, Value>) {
+        let (mut choice, mut top) = (serde_json::Map::new(), serde_json::Map::new());
+        if !self.entries.is_empty() {
+            choice.insert("logprobs".into(), json!({"content": std::mem::take(&mut self.entries)}));
+        }
+        if !self.ids.is_empty() {
+            choice.insert("token_ids".into(), Value::Array(std::mem::take(&mut self.ids)));
+        }
+        if let Some(prompt) = self.prompt_ids.take() {
+            top.insert("prompt_token_ids".into(), prompt);
+        }
+        (choice, top)
+    }
+}
+
 /// The `data:` payloads of [`chat_sse`], in order.
 fn chat_sse_payloads(
     base: OutStream,
@@ -795,6 +862,7 @@ fn chat_sse_payloads(
     created: i64,
     model: String,
     include_usage: bool,
+    record: TokenRecord,
 ) -> impl futures::Stream<Item = String> {
     // Set if a terminal error is emitted mid-stream, so the tail below does NOT
     // append a clean finish + `[DONE]` — a failed request must
@@ -805,6 +873,9 @@ fn chat_sse_payloads(
     let text = Arc::new(std::sync::Mutex::new(Utf8Stream::default()));
     // The closing `usage` chunk's metadata, for the tail.
     let usage: Arc<std::sync::Mutex<Option<Value>>> = Arc::default();
+    // nothing to lock per chunk for a chat that asked for no tokens
+    let tokens_on = record.on();
+    let record = Arc::new(std::sync::Mutex::new(record));
     let body = {
         let model = model.clone();
         let id = request_id.clone();
@@ -812,17 +883,25 @@ fn chat_sse_payloads(
         let role_sent = role_sent.clone();
         let text = text.clone();
         let usage = usage.clone();
+        let record = record.clone();
         base.filter_map(move |item| futures::future::ready(match item {
             Out::Chunk(c) if c.modality == "usage" => {
                 *usage.lock().unwrap() = Some(c.metadata);
                 None
             }
-            Out::Chunk(c) => chat_delta(&c, &mut text.lock().unwrap()).map(|mut delta| {
-                if !role_sent.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                    delta["role"] = json!("assistant");
+            Out::Chunk(c) => {
+                let takes_tokens = tokens_on && c.modality == "text";
+                if takes_tokens {
+                    record.lock().unwrap().add(&c);
                 }
-                chunk_json(&id, created, &model, delta, None)
-            }),
+                chat_delta(&c, &mut text.lock().unwrap()).map(|mut delta| {
+                    if !role_sent.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        delta["role"] = json!("assistant");
+                    }
+                    let tokens = if takes_tokens { record.lock().unwrap().take() } else { Default::default() };
+                    chunk_json(&id, created, &model, delta, None, tokens)
+                })
+            }
             // Terminal mid-stream failure: an OpenAI error event, and suppress
             // the normal stop/[DONE] tail (mstar's generator exception drops the
             // connection; the explicit error event is strictly more informative).
@@ -842,13 +921,14 @@ fn chat_sse_payloads(
                 delta
             };
             let rest = text.lock().unwrap().flush();
+            let mut record = record.lock().unwrap();
             if !rest.is_empty() {
-                out.push(chunk_json(&request_id, created, &model, with_role(json!({"content": rest})), None));
+                let delta = with_role(json!({"content": rest}));
+                out.push(chunk_json(&request_id, created, &model, delta, None, record.take()));
             }
             let usage = usage.lock().unwrap().take();
-            out.push(chunk_json(
-                &request_id, created, &model, with_role(json!({})), Some(finish_reason(usage.as_ref())),
-            ));
+            let finish = Some(finish_reason(usage.as_ref()));
+            out.push(chunk_json(&request_id, created, &model, with_role(json!({})), finish, record.take()));
             if include_usage {
                 out.push(json!({
                     "id": request_id,
@@ -886,15 +966,26 @@ fn chat_delta(c: &ResultChunk, text: &mut Utf8Stream) -> Option<Value> {
     })
 }
 
-fn chunk_json(id: &str, created: i64, model: &str, delta: Value, finish: Option<&str>) -> String {
-    json!({
+/// One `chat.completion.chunk`, with a [`TokenRecord::take`]'s choice and top-level fields.
+fn chunk_json(
+    id: &str,
+    created: i64,
+    model: &str,
+    delta: Value,
+    finish: Option<&str>,
+    (extra, top): (serde_json::Map<String, Value>, serde_json::Map<String, Value>),
+) -> String {
+    let mut choice = json!({"index": 0, "delta": delta, "finish_reason": finish});
+    choice.as_object_mut().unwrap().extend(extra);
+    let mut chunk = json!({
         "id": id,
         "object": "chat.completion.chunk",
         "created": created,
         "model": model,
-        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
-    })
-    .to_string()
+        "choices": [choice],
+    });
+    chunk.as_object_mut().unwrap().extend(top);
+    chunk.to_string()
 }
 
 /// The container `message.audio` is sent in, from OpenAI's `audio.format`, as
@@ -940,6 +1031,7 @@ fn build_chat_response(
     chunks: Vec<ResultChunk>,
     sample_rate: u32,
     audio_format: &str,
+    mut record: TokenRecord,
 ) -> Result<Value, String> {
     let mut text_bytes: Vec<u8> = Vec::new();
     let mut audio_pcm: Vec<u8> = Vec::new();
@@ -947,7 +1039,12 @@ fn build_chat_response(
     let mut usage: Option<&Value> = None;
     for c in &chunks {
         match c.modality.as_str() {
-            "text" => text_bytes.extend_from_slice(&c.data),
+            "text" => {
+                text_bytes.extend_from_slice(&c.data);
+                if record.on() {
+                    record.add(c);
+                }
+            }
             "audio" => audio_pcm.extend_from_slice(&c.data),
             "image" => images.push(c.data.clone()),
             "usage" => usage = Some(&c.metadata),
@@ -978,14 +1075,23 @@ fn build_chat_response(
         message["content"] = Value::Array(parts);
     }
 
-    Ok(json!({
+    let mut choice = json!({"index": 0, "message": message, "finish_reason": finish_reason(usage)});
+    let mut response = json!({
         "id": request_id,
         "object": "chat.completion",
         "created": now(),
         "model": model,
-        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason(usage)}],
         "usage": usage_json(usage),
-    }))
+    });
+    if record.logprobs {
+        choice["logprobs"] = json!({"content": std::mem::take(&mut record.entries)});
+    }
+    if record.token_ids {
+        choice["token_ids"] = Value::Array(std::mem::take(&mut record.ids));
+        response["prompt_token_ids"] = record.prompt_ids.take().unwrap_or(Value::Null);
+    }
+    response["choices"] = json!([choice]);
+    Ok(response)
 }
 
 // ---- POST /v1/audio/speech -----------------------------------------------
@@ -2340,7 +2446,7 @@ mod tests {
             };
             let st = state(None);
             let base = result_stream(&st, &args, "r", true);
-            let (status, _, data) = body(chat_sse(base, "r".into(), st.model_name.clone(), false).into_response()).await;
+            let (status, _, data) = body(chat_sse(base, "r".into(), st.model_name.clone(), false, TokenRecord::default()).into_response()).await;
             assert_eq!(status, StatusCode::OK);
             let text = String::from_utf8(data).unwrap();
             let events: Vec<&str> = text
@@ -2606,7 +2712,7 @@ mod tests {
         assert_eq!((compressed("MP3"), compressed("opus")), (Ok("mp3"), Ok("opus")));
         let pcm = vec![1u8, 0, 2, 0];
         let chunks = vec![ResultChunk { modality: "audio".into(), data: pcm.clone(), metadata: Value::Null }];
-        let resp = build_chat_response("m", "r", chunks, 24000, "pcm").unwrap();
+        let resp = build_chat_response("m", "r", chunks, 24000, "pcm", TokenRecord::default()).unwrap();
         assert_eq!(resp["choices"][0]["message"]["audio"]["data"], media::b64(&pcm));
     }
 
@@ -2661,7 +2767,7 @@ mod tests {
     fn streamed_payloads(items: Vec<Out>, include_usage: bool) -> Vec<String> {
         let base: serving::OutStream = Box::pin(futures::stream::iter(items));
         futures::executor::block_on(
-            chat_sse_payloads(base, "r".to_string(), 0, "m".to_string(), include_usage).collect::<Vec<_>>(),
+            chat_sse_payloads(base, "r".to_string(), 0, "m".to_string(), include_usage, TokenRecord::default()).collect::<Vec<_>>(),
         )
     }
 
@@ -2679,9 +2785,101 @@ mod tests {
         (content, events)
     }
 
+    /// "café" split inside the "é", then the stop token (empty text), each with
+    /// its log-prob and id; the prompt's ids ride on the first: the reply of
+    /// `test/modular/test_chat_token_record.py`.
+    fn token_chunks() -> Vec<ResultChunk> {
+        let text = |data: &[u8], metadata: Value| ResultChunk { modality: "text".into(), data: data.to_vec(), metadata };
+        vec![
+            text(b"caf\xc3", json!({"logprobs": [-0.5], "token_ids": [10], "prompt_token_ids": [1, 2, 3]})),
+            text(b"\xa9", json!({"logprobs": [-0.25], "token_ids": [11]})),
+            text(b"", json!({"logprobs": [-0.125], "token_ids": [12]})),
+            ResultChunk {
+                modality: "usage".into(),
+                data: vec![],
+                metadata: json!({"prompt_tokens": 3, "completion_tokens": 3, "finish_reason": "stop"}),
+            },
+        ]
+    }
+
+    fn token_entries() -> Vec<Value> {
+        vec![
+            json!({"token": "caf\u{fffd}", "logprob": -0.5, "bytes": [99, 97, 102, 195], "top_logprobs": []}),
+            json!({"token": "\u{fffd}", "logprob": -0.25, "bytes": [169], "top_logprobs": []}),
+            json!({"token": "", "logprob": -0.125, "bytes": [], "top_logprobs": []}),
+        ]
+    }
+
+    fn asked() -> TokenRecord {
+        let mk = json!({"return_logprobs": true, "return_token_ids": true});
+        TokenRecord::new(mk.as_object().unwrap())
+    }
+
+    #[test]
+    fn a_reply_carries_one_entry_per_sampled_token_stop_token_included() {
+        let resp = build_chat_response("m", "r", token_chunks(), 24000, "wav", asked()).unwrap();
+        let choice = &resp["choices"][0];
+        assert_eq!(choice["message"]["content"], "café");
+        assert_eq!(choice["logprobs"], json!({"content": token_entries()}));
+        assert_eq!(choice["token_ids"], json!([10, 11, 12]));
+        assert_eq!(resp["prompt_token_ids"], json!([1, 2, 3]));
+        assert_eq!(resp["usage"]["completion_tokens"], 3);
+        // nothing asked: the body has no token fields
+        let plain = build_chat_response("m", "r", token_chunks(), 24000, "wav", TokenRecord::default()).unwrap();
+        assert!(plain.get("prompt_token_ids").is_none() && plain["choices"][0].get("logprobs").is_none());
+    }
+
+    #[test]
+    fn a_stream_sends_a_held_back_token_s_entry_with_the_next_chunk() {
+        let base: serving::OutStream = Box::pin(futures::stream::iter(token_chunks().into_iter().map(Out::Chunk)));
+        let payloads: Vec<String> = futures::executor::block_on(
+            chat_sse_payloads(base, "r".to_string(), 0, "m".to_string(), false, asked()).collect::<Vec<_>>(),
+        );
+        let events: Vec<Value> =
+            payloads.iter().filter(|p| *p != "[DONE]").map(|p| serde_json::from_str(p).unwrap()).collect();
+        let entries = token_entries();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["choices"][0]["delta"], json!({"role": "assistant", "content": "caf"}));
+        assert_eq!(events[0]["choices"][0]["logprobs"], json!({"content": [entries[0]]}));
+        assert_eq!(events[0]["choices"][0]["token_ids"], json!([10]));
+        assert_eq!(events[0]["prompt_token_ids"], json!([1, 2, 3]));
+        assert_eq!(events[1]["choices"][0]["delta"], json!({"content": "é"}));
+        assert_eq!(events[1]["choices"][0]["logprobs"], json!({"content": [entries[1]]}));
+        assert!(events[1].get("prompt_token_ids").is_none());
+        assert_eq!(events[2]["choices"][0]["finish_reason"], "stop");
+        assert_eq!(events[2]["choices"][0]["logprobs"], json!({"content": [entries[2]]}));
+        assert_eq!(events[2]["choices"][0]["token_ids"], json!([12]));
+    }
+
+    #[test]
+    fn a_stream_ending_inside_a_character_still_sends_every_entry() {
+        // A `max_tokens` cut can end a reply on half a character: the flushed tail
+        // carries the held token's entry (Python sends it with the finish), so none is lost.
+        let text = |data: &[u8], lp: f64| ResultChunk {
+            modality: "text".into(),
+            data: data.to_vec(),
+            metadata: json!({"logprobs": [lp]}),
+        };
+        let items = vec![Out::Chunk(text(b"a", -0.5)), Out::Chunk(text(b"\xe2\x88", -0.25))];
+        let base: serving::OutStream = Box::pin(futures::stream::iter(items));
+        let record = TokenRecord::new(json!({"return_logprobs": true}).as_object().unwrap());
+        let payloads: Vec<String> = futures::executor::block_on(
+            chat_sse_payloads(base, "r".to_string(), 0, "m".to_string(), false, record).collect::<Vec<_>>(),
+        );
+        let events: Vec<Value> =
+            payloads.iter().filter(|p| *p != "[DONE]").map(|p| serde_json::from_str(p).unwrap()).collect();
+        let entries: Vec<Value> = events
+            .iter()
+            .flat_map(|e| e["choices"][0]["logprobs"]["content"].as_array().cloned().unwrap_or_default())
+            .collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(events[1]["choices"][0]["delta"]["content"], "\u{fffd}");
+        assert_eq!(events[1]["choices"][0]["logprobs"]["content"][0]["bytes"], json!([226, 136]));
+    }
+
     #[test]
     fn chat_response_joins_text_before_decoding() {
-        let resp = build_chat_response("m", "r", split_text_chunks(), 24000, "wav").unwrap();
+        let resp = build_chat_response("m", "r", split_text_chunks(), 24000, "wav", TokenRecord::default()).unwrap();
         assert_eq!(resp["choices"][0]["message"]["content"], "中文 😀");
     }
 
@@ -2885,13 +3083,13 @@ mod tests {
         for finish in ["length", "stop"] {
             let mut chunks = split_text_chunks();
             chunks.push(usage_chunk(finish));
-            let resp = build_chat_response("m", "r", chunks, 24000, "wav").unwrap();
+            let resp = build_chat_response("m", "r", chunks, 24000, "wav", TokenRecord::default()).unwrap();
             assert_eq!(resp["choices"][0]["message"]["content"], "中文 😀");
             assert_eq!(resp["choices"][0]["finish_reason"], finish);
             assert_eq!(resp["usage"], json!({"prompt_tokens": 7, "completion_tokens": 4, "total_tokens": 11}));
         }
         // the mock source sends none
-        let resp = build_chat_response("m", "r", split_text_chunks(), 24000, "wav").unwrap();
+        let resp = build_chat_response("m", "r", split_text_chunks(), 24000, "wav", TokenRecord::default()).unwrap();
         assert_eq!(resp["choices"][0]["finish_reason"], "stop");
         assert_eq!(resp["usage"], json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}));
     }

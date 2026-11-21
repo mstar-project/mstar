@@ -624,6 +624,9 @@ class RequestOutputState:
     # A video_frame chunk can carry several frames, so this advances by
     # frame_count rather than chunks.
     frame_index: int = 0
+    # The prompt's token ids, for a request that set ``return_token_ids``; the
+    # first text chunk emitted carries them (``prompt_token_ids``)
+    prompt_token_ids: list[int] | None = None
 
 
 class EncodedOutput(NamedTuple):
@@ -1100,6 +1103,9 @@ class PreprocessWorkerThread:
     ) -> None:
         """Store a prepared request's tensors and hand it to the conductor."""
         tensors, input_metadata, model_kwargs, num_prompt_tokens = prepared
+        # read before the tensors are stored away
+        asks = self.model is not None and model_kwargs.get("return_token_ids")
+        prompt_ids = self.model.prompt_token_ids(tensors) if asks else None
 
         # A client stream's first chunk, not a prompt signal: a one-shot upload
         # is a stream of one chunk. Stored before the request reaches the
@@ -1117,7 +1123,7 @@ class PreprocessWorkerThread:
             call.held.append(HeldItems(self._store_held(input.request_id, stream_items), None))
 
         self.request_model_kwargs[input.request_id] = model_kwargs
-        self.request_output_state[input.request_id] = RequestOutputState()
+        self.request_output_state[input.request_id] = RequestOutputState(prompt_token_ids=prompt_ids)
         preprocess_only = getattr(self.model, "PREPROCESS_ONLY_KWARGS", ())
         conductor_kwargs = {k: v for k, v in model_kwargs.items() if k not in preprocess_only}
         msg = ConductorMessage(
@@ -1866,6 +1872,9 @@ class PreprocessWorkerThread:
 
         while state.next_emit in state.pending:
             ready = state.pending.pop(state.next_emit)
+            if state.prompt_token_ids is not None and ready.modality == "text":
+                ready.metadata = {**ready.metadata, "prompt_token_ids": state.prompt_token_ids}
+                state.prompt_token_ids = None
             if ready.modality == "video_frame":
                 ready.metadata["frame_index"] = state.frame_index
                 state.frame_index += ready.metadata["frame_count"]

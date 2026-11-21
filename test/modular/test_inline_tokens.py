@@ -248,6 +248,32 @@ def test_a_request_that_asks_gets_each_text_chunks_token_ids():
     assert worker._with_token_ids("req", "text", torch.rand(2, 3), {}) == {}
 
 
+def test_the_first_text_chunk_emitted_carries_the_prompt_s_token_ids():
+    """``Model.prompt_token_ids`` when the request set ``return_token_ids``,
+    attached where the chunks are emitted in order, so they ride on the first one
+    the client gets whichever read finished first."""
+    class _Counted(StubModel):
+        def prompt_tokens(self, tensors, kv_layout):
+            return 7
+
+    tensors = {"text_inputs": [torch.tensor([1, 2]), torch.tensor([[3]])]}
+    assert StubModel().prompt_token_ids(tensors) == [1, 2, 3]
+    # a model that lays its prompt out its own way (BAGEL, Qwen3-Omni) gets none unless it says
+    assert _Counted().prompt_token_ids(tensors) is None
+    worker, _ = _thread()
+    worker.request_output_state = {"req": RequestOutputState(next_sequence=3, prompt_token_ids=[1, 2, 3])}
+    later = ResultChunk(request_id="req", modality="text", data=b"b", metadata={"token_ids": [8]})
+    worker._queue_completed_output("req", 1, later)
+    assert worker.out_queue.empty()
+    worker._queue_completed_output("req", 0, ResultChunk(request_id="req", modality="text", data=b"a",
+                                                         metadata={"token_ids": [7]}))
+    worker._queue_completed_output("req", 2, ResultChunk(request_id="req", modality="text", data=b"c",
+                                                         metadata={}))
+    first, second, third = (worker.out_queue.get_nowait() for _ in range(3))
+    assert first.metadata == {"token_ids": [7], "prompt_token_ids": [1, 2, 3]}
+    assert second.metadata == {"token_ids": [8]} and third.metadata == {}
+
+
 def test_the_facade_accounts_an_inline_token_like_a_tensor():
     facade = PreprocessWorker.__new__(PreprocessWorker)
     facade.result_tensor_input_queue = queue.Queue()
@@ -474,3 +500,21 @@ def test_a_stream_riding_the_column_lets_the_step_route_inline():
     )
     w, engine, batch = _inline_step(**spoken)
     assert w._get_postprocess_request(batch, rows, engine, False, None, None).inline is None
+
+
+def test_bagel_and_qwen3_omni_report_no_prompt_ids_and_qwen3_5_does():
+    """BAGEL and Qwen3-Omni move their text out of ``text_inputs`` and count their
+    prompt themselves, so the ids there are not their prompt."""
+    from mstar.model.bagel.bagel_model import BagelModel
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+
+    tensors = {"text_inputs": [torch.tensor([4, 5])]}
+    for cls, want in ((BagelModel, None), (Qwen3OmniModel, None), (Qwen3_5DenseModel, [4, 5])):
+        assert object.__new__(cls).prompt_token_ids(tensors) == want, cls.__name__
+    # Nemotron duplex marks a session with no system prompt with a -1, which is no token
+    from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
+
+    duplex = object.__new__(NemotronDuplexModel)
+    assert duplex.prompt_token_ids({"text_inputs": [torch.tensor([-1])]}) == []
+    assert duplex.prompt_token_ids({"text_inputs": [torch.tensor([7, 8])], "has_prompt": [torch.tensor([1])]}) == [7, 8]

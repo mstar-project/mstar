@@ -4,7 +4,8 @@ Translates an OpenAI chat request into a submit_request via the model adapter,
 then maps the resulting modality chunks back to OpenAI shapes: text into
 ``message.content``, audio into ``message.audio`` (base64, in ``audio.format``), images into
 ``image_url`` data-URL content parts, and the closing ``usage`` chunk into
-``usage`` and ``finish_reason``.
+``usage`` and ``finish_reason``. A chat that asked for them also gets the sampled
+tokens' log-probs and ids, and the prompt's ids, as vLLM returns them.
 """
 
 from __future__ import annotations
@@ -54,14 +55,63 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
             batches = await api.open_result_stream(request_id, raw_request, batches=True)
             include_usage = bool(req.stream_options and req.stream_options.include_usage)
             return ReleasingStreamingResponse(
-                _stream_events(batches, model_name, request_id, sample_rate, include_usage),
+                _stream_events(batches, model_name, request_id, sample_rate, include_usage,
+                               _TokenRecord(model_kwargs)),
                 release=lambda: api.release_request(request_id),
                 media_type="text/event-stream", headers={"Cache-Control": "no-cache"},
             )
         chunks = await api.collect_results(request_id, raw_request)
     finally:
         media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
-    return _build_response(model_name, request_id, chunks, sample_rate, audio_format)
+    return _build_response(model_name, request_id, chunks, sample_rate, audio_format, _TokenRecord(model_kwargs))
+
+
+class _TokenRecord:
+    """A reply's sampled tokens, for a chat that set ``return_logprobs`` (OpenAI
+    ``logprobs``) or ``return_token_ids``, from its text chunks' metadata. A chunk
+    with a log-prob carries one sampled token (one sampler draw per step), so its
+    bytes are that token's."""
+
+    __slots__ = ("logprobs", "token_ids", "entries", "ids", "prompt_ids")
+
+    def __init__(self, model_kwargs: dict | None):
+        mk = model_kwargs or {}
+        self.logprobs = bool(mk.get("return_logprobs"))
+        self.token_ids = bool(mk.get("return_token_ids"))
+        self.entries: list[dict] = []
+        self.ids: list[int] = []
+        self.prompt_ids: list[int] | None = None
+
+    @property
+    def on(self) -> bool:
+        return self.logprobs or self.token_ids
+
+    def add(self, chunk) -> None:
+        metadata = chunk.metadata or {}
+        if self.logprobs:
+            self.entries += [{
+                "token": chunk.data.decode("utf-8", "replace"),
+                "logprob": value,
+                "bytes": list(chunk.data),
+                "top_logprobs": [],
+            } for value in metadata.get("logprobs") or ()]
+        if self.token_ids:
+            self.ids += metadata.get("token_ids") or ()
+            if "prompt_token_ids" in metadata:
+                self.prompt_ids = metadata["prompt_token_ids"]
+
+    def take(self) -> tuple[dict, dict]:
+        """A stream chunk's choice and top-level fields: what arrived since the
+        last chunk that carried any, so a token that completes no character (or
+        an end token) rides on the next chunk sent."""
+        choice: dict = {}
+        if self.entries:
+            choice["logprobs"] = {"content": self.entries}
+        if self.ids:
+            choice["token_ids"] = self.ids
+        top = {"prompt_token_ids": self.prompt_ids} if self.prompt_ids is not None else {}
+        self.entries, self.ids, self.prompt_ids = [], [], None
+        return choice, top
 
 
 def _audio_format(req, sample_rate: int) -> str:
@@ -87,7 +137,8 @@ def _finish_reason(reported: dict | None) -> str:
     return (reported or {}).get("finish_reason", "stop")
 
 
-def _build_response(model_name, request_id, chunks, sample_rate, audio_format="wav") -> dict:
+def _build_response(model_name, request_id, chunks, sample_rate, audio_format="wav", record=None) -> dict:
+    record = record or _TokenRecord(None)
     text_parts: list[bytes] = []
     audio_pcm: list[bytes] = []
     images: list[bytes] = []
@@ -95,6 +146,8 @@ def _build_response(model_name, request_id, chunks, sample_rate, audio_format="w
     for c in chunks:
         if c.modality == "text":
             text_parts.append(c.data)
+            if record.on:
+                record.add(c)
         elif c.modality == "audio":
             audio_pcm.append(c.data)
         elif c.modality == "image":
@@ -122,26 +175,36 @@ def _build_response(model_name, request_id, chunks, sample_rate, audio_format="w
             parts.append({"type": "image_url", "image_url": {"url": media_io.png_to_data_url(img)}})
         message["content"] = parts
 
-    return {
+    choice: dict = {"index": 0, "message": message, "finish_reason": _finish_reason(usage)}
+    response = {
         "id": request_id,
         "object": "chat.completion",
         "created": now(),
         "model": model_name,
-        "choices": [{"index": 0, "message": message, "finish_reason": _finish_reason(usage)}],
+        "choices": [choice],
         "usage": _usage(usage),
     }
+    if record.logprobs:
+        choice["logprobs"] = {"content": record.entries}
+    if record.token_ids:
+        choice["token_ids"] = record.ids
+        response["prompt_token_ids"] = record.prompt_ids
+    return response
 
 
-async def _stream_events(batches, model_name, request_id, sample_rate, include_usage=False):
+async def _stream_events(batches, model_name, request_id, sample_rate, include_usage=False, record=None):
     created = now()
+    record = record or _TokenRecord(None)
 
-    def chunk(delta, finish=None) -> str:
+    def chunk(delta, finish=None, tokens=False) -> str:
+        choice, top = record.take() if tokens and record.on else ({}, {})
         return sse({
             "id": request_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": model_name,
-            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish, **choice}],
+            **top,
         })
 
     def error(message: str, status: int) -> str:
@@ -163,9 +226,11 @@ async def _stream_events(batches, model_name, request_id, sample_rate, include_u
             text_events: list[str] = []
             for c in batch:
                 if c.modality == "text":
+                    if record.on:
+                        record.add(c)
                     content = text.feed(c.data)
                     if content:
-                        text_events.append(chunk({**role, "content": content}))
+                        text_events.append(chunk({**role, "content": content}, tokens=True))
                         role = {}
                     continue
                 if c.modality == USAGE:
@@ -202,7 +267,7 @@ async def _stream_events(batches, model_name, request_id, sample_rate, include_u
         yield error(str(exc.detail), exc.status_code)
     if not failed:
         tail = text.flush()
-        yield chunk({**role, "content": tail} if tail else role, finish=_finish_reason(usage))
+        yield chunk({**role, "content": tail} if tail else role, finish=_finish_reason(usage), tokens=True)
         if include_usage:
             yield sse({
                 "id": request_id,

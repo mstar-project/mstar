@@ -548,6 +548,25 @@ def test_a_chat_that_asks_for_an_unserved_field_is_a_400_with_the_adapters_messa
     assert not server.submitted, "the chat reached the model, which ignores the field"
 
 
+@pytest.mark.parametrize(("fields", "named"), [
+    ({"logprobs": True}, "logprobs"), ({"return_logprobs": True}, "logprobs"),
+    ({"return_token_ids": True}, "return_token_ids"),
+    ({"chat_template_kwargs": {"return_token_ids": True}}, "return_token_ids"),
+], ids=["logprobs", "return_logprobs", "return_token_ids", "template_kwargs"])
+def test_a_chat_asking_for_its_tokens_is_a_400_and_keeps_no_upload(tmp_path, fields, named):
+    """These chunks carry no log-probs or ids, so the chat is refused however it
+    asked, and the attachments the adapter saved go with it (only a submitted
+    chat's are cleaned up)."""
+    server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
+    image_chat = {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "what is it"}, {"type": "image_url", "image_url": {"url": PNG_1X1}}]}], **fields}
+    with pytest.raises(ValueError) as refused:
+        _chat_through_bridge(server, image_chat, adapter=ADAPTER_REGISTRY["qwen3_5_0.8b"])
+    assert (refused.value.code, refused.value.message) == (400, f"{named} is not supported")
+    assert not server.submitted
+    assert not [p for p in tmp_path.rglob("*") if p.is_file()], "the refused chat left its attachment on disk"
+
+
 def test_the_chat_fields_clients_send_by_default_reach_the_model(tmp_path):
     server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
     _chat_through_bridge(server, {"tools": [], "tool_choice": "auto", "presence_penalty": 0, "logprobs": False,

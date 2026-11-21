@@ -776,11 +776,14 @@ token, as ``token_ids``). Qwen3.5 reports them; other models refuse the request
 with a 400. Add ``enable_processed_logprobs: true`` and ``"logprobs_mode":
 "processed"`` for the log-prob under the distribution it was actually drawn from
 (penalties and top-k/top-p applied); greedy requests want ``"raw"``, as a greedy
-token scores 0 there. Top alternatives and OpenAI's ``logprobs`` are not
-supported yet. On any deployment,
+token scores 0 there. Top alternatives are not supported yet. On any deployment,
 ``"return_token_ids": true`` adds each text chunk's sampled ids
-(``{"token_ids": [...]}``), stop tokens included, so a trainer need not
-re-tokenize the text.
+(``{"token_ids": [...]}``), stop tokens included, and the prompt's ids on the first
+text chunk (``{"prompt_token_ids": [...]}``, attachments as their placeholder
+tokens; left out for a model whose prompt is not one id per position, such as
+BAGEL and Qwen3-Omni), so a trainer need not re-tokenize the text. On ``/v1/chat/completions``,
+OpenAI's ``logprobs: true`` asks for the log-probs and vLLM's ``return_token_ids``
+for the ids, returned where vLLM returns them (:doc:`clients`).
 
 **LoRA adapters.** A ``resources: lora:`` block in the serving config serves
 per-request LoRA adapters (PEFT ``adapter_model.safetensors``; the scaling comes

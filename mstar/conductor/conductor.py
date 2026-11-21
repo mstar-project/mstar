@@ -820,7 +820,7 @@ class Conductor:
         if model_kwargs.get("return_logprobs") and not any(
             getattr(cfg, "return_logprobs", False) for cfg in configs.values()
         ):
-            raise ValueError("this model does not report logprobs; leave return_logprobs unset")
+            raise ValueError("this model does not report logprobs; leave logprobs (return_logprobs) unset")
         layout = (model_kwargs or {}).get("kv_layout") or {}
         for key, labels in self._kv_labels.items():
             configs.setdefault(key, KVReqConfig(needed_labels=list(layout.get(key, labels))))
