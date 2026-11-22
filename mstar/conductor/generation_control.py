@@ -5,6 +5,7 @@ States, and what moves between them::
     serving --pause--> draining --no request left--> quiescing --every rank idle--> paused
     paused --update--> preparing --every rank checked--> applying --every rank copied--> paused
     paused --continue--> verifying --every rank on the committed version--> serving
+    draining --continue--> serving
 
 Any state but ``serving`` refuses new requests (the conductor answers them with a
 503). ``pause`` with mode ``abort`` also fails the requests in flight; ``wait`` lets
@@ -17,7 +18,15 @@ answer while copying leaves the deployment paused, since some ranks may hold the
 new weights and some not. ``continue`` resumes only when every rank reports the
 committed version: its label and the epoch of the apply step that copied it, so a
 label reused for other weights, or an apply that never ran on a rank or ran after
-its step timed out, keeps the deployment paused.
+its step timed out, keeps the deployment paused. A pause that arrives while that
+check is still running waits for the ranks to answer, and the deployment stays
+paused.
+
+``continue`` while still draining cancels the pause: no rank has been asked
+anything yet, so generation goes straight back to serving. Each pause still
+waiting gets a 409 saying it was cancelled, and the continue gets a 200.
+Requests a pause in abort mode already failed stay failed. Once the ranks are
+being asked to confirm idle, ``continue`` gets a 409 until the pause lands.
 
 A rank that does not answer within ``timeout_s`` fails the step it was in. Its late
 answer is ignored: each step carries its own epoch.
@@ -150,6 +159,10 @@ class GenerationControl:
             self._pause_waiters.append(body.op_id)
             self._start(WeightOp.QUIESCE, GenerationState.QUIESCING)
             return
+        if self.state is GenerationState.VERIFYING:
+            # answering 200 here reports paused, then a successful verify resumes
+            self._pause_waiters.append(body.op_id)
+            return
         self._answer(body.op_id, 200)
 
     def update(self, body: UpdateWeightsFromDisk) -> None:
@@ -176,8 +189,8 @@ class GenerationControl:
             self._answer(body.op_id, 200)
             return
         if self.state is GenerationState.DRAINING:
-            # No rank has received QUIESCE yet. Reopen admission; requests
-            # already failed by an abort-mode pause still finish their drain.
+            # no rank has been asked anything yet, so nothing needs checking
+            logger.info("Continue while draining; cancelling the pause")
             self.state = GenerationState.SERVING
             self.mode = None
             self._quiesced = False
@@ -330,6 +343,13 @@ class GenerationControl:
                 f"not every rank holds the committed version {self.weight_version!r}",
                 {**failed, **mismatched},
             ))
+            self._answer_pause(200)
+            return
+        if self._pause_waiters:
+            self.state = GenerationState.PAUSED
+            logger.info("Pause arrived while resume was still being verified; staying paused")
+            self._answer(op_id, 409, "generation was paused again before it resumed")
+            self._answer_pause(200)
             return
         logger.info("Resuming generation on weight version %r", self.weight_version)
         self.state = GenerationState.SERVING

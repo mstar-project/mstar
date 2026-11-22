@@ -10,7 +10,11 @@ refuse a checkpoint that does not match before copying anything.
 from __future__ import annotations
 
 import json
+import logging
+import shutil
+import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -22,16 +26,18 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.engine.engine import Engine
+from mstar.engine.resources.base import Resource, StepAllowance
+from mstar.engine.resources.kv import cpu_page_pool
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.model.base import Model
 from mstar.model.loader import HF_DEFAULT_SKIP_FRAGMENTS, load_weights
-from mstar.model.loader.reload import WeightReloadRefusedError, check_reload_compatible, reload_manifest
+from mstar.model.loader.reload import WeightReloadRefusedError, check_reload_compatible, snapshot_checkpoint
 from mstar.model.orpheus.components.language_model import OrpheusForCausalLM
 from mstar.model.orpheus.config import OrpheusModelConfig
-from mstar.model.orpheus.orpheus_model import OrpheusModel
+from mstar.model.orpheus.orpheus_model import OrpheusModel, _snapshot_for_reload
 from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
 
 ROPE_SCALING = {
@@ -97,10 +103,10 @@ def _lm(path: str, comm_group: CommGroup | None = None, dtype=torch.float32) -> 
 
 
 def _orpheus(weights_dir: str) -> OrpheusModel:
+    """Orpheus as ``_create_llm_submodule`` leaves it, loaded from ``weights_dir``."""
     model = OrpheusModel.__new__(OrpheusModel)
     model.config = _config()
-    model._llm_weights_dir = weights_dir
-    model._llm_reload_manifest = reload_manifest(weights_dir, skip_fragments=HF_DEFAULT_SKIP_FRAGMENTS)
+    model._llm_checkpoint = snapshot_checkpoint(weights_dir, HF_DEFAULT_SKIP_FRAGMENTS)
     return model
 
 
@@ -289,6 +295,54 @@ def test_a_checkpoint_without_a_config_is_checked_on_names_and_shapes(ckpts):
     check_reload_compatible(str(bare), ckpts.a_dir)
 
 
+def test_runtime_only_config_keys_do_not_block_a_reload(ckpts):
+    runtime = {"use_cache": False, "_attn_implementation": "sdpa", "output_hidden_states": True}
+    check_reload_compatible(_checkpoint(ckpts.tmp / "runtime", ckpts.b, extra_config=runtime), ckpts.a_dir)
+    # and nested, as a multimodal config carries its text model's
+    nested = {"text_config": {"hidden_size": HIDDEN, "use_cache": True}}
+    ref = _checkpoint(ckpts.tmp / "nested_a", ckpts.a, extra_config=nested)
+    nested["text_config"]["use_cache"] = False
+    check_reload_compatible(_checkpoint(ckpts.tmp / "nested_b", ckpts.b, extra_config=nested), ref)
+    nested["text_config"]["hidden_size"] = HIDDEN * 2
+    with pytest.raises(WeightReloadRefusedError, match=r"config.json differs in \['text_config'\]"):
+        check_reload_compatible(_checkpoint(ckpts.tmp / "nested_c", ckpts.b, extra_config=nested), ref)
+
+
+def _with_tokenizer(root: str, files: dict[str, str]) -> str:
+    for name, text in files.items():
+        (Path(root) / name).write_text(text)
+    return root
+
+
+def test_tokenizer_files_compare_on_content_not_bytes(ckpts):
+    vocab = {"model": {"type": "BPE", "vocab": {"a": 0, "b": 1}}, "added_tokens": [], "truncation": None}
+    tok_cfg = {"bos_token": "<s>", "model_max_length": 2048, "padding_side": "right"}
+    ref = _with_tokenizer(_checkpoint(ckpts.tmp / "tok_a", ckpts.a), {
+        "tokenizer.json": json.dumps(vocab, separators=(",", ":")),
+        "tokenizer_config.json": json.dumps(tok_cfg),
+    })
+    # pretty-printed, keys reordered, and only runtime settings changed
+    same = _with_tokenizer(_checkpoint(ckpts.tmp / "tok_b", ckpts.b), {
+        "tokenizer.json": json.dumps(
+            {**dict(reversed(vocab.items())), "truncation": {"max_length": 512}}, indent=2,
+        ),
+        "tokenizer_config.json": json.dumps({**tok_cfg, "model_max_length": 131072, "padding_side": "left"}),
+    })
+    check_reload_compatible(same, ref)
+
+    remapped = {**vocab, "model": {"type": "BPE", "vocab": {"a": 1, "b": 0}}}
+    other_vocab = _with_tokenizer(_checkpoint(ckpts.tmp / "tok_c", ckpts.b), {
+        "tokenizer.json": json.dumps(remapped, indent=2),
+    })
+    with pytest.raises(WeightReloadRefusedError, match="tokenizer.json differs"):
+        check_reload_compatible(other_vocab, ref)
+    other_bos = _with_tokenizer(_checkpoint(ckpts.tmp / "tok_d", ckpts.b), {
+        "tokenizer_config.json": json.dumps({**tok_cfg, "bos_token": "<bos>"}),
+    })
+    with pytest.raises(WeightReloadRefusedError, match="tokenizer_config.json differs"):
+        check_reload_compatible(other_bos, ref)
+
+
 def test_truncated_or_garbage_files_are_refused(ckpts):
     data = (ckpts.tmp / "b" / "model.safetensors").read_bytes()
     truncated = ckpts.tmp / "truncated"
@@ -309,6 +363,52 @@ def test_an_index_naming_a_file_outside_the_checkpoint_is_refused(ckpts):
         {"weight_map": {"model.norm.weight": "../b/model.safetensors"}},
     ))
     _refused(ckpts, str(outside), "outside")
+
+
+def test_an_index_naming_an_absolute_path_is_refused(ckpts):
+    absolute = ckpts.tmp / "absolute"
+    absolute.mkdir()
+    (absolute / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"model.norm.weight": str(Path(ckpts.b_dir) / "model.safetensors")}},
+    ))
+    _refused(ckpts, str(absolute), "outside")
+
+
+def _hub_snapshot(hub, name: str, state) -> str:
+    """``state`` laid out as the Hugging Face cache stores it: two shards and an
+    index in ``snapshots/<rev>/``, each a symlink into ``blobs/``."""
+    blobs, snap = hub / "blobs", hub / "snapshots" / name
+    blobs.mkdir(parents=True, exist_ok=True)
+    snap.mkdir(parents=True)
+    keys = sorted(state)
+    shards = {"model-00001-of-00002.safetensors": keys[::2], "model-00002-of-00002.safetensors": keys[1::2]}
+    files = {}
+    for shard, names in shards.items():
+        save_file({k: state[k] for k in names}, str(blobs / f"{name}-{shard}"))
+        files[shard] = f"{name}-{shard}"
+    index = {"weight_map": {k: shard for shard, names in shards.items() for k in names}}
+    (blobs / f"{name}-index").write_text(json.dumps(index))
+    files["model.safetensors.index.json"] = f"{name}-index"
+    (blobs / f"{name}-config").write_text(json.dumps({
+        "architectures": ["LlamaForCausalLM"], "hidden_size": HIDDEN,
+        "num_hidden_layers": LAYERS, "torch_dtype": "float32",
+    }))
+    files["config.json"] = f"{name}-config"
+    for link, blob in files.items():
+        (snap / link).symlink_to(Path("..") / ".." / "blobs" / blob)
+    return str(snap)
+
+
+def test_a_checkpoint_in_the_hub_cache_layout_reloads(ckpts):
+    """Every file of a cached snapshot is a symlink out of its directory, into
+    ``blobs/``; those are the checkpoint's own files, not ones outside it."""
+    hub = ckpts.tmp / "hub"
+    a, b = _hub_snapshot(hub, "rev-a", ckpts.a), _hub_snapshot(hub, "rev-b", ckpts.b)
+    lm = _lm(a)
+    engine = _engine(_orpheus(a), lm)
+    engine.reload_weights(b, "v1")
+    assert torch.equal(lm.model.norm.weight, ckpts.b["model.norm.weight"])
+    assert torch.equal(lm.model.layers[0].self_attn.qkv_proj.weight, _qkv(ckpts.b))
 
 
 def test_hub_snapshot_index_accepts_a_blob_symlink(ckpts):
@@ -338,6 +438,68 @@ def test_reload_uses_the_loaded_config_not_a_later_overwrite(ckpts):
     engine = _engine(model, _lm(ckpts.a_dir))
     (ckpts.tmp / "a" / "config.json").write_text(json.dumps({"num_hidden_layers": 999}))
     engine.check_weight_reload(ckpts.b_dir)
+
+
+def test_a_deleted_startup_directory_does_not_block_a_reload(ckpts):
+    start = _checkpoint(ckpts.tmp / "start", ckpts.a)
+    lm = _lm(start)
+    engine = _engine(_orpheus(start), lm)
+    shutil.rmtree(start)  # a trainer cleaned up its old checkpoints
+
+    engine.check_weight_reload(ckpts.b_dir)
+    engine.reload_weights(ckpts.b_dir, "v1")
+    assert torch.equal(lm.model.layers[0].self_attn.qkv_proj.weight, _qkv(ckpts.b))
+
+
+def test_a_startup_directory_saved_over_in_place_is_checked_against_what_was_loaded(ckpts):
+    """Re-reading the startup directory would compare a checkpoint saved over it
+    with itself and pass, then fail partway through the copy."""
+    start = _checkpoint(ckpts.tmp / "start", ckpts.a)
+    lm = _lm(start)
+    engine = _engine(_orpheus(start), lm)
+
+    reshaped = dict(ckpts.b)
+    reshaped["model.layers.0.mlp.gate_proj.weight"] = torch.randn(INTER + 2, HIDDEN)
+    save_file(reshaped, str(Path(start) / "model.safetensors"))
+    with pytest.raises(WeightReloadRefusedError, match="gate_proj.weight: shape"):
+        engine.check_weight_reload(start)
+    _assert_still(lm, ckpts.a)
+
+    # the next save, with the right shapes, reloads from the same place
+    save_file(ckpts.b, str(Path(start) / "model.safetensors"))
+    engine.check_weight_reload(start)
+    engine.reload_weights(start, "v1")
+    assert torch.equal(lm.model.layers[0].self_attn.qkv_proj.weight, _qkv(ckpts.b))
+
+
+def test_a_startup_checkpoint_that_cannot_be_read_disables_only_reload(ckpts, caplog):
+    with caplog.at_level(logging.WARNING):
+        reason = _snapshot_for_reload(str(ckpts.tmp / "nowhere"))
+    assert isinstance(reason, str) and "weight reload disabled" in caplog.text
+    model = _orpheus(ckpts.a_dir)
+    model._llm_checkpoint = reason
+    lm = _lm(ckpts.a_dir)
+    with pytest.raises(WeightReloadRefusedError, match="could not be read at startup"):
+        _engine(model, lm).check_weight_reload(ckpts.b_dir)
+
+
+def test_importing_model_base_does_not_import_safetensors():
+    """rust-transport does not install safetensors. Importing the model base
+    used to load the loader package, and the rust tests could not collect."""
+    code = (
+        "import sys\n"
+        "class Block:\n"
+        "    def find_spec(self, name, path, target=None):\n"
+        "        if name == 'safetensors' or name.startswith('safetensors.'):\n"
+        "            raise ModuleNotFoundError(name)\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, Block())\n"
+        "from mstar.model.base import Model\n"
+        "assert 'safetensors' not in sys.modules\n"
+        "print('ok', Model.__name__)\n"
+    )
+    got = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
+    assert got.returncode == 0, got.stderr
 
 
 def test_a_rank_hosting_only_the_snac_decoder_has_nothing_to_reload(ckpts):
@@ -404,5 +566,148 @@ def test_reload_drops_the_prefix_cache_and_reroots_it(ckpts, monkeypatch):
     assert kv._index.num_pages() == 0 and kv._arena.num_free == free, "cached pages kept"
     assert kv._prefix_root != b"root", "a key from the old weights would still match"
     root_v1 = kv._prefix_root
-    kv.drop_prefix_cache("v1")
+    page = kv._arena.acquire(1)[0]
+    kv._index.insert(fingerprint(root_v1, b"k2"), page)
+    kv._arena.release([page])
+    assert kv.drop_prefix_cache("v1") == 1
+    assert kv._arena.num_free == free
     assert kv._prefix_root != root_v1, "a second reload under the same name reused the root"
+
+
+def _kv_with_cached_pages(monkeypatch) -> KVManager:
+    """A KV pool with its prefix cache open under ``b"root"`` and two pages
+    cached by a request that has finished."""
+    monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
+    kv = KVManager(
+        cfg=PagedKVConfig(
+            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
+            max_num_pages=16, page_size=16,
+        ),
+        name="kv", joint_comm_group=None, transfer_engine_info=None,
+        device=torch.device("cpu"), dtype=torch.float32,
+    )
+    kv.enable_prefix_cache(b"root")
+    assert kv._index is not None
+    pages = kv._arena.acquire(2)
+    kv._index.insert_run([fingerprint(b"root", k) for k in (b"k0", b"k1")], pages, None)
+    kv._arena.release(pages)
+    assert kv._index.num_pages() == 2
+    return kv
+
+
+class _CopyFails(OrpheusModel):
+    """Checks, then fails before copying anything; records what the KV pool
+    held when the copy was about to start."""
+
+    def reload_weights(self, path, submodules, *, check_only=False):
+        if check_only:
+            return super().reload_weights(path, submodules, check_only=True)
+        self.seen = (self.kv._index.num_pages(), self.kv._prefix_root)
+        raise OSError("read error before the first tensor")
+
+
+def test_the_prefix_cache_is_dropped_before_the_copy_even_when_the_copy_fails(ckpts, monkeypatch):
+    kv = _kv_with_cached_pages(monkeypatch)
+    model = _CopyFails.__new__(_CopyFails)
+    model.config, model._llm_checkpoint, model.kv = _config(), _orpheus(ckpts.a_dir)._llm_checkpoint, kv
+    lm = _lm(ckpts.a_dir)
+
+    with pytest.raises(OSError, match="before the first tensor"):
+        _engine(model, lm, kv=kv).reload_weights(ckpts.b_dir, "v1")
+
+    assert model.seen == (0, fingerprint(b"root", "weights", "v1")), "dropped after the copy, or not at all"
+    _assert_still(lm, ckpts.a)
+
+
+class _Recording(Resource):
+    """A resource that keeps something derived from the weights."""
+
+    @classmethod
+    def build(cls, spec, info):
+        raise NotImplementedError
+
+    def __init__(self):
+        self.dropped: list[str] = []
+
+    def drop_weight_derived_state(self, salt):
+        self.dropped.append(salt)
+        return 1
+
+
+class _Stateless(Resource):
+    @classmethod
+    def build(cls, spec, info):
+        raise NotImplementedError
+
+
+def test_every_resource_hears_of_a_reload_and_the_default_keeps_nothing(ckpts):
+    assert _Stateless().drop_weight_derived_state("v1") == 0
+    recording = _Recording()
+    lm = _lm(ckpts.a_dir)
+    engine = _engine(_orpheus(ckpts.a_dir), lm)
+    engine._resources = {"stateless": _Stateless(), "recording": recording}
+
+    engine.reload_weights(ckpts.b_dir, "v1")
+    engine.reload_weights(ckpts.a_dir, "v2")
+
+    assert recording.dropped == ["v1", "v2"]
+    assert torch.equal(lm.model.layers[0].self_attn.qkv_proj.weight, _qkv(ckpts.a))
+
+
+class _UnpinnedTorch:
+    """``torch`` for ``cpu_page_pool`` on a host with no pinned-memory allocator."""
+
+    def __getattr__(self, name):
+        return getattr(torch, name)
+
+    @staticmethod
+    def empty(*args, pin_memory=False, **kwargs):
+        del pin_memory
+        return torch.empty(*args, **kwargs)
+
+
+def test_reload_frees_the_host_tier_too(ckpts, monkeypatch, caplog):
+    """With offload on, the host pool files pages under the same rooted keys.
+    Re-rooting without evicting them would leave them resident where no key
+    reaches them; the device evictions also go through the host pool's count."""
+    monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
+    monkeypatch.setattr(cpu_page_pool, "torch", _UnpinnedTorch())
+    kv = KVManager(
+        cfg=PagedKVConfig(
+            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
+            max_num_pages=16, page_size=16, cpu_offload_pages=8,
+        ),
+        name="kv", joint_comm_group=None, transfer_engine_info=None,
+        device=torch.device("cpu"), dtype=torch.float32, host_allowance=StepAllowance(),
+    )
+    kv.enable_prefix_cache(b"root")
+    assert kv._index is not None
+    keys = [fingerprint(b"root", k) for k in (b"k0", b"k1", b"k2")]
+    device_free = kv._arena.num_free
+    first, second = kv._arena.acquire(2)
+    kv._index.insert_run(keys[:2], [first, second], None)
+    kv._arena.release([first, second])
+    # the host holds a copy of k0 and the only copy of k1 and k2
+    host = kv._cpu_pool
+    host_free = host.arena.num_free
+    host_pages = host.arena.acquire(3)
+    host.index.insert_run(keys, host_pages, None)
+    host.arena.release(host_pages)
+    assert host.arena.num_free == host_free - 3
+
+    dropped_keys: list[bytes] = []
+    count_dropped = host.count_dropped
+    monkeypatch.setattr(host, "count_dropped", lambda ks: (dropped_keys.extend(ks), count_dropped(ks)))
+    returned: list = []
+    drop = kv.drop_prefix_cache
+    monkeypatch.setattr(kv, "drop_prefix_cache", lambda salt: returned.append(drop(salt)))
+
+    # caplog's handler fails the test on a record that does not format
+    with caplog.at_level(logging.INFO, logger=manager_mod.logger.name):
+        _engine(_orpheus(ckpts.a_dir), _lm(ckpts.a_dir), kv=kv).reload_weights(ckpts.b_dir, "v1")
+
+    assert returned == [5] and type(returned[0]) is int
+    assert sorted(dropped_keys) == sorted(keys[:2]), "device evictions skipped the host pool's count"
+    assert kv._arena.num_free == device_free and kv._index.num_pages() == 0
+    assert host.arena.num_free == host_free and host.index.num_pages() == 0, "host pages kept under the old root"
+    assert "(2 device and 3 host pages freed)" in caplog.text
