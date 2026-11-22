@@ -101,6 +101,10 @@ class WeightOps:
                 self.weight_version = op.weight_version
                 self.weight_epoch = op.epoch
                 self.dirty = False
+                logger.info(
+                    "Worker %s: weights reloaded from %s as version %r",
+                    self.worker_id, op.model_path, op.weight_version,
+                )
         else:
             error = f"unknown weight control step {op.op!r}"
         self._communicator.send("conductor", ConductorMessage(

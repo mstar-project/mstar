@@ -1038,8 +1038,12 @@ class Engine:
         model.reload_weights(path, modules, check_only=True)
 
     def reload_weights(self, path: str, weight_version: str) -> None:
-        """Copy ``path`` into the loaded parameters and drop what was derived
-        from the old weights. Only with nothing in flight on this engine.
+        """Drop what was derived from the old weights, then copy ``path`` into
+        the loaded parameters. Only with nothing in flight on this engine.
+
+        The drop comes first so that every rank asked to copy drops, whether
+        or not its copy then succeeds: a rank whose copy failed would otherwise
+        keep its old prefix-cache root and drift from the others.
 
         Raises if the model's reload moved any parameter's storage: compiled
         code and captured graphs would keep reading the old storage.
@@ -1058,6 +1062,8 @@ class Engine:
         if accelerator:
             # side-stream work of the last step may still read the weights
             torch.accelerator.synchronize(self._device)
+        for resource in self._resources.values():
+            resource.drop_weight_derived_state(weight_version)
         with torch.no_grad():
             model.reload_weights(path, modules)
         if accelerator:
@@ -1071,8 +1077,6 @@ class Engine:
                 f"parameter(s), e.g. {moved[:3]}; compiled code and captured graphs "
                 "still point at the old storage"
             )
-        for kv in self.paged_kv_caches():
-            kv.cache.drop_prefix_cache(salt=weight_version)
 
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""

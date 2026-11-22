@@ -16,6 +16,8 @@ import pytest
 from mstar.conductor.conductor import Conductor, RequestData
 from mstar.conductor.generation_control import GenerationControl
 from mstar.utils.ipc_format import (
+    ConductorMessage,
+    ConductorMessageType,
     ContinueGeneration,
     GetGenerationState,
     NewRequestConductor,
@@ -190,6 +192,74 @@ def test_continue_cancels_a_draining_pause_before_any_rank_is_touched(mode):
     assert not c._generation.paused
     c._generation.tick(0)
     assert _steps(c) == [], "a cancelled pause started quiescing later"
+
+
+def test_continue_while_draining_cancels_the_pause():
+    """With no drain timeout, one long request holds a wait pause in draining.
+    Continue cancels it: no rank was asked anything, so serving resumes at once
+    and every pause still waiting hears it was cancelled."""
+    c = _conductor({"r1": _request_data()})
+    c._generation.pause(PauseGeneration(op_id="p1", mode="wait"))
+    c._generation.pause(PauseGeneration(op_id="p2", mode="wait"))
+    c._ingest_request(_new_request("late"))
+    assert _failures(c) == {"late": (503, "generation is paused")}
+
+    c._generation.resume(ContinueGeneration(op_id="c"))
+
+    answer = _answers(c, "c")[-1]
+    assert (answer.status, answer.state, answer.paused) == (200, "serving", False)
+    for op_id in ("p1", "p2"):
+        pause = _answers(c, op_id)[-1]
+        assert (pause.status, pause.state, pause.paused) == (409, "serving", False)
+        assert "cancelled" in pause.error_message
+    assert _steps(c) == [], "a rank was asked to quiesce"
+    assert "r1" in c.requests and "r1" not in c.draining, "the running request was touched"
+    c._ingest_request(_new_request("next"))
+    assert c.admitted == ["next"]
+
+    # the next pause runs from the start
+    c.requests.clear()
+    c._generation.pause(PauseGeneration(op_id="p3", mode="wait"))
+    c._generation.tick(0)
+    _ack_all(c, WeightOp.QUIESCE)
+    assert _answers(c, "p3")[-1].status == 200 and c._generation.state.value == "paused"
+
+
+def test_continue_after_an_abort_pause_resumes_but_the_aborted_requests_stay_failed():
+    c = _conductor({"r1": _request_data()})
+    c._generation.pause(PauseGeneration(op_id="p", mode="abort"))
+    assert "r1" in c.draining
+
+    c._generation.resume(ContinueGeneration(op_id="c"))
+    assert _answers(c, "c")[-1].status == 200 and not c._generation.paused
+    assert _answers(c, "p")[-1].status == 409
+    assert c._generation.mode is None
+
+    _finish_drain(c, "r1")
+    assert _failures(c) == {"r1": (503, "generation was paused, aborting requests in flight")}
+    c._ingest_request(_new_request("next"))
+    assert c.admitted == ["next"]
+
+
+def test_a_pause_during_resume_verification_stays_paused():
+    """A pause that lands while continue is still being verified used to get
+    200 paused, and the verify then resumed anyway."""
+    c = _paused(_conductor())
+    c._generation.resume(ContinueGeneration(op_id="c"))
+    assert c._generation.state.value == "verifying"
+    c._generation.pause(PauseGeneration(op_id="p", mode="wait"))
+    assert _answers(c, "p") == [], "pause was answered before verify finished"
+    _ack_all(c, WeightOp.VERIFY, version=None)
+    pause = _answers(c, "p")[-1]
+    assert (pause.status, pause.state, pause.paused) == (200, "paused", True)
+    assert c._generation.state.value == "paused"
+    cont = _answers(c, "c")[-1]
+    assert cont.status == 409 and cont.paused and cont.state == "paused"
+    c._ingest_request(_new_request("late"))
+    assert _failures(c)["late"] == (503, "generation is paused")
+    c._generation.resume(ContinueGeneration(op_id="c2"))
+    _ack_all(c, WeightOp.VERIFY, version=None)
+    assert (_answers(c, "c2")[-1].status, c._generation.state.value) == (200, "serving")
 
 
 def test_abort_mode_fails_requests_through_the_drain_barrier():
@@ -413,7 +483,10 @@ def test_operations_in_the_wrong_order_are_refused():
     c._generation.pause(PauseGeneration(op_id="p2", mode="wait"))
     c.requests.clear()
     c._generation.tick(0)
+    c._generation.resume(ContinueGeneration(op_id="quiescing"))
+    assert _answers(c, "quiescing")[-1].status == 409, "resumed while the ranks were asked to confirm idle"
     _ack_all(c, WeightOp.QUIESCE)
+    assert _answers(c, "p2")[-1].status == 200
 
     c._generation.update(UpdateWeightsFromDisk(op_id="u", model_path="/ckpt", weight_version="v1"))
     c._generation.update(UpdateWeightsFromDisk(op_id="u2", model_path="/ckpt", weight_version="v2"))
@@ -433,3 +506,21 @@ def test_an_update_needs_a_path_and_a_version(field, value):
     setattr(body, field, value)
     c._generation.update(body)
     assert _answers(c, "u")[-1].status == 400 and field in _answers(c, "u")[-1].error_message
+
+
+def test_a_conductor_without_the_state_machine_refuses_control_messages():
+    c = _conductor()
+    c._generation = None
+    for message_type, body in [
+        (ConductorMessageType.PAUSE_GENERATION, PauseGeneration(op_id="p")),
+        (ConductorMessageType.CONTINUE_GENERATION, ContinueGeneration(op_id="c")),
+        (ConductorMessageType.UPDATE_WEIGHTS_FROM_DISK,
+         UpdateWeightsFromDisk(op_id="u", model_path="/ckpt", weight_version="v1")),
+        (ConductorMessageType.GET_GENERATION_STATE, GetGenerationState(op_id="s")),
+        (ConductorMessageType.WEIGHT_CONTROL_ACK, WeightControlAck(epoch=1, worker_id="worker_0", op="quiesce")),
+    ]:
+        c._route_message(ConductorMessage(message_type=message_type, body=body), [])
+    assert [(a.op_id, a.status, a.paused) for a in _answers(c)] == [
+        ("p", 503, False), ("c", 503, False), ("u", 503, False), ("s", 503, False),
+    ]
+    assert len(c.sent) == 4, "the ack has no caller to answer"

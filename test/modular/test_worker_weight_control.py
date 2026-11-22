@@ -1,6 +1,7 @@
 """Pause and weight reload across two TP ranks' weight-control components."""
 from __future__ import annotations
 
+import shutil
 import sys
 from collections import deque
 from types import SimpleNamespace
@@ -9,11 +10,12 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
-from test_weight_reload import _checkpoint, _engine, _lm, _orpheus, _state
+from safetensors.torch import save_file
+from test_weight_reload import _checkpoint, _engine, _kv_with_cached_pages, _lm, _orpheus, _state
 
 from mstar.conductor.generation_control import GenerationControl
 from mstar.distributed.communication import CommGroup
-from mstar.model.loader.reload import reload_manifest
+from mstar.model.loader.reload import snapshot_checkpoint
 from mstar.model.orpheus.orpheus_model import OrpheusModel
 from mstar.utils.ipc_format import (
     ContinueGeneration,
@@ -140,10 +142,11 @@ def ckpts(tmp_path):
     )
 
 
-def _tp2(ckpts, follower_model=None):
-    lms = [_lm(ckpts.a_dir, comm_group=_rank(i)) for i in range(2)]
-    models = [_orpheus(ckpts.a_dir), follower_model or _orpheus(ckpts.a_dir)]
-    return lms, _Deployment([_engine(m, lm) for m, lm in zip(models, lms, strict=True)])
+def _tp2(ckpts, follower_model=None, kvs=(None, None), start_dir=None):
+    start_dir = start_dir or ckpts.a_dir
+    lms = [_lm(start_dir, comm_group=_rank(i)) for i in range(2)]
+    models = [_orpheus(start_dir), follower_model or _orpheus(start_dir)]
+    return lms, _Deployment([_engine(m, lm, kv) for m, lm, kv in zip(models, lms, kvs, strict=True)])
 
 
 def _shard(state, rank):
@@ -226,8 +229,7 @@ def test_both_ranks_reload_their_shards_in_one_epoch_and_commit(ckpts):
 
 def test_a_follower_that_fails_mid_copy_keeps_the_deployment_paused(ckpts):
     failing = _FailingAfterCopy.__new__(_FailingAfterCopy)
-    failing.config, failing._llm_weights_dir = _orpheus(ckpts.a_dir).config, ckpts.a_dir
-    failing._llm_reload_manifest = reload_manifest(ckpts.a_dir)
+    failing.config, failing._llm_checkpoint = _orpheus(ckpts.a_dir).config, snapshot_checkpoint(ckpts.a_dir)
     lms, d = _tp2(ckpts, follower_model=failing)
     assert d.pause().status == 200
 
@@ -286,7 +288,7 @@ def test_a_checkpoint_one_rank_refuses_copies_nothing_anywhere(ckpts, tmp_path):
     lms, d = _tp2(ckpts)
     # the follower was loaded from a deeper config, so it refuses this one
     deeper = _checkpoint(tmp_path / "deeper", ckpts.a, extra_config={"num_hidden_layers": 3})
-    d.workers["worker_1"].ops._engine._model._llm_reload_manifest = reload_manifest(deeper)
+    d.workers["worker_1"].ops._engine._model._llm_checkpoint = snapshot_checkpoint(deeper)
     assert d.pause().status == 200
 
     d.control.update(UpdateWeightsFromDisk(op_id="u", model_path=ckpts.b_dir, weight_version="v1"))
@@ -301,3 +303,76 @@ def test_a_checkpoint_one_rank_refuses_copies_nothing_anywhere(ckpts, tmp_path):
     d.control.resume(ContinueGeneration(op_id="c"))
     d.run()
     assert d.answer("c").status == 200, "a refused update must not block serving the old weights"
+
+
+class _FailingBeforeCopy(OrpheusModel):
+    """Passes the check, then fails before copying a tensor."""
+
+    fail = True
+
+    def reload_weights(self, path, submodules, *, check_only=False):
+        if not check_only and self.fail:
+            raise OSError("read error before the first tensor")
+        super().reload_weights(path, submodules, check_only=check_only)
+
+
+def test_a_rank_whose_copy_fails_still_drops_its_prefix_cache_in_step(ckpts, monkeypatch):
+    """Every rank drops before it copies, so a failed copy can't leave one rank
+    on the old prefix-cache root while the others move on."""
+    failing = _FailingBeforeCopy.__new__(_FailingBeforeCopy)
+    failing.config, failing._llm_checkpoint = _orpheus(ckpts.a_dir).config, _orpheus(ckpts.a_dir)._llm_checkpoint
+    kvs = (_kv_with_cached_pages(monkeypatch), _kv_with_cached_pages(monkeypatch))
+    lms, d = _tp2(ckpts, follower_model=failing, kvs=kvs)
+    assert d.pause().status == 200
+
+    d.control.update(UpdateWeightsFromDisk(op_id="u1", model_path=ckpts.b_dir, weight_version="v1"))
+    d.run()
+    assert d.answer("u1").status == 500 and d.workers["worker_1"].ops.dirty
+    assert [kv._index.num_pages() for kv in kvs] == [0, 0], "the failed rank kept its cached pages"
+    assert kvs[0]._prefix_root == kvs[1]._prefix_root != b"root"
+
+    failing.fail = False
+    d.control.update(UpdateWeightsFromDisk(op_id="u2", model_path=ckpts.b_dir, weight_version="v2"))
+    d.run()
+    assert d.answer("u2").status == 200
+    assert kvs[0]._prefix_root == kvs[1]._prefix_root, "the ranks' prefix-cache roots diverged"
+    d.control.resume(ContinueGeneration(op_id="c"))
+    d.run()
+    assert d.answer("c").status == 200
+
+
+def test_a_deleted_startup_directory_still_reloads_a_new_checkpoint(ckpts, tmp_path):
+    start = _checkpoint(tmp_path / "start", ckpts.a)
+    lms, d = _tp2(ckpts, start_dir=start)
+    shutil.rmtree(start)
+    assert d.pause().status == 200
+
+    d.control.update(UpdateWeightsFromDisk(op_id="u", model_path=ckpts.b_dir, weight_version="v1"))
+    d.run()
+    assert d.answer("u").status == 200, d.answer("u").error_message
+    for rank, lm in enumerate(lms):
+        assert torch.equal(lm.model.layers[0].self_attn.qkv_proj.weight, _shard(ckpts.b, rank))
+    d.control.resume(ContinueGeneration(op_id="c"))
+    d.run()
+    assert d.answer("c").status == 200
+
+
+def test_a_startup_directory_saved_over_with_other_shapes_is_refused_before_any_copy(ckpts, tmp_path):
+    start = _checkpoint(tmp_path / "start", ckpts.a)
+    lms, d = _tp2(ckpts, start_dir=start)
+    reshaped = dict(ckpts.b)
+    reshaped["model.layers.1.mlp.up_proj.weight"] = torch.randn(48 + 2, 32)
+    save_file(reshaped, str(tmp_path / "start" / "model.safetensors"))
+    assert d.pause().status == 200
+
+    d.control.update(UpdateWeightsFromDisk(op_id="u", model_path=start, weight_version="v1"))
+    d.run()
+    answer = d.answer("u")
+    assert answer.status == 400, answer.error_message
+    assert all("up_proj.weight: shape" in answer.ranks[w] for w in WORKERS)
+    assert not any(w.ops.dirty for w in d.workers.values()), "a rank started copying"
+    for rank, lm in enumerate(lms):
+        assert torch.equal(lm.model.layers[0].self_attn.qkv_proj.weight, _shard(ckpts.a, rank))
+    d.control.resume(ContinueGeneration(op_id="c"))
+    d.run()
+    assert d.answer("c").status == 200
