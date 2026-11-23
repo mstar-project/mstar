@@ -11,9 +11,9 @@ WORKFLOW = (ROOT / ".github/workflows/e2e-matrix.yml").read_text()
 REPORTER = runpy.run_path(str(ROOT / ".github/e2e/report_pr.py"))
 
 
-def row(*, flagged=False, correct="pass"):
+def row(*, flagged=False, correct="pass", quality=None):
     return {"model": "kokoro", "case": "text", "correct": correct, "flagged": flagged,
-            "starts": {"base": True, "head": True}, "quality": [],
+            "starts": {"base": True, "head": True}, "quality": [] if quality is None else quality,
             "latency": {"delta_pct": 2.1, "verdict": "regression" if flagged else "same"},
             "throughput": {"delta_pct": -1.3, "verdict": "same"}}
 
@@ -85,6 +85,23 @@ class MatrixWorkflowTests(unittest.TestCase):
             path.write_text(json.dumps([row(correct="FAIL", flagged=False)]))
             with self.assertRaises(ValueError):
                 REPORTER["load_rows"](path)
+
+    def test_unscored_quality_verdict_is_accepted_and_unknown_is_rejected(self):
+        from tempfile import TemporaryDirectory
+
+        unscored = row(quality=[{"kind": "mos", "verdict": "n/a"}])
+        unknown = row(quality=[{"kind": "mos", "verdict": "unknown"}])
+        with TemporaryDirectory() as d:
+            path = Path(d) / "summary.json"
+            path.write_text(json.dumps([unscored]))
+            loaded = REPORTER["load_rows"](path)
+            self.assertEqual(loaded, [unscored])
+            self.assertEqual(REPORTER["conclusion"]("0", loaded), "success")
+
+            path.write_text(json.dumps([unknown]))
+            with self.assertRaises(ValueError):
+                REPORTER["load_rows"](path)
+            self.assertEqual(REPORTER["conclusion"]("0", [unknown]), "neutral")
 
 
 if __name__ == "__main__":

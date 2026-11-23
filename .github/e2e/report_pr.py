@@ -21,7 +21,7 @@ MAX_SUMMARY_BYTES = 2_000_000
 MAX_ROWS = 200
 CORRECT = {"pass", "changed", "FAIL", "incomplete", "base broken"}
 PERF = {"same", "noisy", "better", "regression", "n/a"}
-QUALITY = {"same", "better", "worse"}
+QUALITY = {"same", "better", "worse", "n/a"}
 
 
 def _cell(value: object) -> str:
