@@ -425,7 +425,7 @@ def test_a_resource_on_sdpa_builds_no_spec():
 def test_kernel_settings_on_a_resource_on_sdpa_set_nothing_and_still_refuse_a_bad_field():
     assert build_specs([_array("a")], setup=_on_sdpa("a_read"), kernel_settings={"a_read": {"workspace_mb": 1}}) == []
     with pytest.raises(ValueError, match="it may set only"):
-        build_specs([_array("a")], setup=_on_sdpa("a_read"), kernel_settings={"a_read": {"backend": "dense"}})
+        build_specs([_array("a")], setup=_on_sdpa("a_read"), kernel_settings={"a_read": {"flashinfer_backend": "fa2"}})
 
 
 def test_sdpa_on_a_resource_no_read_runs_on_is_refused_and_left_out():

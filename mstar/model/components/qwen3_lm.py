@@ -6,7 +6,7 @@ audio-LLM checkpoints ship one as their text decoder (Qwen3-ASR, Higgs-Audio,
 Qwen3-Omni's dense layers); this is the one place to build it from
 ``ParallelAttention`` / ``ParallelGatedMLP`` / ``RMSNorm``, bound to the
 array of the node that owns it, or to its KV, attention and position resources
-on a model not yet on the state contract (Higgs-Audio, MiniCPM-o).
+on a model not yet on the state contract (MiniCPM-o).
 
 Parameter paths mirror HF's ``Qwen3ForCausalLM`` with the ``model.`` prefix
 dropped (``embed_tokens.*``, ``layers.N.*``, ``norm.*``, ``lm_head.*``); a
