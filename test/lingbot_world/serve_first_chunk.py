@@ -84,6 +84,8 @@ def summarize_chunks(arrivals_s: list[float], frame_counts: list[int], fps_value
 def pingpong(poses: np.ndarray, n: int) -> np.ndarray:
     if len(poses) < 1:
         raise ValueError("poses must be non-empty")
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise ValueError(f"n must be an int; got {n!r}")
     if n < 0:
         raise ValueError("n must be non-negative")
     period = np.concatenate([np.arange(len(poses)), np.arange(len(poses) - 2, 0, -1)])
@@ -186,6 +188,7 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=18451)
     ap.add_argument("--timeout", type=float, default=900.0, help="startup and per-request timeout in seconds")
     args = ap.parse_args()
+    args.repo = args.repo.resolve()
     if str(args.repo) not in sys.path:
         sys.path.insert(0, str(args.repo))
     if args.chunks < 1:
@@ -196,8 +199,9 @@ def main() -> int:
         ap.error("--port must be between 1 and 65535")
     config_path = args.config if args.config.is_absolute() else (
         args.repo / args.config if (args.repo / args.config).is_file() or not args.config.is_file()
-        else args.config.resolve()
+        else args.config
     )
+    config_path = config_path.resolve()
     if not config_path.is_file():
         ap.error(f"config file not found: {config_path}")
     cases = []
@@ -216,34 +220,41 @@ def main() -> int:
     try:
         poses = np.load(args.example / "poses.npy")
         intr_arr = np.load(args.example / "intrinsics.npy")
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, EOFError) as e:
         ap.error(f"failed to load example trajectory: {e}")
+    if not isinstance(poses, np.ndarray) or not isinstance(intr_arr, np.ndarray):
+        for obj in (poses, intr_arr):
+            if not isinstance(obj, np.ndarray) and hasattr(obj, "close"):
+                obj.close()
+        ap.error("poses.npy and intrinsics.npy must be .npy arrays")
     if (
-        not np.issubdtype(poses.dtype, np.number)
+        not (np.issubdtype(poses.dtype, np.floating) or np.issubdtype(poses.dtype, np.integer))
         or poses.ndim != 3
         or len(poses) < 1
         or poses.shape[1:] != (4, 4)
         or not np.isfinite(poses).all()
     ):
-        ap.error(f"poses.npy must be finite with shape (N, 4, 4) and N >= 1; got {poses.shape}")
+        ap.error(f"poses.npy must be finite real numeric with shape (N, 4, 4) and N >= 1; got {poses.shape}")
     if (
-        not np.issubdtype(intr_arr.dtype, np.number)
+        not (np.issubdtype(intr_arr.dtype, np.floating) or np.issubdtype(intr_arr.dtype, np.integer))
         or intr_arr.ndim != 2
         or len(intr_arr) < 1
         or intr_arr.shape[1] != 4
         or not np.isfinite(intr_arr[0]).all()
     ):
-        ap.error(f"intrinsics.npy must have finite first row with shape (M, 4) and M >= 1; got {intr_arr.shape}")
+        ap.error(f"intrinsics.npy must have finite real first row with shape (M, 4) and M >= 1; got {intr_arr.shape}")
     intr = intr_arr[0].tolist()
     from mstar.client import MStarClient, VideoFrameChunk
 
     args.out.mkdir(parents=True, exist_ok=True)
-    workdir = Path(tempfile.mkdtemp(prefix="lingbot-ff-"))
-    log = open(args.out / "server.log", "w")
+    workdir = None
+    log = None
     proc = None
     report = {"cases": [], "full_rollout": args.full_rollout}
 
     try:
+        workdir = Path(tempfile.mkdtemp(prefix="lingbot-ff-"))
+        log = open(args.out / "server.log", "w")
         proc = subprocess.Popen(
             [sys.executable, str(args.repo / "mstar/api_server/entrypoint.py"),
              "--config", str(config_path),
@@ -272,8 +283,10 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
-        log.close()
-        shutil.rmtree(workdir, ignore_errors=True)
+        if log is not None:
+            log.close()
+        if workdir is not None:
+            shutil.rmtree(workdir, ignore_errors=True)
     (args.out / "first_frame.json").write_text(json.dumps(report, indent=2))
     runs = [report["warmup"], report["warm_93"], *report["cases"]]
     return int(any(r.get("error") for r in runs) or not all(r["sample_complete"] for r in runs[:2])

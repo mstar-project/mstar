@@ -218,6 +218,9 @@ def test_pingpong_short_exact_wrap_and_small_poses():
         probe.pingpong(np.empty((0, 4, 4)), 4)
     with pytest.raises(ValueError, match="non-negative"):
         probe.pingpong(poses2, -1)
+    for invalid_n in (True, False, 1.5):
+        with pytest.raises(ValueError, match="int"):
+            probe.pingpong(poses2, invalid_n)
 
 
 def test_expected_chunk_frame_counts_boundaries_and_config_parity():
@@ -578,3 +581,185 @@ def test_main_exit_codes_and_config_timeout_forwarding(monkeypatch, tmp_path):
         ["--full-rollout", "--cases", "29:4x4"],
     )
     assert rc == 1
+
+
+def test_main_rejects_complex_empty_and_npz_trajectory_files_before_server_start(monkeypatch, tmp_path):
+    popen_called = False
+
+    def unexpected_start(*_args, **_kwargs):
+        nonlocal popen_called
+        popen_called = True
+        raise AssertionError("server started for invalid trajectory file")
+
+    monkeypatch.setattr(probe.subprocess, "Popen", unexpected_start)
+
+    valid_poses = np.tile(np.eye(4, dtype=np.float32), (29, 1, 1))
+    valid_intr = np.ones((1, 4), dtype=np.float32)
+
+    # 1. Complex and bool dtypes in poses.npy and intrinsics.npy
+    for tag, poses_arr, intr_arr in [
+        ("complex128_poses", valid_poses.astype(np.complex128), valid_intr),
+        ("complex64_poses", valid_poses.astype(np.complex64), valid_intr),
+        ("bool_poses", np.ones((29, 4, 4), dtype=bool), valid_intr),
+        ("complex128_intr", valid_poses, valid_intr.astype(np.complex128)),
+        ("bool_intr", valid_poses, np.ones((1, 4), dtype=bool)),
+    ]:
+        bad_dir = _make_example_dir(tmp_path / tag)
+        np.save(bad_dir / "poses.npy", poses_arr)
+        np.save(bad_dir / "intrinsics.npy", intr_arr)
+        out_dir = tmp_path / f"out_{tag}"
+        monkeypatch.setattr(
+            sys, "argv",
+            ["probe", "--example", str(bad_dir), "--out", str(out_dir), "--cases", "29:4x4"],
+        )
+        with pytest.raises(SystemExit) as error:
+            probe.main()
+        assert error.value.code == 2
+        assert popen_called is False
+        assert not out_dir.exists()
+
+    # 2. 0-byte .npy files (EOFError from np.load)
+    for target in ("poses.npy", "intrinsics.npy"):
+        empty_dir = _make_example_dir(tmp_path / f"empty_{target}")
+        np.save(empty_dir / "poses.npy", valid_poses)
+        np.save(empty_dir / "intrinsics.npy", valid_intr)
+        (empty_dir / target).write_bytes(b"")
+        out_dir = tmp_path / f"out_empty_{target}"
+        monkeypatch.setattr(
+            sys, "argv",
+            ["probe", "--example", str(empty_dir), "--out", str(out_dir), "--cases", "29:4x4"],
+        )
+        with pytest.raises(SystemExit) as error:
+            probe.main()
+        assert error.value.code == 2
+        assert popen_called is False
+        assert not out_dir.exists()
+
+    # 3. .npz archives renamed to .npy (NpzFile from np.load)
+    for target, arr in (("poses.npy", valid_poses), ("intrinsics.npy", valid_intr)):
+        npz_dir = _make_example_dir(tmp_path / f"npz_{target}")
+        np.save(npz_dir / "poses.npy", valid_poses)
+        np.save(npz_dir / "intrinsics.npy", valid_intr)
+        tmp_npz = npz_dir / "archive.npz"
+        np.savez(tmp_npz, data=arr)
+        tmp_npz.replace(npz_dir / target)
+        out_dir = tmp_path / f"out_npz_{target}"
+        monkeypatch.setattr(
+            sys, "argv",
+            ["probe", "--example", str(npz_dir), "--out", str(out_dir), "--cases", "29:4x4"],
+        )
+        with pytest.raises(SystemExit) as error:
+            probe.main()
+        assert error.value.code == 2
+        assert popen_called is False
+        assert not out_dir.exists()
+
+
+def test_main_resolves_relative_repo_and_config_before_popen(monkeypatch, tmp_path):
+    from mstar import client as client_module
+
+    repo = tmp_path / "rel_repo"
+    (repo / "configs").mkdir(parents=True)
+    (repo / "configs" / "lingbot_world_1_3b.yaml").write_text("model: lingbot_world_1_3b\n")
+    (repo / "mstar" / "api_server").mkdir(parents=True)
+    (repo / "mstar" / "api_server" / "entrypoint.py").write_text("# stub\n")
+
+    cwd_cfg = tmp_path / "cwd_custom.yaml"
+    cwd_cfg.write_text("model: lingbot_world_1_3b\n")
+
+    example = _make_example_dir(tmp_path)
+    np.save(example / "poses.npy", np.tile(np.eye(4, dtype=np.float32), (29, 1, 1)))
+    np.save(example / "intrinsics.npy", np.ones((1, 4), dtype=np.float32))
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setattr(probe.time, "sleep", lambda *_args: None)
+
+    popen_calls = []
+
+    class FakeProcess:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            pass
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def health(self):
+            return True
+
+        def stream(self, **kwargs):
+            if kwargs["request_id"] in {"warm", "warm2"}:
+                return iter(_warm_chunks())
+            return iter([_chunk(0, 13), _chunk(13, 16)])
+
+    def make_popen(cmd, **kwargs):
+        popen_calls.append((cmd, kwargs))
+        return FakeProcess()
+
+    monkeypatch.setattr(probe.subprocess, "Popen", make_popen)
+    monkeypatch.setattr(client_module, "MStarClient", FakeClient)
+
+    # 1. Relative --repo with default relative --config (inside --repo)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["probe", "--repo", "rel_repo", "--example", "example", "--out", "out_default",
+         "--full-rollout", "--cases", "29:4x4"],
+    )
+    assert probe.main() == 0
+    cmd, kwargs = popen_calls[-1]
+    assert kwargs["cwd"] == repo.resolve()
+    assert Path(cmd[1]).is_absolute()
+    assert Path(cmd[1]) == (repo / "mstar/api_server/entrypoint.py").resolve()
+    cfg_arg = Path(cmd[cmd.index("--config") + 1])
+    assert cfg_arg.is_absolute()
+    assert cfg_arg == (repo / "configs/lingbot_world_1_3b.yaml").resolve()
+
+    # 2. Relative --repo with relative --config resolved from caller CWD
+    monkeypatch.setattr(
+        sys, "argv",
+        ["probe", "--repo", "rel_repo", "--config", "cwd_custom.yaml", "--example", "example",
+         "--out", "out_cwd_cfg", "--full-rollout", "--cases", "29:4x4"],
+    )
+    assert probe.main() == 0
+    cmd, kwargs = popen_calls[-1]
+    assert kwargs["cwd"] == repo.resolve()
+    cfg_arg = Path(cmd[cmd.index("--config") + 1])
+    assert cfg_arg.is_absolute()
+    assert cfg_arg == cwd_cfg.resolve()
+
+
+def test_main_cleans_up_workdir_when_server_log_open_fails(monkeypatch, tmp_path):
+    example = _make_example_dir(tmp_path / "example")
+    np.save(example / "poses.npy", np.tile(np.eye(4, dtype=np.float32), (29, 1, 1)))
+    np.save(example / "intrinsics.npy", np.ones((1, 4), dtype=np.float32))
+
+    out_dir = tmp_path / "out"
+    (out_dir / "server.log").mkdir(parents=True)  # force open(..., "w") to raise IsADirectoryError
+
+    created_workdirs = []
+    real_mkdtemp = probe.tempfile.mkdtemp
+
+    def track_mkdtemp(**kwargs):
+        d = Path(real_mkdtemp(dir=tmp_path, **kwargs))
+        created_workdirs.append(d)
+        return str(d)
+
+    monkeypatch.setattr(probe.tempfile, "mkdtemp", track_mkdtemp)
+    monkeypatch.setattr(probe.subprocess, "Popen", lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("Popen")))
+    monkeypatch.setattr(
+        sys, "argv",
+        ["probe", "--example", str(example), "--out", str(out_dir), "--cases", "29:4x4"],
+    )
+
+    with pytest.raises(IsADirectoryError):
+        probe.main()
+
+    assert len(created_workdirs) == 1
+    assert not created_workdirs[0].exists()
