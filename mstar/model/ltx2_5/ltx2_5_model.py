@@ -30,6 +30,7 @@ The distilled checkpoint runs a fixed 8-sigma schedule with no guidance;
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
 from typing import Any
@@ -43,7 +44,13 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel,
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, WalkStep
 from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
-from mstar.model.components.quant_linear import apply_linear_dtype
+from mstar.model.components.quant_linear import (
+    check_linear_dtype,
+    check_linear_dtype_steps,
+    check_linear_keep,
+    quantize_linears,
+    select_linears,
+)
 from mstar.model.components.video_encode import encode_mp4
 from mstar.model.ltx2_5.config import (
     AUDIO,
@@ -140,6 +147,8 @@ class LTX25Model(Model):
         max_video_tokens: int = 64 * 1024,
         async_scheduling: bool = True,
         linear_dtype: str = "bf16",
+        linear_keep_bf16: list[str] | None = None,
+        linear_dtype_steps: int | list[str] | None = None,
         **kwargs,
     ):
         refuse_attention_backend_kwarg(kwargs)
@@ -147,9 +156,9 @@ class LTX25Model(Model):
         self.cache_dir = cache_dir
         # Dummy mode: get_submodule returns None for every node (CPU tests).
         self.skip_weight_loading = skip_weight_loading
-        if linear_dtype not in ("bf16", "dense_fp8"):
-            raise ValueError(f"LTX-2.5 linear_dtype must be 'bf16' or 'dense_fp8', got {linear_dtype!r}")
-        self.linear_dtype = linear_dtype
+        self.linear_dtype = check_linear_dtype(linear_dtype)
+        self.linear_keep_bf16 = check_linear_keep(linear_keep_bf16)
+        self.step_dtypes = check_linear_dtype_steps(linear_dtype_steps, self.linear_dtype)
         self.compile_transformer = bool(compile)
         self.compile_eager_rounding = bool(compile_eager_rounding)
         self.accelerator_graph = bool(accelerator_graph)
@@ -527,7 +536,12 @@ class LTX25Model(Model):
             from mstar.model.ltx2_5.components.transformer import QUANTIZABLE_LINEARS
 
             transformer = weight_loader.build_transformer(self.config, snapshot, device, comm_group=tp_group)
-            apply_linear_dtype(transformer, self.linear_dtype, QUANTIZABLE_LINEARS, what="LTX-2.5 DiT")
+            selection = select_linears(
+                transformer, self.linear_dtype, QUANTIZABLE_LINEARS, self.linear_keep_bf16, "LTX-2.5 DiT",
+            )
+            step_dtypes = self.step_dtypes if selection.names else None
+            bf16_transformer = copy.deepcopy(transformer) if step_dtypes is not None else None
+            quantize_linears(transformer, selection)
             return LTXDenoiseSubmodule(
                 transformer,
                 self.config,
@@ -536,6 +550,8 @@ class LTX25Model(Model):
                 compile_transformer=self.compile_transformer, compile_eager_rounding=self.compile_eager_rounding,
                 max_batch_size=self.max_batch_size, capture_buckets=self.capture_buckets(),
                 capture_batch_sizes=self.capture_batch_sizes,
+                step_dtypes=step_dtypes,
+                bf16_transformer=bf16_transformer,
                 # one capture serves every walk: the dit's step is the same in each, and the
                 # refine walks read their extra inputs only when seeding
                 replay_walks={

@@ -129,6 +129,10 @@ class CommGroup:
         # NCCL until ``init_all_reduce`` sets up the deployment's backend
         self._all_reduce = AllReduce()
 
+    def __deepcopy__(self, memo):
+        # Communication groups hold non-copyable process groups and shared collective state.
+        return self
+
     def init_all_reduce(self, mode: str | None = None, max_kb: int | None = None) -> None:
         """Set up the all-reduce backend the deployment config's ``tp_allreduce``
         (``mode``) and ``tp_allreduce_max_kb`` (``max_kb``) ask for (see

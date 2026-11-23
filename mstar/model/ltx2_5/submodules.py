@@ -27,9 +27,14 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.state import gather, scatter
 from mstar.model.components.batched_rows import BatchedRows
-from mstar.model.components.diffusion.compile_utils import compile_transformer_forward, with_inductor_rounding
+from mstar.model.components.diffusion.compile_utils import (
+    compile_transformer_forward,
+    step_schedule_recompile_limit,
+    with_inductor_rounding,
+)
 from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
+from mstar.model.components.quant_linear import BF16, StepDtypes
 from mstar.model.ltx2_5.components.layers import RotaryTable
 from mstar.model.ltx2_5.components.transformer import build_rope
 from mstar.model.ltx2_5.config import (
@@ -221,12 +226,16 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         capture_buckets=(),
         capture_batch_sizes=(1, 2, 4),
         replay_walks=None,
+        step_dtypes: StepDtypes | None = None,
+        bf16_transformer: nn.Module | None = None,
     ):
         super().__init__(
             loop_name=loop_name, max_batch_size=max_batch_size,
-            capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes, replay_walks=replay_walks,
+            capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes,
+            replay_walks=replay_walks, step_dtypes=step_dtypes,
         )
         self.transformer = transformer
+        self.bf16_transformer = bf16_transformer
         self.config = config
         # walks that run the two-stage recipe's stage 2 (the refine loop)
         self.refine_walks = frozenset(refine_walks)
@@ -234,7 +243,12 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
             # Fuses the AdaLN modulation, norms, RoPE and gating chains (44% of an eager
             # step's kernel time at 544x960x121) around the GEMMs and attention; one static
             # graph per shape, which the captured graphs then record.
-            compile_transformer_forward(transformer, eager_rounding=compile_eager_rounding)
+            for module in (transformer, bf16_transformer):
+                if module is not None:
+                    compile_transformer_forward(
+                        module, eager_rounding=compile_eager_rounding,
+                        recompile_limit=step_schedule_recompile_limit(step_dtypes),
+                    )
         # the node's sequence shard, which brackets the DiT (`bind_state`)
         self.shard = None
 
@@ -313,7 +327,12 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         self, engine_inputs, bucket_key: LTXShape, latents, timestep, sigma, sigma_next,
         audio_latents, text_video, text_audio, **cond,
     ):
-        dtype = self.transformer.dtype
+        transformer = (
+            self.bf16_transformer
+            if self.step_dtype == BF16 and self.bf16_transformer is not None
+            else self.transformer
+        )
+        dtype = transformer.dtype
         rope = self.layout(bucket_key, latents.device)
         # on a step the sequence shard splits, the DiT runs on this rank's share of each
         # row's video tokens (the scatter is the identity otherwise)
@@ -322,7 +341,7 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         if shard is not None:
             video, *tables = scatter(shard, latents, *rope.video, *rope.cross_video)
             rope = rope._replace(video=RotaryTable(*tables[:2]), cross_video=RotaryTable(*tables[2:]))
-        velocity, audio_velocity = self.transformer(
+        velocity, audio_velocity = transformer(
             video.to(dtype), audio_latents.to(dtype), text_video, text_audio, timestep, rope,
         )
         if shard is not None:

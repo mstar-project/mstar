@@ -35,9 +35,10 @@ class DenseFp8Format(LinearFormat):
         del input_amax  # the dense kernel uses bf16 input for short rows and quantizes it for long rows
         n, k = weight.shape
         blocks = weight.float().reshape(n // 128, 128, k // 128, 128)
-        scale = blocks.abs().amax(dim=(1, 3)).div_(448.0)
-        scale = torch.where(scale == 0, torch.ones_like(scale), scale)
-        quant = (blocks / scale[:, None, :, None]).reshape(n, k).to(FP8_DTYPE)
+        amax = blocks.abs().amax(dim=(1, 3))
+        scale = amax.clamp(min=1e-10).div_(448.0)
+        scale = torch.where(amax == 0, torch.ones_like(scale), scale)
+        quant = (blocks / scale[:, None, :, None]).clamp(-448.0, 448.0).reshape(n, k).to(FP8_DTYPE)
         if weight.is_cuda:
             # Probe the fast implementations and reserve split-K counters before
             # compilation/capture, as Fp8Linear.process_weights_after_loading does.
