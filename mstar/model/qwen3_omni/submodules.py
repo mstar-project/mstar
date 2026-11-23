@@ -1728,6 +1728,9 @@ class Code2WavSubmodule(NodeSubmodule):
     # compiles the forward itself, so the engine must not compile it again.
     disable_torch_compile = True
     disable_autocast = True
+    # Search cuDNN conv algorithms during this node's capture warm-up. The
+    # chosen plan is baked into the graph without changing other nodes' flags.
+    capture_cudnn_benchmark = True
 
     def __init__(self, code2wav_model: Qwen3OmniMoeCode2Wav, config: Qwen3OmniModelConfig):
         super().__init__()

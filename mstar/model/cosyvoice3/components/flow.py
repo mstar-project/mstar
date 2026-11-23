@@ -40,8 +40,6 @@ Ported from ``cosyvoice/flow/flow.py`` (``CausalMaskedDiffWithDiT``),
 
 from __future__ import annotations
 
-import contextlib
-import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -50,36 +48,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.engine.fp32_precision import native_convolutions
 from mstar.model.chatterbox.components.s3gen_cfm import CausalConditionalCFM
 from mstar.model.chatterbox.loader import load_component
 from mstar.model.cosyvoice3.components.dit import DiT, PackedRows, chunk_attention_mask
 from mstar.model.cosyvoice3.config import FlowConfig
 from mstar.utils.h2d import PinnedStager
-
-_native_lock = threading.Lock()
-_native_holders = 0
-_native_saved = True
-
-
-@contextlib.contextmanager
-def native_convolutions():
-    """Convolutions off cuDNN within the block. ``cudnn.enabled`` is process-wide and
-    the reference encoder runs on the main thread while the GPU thread convolves, so
-    windows nest by count rather than each restoring what it saw on entry, and only
-    ``enabled`` changes (``cudnn.flags`` would also reset TF32 and benchmark mode)."""
-    global _native_holders, _native_saved
-    with _native_lock:
-        if _native_holders == 0:
-            _native_saved = torch.backends.cudnn.enabled
-            torch.backends.cudnn.enabled = False
-        _native_holders += 1
-    try:
-        yield
-    finally:
-        with _native_lock:
-            _native_holders -= 1
-            if _native_holders == 0:
-                torch.backends.cudnn.enabled = _native_saved
 
 
 @dataclass
