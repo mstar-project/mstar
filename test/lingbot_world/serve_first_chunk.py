@@ -23,6 +23,7 @@ A case is ``frames:layout``, the layout ``4x4`` or ``3x4`` (poses without the co
 import argparse
 import json
 import math
+import shutil
 import statistics
 import subprocess
 import sys
@@ -48,13 +49,17 @@ def summarize_chunks(arrivals_s: list[float], frame_counts: list[int], fps_value
     """
     if not arrivals_s or len(arrivals_s) != len(frame_counts) or len(arrivals_s) != len(fps_values):
         raise ValueError("chunk arrivals, frame counts and FPS must have equal nonzero lengths")
-    if any(not math.isfinite(t) or t < 0 for t in arrivals_s):
+    if any(isinstance(t, bool) or not isinstance(t, (int, float)) or not math.isfinite(t) or t < 0 for t in arrivals_s):
         raise ValueError("chunk arrivals must be finite and nonnegative")
     if any(b <= a for a, b in zip(arrivals_s, arrivals_s[1:], strict=False)):
         raise ValueError("chunk arrivals must increase")
     if any(isinstance(n, bool) or not isinstance(n, int) or n <= 0 for n in frame_counts):
         raise ValueError("frame counts must be positive integers")
-    if any(not math.isfinite(fps) or fps <= 0 or fps != fps_values[0] for fps in fps_values):
+    if any(
+        isinstance(fps, bool) or not isinstance(fps, (int, float)) or not math.isfinite(fps) or fps <= 0
+        or fps != fps_values[0]
+        for fps in fps_values
+    ):
         raise ValueError("chunk playback FPS must be finite, positive and constant")
 
     gaps = [b - a for a, b in zip(arrivals_s, arrivals_s[1:], strict=False)]
@@ -77,6 +82,10 @@ def summarize_chunks(arrivals_s: list[float], frame_counts: list[int], fps_value
 
 
 def pingpong(poses: np.ndarray, n: int) -> np.ndarray:
+    if len(poses) < 1:
+        raise ValueError("poses must be non-empty")
+    if n < 0:
+        raise ValueError("n must be non-negative")
     period = np.concatenate([np.arange(len(poses)), np.arange(len(poses) - 2, 0, -1)])
     return poses[np.resize(period, n)]
 
@@ -89,6 +98,8 @@ def expected_chunk_frame_counts(num_frames: int) -> list[int]:
     """
     from mstar.model.lingbot_world.config import lingbot_world_1_3b
 
+    if isinstance(num_frames, bool) or not isinstance(num_frames, int):
+        raise ValueError(f"num_frames must be an int; got {num_frames!r}")
     cfg = lingbot_world_1_3b()
     stride = cfg.vae_stride[0]
     requested_latents = (num_frames - 1) // stride + 1
@@ -100,6 +111,8 @@ def expected_chunk_frame_counts(num_frames: int) -> list[int]:
 
 def run_case(client, chunk_type, poses: np.ndarray, intr: list[float], example: Path,
              num_frames: int, layout: str, max_chunks: int | None, rid: str) -> dict:
+    if layout not in {"4x4", "3x4"}:
+        raise ValueError(f"layout must be 4x4 or 3x4; got {layout!r}")
     expected_counts = expected_chunk_frame_counts(num_frames)
     traj = pingpong(poses, num_frames)
     if layout == "3x4":
@@ -149,7 +162,7 @@ def run_case(client, chunk_type, poses: np.ndarray, intr: list[float], example: 
         try:
             res.update(summarize_chunks(res["arrivals_s"], res["frame_counts"], res["fps_values"]))
         except ValueError as e:
-            res["error"] = f"ValueError: {e}"[:400]
+            res.setdefault("error", f"ValueError: {e}"[:400])
             res["sample_complete"] = False
         # Retain the old name/definition for consumers of earlier first-chunk reports.
         gaps = res.get("chunk_gap_s", [])
@@ -163,16 +176,30 @@ def run_case(client, chunk_type, poses: np.ndarray, intr: list[float], example: 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[2])
+    ap.add_argument("--config", type=Path, default=Path("configs/lingbot_world_1_3b.yaml"),
+                    help="server config YAML (relative to --repo unless absolute)")
     ap.add_argument("--example", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--cases", nargs="+", default=["3001:4x4"])
     ap.add_argument("--chunks", type=int, default=8)
     ap.add_argument("--full-rollout", action="store_true", help="measure every chunk through natural completion")
     ap.add_argument("--port", type=int, default=18451)
+    ap.add_argument("--timeout", type=float, default=900.0, help="startup and per-request timeout in seconds")
     args = ap.parse_args()
-    sys.path.insert(0, str(args.repo))
+    if str(args.repo) not in sys.path:
+        sys.path.insert(0, str(args.repo))
     if args.chunks < 1:
         ap.error("--chunks must be positive")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        ap.error("--timeout must be finite and positive")
+    if not (1 <= args.port <= 65535):
+        ap.error("--port must be between 1 and 65535")
+    config_path = args.config if args.config.is_absolute() else (
+        args.repo / args.config if (args.repo / args.config).is_file() or not args.config.is_file()
+        else args.config.resolve()
+    )
+    if not config_path.is_file():
+        ap.error(f"config file not found: {config_path}")
     cases = []
     for case in args.cases:
         try:
@@ -184,26 +211,49 @@ def main() -> int:
         except ValueError as e:
             ap.error(f"invalid case {case!r}: {e}")
         cases.append((count, layout))
+    if not (args.example / "image.jpg").is_file():
+        ap.error(f"example image not found: {args.example / 'image.jpg'}")
+    try:
+        poses = np.load(args.example / "poses.npy")
+        intr_arr = np.load(args.example / "intrinsics.npy")
+    except (OSError, ValueError) as e:
+        ap.error(f"failed to load example trajectory: {e}")
+    if (
+        not np.issubdtype(poses.dtype, np.number)
+        or poses.ndim != 3
+        or len(poses) < 1
+        or poses.shape[1:] != (4, 4)
+        or not np.isfinite(poses).all()
+    ):
+        ap.error(f"poses.npy must be finite with shape (N, 4, 4) and N >= 1; got {poses.shape}")
+    if (
+        not np.issubdtype(intr_arr.dtype, np.number)
+        or intr_arr.ndim != 2
+        or len(intr_arr) < 1
+        or intr_arr.shape[1] != 4
+        or not np.isfinite(intr_arr[0]).all()
+    ):
+        ap.error(f"intrinsics.npy must have finite first row with shape (M, 4) and M >= 1; got {intr_arr.shape}")
+    intr = intr_arr[0].tolist()
     from mstar.client import MStarClient, VideoFrameChunk
 
-    poses = np.load(args.example / "poses.npy")
-    intr = np.load(args.example / "intrinsics.npy")[0].tolist()
     args.out.mkdir(parents=True, exist_ok=True)
     workdir = Path(tempfile.mkdtemp(prefix="lingbot-ff-"))
     log = open(args.out / "server.log", "w")
-    proc = subprocess.Popen(
-        [sys.executable, str(args.repo / "mstar/api_server/entrypoint.py"),
-         "--config", str(args.repo / "configs/lingbot_world_1_3b.yaml"),
-         "--port", str(args.port), "--host", "127.0.0.1", "--socket-path-prefix", str(workdir / "sock"),
-         "--upload-dir", str(workdir / "uploads"), "--tensor-comm-protocol", "SHM", "--log-level", "INFO",
-         "--timeout", "900"],
-        stdout=log, stderr=subprocess.STDOUT, cwd=args.repo,
-    )
-    client = MStarClient(f"http://127.0.0.1:{args.port}", timeout=900)
+    proc = None
     report = {"cases": [], "full_rollout": args.full_rollout}
 
     try:
-        deadline = time.time() + 900
+        proc = subprocess.Popen(
+            [sys.executable, str(args.repo / "mstar/api_server/entrypoint.py"),
+             "--config", str(config_path),
+             "--port", str(args.port), "--host", "127.0.0.1", "--socket-path-prefix", str(workdir / "sock"),
+             "--upload-dir", str(workdir / "uploads"), "--tensor-comm-protocol", "SHM", "--log-level", "INFO",
+             "--timeout", str(args.timeout)],
+            stdout=log, stderr=subprocess.STDOUT, cwd=args.repo,
+        )
+        client = MStarClient(f"http://127.0.0.1:{args.port}", timeout=args.timeout)
+        deadline = time.time() + args.timeout
         while not client.health():
             if proc.poll() is not None or time.time() > deadline:
                 raise SystemExit(f"server did not come up (exit {proc.poll()})")
@@ -215,12 +265,15 @@ def main() -> int:
                                             None if args.full_rollout else args.chunks, f"case{i}"))
             time.sleep(5)
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=60)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
         log.close()
+        shutil.rmtree(workdir, ignore_errors=True)
     (args.out / "first_frame.json").write_text(json.dumps(report, indent=2))
     runs = [report["warmup"], report["warm_93"], *report["cases"]]
     return int(any(r.get("error") for r in runs) or not all(r["sample_complete"] for r in runs[:2])
