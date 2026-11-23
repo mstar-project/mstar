@@ -626,3 +626,231 @@ def test_the_base_only_choice_is_the_same_on_every_rank(adapters):
         pool.remove_request("r1")
         pool.remove_request("r2")
         assert not pool._live and not pool.runs_adapters(list(named))
+
+
+# --- startup check for bound targets whose delta never runs (#1123) ------------------------
+
+
+def test_bound_delta_bypass_caught_after_warmup_captures():
+    """A parent reading a bound child's ``.weight`` directly (``F.linear``) leaves its
+    delta unrun; ``post_capture_validate`` catches it when the node's captures all ran,
+    naming the target and pointing at ``lora_unservable``, and stays quiet when not all
+    captures ran or once ``lora_unservable`` declares the bypass."""
+    import torch.nn.functional as F
+
+    from mstar.model.components.lora.modules import bind_module_lora, module_lora_spec
+
+    class _Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(8, 8, bias=False)
+            self.bypassed = torch.nn.Linear(8, 8, bias=False)
+
+        def forward(self, x):
+            return F.linear(self.proj(x), self.bypassed.weight)
+
+    class _Root(torch.nn.Module):
+        def __init__(self, block_cls):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([block_cls(), block_cls()])
+
+        def forward(self, x):
+            for layer in self.layers:
+                x = layer(x)
+            return x
+
+    spec = module_lora_spec(lambda _: _Root(_Block), nodes={"LLM"}, root_path="")
+    spec.apply_yaml_overrides(max_slots=1, max_rank=2)
+    root = _Root(_Block).to(dtype=F64)
+    pool = LoraAdapterPool(spec, CPU, backend=LoraOpsBackend(), dtype=F64)
+    bind_module_lora(root, {LORA_RESOURCE_KEY: pool})
+
+    # run a lean capture step (deltas return early, still marking themselves as reached)
+    lean_ctx = StepContext(
+        request_ids=[-1], graph_walk="decode", slot=0, capture=True, lean=frozenset({LORA_RESOURCE_KEY}),
+    )
+    pool.plan(ResourceStep(segments=(Segment(-1, "main", 2),)), lean_ctx)
+    with torch.no_grad():
+        root(torch.randn(2, 8, dtype=F64))
+    pool.commit(ResourceStep(segments=(Segment(-1, "main", 2),)), lean_ctx)
+
+    assert all(pool.layer_delta("proj", i).ran for i in range(2))
+    assert not any(pool.layer_delta("bypassed", i).ran for i in range(2))
+
+    # skipped when not all captures ran on the node
+    pool.post_capture_validate("LLM", fully_captured=False)
+
+    with pytest.raises(RuntimeError, match=r"LLM.*bypassed.*layers\.0\.bypassed.*2 of 2 layers.*lora_unservable"):
+        pool.post_capture_validate("LLM", fully_captured=True)
+
+    # declaring the bypass in `lora_unservable` keeps the child unbound so startup passes
+    class _DeclaredBlock(_Block):
+        lora_unservable = {"bypassed": "run as F.linear over its weight"}
+
+    declared = module_lora_spec(lambda _: _Root(_DeclaredBlock), nodes={"LLM"}, root_path="")
+    declared.apply_yaml_overrides(max_slots=1, max_rank=2)
+    clean_root = _Root(_DeclaredBlock).to(dtype=F64)
+    clean_pool = LoraAdapterPool(declared, CPU, backend=LoraOpsBackend(), dtype=F64)
+    bind_module_lora(clean_root, {LORA_RESOURCE_KEY: clean_pool})
+    clean_pool.plan(ResourceStep(segments=(Segment(-1, "main", 2),)), lean_ctx)
+    with torch.no_grad():
+        clean_root(torch.randn(2, 8, dtype=F64))
+    clean_pool.commit(ResourceStep(segments=(Segment(-1, "main", 2),)), lean_ctx)
+    clean_pool.post_capture_validate("LLM", fully_captured=True)
+
+
+def test_moe_experts_deltas_mark_on_expert_rows_and_catch_bypass():
+    """On active steps, MoE experts deltas must run ``grouped_`` (calling ``expert_rows``
+    alone does not mask a skipped ``down`` delta); on lean steps, ``expert_rows`` marks
+    every passed delta because ``grouped_`` is skipped; fullgraph compile adds no recompile."""
+    from mstar.engine.resources.lora.config import LoraSpec, LoraTarget
+
+    spec = LoraSpec(
+        resource_key=LORA_RESOURCE_KEY,
+        nodes=frozenset({"Thinker"}),
+        targets={
+            "experts_gate_up_proj": LoraTarget(
+                in_features=8, out_slices=(6, 6), slice_names=("gate", "up"), parallel="column", experts=2,
+            ),
+            "experts_down_proj": LoraTarget(
+                in_features=6, out_slices=(8,), slice_names=("down",), parallel="row", experts=2,
+            ),
+        },
+        num_layers=1,
+        max_slots=1,
+        max_rank=2,
+        dtype=F64,
+    )
+    pool = LoraAdapterPool(spec, CPU, backend=LoraOpsBackend(), dtype=F64)
+    gate_up = pool.layer_delta("experts_gate_up_proj", 0, module_path="layers.0.mlp.experts.gate_up_proj")
+    down = pool.layer_delta("experts_down_proj", 0, module_path="layers.0.mlp.experts.down_proj")
+
+    with pytest.raises(RuntimeError, match=r"experts_down_proj.*experts_gate_up_proj.*lora_unservable"):
+        pool.check_deltas_ran("Thinker")
+
+    # active step: expert_rows + gate_up.grouped_ runs, but down.grouped_ is omitted -> caught
+    active_ctx = StepContext(request_ids=[-1], graph_walk="decode", slot=0, capture=True)
+    step = ResourceStep(segments=(Segment(-1, "main", 2),))
+    pool.plan(step, active_ctx)
+    topk = torch.tensor([[0], [1]], dtype=torch.int32)
+    rows = gate_up.expert_rows(topk, [down])
+    assert rows is not None
+    gate_up.grouped_(
+        torch.randn(2, 8, dtype=F64), torch.zeros(2, 12, dtype=F64),
+        rows.ids, rows.scale[:, None].expand_as(rows.ids).contiguous(), 1, rows.alignment,
+    )
+    pool.commit(step, active_ctx)
+
+    assert gate_up.ran and not down.ran
+    with pytest.raises(RuntimeError, match=r"experts_down_proj.*lora_unservable"):
+        pool.check_deltas_ran("Thinker")
+
+    # lean step: expert_rows returns None and marks both deltas, compiling fullgraph w/o recompile
+    gate_up._ran = down._ran = False
+    lean_ctx = StepContext(
+        request_ids=[-1], graph_walk="decode", slot=0, capture=True, lean=frozenset({LORA_RESOURCE_KEY}),
+    )
+    pool.plan(step, lean_ctx)
+    try:
+        def fn(ids):
+            r = gate_up.expert_rows(ids, (down,))
+            return ids + 1 if r is None else r.ids
+
+        torch._dynamo.reset()
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled(topk)
+        assert gate_up.ran and down.ran
+        with torch.compiler.set_stance("fail_on_recompile"):
+            compiled(topk)
+    finally:
+        pool.commit(step, lean_ctx)
+
+    pool.check_deltas_ran("Thinker")
+
+
+@pytest.mark.parametrize("lean", [False, True])
+def test_delta_ran_mark_compiles_without_graph_break_or_recompile(adapters, lean):
+    """Setting ``_ran`` unconditionally adds no Dynamo graph break or guard, so a second
+    call inside ``fail_on_recompile`` (as graph capture runs under) does not recompile."""
+    pool = P.make_pool(adapters[1])
+    delta = pool.layer_delta("qkv", 0)
+    w = torch.randn(P.Q_OUT + 2 * P.KV_OUT, P.HIDDEN, dtype=F64)
+    x = torch.randn(4, P.HIDDEN, dtype=F64)
+    ctx = StepContext(
+        request_ids=[-1], graph_walk="decode", slot=0, capture=True,
+        lean=frozenset({pool.resource_key}) if lean else frozenset(),
+    )
+    step = P.step([-1], [4])
+    pool.plan(step, ctx)
+    try:
+        def fn(x):
+            return delta(x, torch.nn.functional.linear(x, w))
+
+        torch._dynamo.reset()
+        explained = torch._dynamo.explain(fn)(x)
+        assert explained.graph_break_count == 0 and not explained.break_reasons
+        assert delta.ran
+
+        # fresh delta: trace under Inductor, then replay under fail_on_recompile
+        delta._ran = False
+        torch._dynamo.reset()
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled(x)
+        assert delta.ran
+        with torch.compiler.set_stance("fail_on_recompile"):
+            compiled(x)
+    finally:
+        pool.commit(step, ctx)
+
+
+def test_engine_node_fully_captured_gates_post_capture_validate():
+    """Coverage gating: only nodes with whole-forward captures covering every declared
+    walk and zero dropped buckets or piecewise shapes trigger ``post_capture_validate``."""
+    from mstar.engine.engine import Engine
+
+    engine = Engine.__new__(Engine)
+    engine._node_walks = {"LLM": frozenset({"prefill_text", "decode"}), "vision": frozenset({"prefill_vision"})}
+
+    full_runner = SimpleNamespace(
+        capture_configs=[object()],
+        any_graphs=True,
+        dropped_buckets=[],
+        captured_walks=frozenset({"prefill_text", "decode", MIXED}),
+    )
+    ok_pw = SimpleNamespace(any_graphs=True, dropped_shapes=[])
+
+    # all walks captured, no drops
+    assert engine._node_fully_captured("LLM", full_runner, {})
+    assert engine._node_fully_captured("LLM", full_runner, {"region": ok_pw})
+
+    # piecewise-only node (vision tower without whole-forward capture)
+    pw_only = SimpleNamespace(capture_configs=[], any_graphs=False, dropped_buckets=[], captured_walks=frozenset())
+    assert not engine._node_fully_captured("vision", pw_only, {"block_loop": ok_pw})
+
+    # CPU / graph backend unavailable
+    no_graphs = SimpleNamespace(
+        capture_configs=[object()], any_graphs=False, dropped_buckets=[], captured_walks=frozenset(),
+    )
+    assert not engine._node_fully_captured("LLM", no_graphs, {})
+
+    # dropped whole-forward bucket
+    dropped_bucket = SimpleNamespace(
+        capture_configs=[object()], any_graphs=True,
+        dropped_buckets=[BucketKey("decode", 8, 8)],
+        captured_walks=frozenset({"prefill_text", "decode"}),
+    )
+    assert not engine._node_fully_captured("LLM", dropped_bucket, {})
+
+    # dropped piecewise shape
+    dropped_pw = SimpleNamespace(any_graphs=True, dropped_shapes=[(1, 64)])
+    assert not engine._node_fully_captured("LLM", full_runner, {"region": dropped_pw})
+
+    # unwarmed walk (prefill_text missing from captured_walks)
+    missing_walk = SimpleNamespace(
+        capture_configs=[object()], any_graphs=True, dropped_buckets=[],
+        captured_walks=frozenset({"decode"}),
+    )
+    assert not engine._node_fully_captured("LLM", missing_walk, {})
+
+    # missing walk metadata (e.g. model=None) must not pass vacuously
+    assert not engine._node_fully_captured("unknown_node", full_runner, {})

@@ -664,7 +664,7 @@ def bind_module_lora(submodule: nn.Module, resources: Mapping[str, Any]) -> None
             except Exception:
                 module.__class__ = original
                 raise
-            delta = pool.layer_delta(ref.target, ref.layer)
+            delta = pool.layer_delta(ref.target, ref.layer, module_path=path)
             if ref.param is not None:
                 module.lora_params = {**module.lora_params, ref.param: delta}
             else:

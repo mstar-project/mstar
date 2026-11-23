@@ -665,6 +665,14 @@ class Resource(ResidentHooks, ABC):
         runners by region."""
         return
 
+    def post_capture_validate(self, node: str, fully_captured: bool) -> None:
+        """Check ``node`` once its warmup captures have finished.
+
+        ``fully_captured`` is True when warmup ran whole-forward captures covering
+        every walk of ``node`` with no dropped buckets or piecewise shapes.
+        """
+        return
+
     def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec],
         max_bs: int, max_seq_len: int

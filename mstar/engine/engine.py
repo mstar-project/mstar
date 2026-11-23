@@ -706,6 +706,8 @@ class Engine:
         self._resource_nodes: dict[str, frozenset[str]] = {}
         # (node, combined walk) -> the walks whose rows a step of it runs last
         self._split_prompt_walks: dict[tuple[str, str], frozenset[str]] = {}
+        # node -> the graph walks from `model.get_graph_walk_graphs()` containing it
+        self._node_walks: dict[str, frozenset[str]] = {}
         self._submodules: dict[str, SubmoduleManagement] = {}
         self._runner: StepRunner = None
         # node -> the event after its plan stream's latest pre-plan; see
@@ -927,6 +929,11 @@ class Engine:
                 resources[loopback.sampler].enable_device_loopback_reader()
         share_slot_rotations(self._submodules.values())
         if model is not None:
+            walk_nodes = {walk: graph.get_nodes() for walk, graph in model.get_graph_walk_graphs().items()}
+            self._node_walks = {
+                node: frozenset(walk for walk, nodes in walk_nodes.items() if node in nodes)
+                for node in self._submodules
+            }
             self._check_rebuild_policies(model)
             self._check_host_fields(model)
 
@@ -1222,6 +1229,13 @@ class Engine:
             for bs, tokens in runner.dropped_shapes
         ])
 
+        for node_name, submodule_mgmt in self._submodules.items():
+            fully_captured = self._node_fully_captured(
+                node_name, ag_runners[node_name], piecewise[node_name],
+            )
+            for resource in submodule_mgmt.resources.values():
+                resource.post_capture_validate(node_name, fully_captured)
+
         # torch.compile applied after CUDA graph capture because the cuda
         # graph runner compiles internally
         self._compile_submodules({node: runner.recompile_limit for node, runner in ag_runners.items()})
@@ -1231,6 +1245,21 @@ class Engine:
 
         for resource in self._resources.values():
             resource.post_warmup_validate()
+
+    def _node_fully_captured(
+        self,
+        node_name: str,
+        runner: AcceleratorGraphRunner,
+        pw_runners: Mapping[str, PiecewiseAcceleratorGraphRunner],
+    ) -> bool:
+        """Whether warmup ran whole-forward captures covering every walk of
+        ``node_name``, with no dropped buckets or piecewise shapes."""
+        if not runner.any_graphs or runner.dropped_buckets or not getattr(runner, "capture_configs", None):
+            return False
+        if any(not pw.any_graphs or pw.dropped_shapes for pw in pw_runners.values()):
+            return False
+        walks = self._node_walks.get(node_name)
+        return bool(walks) and walks <= getattr(runner, "captured_walks", frozenset())
 
     def _plan_captures(
         self, ag_runners: dict[str, AcceleratorGraphRunner],
