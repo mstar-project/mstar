@@ -1628,3 +1628,145 @@ def test_mstar_server_exits_when_its_launcher_is_killed():
                 if time.time() > deadline:
                     raise
         time.sleep(0.1)
+
+
+def test_lone_surrogates_parity_across_rust_http_and_ws():
+    """Live Rust HTTP and WS parity for #703:
+    - JSON routes reject escaped lone surrogates with 400 invalid_request_error before submit.
+    - /generate rejects lone surrogate model_kwargs with 400 and leaves upload_dir clean.
+    - Multipart /v1/audio/transcriptions and /v1/images/edits keep literal invalid-JSON form text.
+    - /generate/ws and /v1/realtime return an error frame and keep the socket usable.
+    """
+    import io
+    import wave
+
+    pytest.importorskip("websockets")
+    import websockets.sync.client
+
+    from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
+    from mstar.api_server.rust_frontend import (
+        REALTIME_ENV,
+        TRANSCRIPTION_ENV,
+        realtime_facts,
+        transcription_facts,
+    )
+
+    class _SurrogateStub(_StubAPIServer):
+        model = None
+        max_concurrent_requests = None
+
+        def submit_request(self, *, end_input=True, file_streams=None, raw_inputs=None, **kwargs):
+            return super().submit_request(**kwargs)
+
+        async def collect_results(self, request_id, raw_request=None):
+            return [_Chunk("text", b"ok")]
+
+        def release_request(self, request_id):
+            pass
+
+    # 1. OpenAI JSON routes reject "\ud800" with 400 invalid_request_error before submit.
+    json_cases = [
+        ("bagel", "/v1/chat/completions", b'{"model":"bagel","messages":[{"role":"user","content":"\\ud800"}]}'),
+        ("orpheus", "/v1/audio/speech", b'{"model":"orpheus","input":"\\ud800","voice":"tara"}'),
+        ("cosmos3", "/v1/images/generations", b'{"model":"cosmos3","prompt":"\\ud800"}'),
+        ("cosmos3", "/v1/videos/generations", b'{"model":"cosmos3","prompt":"\\ud800"}'),
+    ]
+    for model, path, payload in json_cases:
+        stub = _SurrogateStub()
+        with _model_stack(model, stub) as (port, _upload):
+            code, body = _post_raw(port, path, payload)
+        assert code == 400, (path, code, body)
+        assert body["error"]["type"] == "invalid_request_error", (path, body)
+        assert body["error"]["code"] == 400, (path, body)
+        assert body["error"]["message"], (path, body)
+        assert stub.submitted == [], (path, stub.submitted)
+
+    # 2. /generate with lone surrogate model_kwargs + file upload -> 400, no submit, clean upload_dir.
+    stub = _SurrogateStub()
+    with _model_stack("qwen3_omni", stub) as (port, upload_dir):
+        body_bytes, ctype = _multipart(
+            {"text": "hi", "model_kwargs": '{"ref_text":"\\ud800"}'},
+            [("a.png", b"\x89PNG-a")],
+        )
+        code, body = _post_raw(port, "/generate", body_bytes, content_type=ctype)
+        assert code == 400, (code, body)
+        assert stub.submitted == []
+        assert list(Path(upload_dir).iterdir()) == []
+
+    # 3. Multipart /v1/audio/transcriptions and /v1/images/edits keep literal text passthrough.
+    wav_buf = io.BytesIO()
+    with wave.open(wav_buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(b"\x01\x00" * 8000)
+    wav_bytes = wav_buf.getvalue()
+
+    literal_surrogate = '"\\ud800"'
+    stub = _SurrogateStub()
+    tx_env = {TRANSCRIPTION_ENV: json.dumps(transcription_facts(stub, ADAPTER_REGISTRY["whisper_large"]))}
+    with _model_stack("whisper_large", stub, env=tx_env) as (port, _upload):
+        boundary = "----mstartxsurrogate"
+        tx_body = (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper_large\r\n'
+            f'--{boundary}\r\nContent-Disposition: form-data; name="instructions"\r\n\r\n{literal_surrogate}\r\n'
+            f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="clip.wav"\r\n'
+            f"Content-Type: audio/wav\r\n\r\n"
+        ).encode() + wav_bytes + f"\r\n--{boundary}--\r\n".encode()
+        code, body = _post_raw(
+            port, "/v1/audio/transcriptions", tx_body, content_type=f"multipart/form-data; boundary={boundary}",
+        )
+        assert code == 200, (code, body)
+        assert stub.submitted[-1]["mk"]["instructions"] == literal_surrogate
+
+    stub = _SurrogateStub()
+    with _model_stack("bagel", stub) as (port, _upload):
+        boundary = "----mstarimgsurrogate"
+        ed_body = (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="prompt"\r\n\r\nmake it neon\r\n'
+            f'--{boundary}\r\nContent-Disposition: form-data; name="instructions"\r\n\r\n{literal_surrogate}\r\n'
+            f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="in.png"\r\n'
+            f"Content-Type: image/png\r\n\r\n"
+        ).encode() + b"\x89PNGinput\r\n" + f"--{boundary}--\r\n".encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/images/edits",
+            data=ed_body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            assert r.status == 200
+        assert stub.submitted[-1]["mk"]["instructions"] == literal_surrogate
+
+    # 4. WS /generate/ws and /v1/realtime?intent=transcription return error and stay usable.
+    stub = _SurrogateStub()
+    with _model_stack("qwen3_omni", stub) as (port, _upload):
+        with websockets.sync.client.connect(f"ws://127.0.0.1:{port}/generate/ws") as ws:
+            ws.send('{"text":"\\ud800","request_id":"bad"}')
+            err_frame = json.loads(ws.recv(timeout=15))
+            assert "error" in err_frame, err_frame
+            ws.send('{"text":"hello","request_id":"good","output_modalities":["text"]}')
+            replies = []
+            while True:
+                msg = json.loads(ws.recv(timeout=15))
+                replies.append(msg)
+                if msg.get("finish"):
+                    break
+            assert replies[-1] == {"request_id": "good", "finish": True}
+            assert [s["rid"] for s in stub.submitted] == ["good"]
+
+    stub = _SurrogateStub()
+    rt_dir = tempfile.mkdtemp(prefix="mstar_rf_rt_")
+    rt_env = {
+        TRANSCRIPTION_ENV: json.dumps(transcription_facts(stub, ADAPTER_REGISTRY["qwen3_asr"])),
+        REALTIME_ENV: json.dumps(realtime_facts(stub, ADAPTER_REGISTRY["qwen3_asr"], rt_dir)),
+    }
+    with _model_stack("qwen3_asr", stub, env=rt_env) as (port, _upload):
+        with websockets.sync.client.connect(f"ws://127.0.0.1:{port}/v1/realtime?intent=transcription") as ws:
+            created = json.loads(ws.recv(timeout=15))
+            assert created["type"] == "transcription_session.created", created
+            ws.send('{"type":"transcription_session.update","session":{"prompt":"\\ud800"}}')
+            err_ev = json.loads(ws.recv(timeout=15))
+            assert err_ev["type"] == "error", err_ev
+            ws.send('{"type":"transcription_session.update","session":{"prompt":"ok"}}')
+            updated = json.loads(ws.recv(timeout=15))
+            assert updated["type"] == "transcription_session.updated", updated
