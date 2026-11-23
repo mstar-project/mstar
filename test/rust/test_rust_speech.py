@@ -217,10 +217,10 @@ SPEECH_CASES = {
     "unchunked": {"input": LONG, "seed": 5, "sentence_chunking": False},
     "forced-short": {"input": "  Hello there.  ", "sentence_chunking": True, "seed": 1},
     "forced-cjk": {"input": "海は広い。" * 90 + "Done!", "sentence_chunking": True},
-    # U+0897 sits on an even cut, and it is a mark to the Unicode tables the
-    # `regex` crate carries but unassigned to the interpreter's: the two
-    # frontends cut here in the same place only while both read the
-    # interpreter's (see rust/server/src/unicode_marks.rs)
+    # U+0897 sits on an even cut: it is a mark in newer Unicode tables (e.g.
+    # the `regex` crate or newer Python interpreters) but unassigned in the
+    # pinned UCD 15.0.0 table that both frontends read (see
+    # mstar/api_server/openai/unicode_marks.py and rust/server/src/unicode_marks.rs).
     "mark-on-an-even-cut": {"input": "a" * 267 + "\u0897" + "b" * 533, "sentence_chunking": True},
     # OpenAI's own streaming switch, which its SDK (and so LiveKit's TTS
     # plugin) sends instead of ``stream``: it streams on its own, and ``"sse"``
