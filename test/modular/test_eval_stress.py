@@ -209,6 +209,15 @@ async def generate(request):
     if MODE == "sequential":
         while rid in live:
             await asyncio.sleep(0.001)
+    if MODE == "http_409_cascade" and (rid in live or rid in last):
+        return web.Response(status=409, text="request superseded")
+    if MODE == "http_409":
+        for _ in range(15):
+            if rid not in live:
+                break
+            await asyncio.sleep(0.002)
+        if rid in live:
+            return web.Response(status=409, text="request superseded")
     if rid in live and MODE != "accept_twice":
         # a newer submission supersedes the live one, which ends with an in-band 409
         live[rid]["superseded"] = True
@@ -235,7 +244,11 @@ async def generate(request):
                 raise ConnectionResetError
             await asyncio.sleep(0.02)
         for w in reply.split():
-            await asyncio.sleep(0.003)
+            if MODE in ("http_409", "http_409_cascade") and (
+                request.transport is None or request.transport.is_closing()
+            ):
+                break
+            await asyncio.sleep(0.015 if MODE == "http_409" else 0.003)
             if me["superseded"]:
                 await resp.write(line("request superseded", "error", status=409))
                 break
@@ -367,6 +380,23 @@ def test_sequential_reuse_is_not_a_failed_overlap(tmp_path, monkeypatch):
     v, md, code = run_pair(tmp_path, monkeypatch, "sequential", runs=2)
     assert code == 0 and not v.flagged, (v.head.runs, md)
     assert v.head.with_class("accepted_twice") == 0
+
+
+def test_synchronous_http_409_overlap_passes(tmp_path, monkeypatch):
+    v, md, code = run_pair(tmp_path, monkeypatch, "http_409", runs=2)
+    assert code == 0 and not v.flagged, (v.head.runs, md)
+    assert v.head.failed == 0
+    res = v.head.results()
+    assert res["conflict"] > 0 and res["ok"] > 0 and not res.get("accepted_twice")
+
+
+def test_spurious_http_409_cascade_is_flagged(tmp_path, monkeypatch):
+    v, md, code = run_pair(tmp_path, monkeypatch, "http_409_cascade", runs=4)
+    assert code == 1 and v.flagged, (v.head.runs, md)
+    assert v.base.failed == 0 and v.head.with_class("error") == 4
+    assert all(r["classes"] == ["error"] for r in v.head.runs)
+    assert any(r["by_pattern"].get(p, {}).get("error", 0) > 0 for r in v.head.runs for p in ("reuse", "retry"))
+    assert "**1 of 1 models flagged**" in md
 
 
 @pytest.mark.parametrize("mode, runs, outright, cls", [
