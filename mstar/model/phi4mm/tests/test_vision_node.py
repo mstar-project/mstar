@@ -15,6 +15,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from mstar.engine.resources.attn.ragged.config import RaggedAttnBackend
+from mstar.engine.state.adapters import build_specs
 from mstar.model.keys import VISION_ATTN
 from mstar.model.multimodal import MEDIA_LAYOUT
 from mstar.model.phi4mm.components.vision import (
@@ -23,15 +25,17 @@ from mstar.model.phi4mm.components.vision import (
     Phi4MMVisionModel,
     unused_weight,
 )
+from mstar.model.phi4mm.tests._state import bind_vision, vision_step
 from mstar.model.phi4mm.vision import (
     GLOBAL_PIXEL_VALUES,
     PIXEL_VALUES,
     VISION_OUTPUT,
     Phi4MMVisionEncoderSubmodule,
     image_intake,
-    vision_resources,
+    vision_array,
+    vision_kernel_settings,
 )
-from mstar.model.submodule_base import ModelInputsFromEngine
+from mstar.model.submodule_base import ModelInputsFromEngine, engine_step
 
 TINY = Phi4MMVisionConfig(
     hidden_size=32, intermediate_size=48, num_attention_heads=2, num_hidden_layers=3,
@@ -78,7 +82,7 @@ def _model() -> Phi4MMVisionModel:
 def _node(model) -> tuple[Phi4MMVisionEncoderSubmodule, SegmentSDPA]:
     node = Phi4MMVisionEncoderSubmodule(model, TINY)
     attn = SegmentSDPA()
-    node.bind_node_resources({VISION_ATTN: attn})
+    bind_vision(node, attn)
     return node, attn
 
 
@@ -106,10 +110,9 @@ def _run(node, attn, requests):
             PIXEL_VALUES: [p.inputs[PIXEL_VALUES] for p in prepared],
             GLOBAL_PIXEL_VALUES: [p.inputs[GLOBAL_PIXEL_VALUES] for p in prepared],
         }))
-    step = node.declare_step("prefill_vision", rids, inputs)
-    attn.plan(step.get(VISION_ATTN))
     engine = ModelInputsFromEngine(request_ids=rids, per_request_info=infos)
-    with torch.no_grad():
+    with vision_step(node, rids, inputs) as step, torch.no_grad():
+        attn.plan(step.get(VISION_ATTN))
         out = node.forward_batched("prefill_vision", engine, **node.preprocess("prefill_vision", engine, inputs))
     return [out[rid][VISION_OUTPUT][0] for rid in rids]
 
@@ -201,7 +204,7 @@ def test_the_node_declares_a_segment_per_crop_and_global_view():
     # a 2 x 2 grid of 4 x 4-patch crops, 5 of 8 patch rows valid: the bottom crops keep one row
     assert images[0].grids == [(2, 2, 5, 8)]
     assert inp.resource_step_info == {"main": [16, 16, 16, 4, 4]} and inp.input_seq_len == 56
-    step = node.declare_step("prefill_vision", ["r0"], [inp])
+    step = engine_step(node, graph_walk="prefill_vision", request_ids=["r0"], inputs=[inp])
     assert [s.span for s in step.get(VISION_ATTN).segments] == [16, 16, 16, 4, 4]
     assert step.get(VISION_ATTN).causal is False
     with pytest.raises(ValueError, match="crops for its grid"):
@@ -211,11 +214,13 @@ def test_the_node_declares_a_segment_per_crop_and_global_view():
         })
 
 
-def test_vision_resources():
-    (spec,) = vision_resources(Phi4MMVisionConfig())
+def test_the_vision_read_builds_its_ragged_spec():
+    config = Phi4MMVisionConfig()
+    (spec,) = build_specs([vision_array(config)], kernel_settings={VISION_ATTN: vision_kernel_settings(config)})
     assert spec.resource_key == VISION_ATTN and spec.nodes == {"vision_encoder"}
     assert (spec.config.num_qo_heads, spec.config.head_dim) == (16, 72)
     assert spec.config.max_segments_per_step == Phi4MMVisionEncoderSubmodule.MAX_BATCH_SIZE * 37
+    assert spec.config.backend is RaggedAttnBackend.DENSE, "FlashInfer would pad the tower's head_dim to 128"
 
 
 def test_the_loader_skips_what_the_feature_tap_never_reads():
