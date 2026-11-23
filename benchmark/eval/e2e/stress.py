@@ -9,8 +9,9 @@ cycles through five patterns (one per client per round, mixed across clients):
   reuse      read a reply to the end, then send again under the same id and read that to the end
   overlap    send a second request under the id while the first is streaming: one of the pair should get a 409
 
-A run fails on a hang (no progress for ``hang_s``), an HTTP 5xx, unexpected 4xx, empty reply or in-band error, a
-cross-talk (a reply holding another prompt's answer: each prompt's answer has a signature, such as three
+A run fails on a hang (no progress for ``hang_s``), an HTTP 5xx, unexpected 4xx, empty reply or in-band error,
+overlapping text replies under one id, or cross-talk (a reply holding another prompt's answer: each prompt's answer
+has a signature, such as three
 consecutive integers or two weekday names), a leak (the server's own M* tensor files in ``/dev/shm`` still above
 the post-warm-up count ``settle_s`` after the run) or a crash (a process of the server's group exits). Every request
 under one id asks a different prompt, so cross-talk within an id (a retry receiving its predecessor's tail) shows up
@@ -38,9 +39,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 PATTERNS = ("barge_in", "drop", "retry", "reuse", "overlap")
-CLASSES = ("hang", "error", "crosstalk", "leak", "crash")
+CLASSES = ("hang", "error", "accepted_twice", "crosstalk", "leak", "crash")
 OUTRIGHT = ("crash", "crosstalk")
-FAILED_REQUEST = ("hang", "error", "crosstalk")
+FAILED_REQUEST = ("hang", "error", "accepted_twice", "crosstalk")
 ALPHA = 0.05
 PER_SERVER = 5          # runs per server session: a fresh server every 5 runs
 CAP_HANGS = 4           # a request still streaming after this many hang_s is a hang (max_tokens bounds a reply)
@@ -68,6 +69,8 @@ class Reply:
     error_status: int | None = None
     hang: bool = False
     closed: bool = False       # the client closed it on purpose (barge-in, drop, retry's first half)
+    first_text_at: float | None = None
+    last_text_at: float | None = None
     result: str = ""
 
 
@@ -145,6 +148,16 @@ def judge(r: Reply, refs: Refs, expect_conflict: bool = False) -> str:
     return "ok" if refs.matches(r.text, r.prompt) else "unmatched"
 
 
+def classify_overlap(a: Reply, b: Reply) -> None:
+    """Count two successful streams only when their text arrived interleaved."""
+    if a.result == b.result == "conflict":
+        b.result = "error"  # one of the pair must be served
+    elif (a.result in ("ok", "unmatched") and b.result in ("ok", "unmatched")
+          and a.last_text_at is not None and b.first_text_at is not None
+          and b.first_text_at < a.last_text_at):
+        b.result = "accepted_twice"
+
+
 async def send(session, url: str, rid: str, prompt: int, cfg: dict, *, stop_after: int | None = None,
                drop: bool = False, started: asyncio.Event | None = None) -> Reply:
     """POST /generate (streamed NDJSON) under ``rid``. No text or end for ``hang_s``, or no end after
@@ -192,6 +205,9 @@ async def send(session, url: str, rid: str, prompt: int, cfg: dict, *, stop_afte
                 r.text += _b64(msg.get("data"))
                 r.chunks += 1
                 last = time.monotonic()
+                if r.first_text_at is None:
+                    r.first_text_at = last
+                r.last_text_at = last
                 if started is not None:
                     started.set()
                 if stop_after is not None and r.chunks >= stop_after:
@@ -269,10 +285,7 @@ class Client:
                     a_task.cancel()
                     await asyncio.gather(a_task, return_exceptions=True)
             a.result, b.result = judge(a, refs, True), judge(b, refs, True)
-            if a.result == b.result == "conflict":
-                b.result = "error"        # one of the pair must be served
-            elif "conflict" not in (a.result, b.result) and b.result in ("ok", "unmatched"):
-                b.result = "accepted_twice"
+            classify_overlap(a, b)
             self.record(pattern, a)
             self.record(pattern, b)
 
@@ -612,28 +625,27 @@ class Verdict:
 
     @property
     def flagged(self) -> bool:
-        return bool(self.outright) or (self.p is not None and self.p < ALPHA)
+        return not self.unfinished and (bool(self.outright) or (self.p is not None and self.p < ALPHA))
 
     def text(self) -> str:
-        if self.outright:
-            return f"**FAIL** ({' and '.join(self.outright)} only on head)"
-        if self.p is not None and self.p < ALPHA:
-            return f"**FAIL** (more failed runs, p = {self.p:.3f})"
         if self.unfinished:
             if self.status != "done":
                 return f"incomplete ({self.reason or self.status})"
             if any(r.get("no_server") for r in self.base.runs):
                 return "incomplete (base did not start)"
             return f"incomplete ({min(self.base.n, self.head.n)} of {self.expected} runs)"
+        if self.outright:
+            return f"**FAIL** ({' and '.join(self.outright)} only on head)"
+        if self.p is not None and self.p < ALPHA:
+            return f"**FAIL** (more failed runs, p = {self.p:.3f})"
         return "same"
 
 
 def judge_model(model: str, base: Arm, head: Arm, status: str = "done", reason: str = "",
                 expected: int = 0) -> Verdict:
     v = Verdict(model, base, head, status, reason, expected=expected)
-    if base.n and head.n and not any(r.get("no_server") for r in base.runs):   # an unseen base: no outright
-        v.outright = [c for c in OUTRIGHT if head.with_class(c) and not base.with_class(c)]
     if not v.unfinished:
+        v.outright = [c for c in OUTRIGHT if head.with_class(c) and not base.with_class(c)]
         v.p = fisher_one_sided(head.failed, head.n, base.failed, base.n)
     return v
 
@@ -698,8 +710,8 @@ def render_md(verdicts: list[Verdict], run: dict, chart_url: str | None = None) 
                 lines.append(f"| {v.model} | {name} | {pat} | "
                              f"{', '.join(f'{k} {n}' for k, n in sorted(c.items()))} |")
     lines += ["", "Outcomes: ok, closed (closed by the client on purpose), conflict (the 409 an overlap expects), "
-              "accepted_twice (both overlapping requests served, reported only), unmatched (own reply not "
-              "recognised, reported only); hang, error and crosstalk fail the run.", "", "</details>", "",
+              "accepted_twice (text from both same-id replies overlapped and fails the run), unmatched (own reply "
+              "not recognised, reported only); hang, error and crosstalk also fail the run.", "", "</details>", "",
               "<details>", "<summary>Runs</summary>", "", "| Model | Arm | Run | Server session | Requests | Classes "
               "| Examples |", "|---|---|---|---|---|---|---|"]
     for v in verdicts:
@@ -713,7 +725,8 @@ def render_md(verdicts: list[Verdict], run: dict, chart_url: str | None = None) 
               f"- base: {base['label']} (`{base['sha'][:9]}`), head: {head['label']} (`{head['sha'][:9]}`)",
               f"- Command: `{run.get('command', 'python -m benchmark.eval compare --stress')}`",
               f"- A run fails on a hang (no progress for {cfg['hang_s']:g} s), an HTTP 5xx, unexpected 4xx, empty "
-              "reply or in-band error, cross-talk (a reply holding another prompt's answer), a leak (the server's "
+              "reply or in-band error, overlapping text replies under one id, cross-talk (a reply holding another "
+              "prompt's answer), a leak (the server's "
               f"own M\\* tensor files in /dev/shm above the post-warm-up count {cfg['settle_s']:g} s after the run; "
               "other servers' files on the host are not counted) or a crash (a "
               "server process exits); runs a crash or a server that did not start left unrun count as failed",
