@@ -1254,12 +1254,12 @@ class Engine:
     ) -> bool:
         """Whether warmup ran whole-forward captures covering every walk of
         ``node_name``, with no dropped buckets or piecewise shapes."""
-        if not runner.capture_configs or not runner.any_graphs or runner.dropped_buckets:
+        if not runner.any_graphs or runner.dropped_buckets or not getattr(runner, "capture_configs", None):
             return False
         if any(not pw.any_graphs or pw.dropped_shapes for pw in pw_runners.values()):
             return False
         walks = self._node_walks.get(node_name)
-        return bool(walks) and walks <= runner.captured_walks
+        return bool(walks) and walks <= getattr(runner, "captured_walks", frozenset())
 
     def _plan_captures(
         self, ag_runners: dict[str, AcceleratorGraphRunner],
