@@ -58,7 +58,8 @@ from mstar.model.components.request_kwargs import (
     GREEDY_SAMPLING,
     SAMPLING_KEYS,
     checked_request_kwargs,
-    sampler_capabilities,
+    sample_settings,
+    sampler_flags,
     sampling_config,
     sampling_defaults,
 )
@@ -173,7 +174,6 @@ class CanaryQwenModel(Model):
 
     def declare_state(self) -> list[Array | Sampler]:
         llm = self.config.llm
-        capabilities = sampler_capabilities(self.sampling_defaults)
         return [
             Array(
                 KV_CACHE, nodes={"llm"}, layers=frozenset(range(llm.num_hidden_layers)),
@@ -183,7 +183,7 @@ class CanaryQwenModel(Model):
             ),
             Sampler(
                 SAMPLER, nodes={"llm"}, vocab_size=llm.vocab_size,
-                penalty=capabilities["enable_repetition_penalty"], min_p=capabilities["enable_min_p"],
+                **sampler_flags(self.sampling_defaults),
             ),
         ]
 
@@ -198,8 +198,7 @@ class CanaryQwenModel(Model):
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, SampleSettings]:
         del input_modalities, output_modalities
-        config = sampling_config(self.sampling_defaults, model_kwargs)
-        return {SAMPLER: SampleSettings(**{key: getattr(config, key) for key in SAMPLING_KEYS})}
+        return {SAMPLER: sample_settings(sampling_config(self.sampling_defaults, model_kwargs))}
 
     def request_kwargs(self) -> frozenset[str]:
         return frozenset({"instruction", "language", "max_output_tokens", *SAMPLING_KEYS})
