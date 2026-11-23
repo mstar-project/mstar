@@ -1279,7 +1279,9 @@ mod tests {
     /// Fetch into a fresh upload dir; a failed fetch must leave nothing behind.
     fn fetch(url: &str, policy: &RemotePolicy) -> Result<(String, Vec<u8>), String> {
         let dir = std::env::temp_dir().join(format!("mstar-remote-{}", Uuid::new_v4()));
-        let out = save_remote_url(url, &dir, policy).map(|(m, p)| (m, std::fs::read(p).unwrap()));
+        let slots = Semaphore::new(8);
+        let out = save_remote_url_bounded(url, &dir, policy, &slots)
+            .map(|(m, p)| (m, std::fs::read(p).unwrap()));
         if out.is_err() {
             let left = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
             assert_eq!(left, 0, "upload left behind");
@@ -1536,7 +1538,13 @@ mod tests {
         let (port, _) = serve();
         let occupied = std::env::temp_dir().join(format!("mstar-remote-{}", Uuid::new_v4()));
         std::fs::write(&occupied, b"not a directory").unwrap();
-        let out = save_remote_url(&format!("http://127.0.0.1:{port}/a.png"), &occupied, &local());
+        let slots = Semaphore::new(8);
+        let out = save_remote_url_bounded(
+            &format!("http://127.0.0.1:{port}/a.png"),
+            &occupied,
+            &local(),
+            &slots,
+        );
         let _ = std::fs::remove_file(&occupied);
         assert_eq!(out.unwrap_err(), "remote media fetch failed: could not save the file");
     }
