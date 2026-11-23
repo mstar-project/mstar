@@ -38,6 +38,144 @@ def test_code2wav_autotunes_only_during_its_capture():
     assert Code2WavSubmodule.capture_cudnn_benchmark is True
 
 
+@pytest.mark.parametrize("before", [False, True])
+def test_create_code2wav_submodule_preserves_cudnn_benchmark(monkeypatch, torch_flag, before):
+    import mstar.model.utils as model_utils
+    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+
+    torch_flag(torch.backends.cudnn, "benchmark", before)
+    tiny = Code2WavConfig(
+        codebook_size=64, hidden_size=32, num_hidden_layers=1, num_attention_heads=2,
+        num_key_value_heads=2, intermediate_size=64, decoder_dim=96,
+    )
+    model = Qwen3OmniModel.__new__(Qwen3OmniModel)
+    model.config = Qwen3OmniModelConfig(code2wav=tiny)
+    model.local_dir = ""
+
+    monkeypatch.setattr(model_utils, "load_weights_from_hf_shards", lambda **kwargs: None)
+    monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: fn)
+
+    submodule = model._create_code2wav_submodule("cpu")
+    assert isinstance(submodule, Code2WavSubmodule)
+    assert submodule.capture_cudnn_benchmark is True
+    assert torch.backends.cudnn.benchmark is before
+
+
+def test_code2wav_engine_lifecycle_autotunes_only_during_capture_sizing(monkeypatch, torch_flag):
+    from mstar.conductor.request_info import CurrentForwardPassInfo
+    from mstar.distributed.communication import CommGroup, JointGroups
+    from mstar.engine.engine import Engine, ExecutingBatch
+    from mstar.engine.resources import StepContext
+    from mstar.model.submodule_base import NodeInputs, NodeSubmodule
+
+    recorded: list[tuple[str, bool]] = []
+
+    class _RecordingVocoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+        def forward(self, codes: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+            recorded.append(("code2wav_forward", torch.backends.cudnn.benchmark))
+            return torch.zeros((codes.shape[0], 1, codes.shape[-1] * UPSAMPLE - 555))
+
+    class _Peer(NodeSubmodule):
+        disable_autocast = True
+
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(()))
+
+        def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs):
+            return NodeInputs(tensor_inputs={"x": inputs["x"][0]}, input_seq_len=1)
+
+        def forward(self, graph_walk, engine_inputs, x, **kwargs):
+            recorded.append(("peer_forward", torch.backends.cudnn.benchmark))
+            return {"y": [x]}
+
+    class _Groups:
+        def get_joint_group_for_node(self, node):
+            return JointGroups(CommGroup.trivial(), CommGroup.trivial(), CommGroup.trivial())
+
+        def get_instance_world_size_for_node(self, node):
+            return 1
+
+        def get_instance_rank_for_node(self, node):
+            return 0
+
+    class _Sizer:
+        def __init__(self, name: str, run_sample=None):
+            self.name = name
+            self.run_sample = run_sample
+
+        def size_captures(self):
+            recorded.append((f"{self.name}_size", torch.backends.cudnn.benchmark))
+            if self.run_sample is not None:
+                self.run_sample()
+            return {}
+
+        def size_lent_captures(self, wanted):
+            recorded.append((f"{self.name}_lent", torch.backends.cudnn.benchmark))
+            return {}
+
+    torch_flag(torch.backends.cudnn, "benchmark", False)
+    code2wav_sub = Code2WavSubmodule(_RecordingVocoder(), Qwen3OmniModelConfig())
+    peer_sub = _Peer()
+    assert code2wav_sub.capture_cudnn_benchmark is True
+    assert peer_sub.capture_cudnn_benchmark is False
+
+    engine = Engine(None, autocast_dtype=None)
+    engine.load_model(
+        submodules={"Code2Wav": code2wav_sub, "Peer": peer_sub},
+        specs=[], parallel_groups=_Groups(), device=torch.device("cpu"), transfer_engine_info=None,
+    )
+    engine.warmup()
+    assert torch.backends.cudnn.benchmark is False
+
+    def run_code2wav_sample():
+        codes = torch.zeros((1, 16, code2wav_sub.full_seqlen), dtype=torch.long)
+        pos = torch.arange(code2wav_sub.full_seqlen).unsqueeze(0)
+        code2wav_sub.forward_batched(
+            "code2wav_chunk", SimpleNamespace(request_ids=["warm"]), codec_tokens=codes, position_ids=pos,
+        )
+
+    monkeypatch.setattr(engine, "_device", torch.device("cuda"))
+    monkeypatch.setattr(engine, "_gpu_memory_fraction", None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (1 << 30, 1 << 31))
+    engine._plan_captures(
+        {"Code2Wav": _Sizer("Code2Wav", run_code2wav_sample), "Peer": _Sizer("Peer")},
+        {"Code2Wav": {}, "Peer": {}},
+    )
+    assert torch.backends.cudnn.benchmark is False
+    assert recorded == [
+        ("Code2Wav_size", True),
+        ("code2wav_forward", True),
+        ("Peer_size", False),
+        ("Code2Wav_lent", True),
+        ("Peer_lent", False),
+    ]
+
+    monkeypatch.setattr(engine, "_device", torch.device("cpu"))
+    batch = ExecutingBatch(
+        node_name="Code2Wav",
+        per_request_info={0: CurrentForwardPassInfo(
+            request_id="r0", rid_handle=0, graph_walk="code2wav_chunk",
+            fwd_index=0, random_seed=0, max_tokens=1,
+        )},
+        step_context=StepContext(request_ids=(0,), graph_walk="code2wav_chunk", slot=0, capture=False),
+        per_request_input_tensors={0: {"codec_tokens": [torch.zeros((12, 16), dtype=torch.long)]}},
+        per_request_input_metadata={0: InputMetadata(stream_chunks={
+            "codec_tokens": StreamChunkInfo(start_offset=0, context_items=0, num_items=12, is_final=True),
+        })},
+    )
+    engine.prepare_inputs(batch)
+    out = engine.exec_and_postprocess(batch)
+    assert out.get(0)["audio_chunk"][0].numel() == 12 * UPSAMPLE - 555
+    assert recorded[-1] == ("code2wav_forward", False)
+    assert torch.backends.cudnn.benchmark is False
+
+
 def _to_pcm(wav: torch.Tensor) -> torch.Tensor:
     """The submodule's float -> int16 conversion."""
     return (wav.clamp(-1, 1) * 32767).to(torch.int16)

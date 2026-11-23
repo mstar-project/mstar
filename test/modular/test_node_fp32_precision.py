@@ -9,6 +9,7 @@ inside the forward, so they fail on a build whose engine ignores the setting.
 """
 import ast
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,20 +21,87 @@ sys.path.insert(0, ".")
 import mstar.engine.engine as engine_module  # noqa: E402
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.distributed.communication import CommGroup, JointGroups  # noqa: E402
+from mstar.engine.accelerator_graph_runner import CaptureCost  # noqa: E402
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.fp32_precision import native_convolutions  # noqa: E402
-from mstar.engine.resources import StepContext  # noqa: E402
+from mstar.engine.resources import BucketKey, StepContext  # noqa: E402
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule  # noqa: E402
 
 WALK = "run"
 
 
-def test_native_convolutions_restores_cudnn_after_failure():
-    before = torch.backends.cudnn.enabled
+@pytest.mark.parametrize("before", [False, True])
+def test_native_convolutions_restores_cudnn_after_failure(before, torch_flag):
+    torch_flag(torch.backends.cudnn, "enabled", before)
+    with native_convolutions():
+        assert torch.backends.cudnn.enabled is False
+    assert torch.backends.cudnn.enabled is before
     with pytest.raises(RuntimeError, match="failed"), native_convolutions():
         assert torch.backends.cudnn.enabled is False
         raise RuntimeError("failed")
-    assert torch.backends.cudnn.enabled == before
+    assert torch.backends.cudnn.enabled is before
+
+
+@pytest.mark.parametrize("before", [False, True])
+def test_native_convolutions_reentrant_nesting(before, torch_flag):
+    torch_flag(torch.backends.cudnn, "enabled", before)
+    with native_convolutions():
+        assert torch.backends.cudnn.enabled is False
+        with native_convolutions():
+            assert torch.backends.cudnn.enabled is False
+        assert torch.backends.cudnn.enabled is False
+        with pytest.raises(RuntimeError, match="inner"), native_convolutions():
+            assert torch.backends.cudnn.enabled is False
+            raise RuntimeError("inner")
+        assert torch.backends.cudnn.enabled is False
+    assert torch.backends.cudnn.enabled is before
+
+
+def test_native_convolutions_exception_while_peer_active(torch_flag):
+    torch_flag(torch.backends.cudnn, "enabled", True)
+    peer_entered = threading.Event()
+    peer_release = threading.Event()
+    peer_errors: list[BaseException] = []
+
+    def peer():
+        try:
+            with native_convolutions():
+                assert torch.backends.cudnn.enabled is False
+                peer_entered.set()
+                assert peer_release.wait(timeout=5.0)
+                assert torch.backends.cudnn.enabled is False
+        except BaseException as exc:
+            peer_errors.append(exc)
+            peer_entered.set()
+
+    thread = threading.Thread(target=peer, daemon=True)
+    thread.start()
+    try:
+        assert peer_entered.wait(timeout=5.0)
+        assert not peer_errors
+        assert torch.backends.cudnn.enabled is False
+        with pytest.raises(RuntimeError, match="boom"), native_convolutions():
+            assert torch.backends.cudnn.enabled is False
+            raise RuntimeError("boom")
+        assert torch.backends.cudnn.enabled is False
+    finally:
+        peer_release.set()
+        thread.join(timeout=5.0)
+    assert not peer_errors
+    assert torch.backends.cudnn.enabled is True
+
+
+def test_native_convolutions_preserves_tf32_and_benchmark(torch_flag):
+    torch_flag(torch.backends.cudnn, "enabled", True)
+    torch_flag(torch.backends.cudnn, "allow_tf32", False)
+    torch_flag(torch.backends.cudnn, "benchmark", True)
+    with native_convolutions():
+        assert torch.backends.cudnn.enabled is False
+        assert torch.backends.cudnn.allow_tf32 is False
+        assert torch.backends.cudnn.benchmark is True
+    assert torch.backends.cudnn.enabled is True
+    assert torch.backends.cudnn.allow_tf32 is False
+    assert torch.backends.cudnn.benchmark is True
 
 
 def test_model_code_does_not_set_process_wide_cudnn_benchmark():
@@ -42,6 +110,15 @@ def test_model_code_does_not_set_process_wide_cudnn_benchmark():
     for path in model_dir.rglob("*.py"):
         tree = ast.parse(path.read_text(), filename=str(path))
         for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "flags"
+                    and ast.unparse(node.func.value).endswith("cudnn")
+                    and (len(node.args) >= 2 or any(kw.arg == "benchmark" for kw in node.keywords))
+                ):
+                    writes.append(f"{path.relative_to(model_dir)}:{node.lineno}")
+                continue
             if isinstance(node, ast.Assign):
                 targets = node.targets
             elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
@@ -441,12 +518,15 @@ def test_cudnn_benchmark_is_scoped(before, torch_flag) -> None:
     assert torch.backends.cudnn.benchmark is before
 
 
-def test_capture_cudnn_benchmark_covers_sizing_only(monkeypatch):
+@pytest.mark.parametrize("before", [False, True])
+@pytest.mark.parametrize("short", [False, True])
+def test_capture_cudnn_benchmark_covers_sizing_only(monkeypatch, torch_flag, before, short):
     """``capture_cudnn_benchmark`` turns cuDNN's algorithm search on around the
     node's capture sizing, which runs its warm-up forwards (the capture after
     it runs none): another node's sizing and every eager step keep the process
     setting, so a new eager shape never searches."""
     seen: list[tuple[str, bool]] = []
+    lent_wanted: list[bool] = []
 
     class _Tuned(_Recorder):
         capture_cudnn_benchmark = True
@@ -462,12 +542,16 @@ def test_capture_cudnn_benchmark_covers_sizing_only(monkeypatch):
         def size_captures(self):
             torch.nn.functional.conv1d(torch.ones(1, 1, 8), torch.ones(1, 1, 3))
             seen.append((self.label, torch.backends.cudnn.benchmark))
+            if short and self.label == "tuned":
+                return {BucketKey(WALK, None, 1, 1): CaptureCost(peak=0, kept=0, graph=1 << 31, slots=1)}
             return {}
 
         def size_lent_captures(self, wanted):
+            lent_wanted.append(wanted)
+            seen.append((f"{self.label}/lent", torch.backends.cudnn.benchmark))
             return {}
 
-    monkeypatch.setattr(torch.backends.cudnn, "benchmark", False)
+    torch_flag(torch.backends.cudnn, "benchmark", before)
     engine = _engine({"tuned": _Tuned(), "plain": _Recorder()})
     monkeypatch.setattr(engine, "_device", torch.device("cuda"))
     monkeypatch.setattr(engine, "_gpu_memory_fraction", None)
@@ -477,11 +561,51 @@ def test_capture_cudnn_benchmark_covers_sizing_only(monkeypatch):
         {node: _Sizer(node) for node in ("tuned", "plain")},
         {node: {"blocks": _Sizer(f"{node}/region")} for node in ("tuned", "plain")},
     )
-    assert seen == [("tuned", True), ("tuned/region", True), ("plain", False), ("plain/region", False)]
-    assert torch.backends.cudnn.benchmark is False
+    assert lent_wanted == [short] * 4
+    assert seen == [
+        ("tuned", True), ("tuned/region", True), ("plain", before), ("plain/region", before),
+        ("tuned/lent", True), ("tuned/region/lent", True), ("plain/lent", before), ("plain/region/lent", before),
+    ]
+    assert torch.backends.cudnn.benchmark is before
     monkeypatch.setattr(engine, "_device", torch.device("cpu"))
     _step(engine, "tuned")
-    assert seen[-1] == ("forward", False)
+    assert seen[-1] == ("forward", before)
+
+
+@pytest.mark.parametrize("before", [False, True])
+@pytest.mark.parametrize("fraction", [None, 0.55])
+def test_capture_cudnn_benchmark_restores_on_sizing_failure(monkeypatch, torch_flag, before, fraction):
+    class _Tuned(_Recorder):
+        capture_cudnn_benchmark = True
+
+    mem_fraction = [0.9]
+    monkeypatch.setattr(
+        torch.cuda, "set_per_process_memory_fraction",
+        lambda value, device=None: mem_fraction.__setitem__(0, value),
+    )
+    monkeypatch.setattr(torch.cuda, "get_per_process_memory_fraction", lambda device=None: mem_fraction[0])
+
+    def failing_size(*args):
+        assert torch.backends.cudnn.benchmark is True
+        if fraction is not None:
+            assert mem_fraction[0] == fraction
+        raise RuntimeError("sizing failed")
+
+    torch_flag(torch.backends.cudnn, "benchmark", before)
+    engine = _engine({"tuned": _Tuned(), "plain": _Recorder()})
+    monkeypatch.setattr(engine, "_device", torch.device("cuda"))
+    monkeypatch.setattr(engine, "_gpu_memory_fraction", fraction)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (1 << 30, 1 << 31))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device=None: 0)
+    runners = {
+        "tuned": SimpleNamespace(size_captures=failing_size, size_lent_captures=failing_size),
+        "plain": SimpleNamespace(size_captures=lambda: {}, size_lent_captures=lambda w: {}),
+    }
+    with pytest.raises(RuntimeError, match="sizing failed"):
+        engine._plan_captures(runners, {"tuned": {}, "plain": {}})
+    assert torch.backends.cudnn.benchmark is before
+    assert mem_fraction == [0.9]
 
 
 @pytest.mark.parametrize("fails", [False, True])

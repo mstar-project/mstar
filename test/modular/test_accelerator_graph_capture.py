@@ -450,6 +450,78 @@ def test_benchmark_is_off_inside_the_capture_and_restored_after(torch_flag, fail
     assert seen == [False, False], "cuDNN must not search inside the capture"
 
 
+@pytest.mark.parametrize("fails", [False, True], ids=["captured", "failed"])
+def test_benchmark_is_off_inside_cpu_mock_capture_and_restored_after(monkeypatch, torch_flag, fails):
+    from contextlib import contextmanager
+
+    from mstar.utils.device import DeviceCapability
+
+    seen = []
+    events = []
+
+    class _FakePool(AcceleratorGraphPool):
+        def on_failure(self, graph):
+            events.append(("pool_failure", graph))
+
+        def on_success(self):
+            events.append(("pool_success",))
+
+    class _FakeBackend:
+        device_type = "cpu"
+
+        def current_stream(self):
+            return "prev-stream"
+
+        def create_graph(self, keep_graph=False):
+            return f"fake-graph-{keep_graph}"
+
+        @contextmanager
+        def capture(self, graph, pool=None, stream=None):
+            events.append(("capture_enter", torch.backends.cudnn.benchmark))
+            try:
+                yield
+            finally:
+                events.append(("capture_exit", torch.backends.cudnn.benchmark))
+
+        def recover_failed_capture(self, pool, prev_stream):
+            events.append(("recover", prev_stream))
+
+        def synchronize(self):
+            events.append(("sync",))
+
+    backend = _FakeBackend()
+    monkeypatch.setattr(DeviceCapability, "of", lambda dev: SimpleNamespace(graph_backend=backend))
+
+    def run():
+        seen.append(torch.backends.cudnn.benchmark)
+        if fails:
+            raise RuntimeError("capture failed")
+        return "ok"
+
+    for benchmark in (False, True):
+        torch_flag(torch.backends.cudnn, "benchmark", benchmark)
+        pool = _FakePool(handle="fake")
+        if fails:
+            with pytest.raises(RuntimeError, match="capture failed"):
+                capture_into_graph(run, pool, torch.device("cpu"), None)
+        else:
+            graph, output = capture_into_graph(run, pool, torch.device("cpu"), None)
+            assert graph == "fake-graph-False"
+            assert output == "ok"
+        assert torch.backends.cudnn.benchmark is benchmark
+
+    assert seen == [False, False]
+    if fails:
+        assert events == [
+            ("capture_enter", False), ("capture_exit", False), ("pool_failure", "fake-graph-False"),
+            ("recover", "prev-stream"),
+        ] * 2
+    else:
+        assert events == [
+            ("capture_enter", False), ("capture_exit", False), ("sync",), ("pool_success",),
+        ] * 2
+
+
 def test_required_graphs_turn_a_dropped_bucket_into_a_startup_failure(monkeypatch):
     monkeypatch.delenv("MSTAR_REQUIRE_ACCELERATOR_GRAPHS", raising=False)
     fail_if_graphs_required(["node decode[bs=1]"])
