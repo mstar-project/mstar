@@ -700,8 +700,9 @@ def test_bound_delta_bypass_caught_after_warmup_captures():
 
 
 def test_moe_experts_deltas_mark_on_expert_rows_and_catch_bypass():
-    """MoE experts deltas mark themselves when ``expert_rows`` runs (even on lean steps),
-    and fail ``check_deltas_ran`` when a fused layer bypasses ``_dispatch``."""
+    """On active steps, MoE experts deltas must run ``grouped_`` (calling ``expert_rows``
+    alone does not mask a skipped ``down`` delta); on lean steps, ``expert_rows`` marks
+    every passed delta because ``grouped_`` is skipped; fullgraph compile adds no recompile."""
     from mstar.engine.resources.lora.config import LoraSpec, LoraTarget
 
     spec = LoraSpec(
@@ -727,14 +728,43 @@ def test_moe_experts_deltas_mark_on_expert_rows_and_catch_bypass():
     with pytest.raises(RuntimeError, match=r"experts_down_proj.*experts_gate_up_proj.*lora_unservable"):
         pool.check_deltas_ran("Thinker")
 
+    # active step: expert_rows + gate_up.grouped_ runs, but down.grouped_ is omitted -> caught
+    active_ctx = StepContext(request_ids=[-1], graph_walk="decode", slot=0, capture=True)
+    step = ResourceStep(segments=(Segment(-1, "main", 2),))
+    pool.plan(step, active_ctx)
+    topk = torch.tensor([[0], [1]], dtype=torch.int32)
+    rows = gate_up.expert_rows(topk, [down])
+    assert rows is not None
+    gate_up.grouped_(
+        torch.randn(2, 8, dtype=F64), torch.zeros(2, 12, dtype=F64),
+        rows.ids, rows.scale[:, None].expand_as(rows.ids).contiguous(), 1, rows.alignment,
+    )
+    pool.commit(step, active_ctx)
+
+    assert gate_up.ran and not down.ran
+    with pytest.raises(RuntimeError, match=r"experts_down_proj.*lora_unservable"):
+        pool.check_deltas_ran("Thinker")
+
+    # lean step: expert_rows returns None and marks both deltas, compiling fullgraph w/o recompile
+    gate_up._ran = down._ran = False
     lean_ctx = StepContext(
         request_ids=[-1], graph_walk="decode", slot=0, capture=True, lean=frozenset({LORA_RESOURCE_KEY}),
     )
-    pool.plan(ResourceStep(segments=(Segment(-1, "main", 2),)), lean_ctx)
-    assert gate_up.expert_rows(torch.tensor([[0], [1]], dtype=torch.int32), [down]) is None
-    pool.commit(ResourceStep(segments=(Segment(-1, "main", 2),)), lean_ctx)
+    pool.plan(step, lean_ctx)
+    try:
+        def fn(ids):
+            r = gate_up.expert_rows(ids, (down,))
+            return ids + 1 if r is None else r.ids
 
-    assert gate_up.ran and down.ran
+        torch._dynamo.reset()
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled(topk)
+        assert gate_up.ran and down.ran
+        with torch.compiler.set_stance("fail_on_recompile"):
+            compiled(topk)
+    finally:
+        pool.commit(step, lean_ctx)
+
     pool.check_deltas_ran("Thinker")
 
 
@@ -821,3 +851,6 @@ def test_engine_node_fully_captured_gates_post_capture_validate():
         captured_walks=frozenset({"decode"}),
     )
     assert not engine._node_fully_captured("LLM", missing_walk, {})
+
+    # missing walk metadata (e.g. model=None) must not pass vacuously
+    assert not engine._node_fully_captured("unknown_node", full_runner, {})

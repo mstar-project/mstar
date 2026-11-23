@@ -1258,7 +1258,8 @@ class Engine:
             return False
         if any(not pw.any_graphs or pw.dropped_shapes for pw in pw_runners.values()):
             return False
-        return self._node_walks.get(node_name, frozenset()) <= runner.captured_walks
+        walks = self._node_walks.get(node_name)
+        return bool(walks) and walks <= runner.captured_walks
 
     def _plan_captures(
         self, ag_runners: dict[str, AcceleratorGraphRunner],

@@ -273,10 +273,12 @@ class LoraLayerDelta:
         adapter adapts none of these at this layer, or on a skipped (sentinel) expert gets
         the id past every factor, which no GEMM reads.
         """
-        self._ran = True
-        for other in others:
-            other._ran = True
         if not self._active():
+            # lean step skips `grouped_`; mark here so lean-only warmups still record reachability,
+            # while active steps require each bound delta's `grouped_` to actually run
+            self._ran = True
+            for other in others:
+                other._ran = True
             return None
         token_slot = self._pool.addressing(1).token_slot
         if token_slot.shape[0] != topk_ids.shape[0]:
@@ -1255,7 +1257,7 @@ class LoraAdapterPool(Resource):
         )
 
     def post_capture_validate(self, node: str, fully_captured: bool) -> None:
-        if not fully_captured:
+        if not fully_captured or self.spec.nodes != frozenset({node}):
             return
         self.check_deltas_ran(node)
 
