@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # Integer request IDs below the API server (#582)
 
 This is the implementation contract for [#582](https://github.com/mstar-project/mstar/issues/582).
