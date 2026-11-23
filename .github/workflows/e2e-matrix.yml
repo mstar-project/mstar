@@ -1,0 +1,122 @@
+name: e2e matrix
+
+# A maintainer starts a run by applying a label. The GPU job runs PR code on a
+# disposable runner without secrets; only the separate report job can write.
+on:
+  pull_request_target:
+    types: [labeled]
+
+permissions: {}
+
+concurrency:
+  group: e2e-matrix-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    if: >-
+      github.event.label.name == 'e2e-matrix' ||
+      github.event.label.name == 'e2e-matrix-full'
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      enabled: ${{ steps.enabled.outputs.enabled }}
+    steps:
+      - id: enabled
+        env:
+          ENABLED: ${{ vars.E2E_MATRIX_ENABLED }}
+        run: |
+          if [ "$ENABLED" = true ]; then
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'Set E2E_MATRIX_ENABLED=true after the ephemeral GPU runner and budget are approved.'
+          fi
+
+  compare:
+    needs: gate
+    if: needs.gate.outputs.enabled == 'true'
+    runs-on: [self-hosted, Linux, X64, e2e-ephemeral, gpu]
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    outputs:
+      code: ${{ steps.compare.outputs.code }}
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      MODELS: ${{ github.event.label.name == 'e2e-matrix-full' && 'all' || 'tag:small' }}
+    steps:
+      - name: Check runner
+        run: |
+          test "$MSTAR_E2E_EPHEMERAL" = 1
+          nvidia-smi
+      - name: Check out trusted comparison code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch the PR head
+        run: |
+          git fetch --no-tags origin "pull/$PR_NUMBER/head"
+          test "$(git rev-parse FETCH_HEAD)" = "$HEAD_SHA"
+      - name: Compare pinned commits
+        id: compare
+        run: |
+          set +e
+          python3 -m benchmark.eval compare \
+            --base "$BASE_SHA" --head "$HEAD_SHA" --models "$MODELS" \
+            --out "$RUNNER_TEMP/e2e-matrix"
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Keep the report and chart
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-matrix-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/e2e-matrix/run.json
+            ${{ runner.temp }}/e2e-matrix/state.json
+            ${{ runner.temp }}/e2e-matrix/results/**/*.json
+            ${{ runner.temp }}/e2e-matrix/report/report.md
+            ${{ runner.temp }}/e2e-matrix/report/summary.json
+            ${{ runner.temp }}/e2e-matrix/report/chart.png
+          if-no-files-found: ignore
+          retention-days: 14
+
+  report:
+    needs: [gate, compare]
+    if: always() && needs.gate.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: write
+    steps:
+      - name: Check out trusted report code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          sparse-checkout: .github/e2e
+          persist-credentials: false
+      - name: Read the comparison artifact
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: e2e-matrix-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-matrix
+      - name: Post one comment and check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMPARE_CODE: ${{ needs.compare.outputs.code }}
+        run: |
+          python3 .github/e2e/report_pr.py \
+            --summary "$RUNNER_TEMP/e2e-matrix/report/summary.json" \
+            --pr "$PR_NUMBER" --head "$HEAD_SHA" \
+            --run-url "$RUN_URL" --exit-code "$COMPARE_CODE"
