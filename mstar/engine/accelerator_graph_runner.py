@@ -856,6 +856,11 @@ class AcceleratorGraphRunner:
     def any_graphs(self):
         return bool(self._buckets)
 
+    @property
+    def captured_walks(self) -> frozenset[str]:
+        """Graph walks with at least one captured bucket (replay walks included)."""
+        return frozenset(key.graph_walk for key in self._buckets)
+
     def _batch_sizes(self, config: AcceleratorGraphConfig) -> list[int]:
         # None defers to the defaults; [] captures nothing, as in the piecewise runner
         return self.CAPTURE_BATCH_SIZES if config.capture_batch_sizes is None else config.capture_batch_sizes

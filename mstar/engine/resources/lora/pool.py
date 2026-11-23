@@ -202,6 +202,14 @@ class LoraLayerDelta:
         self.experts = declared.experts
         if self.experts > 1:
             self.a, self.b = self.a.flatten(0, 1), self.b.flatten(0, 1)
+        # set unconditionally on every call (no branch, so compiled regions add no guard
+        # or graph break) to verify after warmup captures that no bound target was bypassed
+        self._ran = False
+
+    @property
+    def ran(self) -> bool:
+        """Whether this delta has been entered on at least one forward (active or lean)."""
+        return self._ran
 
     def _active(self) -> bool:
         """Whether this step adds deltas; raises with no planned step addressing them."""
@@ -223,6 +231,7 @@ class LoraLayerDelta:
     def __call__(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         if self.experts > 1:
             raise ValueError("an experts target's delta is per (token, top-k) row: add it with `grouped_`")
+        self._ran = True
         if not self._active():
             # a lean step: no row names an adapter, so nothing is launched
             return y
@@ -249,6 +258,7 @@ class LoraLayerDelta:
         theirs, or None)."""
         if self.experts == 1:
             raise ValueError("`grouped_` adds an experts target's delta; call a linear's delta directly")
+        self._ran = True
         self._backend.apply_experts_(
             x.to(self.a.dtype), y, self.a, self.b, ids, row_weight, top_k, self.out_slices, alignment,
         )
@@ -263,6 +273,9 @@ class LoraLayerDelta:
         adapter adapts none of these at this layer, or on a skipped (sentinel) expert gets
         the id past every factor, which no GEMM reads.
         """
+        self._ran = True
+        for other in others:
+            other._ran = True
         if not self._active():
             return None
         token_slot = self._pool.addressing(1).token_slot
@@ -464,6 +477,8 @@ class LoraAdapterPool(Resource):
         self._store = LoraAdapterStore(spec, rank=rank, world_size=world_size, dtype=self.dtype)
         # (target, layer) -> its bound delta, one per binding so compiled code guards on it
         self._layer_deltas: dict[tuple[str, int], LoraLayerDelta] = {}
+        # (target, layer) -> module path bound by `bind_module_lora`, for startup diagnostics
+        self._bound_paths: dict[tuple[str, int], str] = {}
 
         # Handle-keyed request state, all purged by `remove_request`.
         self._adapter_of: dict = {}   # rid -> adapter name, None for the base model
@@ -534,7 +549,9 @@ class LoraAdapterPool(Resource):
         adapter adds nothing there."""
         return self._ranks[target][self._layer_rows[target][layer_idx]]
 
-    def layer_delta(self, target: str, layer_idx: int) -> "LoraLayerDelta":
+    def layer_delta(
+        self, target: str, layer_idx: int, *, module_path: str | None = None,
+    ) -> "LoraLayerDelta":
         """What a layer calls to add ``target``'s delta at stack layer ``layer_idx``."""
         found = self._layer_deltas.get((target, layer_idx))
         if found is None:
@@ -544,6 +561,8 @@ class LoraAdapterPool(Resource):
                     f"on layer {layer_idx}; it declares {sorted(self.targets)}"
                 )
             found = self._layer_deltas[(target, layer_idx)] = LoraLayerDelta(self, target, layer_idx)
+        if module_path is not None:
+            self._bound_paths[(target, layer_idx)] = module_path
         return found
 
     def addressing(self, grouping: int = 1) -> LoraAddressing:
@@ -1195,6 +1214,51 @@ class LoraAdapterPool(Resource):
 
     # Engine lifecycle
 
+    def check_deltas_ran(self, node: str | None = None) -> None:
+        """Raise ``RuntimeError`` if any bound delta never ran during warmup captures.
+
+        Catches parents that read a bound child's ``.weight`` directly (e.g.
+        ``F.linear(x, self.proj.weight)`` or a fused GEMM) instead of calling its
+        forward, which would otherwise drop its adapter silently.
+        """
+        missed: dict[str, list[int]] = {}
+        totals: dict[str, int] = {}
+        for (target, layer_idx), delta in self._layer_deltas.items():
+            totals[target] = totals.get(target, 0) + 1
+            if not delta.ran:
+                missed.setdefault(target, []).append(layer_idx)
+        if not missed:
+            return
+        details: list[str] = []
+        for target in sorted(missed):
+            layers = sorted(missed[target])
+            total = totals[target]
+            first_path = self._bound_paths.get((target, layers[0]))
+            if total == 1:
+                if first_path is not None and first_path != target:
+                    details.append(f"{target!r} ({first_path})")
+                elif first_path is not None:
+                    details.append(repr(target))
+                else:
+                    details.append(f"{target!r} (layer {layers[0]})")
+            elif first_path is not None:
+                details.append(f"{target!r} ({first_path}, {len(layers)} of {total} layers)")
+            else:
+                details.append(f"{target!r} ({len(layers)} of {total} layers: {layers})")
+        where = f" on {node!r}" if node else ""
+        raise RuntimeError(
+            f"LoRA resource {self.spec.resource_key!r}{where}: bound targets never ran during "
+            f"warmup captures: {', '.join(details)}. A parent module that reads a child's "
+            "`.weight` directly (e.g. `F.linear(x, child.weight)` or a fused GEMM) bypasses "
+            "the bound delta silently; declare bypassed children in `lora_unservable` on their "
+            "parent class, or exclude modules called outside the step in `LoraRoot.exclude`"
+        )
+
+    def post_capture_validate(self, node: str, fully_captured: bool) -> None:
+        if not fully_captured:
+            return
+        self.check_deltas_ran(node)
+
     def cleanup(self):
         if self._reader is not None:
             self._reader.shutdown(wait=False, cancel_futures=True)
@@ -1203,6 +1267,7 @@ class LoraAdapterPool(Resource):
         self._ranks.clear()
         self._cg.clear()
         self._layer_deltas.clear()
+        self._bound_paths.clear()
         self._eager = None
         self._current = self._enclosing = None
 
