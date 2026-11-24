@@ -266,8 +266,10 @@ class _MiniGraphRuntime:
         self.ready: dict[int, set[tuple[str, str]]] = {}
         self.in_flight: set[tuple[int, str]] = set()
         self.combined_walk_of: dict[tuple[str, str], str] = {}
+        self._rid_walk: dict[tuple[int, str], str] = {}
 
     def add_ready(self, rid: int, node_name: str, graph_walk: str) -> None:
+        self._rid_walk[(rid, node_name)] = graph_walk
         if (rid, node_name) not in self.in_flight:
             self.ready.setdefault(rid, set()).add((node_name, graph_walk))
 
@@ -313,11 +315,31 @@ class _MiniGraphRuntime:
             output_signals=("out",),
         )
 
+    def pop_walk_rids(self, node_name, rows, check_ready=False):
+        del check_ready
+        rids, walk_idx = [], []
+        for rid, w in zip(rows.rids, rows.walk_idx, strict=True):
+            walk = rows.walks[w]
+            if (node_name, walk) in self.ready.get(rid, ()):
+                self.ready[rid].remove((node_name, walk))
+                rids.append(rid)
+                walk_idx.append(w)
+        signals = tuple((f"out_{walk}",) for walk in rows.walks)
+        return PopRidsOutput(
+            wg_ids=ParallelList(rids, [0] * len(rids)),
+            input_edges=ColumnarEdgeSpecs.empty(),
+            output_signals=signals[0],
+            rid_walk_idx=walk_idx,
+            walk_output_signals=signals,
+        )
+
     def push_back_node(self, node_name, rids, wg_ids):
         del wg_ids
-        # Re-readies on the single walk known for `node_name` when pushed back.
+        # Re-readies on the rid's known walk when pushed back.
         for rid in rids:
-            walk = next((w for (n, w) in self.async_walks if n == node_name), "decode")
+            walk = self._rid_walk.get((rid, node_name)) or next(
+                (w for (n, w) in self.async_walks if n == node_name), "decode",
+            )
             self.add_ready(rid, node_name, walk)
 
     def set_in_flight(self, node_name, rids, wg_ids, in_flight):
@@ -367,10 +389,14 @@ class _MiniGraphRuntime:
 
 
 class _MiniEngine:
-    def __init__(self, groups: dict[int, bool], order: StepOrder = StepOrder.ARRIVAL, max_bs: int = 32):
+    def __init__(
+        self, groups: dict[int, bool | int], order: StepOrder = StepOrder.ARRIVAL,
+        max_bs: int = 32, split_nodes: frozenset[str] = frozenset({"T3"}),
+    ):
         self.groups = dict(groups)
         self.order = order
         self.max_bs = max_bs
+        self.split_nodes = split_nodes
 
     def get_step_order(self, node_name, graph_walk):
         del node_name, graph_walk
@@ -399,7 +425,13 @@ class _MiniEngine:
         return False
 
     def splits_by_capture_key(self, node_name, graph_walk):
-        return (node_name, graph_walk) == ("T3", "decode")
+        if self.split_nodes == frozenset({"T3"}):
+            return (node_name, graph_walk) == ("T3", "decode")
+        return node_name in self.split_nodes
+
+    def order_split_rows(self, node_name, graph_walk, request_ids, request_walks):
+        del node_name, graph_walk, request_walks
+        return request_ids
 
     def capture_group(self, node_name, graph_walk, rid, fwd_info, input_metadata=None):
         del node_name, graph_walk, fwd_info, input_metadata
@@ -445,18 +477,23 @@ class _MiniRequestState:
 def _build_multi_step_worker(
     monkeypatch,
     *,
-    groups: dict[int, bool],
+    groups: dict[int, bool | int],
     order: StepOrder = StepOrder.ARRIVAL,
     peek: bool = True,
     cap: int = 8,
     async_walks=frozenset({("T3", "decode")}),
     looping_walks=frozenset({("T3", "decode")}),
+    combined_walk_of=None,
+    speculation_mixes_walks=None,
+    split_nodes: frozenset[str] = frozenset({"T3"}),
     on_finish=None,
 ):
     """Build a real Worker (MicroScheduler + FIFOBatchBuilder + Speculator + StepPipeline)
     over pure-Python graph/engine stand-ins with GPU execution stubbed."""
     runtime = _MiniGraphRuntime(async_walks=async_walks, looping_walks=looping_walks)
-    engine = _MiniEngine(groups, order=order)
+    if combined_walk_of:
+        runtime.combined_walk_of = dict(combined_walk_of)
+    engine = _MiniEngine(groups, order=order, split_nodes=split_nodes)
     engine_manager = SimpleNamespace(get_engine=lambda node: engine)
     request_state = _MiniRequestState(groups)
     tensor_manager = SimpleNamespace(
@@ -469,6 +506,8 @@ def _build_multi_step_worker(
         request_state=request_state,
         graph_runtime=runtime,
         tensor_manager=tensor_manager,
+        combined_walk_of=combined_walk_of,
+        speculation_mixes_walks=speculation_mixes_walks,
     )
     worker = make_worker(
         graph_runtime=runtime,
@@ -759,10 +798,12 @@ def test_combined_walk_mixed_yield_away_counts_toward_cap():
     assert excluded == [None, None, ("LLM", "decode")]
 
 
-def test_unmixed_combined_walk_resets_cap_between_constituent_walks():
-    """With speculation_mixes=False, switching between 'decode' and 'prefill'
-    on a combined walk still resets the cap."""
-    speculator, excluded = _combined_speculator(mixes=False, cap=2)
+@pytest.mark.parametrize("mixes", [False, {"decode": True, "prefill": False}])
+def test_combined_walk_shares_cap_across_constituent_walks(mixes):
+    """Constituent walks of a combined walk share one scheduling key and backlog,
+    so switching between 'decode' and 'prefill' keeps counting toward the cap
+    regardless of whether speculation mixes."""
+    speculator, excluded = _combined_speculator(mixes=mixes, cap=2)
     targets = [SpeculationTarget(SimpleNamespace(node_name="LLM", graph_walk="decode"), [0])]
     speculator._choose_spec_target = lambda batch: targets[0]
     speculator._try_speculate_next = lambda pending, picked: _chain_step(picked.info.node_name)
@@ -770,16 +811,86 @@ def test_unmixed_combined_walk_resets_cap_between_constituent_walks():
     launched, yielded_from = speculator.build(_pending())
     assert yielded_from is None
     speculator.note_launched(launched)
-    assert (speculator._cap_key, speculator._since_other) == (("LLM", "decode"), 1)
+    assert (speculator._cap_key, speculator._since_other) == (("LLM", "mixed"), 1)
 
     targets[0] = SpeculationTarget(SimpleNamespace(node_name="LLM", graph_walk="prefill"), [0])
     launched, yielded_from = speculator.build(_pending())
     assert yielded_from is None
     speculator.note_launched(launched)
-    assert (speculator._cap_key, speculator._since_other) == (("LLM", "prefill"), 1)
+    assert (speculator._cap_key, speculator._since_other) == (("LLM", "mixed"), 2)
 
-    launched, yielded_from = speculator.build(_pending())
-    assert yielded_from is None and excluded == []
+    _, yielded_from = speculator.build(_pending())
+    assert yielded_from == ("LLM", "prefill")
+    assert excluded == [("LLM", "prefill")]
+
+
+def _run_combined_competing_worker(
+    *,
+    mixes: dict,
+    order: StepOrder,
+    peek: bool,
+    cap: int,
+    steps: int = 30,
+) -> list[tuple[str, str, tuple[int, ...]]]:
+    groups = {0: 0, 1: 1, 2: 2, 3: 3, 4: 4}
+
+    def on_finish(runtime, step):
+        for rid in step.batch.request_to_worker_graph:
+            runtime.add_ready(rid, step.node_name, step.batch.walk_of(rid))
+
+    worker, runtime, executed = _build_multi_step_worker(
+        None,
+        groups=groups,
+        order=order,
+        peek=peek,
+        cap=cap,
+        async_walks=frozenset({("LLM", "decode"), ("LLM", "prefill")}),
+        looping_walks=frozenset({("LLM", "decode"), ("LLM", "prefill")}),
+        combined_walk_of={("LLM", "decode"): "mixed", ("LLM", "prefill"): "mixed"},
+        speculation_mixes_walks=mixes,
+        split_nodes=frozenset({"LLM"}),
+        on_finish=on_finish,
+    )
+    runtime.add_ready(0, "LLM", "decode")
+    runtime.add_ready(1, "LLM", "prefill")
+    runtime.add_ready(2, "LLM", "decode")
+    runtime.add_ready(3, "LLM", "prefill")
+    runtime.add_ready(4, "s3gen", "s3gen_chunk")
+
+    for _ in range(steps):
+        worker.pipeline._pass()
+    return executed
+
+
+@pytest.mark.parametrize("mixes", [
+    {"LLM": {"decode": True, "prefill": False}},
+    {"LLM": {"decode": False, "prefill": True}},
+])
+@pytest.mark.parametrize("order", [StepOrder.ARRIVAL, StepOrder.TURNS])
+@pytest.mark.parametrize("peek", [True, False])
+@pytest.mark.parametrize("cap", [2, 4])
+def test_partial_mixing_combined_walk_yields_to_competing_node(mixes, order, peek, cap):
+    """Partial speculation mixing on a combined walk must not reset the cap
+    between constituent walks or starve a competing node."""
+    executed = _run_combined_competing_worker(
+        mixes=mixes, order=order, peek=peek, cap=cap,
+    )
+    other_steps = [i for i, (node, _, _) in enumerate(executed) if node == "s3gen"]
+    assert len(other_steps) >= 3, f"s3gen starved: {executed[:15]}"
+
+
+@pytest.mark.parametrize("order", [StepOrder.ARRIVAL, StepOrder.TURNS])
+@pytest.mark.parametrize("peek", [True, False])
+@pytest.mark.parametrize("cap", [0, 1, 2, 4])
+def test_unmixed_combined_walk_yields_to_competing_node(order, peek, cap):
+    """An unmixed combined walk must not ping-pong between constituent walks
+    in the shared backlog past a competing node."""
+    executed = _run_combined_competing_worker(
+        mixes={"LLM": False}, order=order, peek=peek, cap=cap,
+    )
+    other_steps = [i for i, (node, _, _) in enumerate(executed) if node == "s3gen"]
+    assert len(other_steps) >= 3, f"s3gen starved: {executed[:15]}"
+    assert other_steps[0] <= cap + 1, (other_steps, executed[:15])
 
 
 # ── Edge cases ──────────────────────────────────────────────────────────

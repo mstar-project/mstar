@@ -2165,6 +2165,26 @@ def test_a_yield_away_checks_the_rows_behind_the_chains_parked_ones():
     ]
 
 
+@pytest.mark.parametrize("order", [StepOrder.ARRIVAL, StepOrder.TURNS])
+def test_unmixed_combined_yield_away_defers_backlog_to_other_nodes(order):
+    """Under an unmixed combined-walk yield-away (skip_walk), the shared
+    backlog stays deferred behind other backlogs and ready nodes so competing
+    work is not starved by decode/prefill ping-pong."""
+    sched = _combined_scheduler(_Engine(max_bs={MIXED: 4, WALK: 4, "prefill": 4}, order=order))
+    sched.parallel_leader_nodes = {NODE, "B"}
+    parked = _batch(["d0", "p0"], walk=MIXED)
+    parked.request_walks = {"d0": WALK, "p0": "prefill"}
+    sched.backlog[(NODE, MIXED)] = parked
+    sched.node_and_walk_to_last_batch_num[(NODE, MIXED)] = 1
+    sched.batch_number = 1
+
+    manager = _Manager(["x0"], node="B")
+    batch = _next_batch(sched, manager, exclude_target=(NODE, WALK))
+
+    assert (batch.node_name, list(batch.request_to_worker_graph)) == ("B", ["x0"])
+    assert list(sched.backlog[(NODE, MIXED)].request_to_worker_graph) == ["d0", "p0"]
+
+
 def test_a_chain_holding_its_step_leaves_every_row_queued():
     """Continuing rows at the decode cap holding the step under ARRIVAL: the
     merge pops nothing, another walk's rows included, and the chain keeps
