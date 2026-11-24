@@ -9,7 +9,17 @@ from typing import TYPE_CHECKING, get_origin
 
 import torch
 
-from mstar.engine.state.contract import EMPTY, Array, Block, Read, Sampler, SeqShard, is_value, read_layers
+from mstar.engine.state.contract import (
+    EMPTY,
+    Array,
+    Block,
+    CausalBlock,
+    Read,
+    Sampler,
+    SeqShard,
+    is_value,
+    read_layers,
+)
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
@@ -118,11 +128,13 @@ def _array_problems(array: Array) -> list[str]:
     where = f"Array {array.name!r}"
     problems: list[str] = []
     for key, read in array.reads.items():
-        if isinstance(read.mask, Block) and array.max_len != 0:
-            problems.append(f"{where}.reads[{key!r}].mask: Block needs max_len 0, and max_len is {array.max_len}")
-        elif not isinstance(read.mask, Block) and array.max_len == 0:
-            problems.append(f"{where}.reads[{key!r}].mask: every read of an array with max_len 0 is a Block read, "
-                            f"and this one is {type(read.mask).__name__}")
+        within = isinstance(read.mask, Block | CausalBlock)
+        if within and array.max_len != 0:
+            problems.append(f"{where}.reads[{key!r}].mask: {type(read.mask).__name__} needs max_len 0, and max_len "
+                            f"is {array.max_len}")
+        elif not within and array.max_len == 0:
+            problems.append(f"{where}.reads[{key!r}].mask: every read of an array with max_len 0 is a Block or "
+                            f"CausalBlock read, and this one is {type(read.mask).__name__}")
     if array.positions is not None:
         if array.rewritable or array.max_len == 0:
             problems.append(f"{where}.positions: positions sit only on an append-only array that keeps entries")

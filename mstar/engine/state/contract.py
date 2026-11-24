@@ -114,6 +114,14 @@ class Block(Mask):
 
 
 @dataclass(frozen=True)
+class CausalBlock(Mask):
+    """Sees the entries of q's own segment in this step up to q, on an array with ``max_len`` 0: `Block`, causal."""
+
+    uses_query_position = True
+    sees_step_whole = True
+
+
+@dataclass(frozen=True)
 class Bidirectional(Mask):
     """Sees {k : k < n}, where n is the length of q's row on this array after this layer's latest add: every entry the
     row keeps and every entry this step adds for it. For a read with ``queries``, q's row is the row paired with q's

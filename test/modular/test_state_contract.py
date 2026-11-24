@@ -22,6 +22,7 @@ from mstar.engine.state import (
     Bidirectional,
     Block,
     Causal,
+    CausalBlock,
     CausalConv,
     Entry,
     Fork,
@@ -146,6 +147,10 @@ REFUSALS = {
     "queries with a mask that uses the query's position": (
         lambda: _array(reads={"r": _read(queries="video")}), "Array 'kv'.reads['r'].queries",
     ),
+    "queries with a mask that uses the query's position, within the step": (
+        lambda: _array(max_len=0, reads={"r": _read(mask=CausalBlock(), queries="video")}),
+        "Array 'kv'.reads['r'].queries: a read of another array's queries takes a mask that uses no query",
+    ),
     "queries with no op": (
         lambda: _array(reads={"r": Read(mask=Bidirectional(), queries="video")}),
         "Array 'kv'.reads['r'].queries: a read with no op",
@@ -209,6 +214,7 @@ def test_a_bad_mask_or_op_is_refused_when_the_read_is_built(build, where):
 
 @pytest.mark.parametrize("mask, uses_query_position, sees_step_whole", [
     (Causal(), True, False), (Window(4), True, False), (Block(), False, True), (Bidirectional(), False, True),
+    (CausalBlock(), True, True),
 ])
 def test_each_mask_says_whether_it_uses_the_query_position_and_sees_a_step_whole(
     mask, uses_query_position, sees_step_whole,

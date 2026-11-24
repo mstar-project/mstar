@@ -1552,8 +1552,8 @@ class PreprocessWorkerThread:
 
     @cached_property
     def _whole_reads(self) -> dict[str, dict[str | None, str]]:
-        """Each declared array's Block and Bidirectional reads, by the walks they name, or None for every walk. An
-        array with neither, or with no keyed label, is left out."""
+        """Each declared array's reads that see a step whole (`Mask.sees_step_whole`), by the walks they name, or None
+        for every walk. An array with none, or with no keyed label, is left out."""
         return {
             array.name: whole for array in self._declarations
             if isinstance(array, Array) and array.name in self._keyed_labels and (whole := {
