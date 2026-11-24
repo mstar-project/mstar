@@ -2096,7 +2096,7 @@ class Conductor:
         records = getattr(self, "_episode_records", None)
         return bool(
             getattr(self, "_episode_array_names", None)
-            or (body.model_kwargs or {}).get("episode_seed") is not None
+            or (getattr(body, "model_kwargs", None) or {}).get("episode_seed") is not None
             or (type(body.episode) is str and records is not None and (
                 records.has(body.episode)
                 or records.closed_or_ending(body.episode)))
