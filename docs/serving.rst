@@ -615,7 +615,8 @@ failed read restarts its Mooncake client (see below). Next to a
 CUDA 13 torch, install Mooncake's CUDA 13 wheel (see :ref:`mooncake-cuda13`). Loading fails
 when the store can't be reached, and when the pool has no host pool, has the prefix cache
 off, runs above one rank, keeps a sliding window or recurrent-state snapshots (Qwen3.5), or
-has no ``prefix_cache_salt``. The salt is required because the key root names the checkpoint
+has no ``prefix_cache_salt``, and when the engine keeps the cache's prefix cache shut (no node keys
+it, say; the log says why). The salt is required because the key root names the checkpoint
 by its safetensors index and ``config.json``, which two fine-tunes of one architecture can
 share, so change it whenever the weights, or anything else that changes the KV (a
 quantization setting outside ``config.json``, say), change. A request's wait starts when it
