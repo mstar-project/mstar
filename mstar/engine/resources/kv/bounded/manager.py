@@ -60,11 +60,20 @@ class BoundedKVManager(Resource):
         if info.head_shards > 1:
             raise NotImplementedError("bounded KV does not shard heads across ranks yet")
         # resolved here, not written back: the config is the model's, shared by its specs
-        return cls(spec.config, info.device, info.kv_dtype)
+        return cls(
+            spec.config, info.device, info.kv_dtype,
+            name=spec.resource_key, episode_lifetime=spec.episode_lifetime,
+        )
 
-    def __init__(self, config: BoundedKVConfig, device: torch.device, kv_dtype: torch.dtype | None = None):
+    def __init__(
+        self, config: BoundedKVConfig, device: torch.device, kv_dtype: torch.dtype | None = None,
+        name: str = "bounded_kv", episode_lifetime: bool = False,
+    ):
         """``kv_dtype`` (the engine's) stands in for ``config.dtype=None``."""
         self.config = config
+        self.name = name
+        self.episode_lifetime = episode_lifetime
+        self._episode_owner_by_request: dict[int | str, tuple[str, int]] = {}
         self._device = torch.device(device)
         c = config
         dtype = c.dtype or kv_dtype or torch.get_default_dtype()
@@ -91,15 +100,25 @@ class BoundedKVManager(Resource):
         """One layer's slots, ``[max_slots, rows, H, cap, 2D]``."""
         return self._cache[layer_idx]
 
+    def _episode_key(self, rid):
+        return rid if rid in self._requests else self._episode_owner_by_request.get(rid, rid)
+
     def written(self, rid: str) -> int:
         """The entries committed for ``rid``: 0 for a rid that holds no slot, never admitted or torn down."""
-        req = self._requests.get(rid)
+        req = self._requests.get(self._episode_key(rid))
         return 0 if req is None else req.written
 
     def position(self, rid: str, label: str) -> int:
         """Where ``rid``'s next entry goes, its count of committed entries, as a position resource answers."""
         del label
         return self.written(rid)
+
+    def logical_length(self, rid: str, label: str = "main") -> int:
+        del label
+        return self.written(rid)
+
+    def held(self, rid: str) -> int:
+        return min(self.written(rid), self.config.max_retained)
 
     @property
     def current(self) -> BoundedPlan:
@@ -211,8 +230,39 @@ class BoundedKVManager(Resource):
     def ingest_request(self, rid: str, overrides: ResourceReqConfig | None = None):
         del overrides
 
+    def bind_episode(self, rid: int, slot: int, episode_id: str | None, *, cold: bool, reset: bool) -> None:
+        if episode_id is None:
+            return
+        owner = ("episode", slot)
+        with self._lock:
+            if cold:
+                if owner in self._requests:
+                    raise ValueError(f"bounded KV {self.name!r}: episode slot {slot} already has a slot")
+            else:
+                req = self._requests.pop(owner, None)
+                if req is not None:
+                    self._requests[rid] = req
+            if reset:
+                self.reset_request(rid, free=False)
+            self._episode_owner_by_request[rid] = owner
+
+    def end_episode(self, slot: int) -> None:
+        owner = ("episode", slot)
+        with self._lock:
+            if owner in self._episode_owner_by_request.values():
+                raise ValueError(f"episode slot {slot} still has an active request")
+            self.reset_request(owner, free=True)
+
     def remove_request(self, rid: str):
-        self.reset_request(rid, free=True)
+        with self._lock:
+            owner = self._episode_owner_by_request.pop(rid, None)
+            if owner is not None:
+                self._admit_taken.pop(rid, None)
+                req = self._requests.pop(rid, None)
+                if req is not None:
+                    self._requests[owner] = req
+                return
+            self.reset_request(rid, free=True)
 
     def reset_request(self, rid: str, free: bool = False):
         """Nothing to zero: a slot's contents are only read where a later
@@ -349,7 +399,7 @@ class BoundedKVManager(Resource):
 
     def post_warmup_validate(self):
         if self._requests:
-            raise RuntimeError(f"bounded KV slots still held after capture: {sorted(self._requests)}")
+            raise RuntimeError(f"bounded KV slots still held after capture: {sorted(self._requests, key=str)}")
 
     def cleanup(self):
         self._cg_tables.clear()

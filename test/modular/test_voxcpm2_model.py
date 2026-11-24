@@ -1057,6 +1057,7 @@ def test_talker_fields_go_with_the_request_when_the_engine_removes_it(model):
     info = _info("r", 0, meta)
     _commit(talker, "talker_prefill", ["r"], [talker.prepare_inputs("talker_prefill", info, request)])
     engine = Engine.__new__(Engine)
+    engine._episode_pools = {}
     engine._loopback_steps, engine._resources, engine._submodules = {}, {}, {}
     engine._runner = SimpleNamespace(remove_request=lambda rid: None)
     engine._chunking = SimpleNamespace(forget_request=lambda rid: None)

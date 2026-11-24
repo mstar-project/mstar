@@ -1354,6 +1354,7 @@ class StepExecutor:
         # runtime side. A rid left out gets nothing added,
         # which is what an empty entry did.
         ntc_rids = [rid for rid in send_rids if new_token_counts.get(rid)]
+        held_rids = [rid for rid in send_rids if batch_N.node_batch.episode_held.get(rid)]
         return SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(
@@ -1365,6 +1366,9 @@ class StepExecutor:
             ),
             new_token_counts=ParallelList(
                 ntc_rids, [new_token_counts[rid] for rid in ntc_rids],
+            ),
+            episode_held=ParallelList(
+                held_rids, [batch_N.node_batch.episode_held[rid] for rid in held_rids],
             ),
             profiling=self._profiling_payloads(send_rids) if self.enable_prof
             else None,
