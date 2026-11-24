@@ -817,3 +817,73 @@ def test_request_dense_window_refuses_positions_it_cannot_serve():
     frames = _frames(positions=object())
     with pytest.raises(ValueError, match="append-only tensor log"):
         storage_of(frames)
+
+
+def test_input_ingest_propagates_episode_calls_to_forward_pass_info_wrapper():
+    from mstar.conductor.request_info import EPISODE_CALLS, CurrentForwardPassInfo
+    from mstar.engine.engine import ForwardPassInfoWrapper
+    from mstar.graph.base import GraphEdge
+    from mstar.utils.ipc_format import InputSignals, NewRequest
+    from mstar.worker.input_ingest import InputIngest
+    from mstar.worker.node_manager_utils import RequestStateManager
+
+    ingest = object.__new__(InputIngest)
+    ingest._worker_id = "w0"
+    ingest._enable_nvtx = False
+    ingest._runtime = SimpleNamespace(
+        add_request=lambda **kw: 7,
+        register_stop_limits=lambda rid, info: None,
+        get_sharding_config=lambda rid: None,
+        get_rid_handle=lambda wire_rid: 7,
+        set_walk=lambda rid, part, walk: None,
+        get_dynamic_loop_iters=lambda rids, partition=None: (),
+        ingest_inputs_batch=lambda *a, **kw: None,
+    )
+    ingest._request_state = RequestStateManager()
+    ingest._tensors = SimpleNamespace(
+        register_request=lambda rid, cfg: None,
+        start_read_tensors=lambda rid, inputs, graph_walk=None: [],
+    )
+    ingest._wakeup_event = SimpleNamespace(register_futures=lambda futs: None)
+    ingest._engines = SimpleNamespace(add_request=lambda *a, **kw: None)
+    ingest._streams = SimpleNamespace(add_request=lambda rid, info: None)
+    ingest._set_rebuildable = None
+    ingest._skip_unshared_publish = lambda rid, wg_to_workers: None
+    ingest._handlers = {}
+    ingest._lifecycle = SimpleNamespace(
+        add=lambda rid, wire_rid: None,
+        take_parked=lambda wire_rid: [],
+        takes_input=lambda wire_rid: True,
+        pending_removes=set(),
+    )
+
+    new_info = CurrentForwardPassInfo(
+        request_id="req-1", graph_walk="encode", fwd_index=0, random_seed=0, max_tokens=4,
+        step_metadata={EPISODE_CALLS: 3},
+    )
+    ingest._add_new_request(NewRequest(
+        request_id="req-1", partition_worker_graph_ids={0}, worker_graph_to_workers={0: ["w0"]},
+        initial_inputs=[], request_info=new_info, loop_caps={},
+        episode_id="robot-a", episode_slot=0,
+    ))
+    wrapper = ForwardPassInfoWrapper(
+        ingest._request_state.per_request_info[7].per_partition_info["default"].current_fwd_info,
+        SimpleNamespace(dynamic_loop_iter_counts={}),
+    )
+    assert wrapper.step_metadata[EPISODE_CALLS] == 3
+
+    step2_info = CurrentForwardPassInfo(
+        request_id="req-1", graph_walk="decode", fwd_index=1, random_seed=0, max_tokens=4,
+        step_metadata={EPISODE_CALLS: 4},
+    )
+    ingest._process_new_inputs(InputSignals(
+        request_id="req-1",
+        inputs=[GraphEdge(next_node="llm", name="hid", tensor_info=[], is_streaming=False)],
+        request_info=step2_info,
+        partition_name="default",
+    ))
+    wrapper2 = ForwardPassInfoWrapper(
+        ingest._request_state.per_request_info[7].per_partition_info["default"].current_fwd_info,
+        SimpleNamespace(dynamic_loop_iter_counts={}),
+    )
+    assert wrapper2.step_metadata[EPISODE_CALLS] == 4

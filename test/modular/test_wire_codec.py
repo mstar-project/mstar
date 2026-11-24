@@ -816,3 +816,19 @@ def test_per_pass_kv_publish_info_takes_the_typed_path():
         assert extensions(msgpack.unpackb(frame, raw=False, strict_map_key=False)) == 0
         got = decode(frame).body.request_info.resource_publish_info["kv"].info[0]["kv"]
         assert got == seq
+
+
+def test_new_request_conductor_deadline_round_trips():
+    from mstar.utils.ipc_format import NewRequestConductor
+
+    for deadline in (123.45, None):
+        msg = ConductorMessage(
+            message_type=ConductorMessageType.NEW_REQUEST,
+            body=NewRequestConductor(
+                request_id="r", initial_signals={}, initial_input_modalities=["text"],
+                initial_output_modalities=["text"], input_metadata={}, model_kwargs={},
+                episode="robot-a", deadline=deadline,
+            ),
+        )
+        got = roundtrip(msg)
+        assert got.body.deadline == deadline
