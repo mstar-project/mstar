@@ -101,7 +101,7 @@ jobs:
           # flex_attention imports torch._inductor, which needs Triton even on
           # CPU; 3.6.0 is the version torch 2.10.0 pins.
           uv pip install triton==3.6.0
-          uv pip install -e ".[dev,waypoint,metrics]"
+          uv pip install -e ".[dev,waypoint,metrics,tracing]"
           # BAGEL's CPU graph/KV tests import these model modules without
           # loading weights or requiring the CUDA-only BAGEL extras.
           uv pip install einops regex transformers
