@@ -401,6 +401,9 @@ class NewRequestConductor(MessageBody):
     reset_episode: bool = False
     # Final adapter digest selected by the data worker, independent of prefix caching.
     episode_adapter_digest: bytes | None = None
+    # ``time.perf_counter()`` deadline after which the conductor refuses to
+    # admit the request while waiting in its admission queue (None: no deadline).
+    deadline: float | None = None
 
 
 @dataclass

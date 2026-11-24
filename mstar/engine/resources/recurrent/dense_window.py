@@ -13,8 +13,6 @@ from mstar.engine.resources.step import Segment, StepContext
 
 @dataclass
 class DenseWindowSpec(RecurrentStateSpec):
-    episode_lifetime: bool = False
-
     @property
     def restores_prefix(self) -> bool:
         return False
@@ -54,10 +52,6 @@ class DenseWindowPool(RecurrentStatePool):
         super().__init__(*args, **kwargs)
         self.window_size = next(iter(self.config.blocks.values())).shape[0]
         self._logical_lengths: dict[tuple[object, str], int] = {}
-        # An episode keeps one existing recurrent-pool row under an internal
-        # owner key while no request runs. The active request aliases that same
-        # slot dict, so admission and step addressing remain the pool's own.
-        self._episode_owner_by_request: dict[int, tuple[str, int]] = {}
 
     def can_capture(self) -> bool:
         # A no-op read returns packed entries whose length varies by row. A
@@ -77,42 +71,23 @@ class DenseWindowPool(RecurrentStatePool):
 
     def bind_episode(self, rid: int, slot: int, episode_id: str | None, *, cold: bool, reset: bool) -> None:
         """Use the conductor-assigned owner slot; never allocate a second slot here."""
-        if episode_id is None:
-            # An idless call is temporary: the normal request row is freed at
-            # REMOVE_REQUEST, even though it consumes an episode admission slot.
-            return
-        owner = ("episode", slot)
-        if cold:
-            if owner in self._slots:
-                raise ValueError(f"episode slot {slot} already has dense rows")
-            self._slots[owner] = self._slots[rid]
-        elif owner not in self._slots:
-            raise ValueError(f"episode slot {slot} has no dense rows to resume")
-        else:
-            self._slots[rid] = self._slots[owner]
-        if reset:
-            self.reset_request(owner)
+        super().bind_episode(rid, slot, episode_id, cold=cold, reset=reset)
+        if episode_id is not None and reset:
+            owner = ("episode", slot)
             for key in [key for key in self._logical_lengths if key[0] == owner]:
                 del self._logical_lengths[key]
-        self._episode_owner_by_request[rid] = owner
 
     def end_episode(self, slot: int) -> None:
         """Free an idle episode's physical row after its last REMOVE_REQUEST."""
+        super().end_episode(slot)
         owner = ("episode", slot)
-        if owner in self._episode_owner_by_request.values():
-            raise ValueError(f"episode slot {slot} still has an active request")
-        super().remove_request(owner)
         for key in [key for key in self._logical_lengths if key[0] == owner]:
             del self._logical_lengths[key]
 
     def remove_request(self, rid: str):
-        owner = self._episode_owner_by_request.pop(rid, None)
-        if owner is not None:
-            # Drop only the active alias. `super` can then clear per-request
-            # reservations without zeroing the persistent owner's slot.
-            self._slots.pop(rid, None)
+        is_named = rid in self._episode_owner_by_request
         super().remove_request(rid)
-        if owner is None:
+        if not is_named:
             for key in [key for key in self._logical_lengths if key[0] == rid]:
                 del self._logical_lengths[key]
 

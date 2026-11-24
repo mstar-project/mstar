@@ -103,7 +103,11 @@ def test_full_non_episode_queue_is_not_scanned():
             raise AssertionError("a full queue should wait for a free request slot")
 
     c = _serving_conductor(max_concurrent=1)
+    c._next_liveness_check = conductor_mod.time.perf_counter() + 30
+    c._next_summary = None
     c.requests["running"] = object()
     c.waiting_queue = NoScan([_request("waiting")])
     c._try_admit_waiting()
+    c._sweep_expiry()
+    assert c._ms_to_next_timed_check() <= 30_000
     assert [body.request_id for body in c.waiting_queue[:]] == ["waiting"]

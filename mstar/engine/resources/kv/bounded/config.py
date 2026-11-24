@@ -106,10 +106,15 @@ class BoundedKVConfig:
     def slot_tokens(self) -> int:
         return self.sink_capacity + self.window_capacity
 
+    @property
+    def usable_slots(self) -> int:
+        return self.max_slots
+
 
 @dataclass
 class BoundedKVSpec(NodeResourceSpec):
     config: BoundedKVConfig
+    episode_lifetime: bool = False
 
     @property
     def resource_class(self) -> "type[Resource]":

@@ -41,12 +41,20 @@ class SizedValueStore(Resource):
     def build(cls, spec: SizedValueSpec, info: EngineResourceInfo) -> SizedValueStore:
         if info.joint_comm_group is not None and info.joint_comm_group.world_size > 1:
             raise NotImplementedError("a sized value store does not shard across ranks yet")
-        return cls(spec.config, info.device, name=spec.resource_key)
+        return cls(
+            spec.config, info.device, name=spec.resource_key,
+            episode_lifetime=spec.episode_lifetime,
+        )
 
-    def __init__(self, config: SizedValueConfig, device: torch.device, name: str = "sized_value"):
+    def __init__(
+        self, config: SizedValueConfig, device: torch.device, name: str = "sized_value",
+        episode_lifetime: bool = False,
+    ):
         self.config = config
         # the resource key, which a deployment's ``resources:`` block names
         self.name = name
+        self.episode_lifetime = episode_lifetime
+        self._episode_owner_by_request: dict[int | str, tuple[str, int]] = {}
         self._device = torch.device(device)
         self._requests: dict[int, _Request] = {}
         self._used = 0
@@ -68,11 +76,78 @@ class SizedValueStore(Resource):
             with self._lock:
                 self._requests[rid] = _Request(overrides)
 
-    def remove_request(self, rid):
+    def bind_episode(self, rid: int, slot: int, episode_id: str | None, *, cold: bool, reset: bool) -> None:
+        if episode_id is None:
+            return
+        owner = ("episode", slot)
         with self._lock:
-            req = self._requests.pop(rid, None)
+            if cold:
+                if owner in self._requests:
+                    raise ValueError(f"sized value store {self.name!r}: episode slot {slot} already has state")
+            else:
+                prev = self._requests.pop(owner, None)
+                if prev is not None:
+                    if reset:
+                        self._used -= prev.nbytes
+                        prev.tensors.clear()
+                        prev.cleared.clear()
+                        prev.lent.clear()
+                        prev.admitted = False
+                        prev.nbytes = 0
+                        if rid not in self._requests:
+                            self._requests[rid] = prev
+                    else:
+                        cur = self._requests.get(rid)
+                        if not prev.admitted:
+                            if cur is None:
+                                self._requests[rid] = prev
+                        else:
+                            if cur is not None and cur.config.sizes != prev.config.sizes:
+                                self._requests[owner] = prev
+                                raise ValueError(
+                                    f"{self.name}: warm episode sizes changed from {prev.config.sizes} "
+                                    f"to {cur.config.sizes} without reset"
+                                )
+                            self._requests[rid] = prev
+            self._episode_owner_by_request[rid] = owner
+
+    def end_episode(self, slot: int) -> None:
+        owner = ("episode", slot)
+        with self._lock:
+            if owner in self._episode_owner_by_request.values():
+                raise ValueError(f"episode slot {slot} still has an active request")
+            req = self._requests.pop(owner, None)
             if req is not None:
                 self._used -= req.nbytes
+                req.tensors.clear()
+
+    def remove_request(self, rid):
+        with self._lock:
+            owner = self._episode_owner_by_request.pop(rid, None)
+            req = self._requests.pop(rid, None)
+            if owner is not None:
+                if req is not None:
+                    req.lent.clear()
+                    self._requests[owner] = req
+                return
+            if req is not None:
+                self._used -= req.nbytes
+
+    def logical_length(self, rid, label: str = "main") -> int:
+        with self._lock:
+            key = rid if rid in self._requests else self._episode_owner_by_request.get(rid, rid)
+            req = self._requests.get(key)
+            if req is None:
+                return 0
+            return 1 if any(lbl == label for (lbl, _, _) in req.tensors) else 0
+
+    def held(self, rid) -> int:
+        with self._lock:
+            key = rid if rid in self._requests else self._episode_owner_by_request.get(rid, rid)
+            req = self._requests.get(key)
+            if req is None:
+                return 0
+            return len({lbl for (lbl, _, _) in req.tensors})
 
     def _need(self, req: _Request) -> int:
         cleared = sum(self.config.fields[name].bytes_at(req.config.sizes[label]) for label, _, name in req.cleared)

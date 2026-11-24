@@ -113,13 +113,16 @@ class EpisodeRecords:
         """Mark a close while a call drains; return whether it is in flight."""
         record = self._records.get(episode_id)
         if record is None:
-            self._closed[episode_id] = time.monotonic()
+            self._closed[episode_id] = time.perf_counter()
             return False
         record.ending = True
         return record.in_flight is not None
 
     def has(self, episode_id: str) -> bool:
         return episode_id in self._records
+
+    def has_active_or_closed(self) -> bool:
+        return bool(self._records or self._closed)
 
     def ending(self, episode_id: str) -> bool:
         record = self._records.get(episode_id)
@@ -195,7 +198,7 @@ class EpisodeRecords:
             raise ValueError("held counts must be non-negative ints")
         record.held.update(held)
         record.in_flight = None
-        record.last_end = time.monotonic()
+        record.last_end = time.perf_counter()
         record.cold = None
 
     def reset(self, episode_id: str, reason: str = "reset") -> None:
@@ -213,7 +216,7 @@ class EpisodeRecords:
         if record.in_flight is not None:
             raise ValueError(f"episode {episode_id!r} is in flight")
         del self._records[episode_id]
-        self._closed[episode_id] = time.monotonic()
+        self._closed[episode_id] = time.perf_counter()
         return record.slot, record.workers
 
     def evict(self, episode_id: str, reason: str = "evicted") -> tuple[int, set[str]]:
@@ -236,8 +239,36 @@ class EpisodeRecords:
         if record.in_flight != request_id:
             raise ValueError(f"episode {episode_id!r} does not run request {request_id!r}")
         del self._records[episode_id]
-        self._closed[episode_id] = time.monotonic()
+        self._closed[episode_id] = time.perf_counter()
         return record.slot, record.workers
+
+    def lose_workers(self, dead_workers: set[str]) -> list[tuple[str, int, set[str], set[str], str | None]]:
+        """End every episode placed on a lost worker, marking surviving ones ``cold='lost'``."""
+        if not dead_workers:
+            return []
+        lost: list[tuple[str, int, set[str], set[str], str | None]] = []
+        now = time.perf_counter()
+        for episode_id, record in list(self._records.items()):
+            if record.slot is None or not (record.workers & dead_workers):
+                continue
+            slot = record.slot
+            workers = set(record.workers)
+            surviving = workers - dead_workers
+            in_flight = record.in_flight
+            if record.ending:
+                del self._records[episode_id]
+                self._closed[episode_id] = now
+            else:
+                record.slot = None
+                record.placement = None
+                record.workers = set()
+                record.held.clear()
+                record.keys.clear()
+                record.in_flight = None
+                record.last_end = now
+                record.cold = "lost"
+            lost.append((episode_id, slot, workers, surviving, in_flight))
+        return lost
 
     def idle(self) -> list[tuple[str, EpisodeRecord]]:
         return sorted(

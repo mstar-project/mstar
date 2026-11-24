@@ -226,6 +226,11 @@ class Resource(ResidentHooks, ABC):
 
     # this resource's key among the engine's resources, set by `build_resource`
     resource_key: str | None = None
+    # Whether this resource holds cross-request episode state (`lifetime="episode"`).
+    episode_lifetime: bool = False
+    # Whether `Engine.finalize_batch` reports `self.held(rid)` in `batch.episode_held`.
+    # Auxiliary resources (e.g. `PositionManager`) share episode lifecycles without reporting.
+    reports_episode_held: bool = True
 
     # Whether this resource's kernels can be left out of a step whose rows all allow
     # it (``lean_for``). The engine then captures a lean twin of each bucket whose

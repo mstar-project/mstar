@@ -168,12 +168,14 @@ class RecurrentStatePool(Resource):
         return cls(
             device=info.device, config=config, comm_group=info.joint_comm_group,
             name=spec.resource_key, kv_dtype=info.kv_dtype, world_size=world_size,
+            episode_lifetime=spec.episode_lifetime,
         )
 
     def __init__(
         self, device: torch.device, config: RecurrentStateConfig,
         comm_group: JointGroups | None = None, name: str = "recurrent_state",
         kv_dtype: torch.dtype | None = None, world_size: int = 1,
+        episode_lifetime: bool = False,
     ):
         """``kv_dtype`` (the engine's) stands in for a block's ``dtype=None``."""
         if config.prefix_slots and config.disable_sink_slot:
@@ -186,6 +188,8 @@ class RecurrentStatePool(Resource):
         self._comm_group = comm_group
         # the resource key, for errors
         self._name = name
+        self.episode_lifetime = episode_lifetime
+        self._episode_owner_by_request: dict[int | str, tuple[str, int]] = {}
         # the start `set_start` gave, by block and layer, or None before it is called
         self._start: dict[tuple[str, int | None], torch.Tensor] | None = None
 
@@ -403,30 +407,90 @@ class RecurrentStatePool(Resource):
             self._slots[rid] = {}
             self._version += 1
 
-    def remove_request(self, rid: str):
-        self.reset_request(rid, free=True)
+    def logical_length(self, rid, label: str = "main") -> int:
+        key = rid if rid in self._slots else self._episode_owner_by_request.get(rid, rid)
+        slot = self._slots.get(key, {}).get(label)
+        return 0 if slot is None else (slot.tokens or int(slot.has_state))
+
+    def held(self, rid) -> int:
+        key = rid if rid in self._slots else self._episode_owner_by_request.get(rid, rid)
+        labels = self._slots.get(key, {})
+        return sum(1 for slot in labels.values() if slot.has_state)
+
+    def bind_episode(self, rid: int, slot: int, episode_id: str | None, *, cold: bool, reset: bool) -> None:
+        if episode_id is None:
+            return
+        owner = ("episode", slot)
         with self._lock:
-            self._slots.pop(rid, None)
-            self._kept -= self._reserved.pop(rid, 0)
-            self._drop_lease(rid)
-            for key in [k for k in self._restores if k[0] == rid]:
-                self._unref(self._restores.pop(key).slot)
-            # reserved by an admit whose step never committed (its forward raised)
-            for key in [k for k in self._snap_writes if k[0] == rid]:
-                self._snap_free.append(self._snap_writes.pop(key).slot)
-            # a filed decode snapshot stays, for the next turn of the chat
-            for key in [k for k in self._decode if k[0] == rid]:
-                decode = self._decode.pop(key)
-                if key in self._unkeyed:
-                    self._unkeyed.discard(key)
-                    self._snap_free.append(decode.slot)
-            self._keyed -= {k for k in self._keyed if k[0] == rid}
-            self._forget_prefix_admit(lambda key: key[0] == rid)
+            if cold:
+                if owner in self._slots:
+                    raise ValueError(f"episode slot {slot} already has recurrent rows")
+                self._slots[owner] = self._slots[rid]
+            elif owner not in self._slots:
+                raise ValueError(f"episode slot {slot} has no recurrent rows to resume")
+            else:
+                self._slots[rid] = self._slots[owner]
+            if reset:
+                self.reset_request(owner)
+            self._episode_owner_by_request[rid] = owner
             self._version += 1
 
-    supports_drop = True
+    def end_episode(self, slot: int) -> None:
+        owner = ("episode", slot)
+        with self._lock:
+            if owner in self._episode_owner_by_request.values():
+                raise ValueError(f"episode slot {slot} still has an active request")
+        self.reset_request(owner, free=True)
+        with self._lock:
+            self._cleanup_request_state(owner)
+
+    def _cleanup_request_state(self, rid) -> None:
+        """Purge handle-keyed transient and prefix state for ``rid``. Caller holds ``self._lock``."""
+        self._slots.pop(rid, None)
+        self._kept -= self._reserved.pop(rid, 0)
+        self._drop_lease(rid)
+        for key in [k for k in self._restores if k[0] == rid]:
+            self._unref(self._restores.pop(key).slot)
+        # reserved by an admit whose step never committed (its forward raised)
+        for key in [k for k in self._snap_writes if k[0] == rid]:
+            self._snap_free.append(self._snap_writes.pop(key).slot)
+        # a filed decode snapshot stays, for the next turn of the chat
+        for key in [k for k in self._decode if k[0] == rid]:
+            decode = self._decode.pop(key)
+            if key in self._unkeyed:
+                self._unkeyed.discard(key)
+                self._snap_free.append(decode.slot)
+        self._keyed -= {k for k in self._keyed if k[0] == rid}
+        self._forget_prefix_admit(lambda key: key[0] == rid)
+        self._version += 1
+
+    def remove_request(self, rid: str):
+        with self._lock:
+            owner = self._episode_owner_by_request.pop(rid, None)
+            if owner is not None:
+                self._forget_taken(lambda r: r == rid)
+                for key in [k for k in self._chunk_ends if k[0] == rid]:
+                    del self._chunk_ends[key]
+                self._cleanup_request_state(rid)
+                return
+        self.reset_request(rid, free=True)
+        with self._lock:
+            self._cleanup_request_state(rid)
+
+    @property
+    def supports_drop(self) -> bool:
+        return not self.episode_lifetime
+
+    def check_drop(self, rid: str, tokens: int) -> str | None:
+        del rid, tokens
+        if self.episode_lifetime:
+            return f"recurrent state pool {self._name!r}: episode state cannot be rebuilt from token ids"
+        return None
 
     def drop(self, rid: str, tokens: int) -> int:
+        refusal = self.check_drop(rid, tokens)
+        if refusal is not None:
+            raise RuntimeError(refusal)
         # zeroed in place, so recomputing the state never waits for a free slot
         self.reset_request(rid)
         return 0
@@ -512,7 +576,8 @@ class RecurrentStatePool(Resource):
         if not self._decides:
             return None
         with self._lock:
-            if self._slots.get(rid) or rid in self._reserved:
+            missing = len(self.config.labels) - len(self._slots.get(rid, ()))
+            if missing <= 0 or rid in self._reserved:
                 return None
         return ASKS
 
@@ -526,7 +591,12 @@ class RecurrentStatePool(Resource):
     def _reserve(self, rid: str, requests: int) -> int | None:
         """Reserve ``rid``'s slots when there is room for ``requests`` requests' slots."""
         with self._lock:
-            need, room = len(self.config.labels), len(self._free) - self._kept
+            if rid in self._reserved:
+                return None
+            need = max(0, len(self.config.labels) - len(self._slots.get(rid, ())))
+            if need == 0:
+                return None
+            room = len(self._free) - self._kept
             if need * requests > room:
                 return room
             self._reserved[rid] = need
