@@ -50,6 +50,7 @@ from mstar.distributed.base import node_group_axis_sizes
 from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items, variant_root
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG
+from mstar.engine.resources.lora.identity import adapter_prefix_root
 from mstar.engine.resources.position.config import MAX_POSITION_KWARG
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.state.adapters import kv_layouts, sized_values, state_sizes
@@ -679,6 +680,9 @@ class PreparedInput(NamedTuple):
     model_kwargs: dict
     # for the response's usage (``Model.prompt_tokens``)
     prompt_tokens: int
+    episode_keys: dict[str, str] | None = None
+    reset_episode: bool = False
+    episode_adapter_digest: bytes | None = None
 
 
 class PreparingInput(NamedTuple):
@@ -1008,6 +1012,9 @@ class PreprocessWorkerThread:
             model_kwargs.pop(name, None)
         open_streams = self._client_edges - input.ends
         num_prompt_tokens = 0
+        episode_keys = None
+        reset_episode = False
+        episode_adapter_digest = None
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
                 input.text,
@@ -1021,6 +1028,8 @@ class PreprocessWorkerThread:
             )
             root = input.prefix_root
             if isinstance(prompt_tensors, ProcessPromptOutput):
+                episode_keys = dict(prompt_tensors.episode_keys or {})
+                reset_episode = prompt_tensors.reset_episode
                 selected = input.model_kwargs or {}
                 model_kwargs.update(prompt_tensors.metadata)
                 if prompt_tensors.lora_adapter is not KEEP_ADAPTER or any(
@@ -1028,6 +1037,10 @@ class PreprocessWorkerThread:
                 ):
                     model_kwargs, root = self._model_chose(prompt_tensors, model_kwargs, selected, root)
                 prompt_tensors = prompt_tensors.new_input_tensors
+            if model_kwargs.get(LORA_ADAPTER_KWARG) is not None:
+                digest = model_kwargs.get(LORA_DIGEST_KWARG)
+                if type(digest) is bytes and root == adapter_prefix_root(digest):
+                    episode_adapter_digest = digest
             if prompt_tensors:
                 tensors.update(prompt_tensors)
             state_layout = model_kwargs.pop("state_layout", None)
@@ -1064,7 +1077,10 @@ class PreprocessWorkerThread:
             tensors["text_inputs"] = [torch.tensor(
                 list(byte_data), dtype=torch.uint8, device=self.device
             )]
-        return PreparedInput(tensors, input_metadata, model_kwargs, num_prompt_tokens)
+        return PreparedInput(
+            tensors, input_metadata, model_kwargs, num_prompt_tokens, episode_keys, reset_episode,
+            episode_adapter_digest,
+        )
 
     def _model_chose(
         self, output: ProcessPromptOutput, model_kwargs: dict, selected: dict, root: bytes,
@@ -1101,7 +1117,8 @@ class PreprocessWorkerThread:
         self, input: PreprocessInput, prepared: PreparedInput, profile: DataWorkerProfile | None,
     ) -> None:
         """Store a prepared request's tensors and hand it to the conductor."""
-        tensors, input_metadata, model_kwargs, num_prompt_tokens = prepared
+        (tensors, input_metadata, model_kwargs, num_prompt_tokens, episode_keys, reset_episode,
+         episode_adapter_digest) = prepared
 
         # A client stream's first chunk, not a prompt signal: a one-shot upload
         # is a stream of one chunk. Stored before the request reaches the
@@ -1135,6 +1152,11 @@ class PreprocessWorkerThread:
                 input_open=bool(self._client_edges - input.ends),
                 streaming=input.streaming,
                 prompt_tokens=num_prompt_tokens,
+                episode=input.episode,
+                episode_keys=episode_keys,
+                reset_episode=input.reset_episode or reset_episode,
+                episode_adapter_digest=episode_adapter_digest,
+                deadline=input.deadline,
             ),
         )
         self.communicator.send("conductor", msg)

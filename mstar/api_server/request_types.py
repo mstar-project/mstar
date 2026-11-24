@@ -172,6 +172,9 @@ class PreprocessInput:
     input_modalities: list[str]
     output_modalities: list[str]
     model_kwargs: dict
+    # System-owned session identity and reset, separate from model kwargs.
+    episode: str | None = None
+    reset_episode: bool = False
 
     # Ordered text/attachment sequence, when the entrypoint preserved it.
     prompt_parts: list[PromptPart] | None = None
@@ -189,6 +192,9 @@ class PreprocessInput:
     # in place of that modality's files (an image is RGB uint8 ``[3, H, W]``):
     # each goes to ``Model.load_decoded_<modality>``, with no file between.
     raw_inputs: dict[str, list["torch.Tensor"]] | None = None
+    # ``time.perf_counter()`` deadline after which the conductor refuses to
+    # admit the request while waiting in its admission queue (None: no deadline).
+    deadline: float | None = None
 
 
 @dataclass

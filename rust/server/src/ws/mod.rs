@@ -3,6 +3,7 @@
 
 pub mod generate;
 pub mod openpi;
+pub mod positronic;
 
 use axum::extract::ws::{rejection::WebSocketUpgradeRejection, CloseFrame, Message, WebSocketUpgrade};
 use axum::response::Response;

@@ -51,6 +51,19 @@ from mstar.model.submodule_base import (
 from mstar.model.utils import TextChunkDetokenizer, TextOutput, drop_stop_tokens
 
 
+class EpisodeView(NamedTuple):
+    """The conductor's snapshot of state held before a request's first walk.
+
+    Models receive this only when they declare an episode-lifetime array.
+    ``held`` counts resident entries, not the total appended over the episode.
+    """
+
+    id: str | None
+    calls: int
+    held: Mapping[str, int]
+    cold: str | None = None
+
+
 def _wrap_node_in_loop(
     section: GraphSection, node_name: str, graph_walk: str,
     policy: "ChunkingPolicy",
@@ -191,6 +204,8 @@ class ProcessPromptOutput(NamedTuple):
     new_input_tensors: NameToTensorList
     metadata: dict
     lora_adapter: str | None | KeepAdapter = KEEP_ADAPTER
+    episode_keys: Mapping[str, str] | None = None
+    reset_episode: bool = False
 
 
 class ClientChunk(NamedTuple):
@@ -1047,6 +1062,8 @@ class Model(ABC):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict,
+        *,
+        episode: EpisodeView | None = None,
     ) -> list[WalkStep]:
         """The walks ``partition_name`` runs for this request, in order, decided
         at ingest; ``[]`` when the request doesn't use the partition.

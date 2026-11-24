@@ -325,6 +325,12 @@ class PagedKVConfig(KVConfig):
         """Arena pages requests can hold: all but the sink page the KV manager takes at build."""
         return self.num_units - 1
 
+    @property
+    def usable_slots(self) -> int:
+        """Concurrent max_seq_len streams that fit in arena pages beside the sink page."""
+        per_request = max(1, sum(-(-self.max_seq_len // group.page_size) for group in self.groups))
+        return self.request_pages // per_request
+
     def stream_pages(self, layout: "StreamLayout", caps: Mapping[str, int]) -> int:
         """The most arena pages a stream laid out as ``layout`` holds at ``caps``: its pages in
         every group, each window group's under that group's retention."""
@@ -441,6 +447,11 @@ class RingKVConfig(KVConfig):
         padding session is a real, addressable span.
         """
         return self.num_sessions + 1
+
+    @property
+    def usable_slots(self) -> int:
+        """Resident sessions available to requests or episodes."""
+        return self.num_sessions
 
     def __post_init__(self):
         super().__post_init__()
@@ -896,6 +907,7 @@ class KVSpec(NodeResourceSpec):
     # Under CFG parallel, the node whose pool admits each request. The other nodes' pools hold no
     # more pages per request than the leader's, as long as the leader offloads nothing.
     leader: str | None = None
+    episode_lifetime: bool = False
 
     @property
     def resource_class(self) -> "type[Resource]":

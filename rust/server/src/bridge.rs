@@ -12,7 +12,8 @@
 //!
 //! Wire format is msgpack (the conductor speaks msgpack), sent as the
 //! `ZmqCommunicator`'s opaque byte payload:
-//!   frontend -> conductor: SubmitMsg {t:"submit", rid, sub, text, file_paths,
+//!   frontend -> conductor: SubmitMsg {t:"submit", rid, sub, text, episode?,
+//!                        reset_episode?, file_paths,
 //!       input_modalities, output_modalities, model_kwargs, prompt_parts,
 //!       streaming, accepts_chunks, report_usage}, `prompt_parts` present for a
 //!       chat only, `report_usage` only when set
@@ -97,6 +98,10 @@ struct SubmitMsg<'a> {
     rid: &'a str,
     sub: u64,
     text: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    episode: Option<&'a str>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    reset_episode: bool,
     /// Pre-tokenized prompt (frontend-tokenizes path); `text` is None then.
     tokens: Option<&'a [u32]>,
     /// The frontend will detokenize: text emissions come back as raw token
@@ -375,6 +380,8 @@ impl Bridge {
             rid: request_id,
             sub,
             text: args.text.as_deref(),
+            episode: args.episode.as_deref(),
+            reset_episode: args.reset_episode,
             tokens: args.tokens.as_deref(),
             frontend_detok: args.tokens.is_some(),
             accepts_chunks: true,
@@ -583,6 +590,16 @@ impl Bridge {
         }
         self.routes.lock().expect("routes lock").remove(sub);
     }
+
+    pub async fn end_episode(&self, episode: &str) -> Result<(), String> {
+        let mut op = serde_json::Map::new();
+        op.insert("episode".into(), serde_json::Value::String(episode.to_string()));
+        match self.round_trip("end_episode", Extras { op: Some(&op), ..Extras::default() }, Duration::from_secs(10)).await {
+            Some(StreamItem::Done) => Ok(()),
+            Some(StreamItem::Error { message, .. }) => Err(message),
+            _ => Err("episode cleanup did not complete".into()),
+        }
+    }
 }
 
 /// Route one inbound message to its submission's serving task; a terminal one
@@ -688,6 +705,8 @@ mod tests {
             rid: "r",
             sub: 1,
             text: Some("hi"),
+            episode: None,
+            reset_episode: false,
             tokens: None,
             frontend_detok: false,
             accepts_chunks: true,
