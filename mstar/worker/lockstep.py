@@ -598,6 +598,10 @@ class Lockstep:
         """How many queued follow steps name this request."""
         return self._follow_count.get(wire_rid, 0)
 
+    def pending_committed_steps(self) -> int:
+        """Leader steps the follower has received but not consumed."""
+        return len(self._follow_fifo)
+
     def tp_rids(self, message: ScheduleTPNode) -> list[int]:
         """``ScheduleTPNode`` crosses the wire, so its rids are strings; these
         are this rank's handles for them, in the leader's order. A rid this rank

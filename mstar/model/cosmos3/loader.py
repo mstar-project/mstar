@@ -157,6 +157,85 @@ def read_transformer_weight_shapes(checkpoint_dir: str | Path) -> dict[str, tupl
     return shapes
 
 
+def _resolve_shard_files(path: str | Path, *, allow_glob_fallback: bool = False) -> list[Path]:
+    from mstar.model.loader.reload import safetensors_files
+    from mstar.model.reload_errors import WeightReloadRefusedError
+
+    p = Path(path)
+    if p.is_file():
+        return [p]
+    if not p.is_dir():
+        raise FileNotFoundError(f"no weights found under {p}")
+    try:
+        return safetensors_files(p)
+    except WeightReloadRefusedError as exc:
+        if "no model.safetensors" in str(exc):
+            if allow_glob_fallback:
+                shards = sorted(p.glob("*.safetensors"))
+                if shards:
+                    return shards
+            raise FileNotFoundError(f"no weights found under {p}") from exc
+        raise
+
+
+def _verify_complete_load(
+    expected: set[str],
+    loaded: set[str],
+    stacked_rules: list[StackedParamRule],
+    got_shards: dict[str, set[str | int]],
+    component: str,
+    source: str | Path,
+) -> None:
+    missing = set(expected - loaded)
+    for target, seen in got_shards.items():
+        needed = {r.shard_id for r in stacked_rules if r.target_suffix in target}
+        missing_shards = needed - seen
+        if missing_shards:
+            missing.add(f"{target} (missing shards {sorted(missing_shards)})")
+    if missing:
+        sample = sorted(missing)[:10]
+        more = "…" if len(missing) > 10 else ""
+        raise KeyError(
+            f"Cosmos3 {component} load left {len(missing)} parameter(s) unfilled "
+            f"from {source}: {sample}{more}"
+        )
+
+
+def load_transformer_path(
+    model: torch.nn.Module,
+    path: str | Path,
+    device: str = "cpu",
+) -> set[str]:
+    """Stream transformer weights from ``path`` (a ``transformer/`` directory,
+    HF/diffusers shard directory, or direct ``.safetensors`` file) into
+    ``model`` and verify full parameter + ``TRANSFORMER_STACKED`` shard
+    completeness."""
+    from mstar.model.loader import StackedMatcher, iter_safetensors_file, load_hf_weights
+
+    shards = _resolve_shard_files(path, allow_glob_fallback=True)
+    with_lm_head = hasattr(model, "lm_head")
+    expected = set(dict(model.named_parameters()).keys())
+    match_stacked = StackedMatcher(TRANSFORMER_STACKED)
+    got_shards: dict[str, set[str | int]] = {}
+
+    def _weights():
+        for shard in shards:
+            for key, tensor in iter_safetensors_file(shard, device=device):
+                mapped = cosmos3_name_remapper(key, with_lm_head=with_lm_head)
+                if mapped is not None:
+                    target, shard_id = match_stacked(mapped)
+                    if shard_id is not None and target in expected:
+                        got_shards.setdefault(target, set()).add(shard_id)
+                yield key, tensor
+
+    loaded = load_hf_weights(
+        model, _weights(), stacked_params=TRANSFORMER_STACKED,
+        name_remapper=lambda name: cosmos3_name_remapper(name, with_lm_head=with_lm_head),
+    )
+    _verify_complete_load(expected, loaded, TRANSFORMER_STACKED, got_shards, "transformer", path)
+    return loaded
+
+
 def load_transformer_weights(
     model: torch.nn.Module,
     checkpoint_dir: str | Path,
@@ -172,47 +251,57 @@ def load_transformer_weights(
     directly. Raises if any backbone parameter is
     left unfilled — the completeness guarantee bagel's loader also enforces.
     """
-    from mstar.model.loader import iter_safetensors_file, load_hf_weights
-
-    tdir = Path(checkpoint_dir) / "transformer"
-    shard_names = _transformer_shard_names(tdir)
-
-    def _weights():
-        for shard in shard_names:
-            yield from iter_safetensors_file(tdir / shard, device=device)
-
-    with_lm_head = hasattr(model, "lm_head")
-    loaded = load_hf_weights(
-        model, _weights(), stacked_params=TRANSFORMER_STACKED,
-        name_remapper=lambda name: cosmos3_name_remapper(name, with_lm_head=with_lm_head),
-    )
-
-    expected = set(dict(model.named_parameters()).keys())
-    missing = expected - loaded
-    if missing:
-        sample = sorted(missing)[:10]
-        more = "…" if len(missing) > 10 else ""
-        raise KeyError(
-            f"Cosmos3 transformer load left {len(missing)} parameter(s) unfilled "
-            f"from {tdir}: {sample}{more}"
-        )
-    return loaded
+    return load_transformer_path(model, Path(checkpoint_dir) / "transformer", device=device)
 
 
 def read_vision_encoder_weight_shapes(checkpoint_dir: str | Path) -> dict[str, tuple[int, ...]]:
-    """``{parameter: shape}`` of ``vision_encoder/model.safetensors`` as the
-    vision module holds it (q / k / v fused), from the safetensors header only
-    (CPU-side shape verification of the meta-built vision module)."""
+    """``{parameter: shape}`` of ``vision_encoder/`` as the vision module
+    holds it (q / k / v fused), from the safetensors header only (CPU-side
+    shape verification of the meta-built vision module)."""
     from safetensors import safe_open
 
-    path = Path(checkpoint_dir) / "vision_encoder" / "model.safetensors"
+    shards = _resolve_shard_files(Path(checkpoint_dir) / "vision_encoder")
     shapes: dict[str, tuple[int, ...]] = {}
-    with safe_open(path, framework="pt") as handle:
-        for key in handle.keys():
-            mapped = vision_encoder_name_remapper(key)
-            if mapped is not None:
-                shapes[mapped] = tuple(handle.get_slice(key).get_shape())
+    for shard in shards:
+        with safe_open(shard, framework="pt") as handle:
+            for key in handle.keys():
+                mapped = vision_encoder_name_remapper(key)
+                if mapped is not None:
+                    shapes[mapped] = tuple(handle.get_slice(key).get_shape())
     return stacked_param_shapes(shapes, VISION_STACKED)
+
+
+def load_vision_encoder_path(
+    model: torch.nn.Module,
+    path: str | Path,
+    device: str = "cpu",
+) -> set[str]:
+    """Stream ``vision_encoder`` weights from ``path`` into the reasoner's
+    vision module (tower + projector) and return the loaded keys, raising if
+    any parameter or stacked shard is left unfilled."""
+    from mstar.model.loader import StackedMatcher, iter_safetensors_file, load_hf_weights
+
+    shards = _resolve_shard_files(path)
+    expected = set(dict(model.named_parameters()).keys())
+    match_stacked = StackedMatcher(VISION_STACKED)
+    got_shards: dict[str, set[str | int]] = {}
+
+    def _weights():
+        for shard in shards:
+            for key, tensor in iter_safetensors_file(shard, device=device):
+                mapped = vision_encoder_name_remapper(key)
+                if mapped is not None:
+                    target, shard_id = match_stacked(mapped)
+                    if shard_id is not None and target in expected:
+                        got_shards.setdefault(target, set()).add(shard_id)
+                yield key, tensor
+
+    loaded = load_hf_weights(
+        model, _weights(), stacked_params=VISION_STACKED,
+        name_remapper=vision_encoder_name_remapper,
+    )
+    _verify_complete_load(expected, loaded, VISION_STACKED, got_shards, "vision encoder", path)
+    return loaded
 
 
 def load_vision_encoder_weights(
@@ -223,22 +312,69 @@ def load_vision_encoder_weights(
     """Stream ``vision_encoder/model.safetensors`` into the reasoner's vision
     module (tower + projector) and return the loaded keys, raising if any
     parameter is left unfilled."""
-    from mstar.model.loader import iter_safetensors_file, load_hf_weights
+    return load_vision_encoder_path(model, Path(checkpoint_dir) / "vision_encoder", device=device)
 
-    path = Path(checkpoint_dir) / "vision_encoder" / "model.safetensors"
-    if not path.exists():
-        raise FileNotFoundError(f"no vision encoder weights under {path}")
-    loaded = load_hf_weights(
-        model, iter_safetensors_file(path, device=device), stacked_params=VISION_STACKED,
-        name_remapper=vision_encoder_name_remapper,
-    )
-    expected = set(dict(model.named_parameters()).keys())
-    missing = expected - loaded
-    if missing:
-        sample = sorted(missing)[:10]
-        more = "…" if len(missing) > 10 else ""
-        raise KeyError(
-            f"Cosmos3 vision encoder load left {len(missing)} parameter(s) unfilled "
-            f"from {path}: {sample}{more}"
-        )
+
+def load_vae_path(
+    vae: torch.nn.Module,
+    path: str | Path,
+    device: str = "cpu",
+) -> set[str]:
+    """Stream Wan VAE weights from ``path`` into ``vae`` in place, preserving
+    ``channels_last_3d`` / ``channels_last`` layouts and decode dtypes."""
+    from mstar.model.loader import iter_safetensors_file, load_weights_into
+
+    shards = _resolve_shard_files(path, allow_glob_fallback=True)
+    drop_encoder = getattr(vae, "encoder", None) is None
+
+    def _weights():
+        for shard in shards:
+            yield from iter_safetensors_file(shard, device=device)
+
+    remapper = (lambda k: None if k.startswith("encoder.") else k) if drop_encoder else None
+    loaded = load_weights_into(vae, _weights(), name_remapper=remapper)
+    expected = set(dict(vae.named_parameters()).keys())
+    _verify_complete_load(expected, loaded, [], {}, "VAE", path)
     return loaded
+
+
+def load_vae_weights(
+    vae: torch.nn.Module,
+    checkpoint_dir: str | Path,
+    device: str = "cpu",
+) -> set[str]:
+    """Stream ``vae/`` weights into ``vae`` in place."""
+    return load_vae_path(vae, Path(checkpoint_dir) / "vae", device=device)
+
+
+def load_sound_tokenizer_path(
+    model: torch.nn.Module,
+    path: str | Path,
+    device: str = "cpu",
+) -> set[str]:
+    """Stream ``sound_tokenizer`` decoder weights from ``path`` into ``model``
+    in place, ignoring ``encoder.*`` keys and preserving ``weight_norm``
+    ``weight_g``/``weight_v`` storage."""
+    from mstar.model.loader import iter_safetensors_file, load_weights_into
+
+    shards = _resolve_shard_files(path, allow_glob_fallback=True)
+    expected = set(dict(model.named_parameters()).keys())
+
+    def _weights():
+        for shard in shards:
+            yield from iter_safetensors_file(shard, device=device)
+
+    loaded = load_weights_into(
+        model, _weights(), name_remapper=lambda k: k if k in expected else None,
+    )
+    _verify_complete_load(expected, loaded, [], {}, "sound tokenizer", path)
+    return loaded
+
+
+def load_sound_tokenizer_weights(
+    model: torch.nn.Module,
+    checkpoint_dir: str | Path,
+    device: str = "cpu",
+) -> set[str]:
+    """Stream ``sound_tokenizer/`` weights into ``model`` in place."""
+    return load_sound_tokenizer_path(model, Path(checkpoint_dir) / "sound_tokenizer", device=device)
