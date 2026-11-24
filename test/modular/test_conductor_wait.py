@@ -44,7 +44,9 @@ def _episode_idle_due(c, at):
 
 def _waiting_deadline_due(c, at):
     c._queued_since = {}
-    c.waiting_queue.append(NewRequestConductor(
+    c._waiting_deadlines = []
+    c._waiting_deadline_by_id = {}
+    c._enqueue_waiting(NewRequestConductor(
         "expired-waiter", {}, ["text"], ["text"], {}, {}, deadline=at,
     ))
 
@@ -99,6 +101,8 @@ def _conductor(comm):
     c._declaration_digests = {}
     c._episode_array_names = frozenset()
     c._episode_records = conductor_mod.EpisodeRecords()
+    c._waiting_deadlines = []
+    c._waiting_deadline_by_id = {}
     return c
 
 

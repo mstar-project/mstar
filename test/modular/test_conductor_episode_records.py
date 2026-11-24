@@ -519,12 +519,16 @@ def test_ms_to_next_timed_check_includes_earliest_non_queued_idle_episode(monkey
     )
     assert conductor._ms_to_next_timed_check() == 40_000
 
-    # Non-episode model or disabled idle timeout ignores episode deadlines.
+    # Non-episode model or disabled idle timeout ignores episode deadlines, while
+    # arrayless sessions already tracked in EpisodeRecords still wake on idle_timeout_s.
     conductor.waiting_queue = []
+    conductor._episode_records.evict("ep-later", "idle")
     conductor._episode_idle_timeout_s = None
     assert conductor._ms_to_next_timed_check() == 40_000
     conductor._episode_idle_timeout_s = 10.0
     conductor._episode_array_names = frozenset()
+    assert conductor._ms_to_next_timed_check() == 10_000
+    conductor._episode_records = EpisodeRecords()
     assert conductor._ms_to_next_timed_check() == 40_000
 
 

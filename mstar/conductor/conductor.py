@@ -1,5 +1,6 @@
 import atexit
 import hashlib
+import heapq
 import itertools
 import logging
 import math
@@ -565,6 +566,8 @@ class Conductor:
         self._liveness_interval_s = 0.5
         self._next_liveness_check = 0.0
         self.waiting_queue: list[NewRequestConductor] = []
+        self._waiting_deadlines: list[tuple[float, str]] = []
+        self._waiting_deadline_by_id: dict[str, float] = {}
 
         if model_config is None:
             with open(model_config_file, "r") as f:
@@ -1146,7 +1149,10 @@ class Conductor:
             f"worker {worker_id} (pid {p.pid}) exited with "
             f"{describe_exitcode(p.exitcode)}, so the server is shutting down"
         )
-        if self._episode_array_names and getattr(self, "_episode_records", None) is not None:
+        if (
+            (records := getattr(self, "_episode_records", None)) is not None
+            and (getattr(self, "_episode_array_names", None) or records.has_active_or_closed())
+        ):
             self._lose_worker_episodes({w for w, _ in dead})
         # The failures go out before the process does: what a full API server
         # could not take yet is queued in the outbox. Bounded, so a peer that
@@ -1357,47 +1363,86 @@ class Conductor:
                 )
             )
 
+    def _enqueue_waiting(self, body: NewRequestConductor) -> None:
+        self.waiting_queue.append(body)
+        if (deadline := getattr(body, "deadline", None)) is not None:
+            deadlines = getattr(self, "_waiting_deadlines", None)
+            if deadlines is None:
+                deadlines = self._waiting_deadlines = []
+            by_id = getattr(self, "_waiting_deadline_by_id", None)
+            if by_id is None:
+                by_id = self._waiting_deadline_by_id = {}
+            by_id[body.request_id] = deadline
+            heapq.heappush(deadlines, (deadline, body.request_id))
+
+    def _untrack_waiting_deadline(self, request_id: str) -> None:
+        by_id = getattr(self, "_waiting_deadline_by_id", None)
+        if by_id is not None:
+            by_id.pop(request_id, None)
+
+    def _peek_waiting_deadline(self) -> float | None:
+        deadlines = getattr(self, "_waiting_deadlines", None)
+        by_id = getattr(self, "_waiting_deadline_by_id", None)
+        if not deadlines or not by_id:
+            return None
+        while deadlines:
+            deadline, request_id = deadlines[0]
+            if by_id.get(request_id) == deadline:
+                return deadline
+            heapq.heappop(deadlines)
+        return None
+
+    def _has_due_waiting_deadline(self, now: float) -> bool:
+        due = self._peek_waiting_deadline()
+        return due is not None and now >= due
+
     def _try_admit_waiting(self):
         """Scan the queue up to the concurrency cap, preserving survivor order."""
-        if not self._episode_array_names:
-            while self.waiting_queue and (self.max_concurrent_requests is None or
-                                          len(self.requests) < self.max_concurrent_requests):
-                body = self.waiting_queue.pop(0)
-                if (deadline := getattr(body, "deadline", None)) is not None and time.perf_counter() >= deadline:
-                    self._reject_request(body.request_id, "Request timed out", status=500)
-                    continue
-                request_log.debug(
-                    "Admitting queued request %s (%d/%s in-flight)", body.request_id,
-                    len(self.requests), str(self.max_concurrent_requests),
-                )
-                self._admit_request(body)
+        if not self.waiting_queue:
             return
         now = time.perf_counter()
+        records = getattr(self, "_episode_records", None)
+        array_names = getattr(self, "_episode_array_names", frozenset())
+        has_episodes = bool(array_names) or (records is not None and records.has_active_or_closed())
+        if (
+            not has_episodes
+            and self.max_concurrent_requests is not None
+            and len(self.requests) >= self.max_concurrent_requests
+            and not self._has_due_waiting_deadline(now)
+        ):
+            return
         blocked_episodes: set[str] = set()
         waiting, self.waiting_queue = self.waiting_queue, []
         for body in waiting:
-            if (self._episode_array_names and body.episode is not None and
-                    self._episode_records.closed_or_ending(body.episode)):
+            if (
+                has_episodes and body.episode is not None
+                and records is not None and records.closed_or_ending(body.episode)
+            ):
+                self._untrack_waiting_deadline(body.request_id)
                 self._reject_request(body.request_id, "episode ended", status=410)
                 continue
             if (deadline := getattr(body, "deadline", None)) is not None and now >= deadline:
+                self._untrack_waiting_deadline(body.request_id)
                 self._reject_request(body.request_id, "Request timed out", status=500)
                 continue
             if (self.max_concurrent_requests is not None
                     and len(self.requests) >= self.max_concurrent_requests):
                 self.waiting_queue.append(body)
                 continue
-            if (self._episode_array_names and body.episode is not None and
-                    (body.episode in blocked_episodes or self._episode_records.busy(body.episode))):
+            if (
+                has_episodes and body.episode is not None and records is not None
+                and (body.episode in blocked_episodes or records.busy(body.episode))
+            ):
                 blocked_episodes.add(body.episode)
                 self.waiting_queue.append(body)
                 continue
+            self._untrack_waiting_deadline(body.request_id)
             request_log.debug(
                 "Admitting queued request %s (%d/%s in-flight)",
                 body.request_id, len(self.requests),
                 str(self.max_concurrent_requests),
             )
-            if not self._admit_request(body) and body.episode is not None:
+            if not self._admit_request(body) and has_episodes and body.episode is not None:
                 blocked_episodes.add(body.episode)
 
     def _ingest_request(
@@ -1445,7 +1490,7 @@ class Conductor:
             if queued >= self._episode_max_queued_calls or body.input_open:
                 self._reject_request(body.request_id, "episode call queue full", status=429)
                 return
-            self.waiting_queue.append(body)
+            self._enqueue_waiting(body)
             if self._status_interval_s is not None:
                 self._queued_since[body.request_id] = time.perf_counter()
             return
@@ -1465,7 +1510,7 @@ class Conductor:
                 body.request_id, len(self.requests),
                 self.max_concurrent_requests,
             )
-            self.waiting_queue.append(body)
+            self._enqueue_waiting(body)
             if self._status_interval_s is not None:
                 self._queued_since[body.request_id] = time.perf_counter()
             return
@@ -1501,7 +1546,7 @@ class Conductor:
                     status=503,
                 )
                 return True
-            self.waiting_queue.append(body)
+            self._enqueue_waiting(body)
             if self._status_interval_s is not None:
                 self._queued_since.setdefault(body.request_id, time.perf_counter())
             return False
@@ -1926,10 +1971,14 @@ class Conductor:
         episode_id = body.episode_id
         if type(episode_id) is not str or not episode_id:
             raise ValueError("episode id must be a non-empty string")
-        queued = [request for request in self.waiting_queue if request.episode == episode_id]
-        self.waiting_queue = [request for request in self.waiting_queue if request.episode != episode_id]
-        for request in queued:
-            self._reject_request(request.request_id, "episode ended", status=410)
+        survivors: list[NewRequestConductor] = []
+        for request in self.waiting_queue:
+            if request.episode == episode_id:
+                self._untrack_waiting_deadline(request.request_id)
+                self._reject_request(request.request_id, "episode ended", status=410)
+            else:
+                survivors.append(request)
+        self.waiting_queue = survivors
         if not self._episode_records.mark_ending(episode_id):
             self._close_episode(episode_id)
             self._try_admit_waiting()
@@ -2020,18 +2069,20 @@ class Conductor:
 
     def _expire_episode_slots(self, now: float) -> bool:
         freed = False
-        queued = {request.episode for request in self.waiting_queue}
-        for episode_id, record in self._episode_records.idle():
-            if now - record.last_end < self._episode_idle_timeout_s:
-                break
-            if episode_id in queued:
-                continue
-            slot, workers = record.slot, record.workers
-            self._send_end_episode(episode_id, slot, workers)
-            self._episode_records.evict(episode_id, "idle")
-            self._episode_evictions.inc(("idle",))
-            self._episode_slots.release(self._episode_owner(episode_id, ""), workers, slot)
-            freed = True
+        idle = self._episode_records.idle()
+        if idle:
+            queued = {request.episode for request in self.waiting_queue} if self.waiting_queue else ()
+            for episode_id, record in idle:
+                if now - record.last_end < self._episode_idle_timeout_s:
+                    break
+                if episode_id in queued:
+                    continue
+                slot, workers = record.slot, record.workers
+                self._send_end_episode(episode_id, slot, workers)
+                self._episode_records.evict(episode_id, "idle")
+                self._episode_evictions.inc(("idle",))
+                self._episode_slots.release(self._episode_owner(episode_id, ""), workers, slot)
+                freed = True
         self._episode_records.forget_expired_closed(now, self._episode_idle_timeout_s)
         return freed
 
@@ -2169,18 +2220,22 @@ class Conductor:
         a stalled drain barrier through, and drop stale early-message entries so
         they can't accumulate for requests that never come back."""
         now = time.perf_counter()
-        if self.waiting_queue:
+        if self.waiting_queue and self._has_due_waiting_deadline(now):
             survivors: list[NewRequestConductor] = []
-            expired = False
             for body in self.waiting_queue:
                 if (deadline := getattr(body, "deadline", None)) is not None and now >= deadline:
+                    self._untrack_waiting_deadline(body.request_id)
                     self._reject_request(body.request_id, "Request timed out", status=500)
-                    expired = True
                 else:
                     survivors.append(body)
-            if expired:
-                self.waiting_queue = survivors
-        if self._episode_array_names and self._expire_episode_slots(now):
+            self.waiting_queue = survivors
+        records = getattr(self, "_episode_records", None)
+        if (
+            getattr(self, "_episode_idle_timeout_s", None) is not None
+            and records is not None
+            and (getattr(self, "_episode_array_names", None) or records.has_active_or_closed())
+            and self._expire_episode_slots(now)
+        ):
             self._try_admit_waiting()
         for request_id in self._pop_expired(self._draining_deadlines, now):
             dr = self.draining.get(request_id)
@@ -2238,6 +2293,7 @@ class Conductor:
                 # Queued, never dispatched: the preprocess worker is the only
                 # holder of its (persisted) input signals, so hard-remove there.
                 self.waiting_queue.pop(i)
+                self._untrack_waiting_deadline(request_id)
                 if self._status_interval_s is not None:
                     self._queued_since.pop(request_id, None)
                 self._early_reads_done.pop(request_id, None)
@@ -2933,13 +2989,17 @@ class Conductor:
         ):
             if deadlines:
                 due = min(due, deadlines[0][0])
-        if self.waiting_queue:
-            for body in self.waiting_queue:
-                if (deadline := getattr(body, "deadline", None)) is not None:
-                    due = min(due, deadline)
-        if self._episode_array_names and (idle_timeout_s := self._episode_idle_timeout_s) is not None:
+        if (wait_due := self._peek_waiting_deadline()) is not None:
+            due = min(due, wait_due)
+        records = getattr(self, "_episode_records", None)
+        if (
+            (idle_timeout_s := getattr(self, "_episode_idle_timeout_s", None)) is not None
+            and records is not None
+            and (getattr(self, "_episode_array_names", None) or records.has_active_or_closed())
+            and (idle := records.idle())
+        ):
             queued = {request.episode for request in self.waiting_queue} if self.waiting_queue else ()
-            for episode_id, record in self._episode_records.idle():
+            for episode_id, record in idle:
                 if episode_id not in queued:
                     due = min(due, record.last_end + idle_timeout_s)
                     break

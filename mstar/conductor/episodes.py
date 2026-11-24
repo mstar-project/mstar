@@ -121,6 +121,9 @@ class EpisodeRecords:
     def has(self, episode_id: str) -> bool:
         return episode_id in self._records
 
+    def has_active_or_closed(self) -> bool:
+        return bool(self._records or self._closed)
+
     def ending(self, episode_id: str) -> bool:
         record = self._records.get(episode_id)
         return record is not None and record.ending
