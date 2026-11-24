@@ -72,12 +72,15 @@ class DecoderLayer(nn.Module):
     def forward_mlp_residual(
         self, hidden_states: torch.Tensor, residual: torch.Tensor,
         next_norm: nn.Module, comm_group=None,
+        residual_add: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The layer after attention, through ``next_norm`` (the next layer's
         input norm, or the stack's final norm): add+norm, MLP, add+norm. Returns
         ``next_norm``'s output and the residual stream. One function, holding no
         layer index, so a compiled stack runs one frame per layer here."""
         h, residual = self.post_attention_layernorm.forward_residual(hidden_states, residual, comm_group)
+        if residual_add is not None:
+            residual = residual + residual_add
         return next_norm.forward_residual(self.mlp(h), residual, comm_group)
 
 
@@ -100,6 +103,7 @@ def run_layers(
     layers: nn.ModuleList, hidden_states: torch.Tensor, norm: nn.Module,
     set_cursor: Callable[[int, nn.Module], None] | None = None,
     comm_group=None,
+    residual_adds: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """``layers`` then the final ``norm``, each residual add fused into the next
     norm (one add+norm kernel instead of two launches; under TP, with
@@ -123,7 +127,12 @@ def run_layers(
             set_cursor(i, layer.self_attn)
         h = layer.self_attn(h)
         next_norm = layers[i + 1].input_layernorm if i + 1 < len(layers) else norm
-        h, residual = layer.forward_mlp_residual(h, residual, next_norm, comm_group)
+        residual_add = (
+            residual_adds[i]
+            if residual_adds is not None and i < len(residual_adds)
+            else None
+        )
+        h, residual = layer.forward_mlp_residual(h, residual, next_norm, comm_group, residual_add)
     return h
 
 

@@ -5,6 +5,7 @@ without pulling FlashInfer in behind it.
 """
 
 import logging
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -31,6 +32,22 @@ class AttnBackend(Enum):
     # Multi-head Latent Attention over a ``KVLayout.MLA`` cache (FlashInfer's
     # ``BatchMLAPagedAttentionWrapper``); queries are the absorbed latent form
     FLASHINFER_MLA = "flashinfer_mla"
+
+
+def use_cpu_sdpa_fallback(device) -> bool:
+    """Whether attention wrappers should execute PyTorch SDPA on CPU instead of FlashInfer.
+
+    Preserves unit tests that monkeypatch ``sys.modules['flashinfer']`` with a
+    stand-in module/SimpleNamespace (which lacks ``__file__``).
+    """
+    import torch
+
+    if torch.device(device).type == "cuda":
+        return False
+    fi = sys.modules.get("flashinfer")
+    if fi is not None and not hasattr(fi, "__file__"):
+        return False
+    return True
 
 
 @dataclass
@@ -64,8 +81,23 @@ class AttentionConfig:
     # The KV layers a ``sliding_window`` attention runs, which a window shorter than the pool's
     # ``max_seq_len`` needs; the pool's other layers keep every token.
     layers: tuple[int, ...] | None = None
+    # Dense eager binding only: one suffix step has a first query group of this
+    # many rows, then a second group. Both read retained prefix K/V.
+    prefix_suffix_first_group_len: int | None = None
+    # Suffix query head count when it differs from the KV pool's prefix query heads.
+    prefix_suffix_q_heads: int | None = None
+    # Compute grouped prefix/suffix attention in FP32 (for reference parity).
+    prefix_suffix_fp32: bool = False
 
     def __post_init__(self) -> None:
+        if self.prefix_suffix_first_group_len is not None and (
+            type(self.prefix_suffix_first_group_len) is not int or self.prefix_suffix_first_group_len < 1
+        ):
+            raise ValueError("prefix_suffix_first_group_len must be a positive int or None")
+        if self.prefix_suffix_q_heads is not None and (
+            type(self.prefix_suffix_q_heads) is not int or self.prefix_suffix_q_heads < 1
+        ):
+            raise ValueError("prefix_suffix_q_heads must be a positive int or None")
         if self.sliding_window is not None and (
             type(self.sliding_window) is not int or self.sliding_window <= 0
         ):
@@ -303,6 +335,9 @@ def _yaml_bool(name: str, value) -> bool:
 @dataclass(frozen=True)
 class AttentionStep(ResourceStep):
     causal: bool = True
+    # On a shared dense resource, False runs a page-writing prefix walk and
+    # True runs the two-group scratch suffix walk.
+    grouped_suffix: bool = False
     # queries attend to the stream's stored context only, not to the tokens this step appends
     # (a draft block over the context the target has produced so far); the step's own
     # `segments` then carry the query counts, the cache's segments the appended counts.

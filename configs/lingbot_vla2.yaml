@@ -1,0 +1,14 @@
+model: "lingbot_vla2"
+max_seq_len: 4096
+
+node_groups:
+  - node_names:
+      - vit_encoder
+    ranks:
+      - 0
+
+  - node_names:
+      - LLM
+      - action_expert
+    ranks:
+      - 0

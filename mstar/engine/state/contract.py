@@ -124,6 +124,55 @@ class Bidirectional(Mask):
     sees_step_whole = True
 
 
+@dataclass(frozen=True)
+class PrefixSuffixGroups(Mask):
+    """A retained prefix followed by two groups in this step.
+
+    Every suffix query sees retained prefix keys. Queries in the first group
+    see that whole group; queries in the second also see the second group.
+    ``first_group_len`` counts this step's first group, independent of the
+    retained prefix's length. Its query coordinate is relative to this step's
+    suffix, so the binding subtracts the retained prefix's log length.
+    The eager dense binding expects only valid entries in the retained prefix
+    and this step's suffix. A model with padded source tokens must omit them
+    before adding K/V, while retaining their original position IDs.
+    """
+
+    first_group_len: int
+    fp32_attention: bool = False
+    uses_query_position = True
+    sees_step_whole = True
+
+    def __post_init__(self) -> None:
+        if not _is_positive(self.first_group_len):
+            raise ValueError(f"PrefixSuffixGroups.first_group_len must be a positive int, got {self.first_group_len!r}")
+        if not isinstance(self.fp32_attention, bool):
+            raise ValueError(f"PrefixSuffixGroups.fp32_attention must be a bool, got {self.fp32_attention!r}")
+
+    def permits(
+        self, query: int, key: int, *, prefix_valid: tuple[bool, ...], suffix_valid: tuple[bool, ...],
+    ) -> bool:
+        """CPU reference predicate over padded source rows, before valid-key compaction.
+
+        The reference's expanded prefix tile lets a padded suffix query see
+        valid prefix keys. The eager resource accepts only valid suffix rows.
+        """
+        if not (0 <= query < len(suffix_valid)):
+            raise IndexError(f"suffix query {query} outside {len(suffix_valid)} rows")
+        if not (0 <= key < len(prefix_valid) + len(suffix_valid)):
+            raise IndexError(f"key {key} outside {len(prefix_valid) + len(suffix_valid)} rows")
+        if len(suffix_valid) < self.first_group_len:
+            raise ValueError("suffix has fewer rows than first_group_len")
+        if key < len(prefix_valid):
+            # The reference expands prefix validity over suffix queries; it
+            # does not gate this tile with suffix query validity.
+            return prefix_valid[key]
+        suffix_key = key - len(prefix_valid)
+        return suffix_valid[query] and suffix_valid[suffix_key] and (
+            query >= self.first_group_len or suffix_key < self.first_group_len
+        )
+
+
 class Op:
     """A kernel the engine plans before the step and runs on an array's entries.
 

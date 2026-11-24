@@ -115,13 +115,16 @@ class QwenVisionModel(nn.Module):
     tables go into the blocks fp32 (Qwen3.5's and Qwen3-Omni's towers round them to the
     activations' dtype)."""
 
-    def __init__(self, config: QwenVisionConfig, attn_key: str = VISION_ATTN):
+    def __init__(self, config: QwenVisionConfig, attn_key: str = VISION_ATTN, array: str | None = None):
         super().__init__()
         self.config = config
         self.patch_embed = ConvPatchEmbed(config)
         self.pos_embed = nn.Embedding(config.num_position_embeddings, config.hidden_size)
         self.rotary_pos_emb = VisionRotaryEmbedding(config)
-        self.blocks = nn.ModuleList(VisionBlock(config, attn_key) for _ in range(config.depth))
+        self.blocks = nn.ModuleList(
+            VisionBlock(config, attn_key, array=array, layer=None if array is None else layer)
+            for layer in range(config.depth)
+        )
         self.merger = VisionPatchMerger(config)
         self.deepstack_visual_indexes = tuple(config.deepstack_visual_indexes)
         self.deepstack_merger_list = nn.ModuleList(

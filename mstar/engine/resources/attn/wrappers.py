@@ -21,9 +21,11 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from mstar.engine.resources.attn.config import use_cpu_sdpa_fallback
 from mstar.engine.resources.attn.workspace import Workspace
 from mstar.platforms import current_platform
 
@@ -212,10 +214,21 @@ class FlashInferPrefillWrapper(PagedKernel):
         self.page_size = page_size
         self.dtype = None
         self._workspace = workspace_buffer
+        self._qo_indptr_buf = None
+        self._cpu_fallback = use_cpu_sdpa_fallback(device)
+        self._cpu_plan: tuple | None = None
+        if self._cpu_fallback:
+            self.attn_wrapper = None
+            self.token_to_page = None
+            self.token_to_cache = None
+            self._total_tokens = 0
+            self._pinned = {}
+            self._pinned_done = None
+            self._planner_args = None
+            self._planner_key = None
+            return
 
         import flashinfer
-
-        self._qo_indptr_buf = None
         if self.accelerator_graph:
             assert batch_size is not None, "batch_size required for accelerator graph mode"
             assert max_total_tokens is not None, "max_total_tokens required for accelerator graph mode"
@@ -330,6 +343,18 @@ class FlashInferPrefillWrapper(PagedKernel):
         consume them as CPU and async-H2D copy to the device for our own
         per-token bookkeeping below.
         """
+        if self._cpu_fallback:
+            self.dtype = dtype
+            self._qo_indptr_buf = qo_indptr.to(self.device, dtype=torch.int32)
+            if kv_lens is None:
+                num_pages = paged_kv_indptr[1:] - paged_kv_indptr[:-1]
+                kv_lens = (num_pages - 1).clamp_min(0) * self.page_size + paged_kv_last_page_len
+                kv_lens = torch.where(num_pages > 0, kv_lens, torch.zeros_like(kv_lens))
+            self._cpu_plan = (
+                qo_indptr.tolist(), paged_kv_indptr.tolist(), paged_kv_indices.to(self.device, dtype=torch.long),
+                kv_lens.tolist(), bool(causal), int(window_left),
+            )
+            return
         if self.accelerator_graph and paged_kv_indices.device.type != "cuda":
             # planned inline behind the step in flight, which a pageable copy
             # would wait for: stage page-locked, copy the indices in ourselves
@@ -480,6 +505,11 @@ class FlashInferPrefillWrapper(PagedKernel):
             output: [total_tokens, num_qo_heads, head_dim], and with ``return_lse``
             the log-sum-exp [total_tokens, num_qo_heads], fp32, natural log
         """
+        if self._cpu_fallback:
+            return _run_paged_sdpa(
+                q, kv_cache_layer, self._cpu_plan, self.dtype, self.num_qo_heads, self.num_kv_heads,
+                self.head_dim, self.sm_scale, return_lse,
+            )
         if not return_lse:
             return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer)
         return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer, return_lse=True, lse_base="ln")
@@ -545,6 +575,11 @@ class FlashInferDecodeWrapper(PagedKernel):
         self._planner_args: list | None = None
         self._planner_slots: tuple[int, int | None] = (4, 5)
         self._workspace = workspace_buffer
+        self._cpu_fallback = use_cpu_sdpa_fallback(device)
+        self._cpu_plan: tuple | None = None
+        if self._cpu_fallback:
+            self.attn_wrapper = None
+            return
 
         import flashinfer
 
@@ -601,6 +636,18 @@ class FlashInferDecodeWrapper(PagedKernel):
         Inputs may be on CPU; see prefill wrapper's plan docstring.
         """
         n_req = paged_kv_indptr.shape[0] - 1
+        if self._cpu_fallback:
+            self._n_req = n_req
+            self.dtype = dtype
+            if kv_lens is None:
+                num_pages = paged_kv_indptr[1:] - paged_kv_indptr[:-1]
+                kv_lens = (num_pages - 1).clamp_min(0) * self.page_size + paged_kv_last_page_len
+                kv_lens = torch.where(num_pages > 0, kv_lens, torch.zeros_like(kv_lens))
+            self._cpu_plan = (
+                list(range(n_req + 1)), paged_kv_indptr.tolist(), paged_kv_indices.to(self.device, dtype=torch.long),
+                kv_lens.tolist(), True, int(window_left),
+            )
+            return
         if (
             self.accelerator_graph and paged_kv_indices.device.type != "cuda"
             and paged_kv_indices.is_pinned()
@@ -770,11 +817,90 @@ class FlashInferDecodeWrapper(PagedKernel):
             output: [n_req, num_qo_heads, head_dim], and with ``return_lse`` the
             log-sum-exp [n_req, num_qo_heads], fp32, natural log
         """
+        if self._cpu_fallback:
+            return _run_paged_sdpa(
+                q, kv_cache_layer, self._cpu_plan, self.dtype, self.num_qo_heads, self.num_kv_heads,
+                self.head_dim, self.sm_scale, return_lse,
+            )
         if not return_lse:
             return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer)
         out, lse = self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer, return_lse=True)
         # the decode wrapper has no lse_base: its kernels (fa2, on either core type) report base 2
         return out, lse * math.log(2)
+
+
+def _run_paged_sdpa(
+    q: torch.Tensor,
+    kv_cache_layer: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    cpu_plan: tuple | None,
+    dtype: torch.dtype | None,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    sm_scale: float | None,
+    return_lse: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Genuine CPU SDPA fallback for paged FlashInfer prefill and decode wrappers."""
+    assert cpu_plan is not None, "plan() before run()"
+    qo, kv_indptr, kv_indices, kv_lens, causal, window_left = cpu_plan
+    scale = float(sm_scale) if sm_scale is not None else head_dim ** -0.5
+    q_dtype = dtype or q.dtype
+    q_in = q.to(q_dtype)
+    enable_gqa = num_qo_heads != num_kv_heads
+    rep = num_qo_heads // num_kv_heads
+    if isinstance(kv_cache_layer, tuple):
+        k_pages, v_pages = kv_cache_layer
+    else:
+        k_pages, v_pages = kv_cache_layer[:, 0], kv_cache_layer[:, 1]
+    out_parts: list[torch.Tensor] = []
+    lse_parts: list[torch.Tensor] = []
+    for i in range(len(qo) - 1):
+        qs, qe = qo[i], qo[i + 1]
+        if qs == qe:
+            continue
+        m = kv_lens[i]
+        nq = qe - qs
+        if m == 0:
+            out_parts.append(q_in.new_zeros(nq, num_qo_heads, head_dim))
+            if return_lse:
+                lse_parts.append(torch.full((nq, num_qo_heads), float("-inf"), dtype=torch.float32, device=q_in.device))
+            continue
+        pages = kv_indices[kv_indptr[i]:kv_indptr[i + 1]]
+        ki = k_pages.index_select(0, pages).reshape(-1, num_kv_heads, head_dim)[:m].to(q_dtype)
+        vi = v_pages.index_select(0, pages).reshape(-1, num_kv_heads, head_dim)[:m].to(q_dtype)
+        qi = q_in[qs:qe].transpose(0, 1).unsqueeze(0)
+        kt = ki.transpose(0, 1).unsqueeze(0)
+        vt = vi.transpose(0, 1).unsqueeze(0)
+        allowed = None
+        if causal or window_left >= 0:
+            q_pos = torch.arange(nq, device=q_in.device)[:, None] + (m - nq)
+            k_pos = torch.arange(m, device=q_in.device)[None, :]
+            allowed = k_pos <= q_pos if causal else torch.ones((nq, m), dtype=torch.bool, device=q_in.device)
+            if window_left >= 0:
+                allowed = allowed & (k_pos >= q_pos - window_left)
+        if return_lse:
+            kf = kt.float().repeat_interleave(rep, dim=1) if rep > 1 else kt.float()
+            vf = vt.float().repeat_interleave(rep, dim=1) if rep > 1 else vt.float()
+            scores = torch.matmul(qi.float(), kf.transpose(-2, -1)) * scale
+            if allowed is not None:
+                scores = scores.masked_fill(~allowed[None, None], float("-inf"))
+            lse_i = torch.logsumexp(scores, dim=-1).squeeze(0).transpose(0, 1)
+            probs = torch.softmax(scores, dim=-1)
+            att = torch.matmul(probs, vf).to(q_dtype).squeeze(0).transpose(0, 1)
+            out_parts.append(att)
+            lse_parts.append(lse_i)
+        else:
+            att = F.scaled_dot_product_attention(
+                qi, kt, vt, attn_mask=allowed, scale=scale, enable_gqa=enable_gqa,
+            )
+            out_parts.append(att.squeeze(0).transpose(0, 1))
+    out = torch.cat(out_parts, dim=0) if out_parts else q_in.new_empty(0, num_qo_heads, head_dim)
+    if return_lse:
+        lse = torch.cat(lse_parts, dim=0) if lse_parts else torch.empty(
+            0, num_qo_heads, dtype=torch.float32, device=q_in.device,
+        )
+        return out, lse
+    return out
 
 
 @triton.jit

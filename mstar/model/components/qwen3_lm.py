@@ -263,6 +263,7 @@ class Qwen3DenseLM(nn.Module):
     def forward(
         self, input_embeds: torch.Tensor, *, label: str | None = None,
         position_ids_3d: torch.Tensor | None = None,
+        deepstack_addends: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """``(tokens, hidden)`` -> ``(tokens, hidden)`` after the final norm.
 
@@ -281,11 +282,20 @@ class Qwen3DenseLM(nn.Module):
             ))
         elif position_ids_3d is not None:
             raise ValueError("Qwen3 MRoPE positions require mrope_section")
+        if deepstack_addends is not None:
+            if len(deepstack_addends) > len(self.layers):
+                raise ValueError("Qwen3 deepstack has more feature layers than decoder layers")
+            for addend in deepstack_addends:
+                if addend.shape != input_embeds.shape:
+                    raise ValueError("Qwen3 deepstack addends must match the step's token rows and hidden width")
+                if addend.device != input_embeds.device or addend.dtype != input_embeds.dtype:
+                    raise ValueError("Qwen3 deepstack addends must match the step's device and dtype")
         attention = self.layers[0].self_attn
         if attention.state is not None:
-            return run_layers(self.layers, input_embeds, self.norm, no_cursor)
+            return run_layers(self.layers, input_embeds, self.norm, no_cursor,
+                              residual_adds=deepstack_addends)
         attention.attend.bind_step(label)
-        return run_layers(self.layers, input_embeds, self.norm)
+        return run_layers(self.layers, input_embeds, self.norm, residual_adds=deepstack_addends)
 
     def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)

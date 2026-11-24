@@ -49,6 +49,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "qwen3_tts_voicedesign": "qwen3tts_voicedesign.yaml",
     "qwen3_tts_base": "qwen3tts_base.yaml",
     "fish_s2_pro": "fish_s2_pro.yaml",
+    "lingbot_vla2": "lingbot_vla2.yaml",
     "pi05": "pi05.yaml",
     "vjepa2": "vjepa2.yaml",
     "vjepa2_ac": "vjepa2_ac.yaml",
@@ -207,9 +208,9 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
     if model == "fish_s2_pro":
         lines.append("    client.tts(\"Hello there\").to_wav(\"out.wav\")")
         lines.append("    # clone a voice: reference_audio=\"ref.wav\", ref_text=\"<its transcript>\"")
-    if model in ("pi05", "vjepa2", "vjepa2_ac"):
+    if model in ("pi05", "lingbot_vla2", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
-                     ("action" if model == "pi05" else "video") + "\",))")
+                     ("action" if model in ("pi05", "lingbot_vla2") else "video") + "\",))")
     if model in ("whisper_large", "whisper_large_v3_turbo", "higgs_audio", "qwen3_asr", "qwen3_asr_realtime",
                  "canary", "canary_qwen", "parakeet", "nemotron_asr"):
         lines.append("    print(client.transcribe(\"speech.wav\", language=\"en\"))")

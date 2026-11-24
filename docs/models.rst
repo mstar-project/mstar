@@ -104,6 +104,13 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        (see :doc:`clients`).
        ``LLM`` and ``action_expert`` share a KV cache, so ``node_groups`` must list them in
        one entry; the server refuses to start otherwise.
+   * - ``lingbot_vla2``
+     - ``robbyant/lingbot-vla-v2-6b-robotwin``
+     - LingBot-VLA 2.0 vision-language-action robotics model (Qwen3-VL ViT + 36L Qwen3
+       dense prefix with deepstack & alignment queries + 36L flow-matching MoE action
+       expert). Serves OpenPI WebSocket, Dynamo ``TensorBridge``, and ``/generate``.
+       ``LLM`` and ``action_expert`` share a KV cache, so ``node_groups`` must list them in
+       one entry.
    * - ``qwen3_5_{0.8,2,4,9,27}b``
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear

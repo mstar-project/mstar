@@ -36,6 +36,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "ltx2_5": ("mstar.model.ltx2_5.ltx2_5_model", "LTX25Model"),
     "minimax_h3": ("mstar.model.minimax_h3.minimax_h3_model", "H3Model"),
     "muse_glimmer": ("mstar.model.muse.glimmer_model", "MuseGlimmerModel"),
+    "lingbot_vla2": ("mstar.model.lingbot_vla2.lingbot_vla2_model", "LingBotVLA2Model"),
     "lingbot_world_1_3b": ("mstar.model.lingbot_world.lingbot_world_model", "LingBotWorldModel"),
     "nemotron_asr": ("mstar.model.parakeet.parakeet_model", "ParakeetModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
@@ -163,6 +164,7 @@ HF_MODELS: dict[str, dict] = {
     # (~14 GB). mstar/model/pi05/weight_loader.py handles the lerobot->mstar
     # state-dict remap inside Pi05Model.get_submodule().
     "pi05": {"model_path_hf": "lerobot/pi05_base"},
+    "lingbot_vla2": {"model_path_hf": "robbyant/lingbot-vla-v2-6b-robotwin"},
     "qwen3_omni": {"model_path_hf": "Qwen/Qwen3-Omni-30B-A3B-Instruct"},
     # Qwen3-ASR: AuT audio encoder + dense Qwen3 decoder. ``qwen3_asr`` is
     # the 1.7B transcription model, ``qwen3_asr_realtime`` the 0.6B variant
