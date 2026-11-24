@@ -52,6 +52,8 @@ pub struct AppState {
     pub refusals: Arc<Refusals>,
     /// The names a request's `model` may carry, and the LoRA adapters among them.
     pub served: Arc<crate::served_models::ServedModels>,
+    /// Action-generation capabilities (`MSTAR_ACTIONS`), when configured by the launcher.
+    pub actions: Option<crate::actions::ActionsConfig>,
 }
 
 /// One item of a request's result stream.

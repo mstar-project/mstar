@@ -25,12 +25,14 @@
 //! passed: **real** (bridge to the Python conductor) or **mock** (self-contained
 //! generator that proves the HTTP/adapter/media/streaming layer standalone).
 
+mod actions;
 mod adapters;
 mod auth;
 mod bridge;
 mod client_errors;
 mod generation_kwargs;
 mod media;
+mod msgpack_numpy;
 mod protocol;
 mod realtime;
 mod refusals;
@@ -175,6 +177,7 @@ async fn main() {
         bridge,
         refusals: refusals.clone(),
         served,
+        actions: actions::ActionsConfig::from_env(),
     };
 
     // Allow-all CORS, matching mstar's CORSMiddleware configuration. A
@@ -210,6 +213,7 @@ async fn main() {
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/images/edits", post(images_edits))
         .route("/v1/videos/generations", post(videos_generations))
+        .route("/v1/actions/generations", post(actions::actions_generations))
         .route("/generate", post(generate))
         .route_layer(axum::middleware::from_fn_with_state(permits, admission));
 
@@ -2132,7 +2136,7 @@ mod tests {
     use mstar_rust::communicator::RawZmqCommunicator;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    fn state(bridge: Option<Arc<Bridge>>) -> AppState {
+    pub(crate) fn state(bridge: Option<Arc<Bridge>>) -> AppState {
         AppState {
             model_name: "m".into(),
             python_adapter: String::new(),
@@ -2145,6 +2149,7 @@ mod tests {
             bridge,
             refusals: Arc::new(refusals::Refusals::default()),
             served: Arc::new(served_models::ServedModels::from_env("m")),
+            actions: None,
         }
     }
 

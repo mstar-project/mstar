@@ -52,8 +52,12 @@ _CONFIG_KEYS = frozenset({"images", "state", "action_dims", "metadata"})
 
 def _pack_array(obj):
     if isinstance(obj, np.ndarray):
+        if obj.dtype.kind not in _NUMERIC_KINDS:
+            raise ValueError(f"cannot encode {obj.dtype} array; only bool, integer and float are supported")
         return {b"__ndarray__": True, b"data": obj.tobytes(), b"dtype": obj.dtype.str, b"shape": obj.shape}
     if isinstance(obj, np.generic):
+        if obj.dtype.kind not in _NUMERIC_KINDS:
+            raise ValueError(f"cannot encode {obj.dtype} scalar; only bool, integer and float are supported")
         return {b"__npgeneric__": True, b"data": obj.item(), b"dtype": obj.dtype.str}
     raise TypeError(f"cannot encode {type(obj).__name__}")
 
@@ -71,12 +75,26 @@ def _numeric_dtype(name) -> np.dtype:
     return dtype
 
 
+_MISSING = object()
+
+
+def _marker_get(obj: dict, key: str):
+    bkey = key.encode("ascii")
+    if bkey in obj:
+        return obj[bkey]
+    if key in obj:
+        return obj[key]
+    return _MISSING
+
+
 def _unpack_array(obj: dict):
-    if b"__ndarray__" in obj:
-        if not {b"data", b"dtype", b"shape"} <= obj.keys():
+    if b"__ndarray__" in obj or "__ndarray__" in obj:
+        data = _marker_get(obj, "data")
+        dtype_val = _marker_get(obj, "dtype")
+        shape = _marker_get(obj, "shape")
+        if data is _MISSING or dtype_val is _MISSING or shape is _MISSING:
             raise ValueError("an array needs data, dtype and shape")
-        dtype = _numeric_dtype(obj[b"dtype"])
-        shape, data = obj[b"shape"], obj[b"data"]
+        dtype = _numeric_dtype(dtype_val)
         if not isinstance(data, bytes) or not isinstance(shape, list) or not all(
             type(n) is int and n >= 0 for n in shape
         ):
@@ -84,14 +102,15 @@ def _unpack_array(obj: dict):
         if math.prod(shape) * dtype.itemsize != len(data):
             raise ValueError(f"an array of shape {tuple(shape)} and dtype {dtype.str} is not {len(data)} bytes")
         return np.frombuffer(data, dtype=dtype).reshape(shape)
-    if b"__npgeneric__" in obj:
-        if not {b"data", b"dtype"} <= obj.keys():
+    if b"__npgeneric__" in obj or "__npgeneric__" in obj:
+        data = _marker_get(obj, "data")
+        dtype_val = _marker_get(obj, "dtype")
+        if data is _MISSING or dtype_val is _MISSING:
             raise ValueError("a scalar needs data and dtype")
-        data = obj[b"data"]
         # what np.generic.item() packs: a missing or None value would be NaN
         if type(data) not in (bool, int, float):
             raise ValueError(f"a scalar's data must be a number, not {type(data).__name__}")
-        return _numeric_dtype(obj[b"dtype"]).type(data)
+        return _numeric_dtype(dtype_val).type(data)
     return obj
 
 
