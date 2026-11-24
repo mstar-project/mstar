@@ -740,7 +740,7 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   It also refuses a combined walk whose member walks read a layer with two masks, and a capture
   whose replay walks do, since a plan runs one mask. A piecewise region's step, which has no
   walk, can't list an array whose reads name walks, and a cross read takes no ``walks``.
-  A walk can't read through ``Bidirectional()`` or ``Block()``
+  A walk can't read through ``Bidirectional()``, ``Block()`` or ``CausalBlock()``
   on a node where a chunking policy splits it, a label's ``PrefixKeys`` key it, or a rebuild
   policy runs it again, since each regroups a row's adds across steps and would change what its
   tokens see. A keyed walk whose node doesn't take ``PrefixKeys.tensor``, as BAGEL's ``LLM`` on
@@ -754,7 +754,9 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   ``GatedDeltaNet()`` a field ``state`` of shape ``(h_v, d_k, d_v)``, and ``Mamba2()`` a field
   ``ssm`` of shape ``(heads, head_dim, state_size)``.
 - ``max_len=0``: the array keeps nothing between steps, for attention within this step only.
-  Its one read uses ``Block()``, which sees only the entries of the token's own segment. See
+  Its one read uses ``Block()``, which sees only the entries of the token's own segment, or
+  ``CausalBlock()``, which sees those up to the token's own, for a causal attention that keeps
+  nothing; SDPA (``backend: sdpa``) runs only ``Block()``. See
   `Cacheless attention (encoder towers)`_.
 - ``max_len=None``: the log has no bound, and the engine keeps what the reads can still reach.
   Today such an array takes one label and one ``Window`` read through ``Attend``, with
@@ -886,7 +888,7 @@ a refused admit draws the same noise.
 ``kernel_settings(self)`` is a temporary hook for what the engine doesn't pick itself yet:
 ``splits``, ``decode_fmha`` and ``decode_tensor_cores`` on a read of a paged array,
 ``splits`` on a ``GatedDeltaNet``, and ``max_segments_per_request``, ``max_segments_per_step``,
-``compile_op``, ``workspace_mb`` and ``backend`` on a ``Block`` read. Under an array's name it sets the default size of the array's pool, ``max_num_pages``
+``compile_op``, ``workspace_mb`` and ``backend`` on a ``Block`` or ``CausalBlock`` read. Under an array's name it sets the default size of the array's pool, ``max_num_pages``
 on a paged array and ``max_slots`` on a ``Value`` with tensor fields or an unbounded array, which a deployment's
 ``resources:`` block overrides. A cross read on an array that keeps entries takes
 ``decode_tensor_cores`` alone, and two reads that share a resource can't set one field to two
