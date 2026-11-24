@@ -453,6 +453,209 @@ def _run_message_thread(s, pw, chunks=(), messages=(), until=lambda: True):
         thread.join(timeout=10)
 
 
+@pytest.mark.parametrize("audio, status", [(b"", 500), (b"pcm", 200)])
+def test_orpheus_final_empty_audio_is_not_a_success(audio, status):
+    """A retry that ends before one SNAC frame must not answer with empty audio."""
+    pw = _PreprocessWorker()
+    pw.has_pending_tensors = lambda rid: False
+    pw.received_final_chunks = lambda rid, counts: True
+    s = _api_server(pw)
+    s.model_name = "orpheus"
+    s.submit_request(
+        text="Speak this", request_id="X", streaming=True,
+        input_modalities=["text"], output_modalities=["audio"],
+    )
+    key = pw.inputs[0].request_id
+    with s.request_lock:
+        s.pending_requests[key].output_chunk_counts = {"audio_chunk": 1}
+        s.recently_completed[key] = time.time()
+    _run_message_thread(
+        s, pw, chunks=[ResultChunk(request_id=key, modality="audio", data=audio)],
+        until=s.pending_requests[key].event.is_set,
+    )
+
+    async def read():
+        stream = await s.open_result_stream("X")
+        return [chunk async for chunk in stream]
+
+    if status == 500:
+        with pytest.raises(HTTPException) as error:
+            asyncio.run(read())
+        assert error.value.status_code == 500
+        assert "no audio" in error.value.detail
+    else:
+        assert [chunk.data for chunk in asyncio.run(read())] == [audio]
+
+
+@pytest.mark.parametrize("audio", [b"", b"pcm"])
+def test_orpheus_empty_audio_does_not_reach_the_rust_relay(audio):
+    """The Rust frontend's direct chunk sink must not bypass the empty guard."""
+    pw = _PreprocessWorker()
+    pw.has_pending_tensors = lambda rid: False
+    pw.received_final_chunks = lambda rid, counts: True
+    s = _api_server(pw)
+    s.model_name = "orpheus"
+    s.submit_request(
+        text="Speak this", request_id="X", streaming=True,
+        input_modalities=["text"], output_modalities=["audio"],
+    )
+    key = pw.inputs[0].request_id
+    relayed = []
+    sink = SimpleNamespace(
+        loop=SimpleNamespace(call_soon_threadsafe=lambda callback, *args: callback(*args)),
+        relay=lambda tags, chunks: relayed.extend(chunks),
+    )
+    s.relay_chunks_to(key, sink, 1)
+    with s.request_lock:
+        s.pending_requests[key].output_chunk_counts = {"audio_chunk": 1}
+        s.recently_completed[key] = time.time()
+    _run_message_thread(
+        s, pw, chunks=[ResultChunk(request_id=key, modality="audio", data=audio)],
+        until=s.pending_requests[key].event.is_set,
+    )
+    assert [chunk.data for chunk in relayed] == ([audio] if audio else [])
+    chunks = asyncio.run(_collect_chunks(s.iter_result_chunks("X")))
+    assert [chunk.modality for chunk in chunks] == ([] if audio else ["error"])
+
+
+async def _collect_chunks(chunks):
+    return [chunk async for chunk in chunks]
+
+
+def test_orpheus_empty_final_frame_still_finishes_after_audio():
+    """Dropping SNAC's empty terminal frame must not lose its stop signal."""
+    pw = _PreprocessWorker()
+    pw.has_pending_tensors = lambda rid: False
+    s = _api_server(pw)
+    s.model_name = "orpheus"
+    s.submit_request(
+        text="Speak this", request_id="X", streaming=True,
+        input_modalities=["text"], output_modalities=["audio"],
+    )
+    key = pw.inputs[0].request_id
+    pw.received_final_chunks = lambda rid, counts: s.pending_requests[key].stopped
+    with s.request_lock:
+        s.pending_requests[key].output_chunk_counts = {"audio_chunk": 2}
+        s.recently_completed[key] = time.time()
+    _run_message_thread(
+        s, pw, chunks=[
+            ResultChunk(request_id=key, modality="audio", data=b"pcm"),
+            ResultChunk(request_id=key, modality="audio", data=b"", stopped=True),
+        ], until=s.pending_requests[key].event.is_set,
+    )
+    assert s.pending_requests[key].stopped
+    assert [chunk.data for chunk in asyncio.run(_collect_chunks(s.iter_result_chunks("X")))] == [b"pcm"]
+
+
+@pytest.mark.parametrize("audio, status", [(b"", 500), (b"pcm", 200)])
+def test_orpheus_non_streaming_collect_and_generate_refuse_empty_audio(monkeypatch, audio, status):
+    """Non-streaming collect_results and POST /generate (streaming=False) also
+    refuse an Orpheus completion that produced only empty audio."""
+    pw = _PreprocessWorker()
+    pw.has_pending_tensors = lambda rid: False
+    pw.received_final_chunks = lambda rid, counts: True
+    s = _api_server(pw)
+    _routes(monkeypatch, s)
+    s.model_name = "orpheus"
+
+    def run_one(rid):
+        s.submit_request(
+            text="Speak this", request_id=rid, streaming=False,
+            input_modalities=["text"], output_modalities=["audio"],
+        )
+        key = pw.inputs[-1].request_id
+        with s.request_lock:
+            s.pending_requests[key].output_chunk_counts = {"audio_chunk": 1}
+            s.recently_completed[key] = time.time()
+        _run_message_thread(
+            s, pw, chunks=[ResultChunk(request_id=key, modality="audio", data=audio)],
+            until=s.pending_requests[key].event.is_set,
+        )
+
+    run_one("X")
+    if status == 500:
+        with pytest.raises(HTTPException) as error:
+            asyncio.run(s.collect_results("X"))
+        assert error.value.status_code == 500
+        assert "no audio" in error.value.detail
+    else:
+        assert [c.data for c in asyncio.run(s.collect_results("X"))] == [audio]
+
+    # Also exercise POST /generate (streaming=False) end-to-end through the ASGI app.
+    async def post_non_streaming():
+        transport = httpx.ASGITransport(app=entrypoint.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            task = asyncio.create_task(client.post("/generate", data={
+                "text": "Speak this", "request_id": "Y",
+                "output_modalities": "audio", "streaming": "false",
+            }))
+            await _await(lambda: len(pw.inputs) == 2)
+            key = pw.inputs[1].request_id
+            with s.request_lock:
+                s.pending_requests[key].output_chunk_counts = {"audio_chunk": 1}
+                s.recently_completed[key] = time.time()
+            _run_message_thread(
+                s, pw, chunks=[ResultChunk(request_id=key, modality="audio", data=audio)],
+                until=s.pending_requests[key].event.is_set,
+            )
+            return await task
+
+    resp = asyncio.run(post_non_streaming())
+    assert resp.status_code == status, resp.text
+    if status == 500:
+        assert "no audio" in resp.json()["detail"]
+    else:
+        assert [base64.b64decode(o["data"]) for o in resp.json()["outputs"]["audio"]] == [audio]
+
+
+def test_orpheus_empty_initial_audio_chunk_before_real_audio_succeeds():
+    """An initial empty audio frame is dropped without blocking later real audio
+    on either the Python stream or the Rust chunk relay."""
+    def run_case(use_relay):
+        pw = _PreprocessWorker()
+        pw.has_pending_tensors = lambda rid: False
+        s = _api_server(pw)
+        s.model_name = "orpheus"
+        s.submit_request(
+            text="Speak this", request_id="X", streaming=True,
+            input_modalities=["text"], output_modalities=["audio"],
+        )
+        key = pw.inputs[0].request_id
+        pw.received_final_chunks = lambda rid, counts: s.pending_requests[key].stopped
+        relayed = []
+        if use_relay:
+            sink = SimpleNamespace(
+                loop=SimpleNamespace(call_soon_threadsafe=lambda callback, *args: callback(*args)),
+                relay=lambda tags, chunks: relayed.extend(chunks),
+            )
+            s.relay_chunks_to(key, sink, 1)
+        with s.request_lock:
+            s.pending_requests[key].output_chunk_counts = {"audio_chunk": 2}
+            s.recently_completed[key] = time.time()
+        _run_message_thread(
+            s, pw, chunks=[
+                ResultChunk(request_id=key, modality="audio", data=b""),
+                ResultChunk(request_id=key, modality="audio", data=b"pcm", stopped=True),
+            ], until=s.pending_requests[key].event.is_set,
+        )
+        assert s.pending_requests[key].has_audio_output
+        assert s.pending_requests[key].stopped
+
+        async def read():
+            stream = await s.open_result_stream("X")
+            return [chunk async for chunk in stream]
+
+        streamed = asyncio.run(read())
+        if use_relay:
+            assert [(c.modality, c.data) for c in relayed] == [("audio", b"pcm")]
+            assert streamed == []
+        else:
+            assert [(c.modality, c.data) for c in streamed] == [("audio", b"pcm")]
+
+    run_case(use_relay=False)
+    run_case(use_relay=True)
+
+
 def test_chunks_reach_the_client_under_its_own_request_id():
     """The engine's chunks name the request by its key; what the stream and
     collect hand back names it by the client's id."""

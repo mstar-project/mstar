@@ -602,3 +602,115 @@ def test_both_frontends_take_or_refuse_a_voice_clip_alike(cls, case, tmp_path, m
     assert (headers.get("content-type"), rust_body) == (py.headers.get("content-type"), py.content)
     assert rust_submits == python_submits
     assert "audio" in rust_submits[0]["in"]
+
+
+def test_rust_frontend_refuses_orpheus_empty_audio(tmp_path):
+    """Real APIServer._message_loop + RustFrontendBridge + mstar-server refuse
+    an Orpheus reply with only empty audio (HTTP 500, never HTTP 200)."""
+    import queue
+    import select
+    import threading
+    import time
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    from mstar.api_server.lora_admin import LoraAdmin
+    from mstar.api_server.request_types import ResultChunk
+    from mstar.communication.event import EventWakeup
+
+    class _OrpheusEmptyPW:
+        def __init__(self, server):
+            self.server = server
+            self.results_wakeup = EventWakeup()
+            self.chunks: queue.Queue[ResultChunk] = queue.Queue()
+
+        def new_request(self, inp):
+            key = inp.request_id
+            with self.server.request_lock:
+                self.server.pending_requests[key].output_chunk_counts = {"audio_chunk": 1}
+                self.server.recently_completed[key] = time.time()
+            self.chunks.put(ResultChunk(request_id=key, modality="audio", data=b""))
+            self.results_wakeup.signal()
+
+        def get_result_chunks(self):
+            out = []
+            while not self.chunks.empty():
+                out.append(self.chunks.get_nowait())
+            return out
+
+        def get_profile_updates(self):
+            return []
+
+        def has_pending_tensors(self, rid):
+            return False
+
+        def received_final_chunks(self, rid, counts):
+            return True
+
+        def finished_reading(self, rid, drained=True):
+            pass
+
+    class _Comm:
+        def __init__(self):
+            self.event = None
+
+        def register_event_for_poll(self, event):
+            self.event = event
+
+        def get_all_new_messages(self):
+            return []
+
+        def poll_for_messages(self, timeout_ms=20):
+            if select.select([self.event.fd], [], [], timeout_ms / 1000)[0]:
+                self.event.drain()
+            return False
+
+    api = object.__new__(APIServer)
+    api._init_request_state()
+    api.upload_dir = tmp_path
+    api.timeout_seconds = 5.0
+    api.enable_nvtx = False
+    api.log_stats = False
+    api.metrics = None
+    api.model = None
+    api.model_name = "orpheus"
+    api.served_models = ServedModels.of("orpheus", None)
+    api.model_config = None
+    api.openpi_policy = None
+    api.lora_admin = LoraAdmin(None, api.served_models, lambda message: None)
+    api.client_streams = frozenset()
+    api.takes_stream_input = False
+    api.client_audio = []
+    api.reads_turns = False
+    api.max_concurrent_requests = None
+    api._result_cpu = None
+    api._process_cpus = frozenset()
+    api.preprocess_worker = _OrpheusEmptyPW(api)
+    api.communicator = _Comm()
+    api._msg_thread = threading.Thread(target=api._process_messages, daemon=True)
+    api._msg_thread.start()
+    try:
+        with _model_stack("orpheus", api) as (port, _upload):
+            for stream in (False, True):
+                status, headers, data = _http(port, {
+                    "model": "orpheus", "input": "hi", "voice": "tara", "stream": stream,
+                })
+                assert status == 500, (stream, status, headers, data)
+                assert "no audio" in json.loads(b"".join(data))["error"]["message"]
+
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/generate",
+                data=urllib.parse.urlencode({
+                    "text": "hi", "output_modalities": "audio", "streaming": "false",
+                }).encode(),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                urllib.request.urlopen(req, timeout=15)
+            assert exc.value.code == 500
+            assert "no audio" in json.loads(exc.value.read())["detail"]
+    finally:
+        api.running = False
+        api.preprocess_worker.results_wakeup.signal()
+        api._msg_thread.join(timeout=5)
