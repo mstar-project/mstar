@@ -10,8 +10,9 @@ from abc import ABC, abstractmethod
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum, StrEnum
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
+from mstar.engine.resources.kv.store.config import KVStoreConfig
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, RoutingContext, check_sizes
 from mstar.engine.resources.step import ResourceStep
 
@@ -129,6 +130,8 @@ class PagedKVConfig(KVConfig):
     prefix_cache_salt: str = ""
     prefix_cache: bool = True
     prefix_cache_tp: bool = False
+    # a store shared by processes, under the host pool (``resources.<key>.store``); None for none
+    store: KVStoreConfig | None = None
     # place token positions over the ranks that would otherwise hold the same KV heads; see `place`
     context_parallel: bool = False
     # MLA only: the latent is ``[ckv (kv_lora_rank) | kpe (qk_rope_head_dim)]``
@@ -381,8 +384,11 @@ class PagedKVConfig(KVConfig):
         prefix_cache: bool | None = None,
         prefix_cache_tp: bool | None = None,
         context_parallel: bool | None = None,
+        store: Mapping[str, Any] | None = None,
     ) -> None:
         """How much cache this deployment gets, and how it is cut up."""
+        if store is not None:
+            self.store = KVStoreConfig.from_yaml(store)
         for name, value in (
             ("max_num_pages", max_num_pages),
             ("page_size", page_size),

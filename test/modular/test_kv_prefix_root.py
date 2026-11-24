@@ -19,9 +19,12 @@ time out.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -173,6 +176,24 @@ def test_the_same_build_roots_the_same_way_twice():
         "two builds of one deployment rooted differently, so neither could "
         "match what the other wrote"
     )
+
+
+def test_two_processes_root_the_same_way():
+    """A KV store shares pages between processes, which match only if each roots the cache alike. Distinct
+    hash seeds catch a fold that follows the order of a set or dict of strings."""
+    script = (
+        "import sys; sys.path.insert(0, sys.argv[1]); import test_kv_prefix_root as t; "
+        "t.manager_mod.KVTransferManager = t._StubTransfer; print(t._root().hex())"  # as `_stub_transfer` does
+    )
+    roots = {
+        subprocess.run(
+            [sys.executable, "-c", script, str(Path(__file__).parent)],
+            env={**os.environ, "PYTHONHASHSEED": seed, "CUDA_VISIBLE_DEVICES": ""},
+            capture_output=True, text=True, timeout=100, check=True,
+        ).stdout.split()[-1]
+        for seed in ("1", "2")
+    }
+    assert len(roots) == 1, f"two processes rooted the cache apart: {roots}"
 
 
 def test_the_root_changes_with_the_kv_resources_own_config():

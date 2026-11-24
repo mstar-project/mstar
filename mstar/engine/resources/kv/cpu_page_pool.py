@@ -47,6 +47,13 @@ class OffloadedStream:
         return held_pages(self.groups) if len(self.groups) > 1 else self.groups[0].page_indices
 
 
+class FiledPage(NamedTuple):
+    """A page the host index just filed after its copy landed, with its chain's parent key."""
+    key: bytes
+    page: int
+    parent: bytes | None
+
+
 class PageCopies(NamedTuple):
     gpu: list[int]
     cpu: list[int]
@@ -228,18 +235,21 @@ class CPUPagePool:
 
     def file_writes(
         self, keys: list[bytes], pages: list[int], parents: list[bytes | None], cancelled: set[bytes],
-    ) -> None:
+    ) -> list[FiledPage]:
         """File each of ``pages`` under its key in ``keys``, except the keys in ``cancelled``, then
-        release ``pages``. Where an offload filed a key during the copy, the index keeps the offload's
-        page, and this write's page goes back to the free list."""
-        filed = 0
+        release ``pages``, and return the (key, page, parent key) of each page filed. Where an offload filed
+        a key during the copy, the index keeps the offload's page, and this write's page goes back to the free
+        list."""
+        filed = []
         for key, page, parent in zip(keys, pages, parents, strict=True):
-            if key not in cancelled:
-                filed += self.index.insert(key, page, None if parent is None else self.index.page_for(parent))
+            parent_page = None if parent is None else self.index.page_for(parent)
+            if key not in cancelled and self.index.insert(key, page, parent_page):
+                filed.append(FiledPage(key, page, parent))
         self.arena.release(pages)
-        self.written += filed
+        self.written += len(filed)
         self.cancelled += len(cancelled)
         self._log_counts()
+        return filed
 
     def _log_counts(self) -> None:
         now = time.monotonic()
@@ -293,6 +303,18 @@ class CPUPagePool:
         event = torch.cuda.Event()
         event.record(self._get_write_stream())
         return event
+
+    def copies_queued(self) -> list[torch.cuda.Event]:
+        """Events that complete once every copy queued so far, either way, has finished: what a write from
+        the CPU into a free host page waits for, since a reload releases its host pages with the copy still
+        queued."""
+        events = []
+        for stream in (self._stream, self._write_stream):
+            if stream is not None:
+                event = torch.cuda.Event()
+                event.record(stream)
+                events.append(event)
+        return events
 
     def record(self) -> torch.cuda.Event:
         """An event that completes once every copy queued so far has landed."""

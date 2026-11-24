@@ -533,15 +533,18 @@ _MOONCAKE_WHEELS = {
 }
 
 
-def _mooncake_install_hint(err: BaseException | None, torch_cuda: str | None) -> str:
-    """Say which Mooncake wheel loads next to this torch build."""
+def _mooncake_install_hint(
+    err: BaseException | None, torch_cuda: str | None, alternative: str | None = "use SHM protocol",
+) -> str:
+    """Say which Mooncake wheel loads next to this torch build, and ``alternative`` to it, if any."""
     major = torch_cuda.split(".")[0] if torch_cuda else None
     want = _MOONCAKE_WHEELS.get(major) if major else "mooncake-transfer-engine-non-cuda"
     missing = re.search(r"libcudart\.so\.(\d+)", str(err))
+    other = f" or {alternative}" if alternative else ""
     if want is None or missing is None:
         if want and isinstance(err, ModuleNotFoundError) and (err.name or "").startswith("mooncake"):
-            return f"Install {want} or use SHM protocol."
-        return "Install mooncake-transfer-engine or use SHM protocol."
+            return f"Install {want}{other}."
+        return f"Install mooncake-transfer-engine{other}."
     needed = missing.group(1)
     if needed == major:
         fix = (
@@ -549,14 +552,13 @@ def _mooncake_install_hint(err: BaseException | None, torch_cuda: str | None) ->
             if needed == "12"
             else f"put libcudart.so.{needed} on the library path"
         )
-        return f"torch is built for CUDA {torch_cuda} too, so {fix}, or use SHM protocol."
+        return f"torch is built for CUDA {torch_cuda} too, so {fix}{other and ','}{other}."
     torch_desc = f"built for CUDA {torch_cuda}" if major else "built without CUDA"
     have = _MOONCAKE_WHEELS.get(needed)
     uninstall = f"uv pip uninstall {have} && " if have else ""
     return (
         f"This Mooncake build needs the CUDA {needed} runtime, but torch is {torch_desc}. "
-        f"Switch to {want}: `{uninstall}uv pip install --reinstall --no-deps {want}`, "
-        "or use SHM protocol."
+        f"Switch to {want}: `{uninstall}uv pip install --reinstall --no-deps {want}`{other and ','}{other}."
     )
 
 

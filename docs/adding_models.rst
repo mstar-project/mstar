@@ -944,10 +944,11 @@ The spec types are:
      - What it builds
    * - ``KVSpec(config=PagedKVConfig(...))``
      - A paged KV cache. ``KVConfig`` is the abstract base for common model geometry;
-       ``PagedKVConfig`` adds ``max_seq_len`` and five fields that
+       ``PagedKVConfig`` adds ``max_seq_len`` and six fields that
        a deployment can tune: ``max_num_pages``, ``page_size``, ``cpu_offload_pages``
        (the number of pinned host pages used for offload; 0 disables offload),
-       ``prefix_cache`` and ``prefix_cache_salt``. ``layout=KVLayout.MLA`` stores one
+       ``prefix_cache``, ``prefix_cache_salt`` and ``store`` (a KV store shared by
+       processes, under the host pool; see "Resource overrides" in :doc:`serving`). ``layout=KVLayout.MLA`` stores one
        Multi-head Latent Attention latent per token in place of K and V. It needs
        ``kv_lora_rank`` and ``qk_rope_head_dim``, and sets ``num_kv_heads`` to 1 and
        ``head_dim`` to their sum. Every rank holds the whole latent; only
@@ -3165,7 +3166,7 @@ that a misspelled setting is never silently ignored:
      - Accepts
    * - ``KVSpec`` with ``PagedKVConfig``
      - ``max_num_pages``, ``page_size``, ``max_seq_len``, ``cpu_offload_pages``,
-       ``prefix_cache``, ``prefix_cache_salt``, ``context_parallel`` (see below)
+       ``prefix_cache``, ``prefix_cache_salt``, ``context_parallel`` (see below), ``store``
    * - ``KVSpec`` with ``RingKVConfig``
      - ``num_sessions``
    * - ``BoundedKVSpec``

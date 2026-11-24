@@ -144,7 +144,7 @@ resources:
   kv_cache:
     max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages,
                              # prefix_cache, prefix_cache_salt, prefix_cache_tp,
-                             # context_parallel
+                             # context_parallel, store (below)
   talker_attn:
     flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores, decode_fmha
   vit_attn:                  # a cacheless (ragged) attention resource
@@ -165,6 +165,31 @@ Use one block per resource. A model with two caches, such as Whisper's decoder c
 `greedy_capture: false` on a sampler stops all-greedy steps from taking each row's argmax, and the engine from capturing a twin of each batched bucket for them. A sampler whose vocabulary is past 4096 has them by default (see `SamplerSpec` in [Adding a New Model](/adding_models)), so a deployment that never samples greedily can save their capture memory and time this way.
 
 `prefix_cache: false` turns cross-request prefix reuse off for that cache, and `prefix_cache_salt` keeps two otherwise identical deployments off each other's cached pages. A single request opts out by sending `prefix_cache=False`, which travels with its other `model_kwargs`. Above one rank the cache stays off unless `prefix_cache_tp: true` is set as well: rank 0 then decides each hit and the other ranks adopt it. `prefix_cache_tp` can't be combined with `cpu_offload_pages`, and the cache's nodes must run on one TP group, with no replicas and no walks placed on other ranks. Loading fails otherwise. A cache that keeps a sliding window (`AttentionConfig.sliding_window`) has no prefix cache yet: its `prefix_cache` goes off (logged at info), and a serving config that sets `prefix_cache: true` on it is refused.
+
+`store:` gives a paged KV cache with a host pool a KV store shared by processes, under the host pool. A cached page the host pool files is also written to the store, and a new prompt that continues past what the GPU and host hold reads the store's pages into the host pool before the request runs, then copies them to the GPU as any host hit. Other M* processes serving the same model with the same cache config and `prefix_cache_salt` read those pages, and they outlive a restart. Mooncake Store is the one backend; its settings go in a block named after it:
+
+```yaml
+resources:
+  kv_cache:
+    cpu_offload_pages: 8192
+    prefix_cache_salt: agent-prod-2026-11  # required with a store; change it with the weights
+    store:
+      backend: mooncake
+      timeout_ms: 1000       # how long a request waits for the store before it recomputes
+      # (plus a read's bytes at floor_gbps, at most 30 s in all)
+      floor_gbps: 0.5        # a read also gets this rate of time for its bytes
+      min_tokens: 256        # ask the store, and read a hit, only from this many tokens
+      read_share: 0.125      # of cpu_offload_pages, the most store reads hold at once
+      write_share: 0.125     # and store writes (queued pages and the put in flight)
+      mooncake:
+        master: 10.0.0.5:50051
+        metadata: P2PHANDSHAKE  # or the master's HTTP metadata URL
+        protocol: tcp           # or rdma, with rdma_devices
+        local_hostname: ""      # empty: the interface that reaches the master, a free port
+        segment_bytes: 0        # host memory this process gives the store
+```
+
+`min_tokens` counts whole pages past what the GPU and host hold that the request's page budget can take, as SGLang's HiCache counts past its cache, so a short continuation doesn't wait for the store. A `mooncake_master` keeps no pages itself: run Mooncake store processes that give memory (`mooncake_store_service`), or give memory from an M* process with `segment_bytes`, whose pages go when it exits, and when a failed read restarts its Mooncake client (see below). Next to a CUDA 13 torch, install Mooncake's CUDA 13 wheel (see [libcudart.so.12: cannot open shared object file](/installation#mooncake-cuda13)). Loading fails when the store can't be reached, and when the pool has no host pool, has the prefix cache off, runs above one rank, keeps a sliding window or recurrent-state snapshots (Qwen3.5), or has no `prefix_cache_salt`, and when the engine keeps the cache's prefix cache shut (no node keys it, say; the log says why). The salt is required because the key root names the checkpoint by its safetensors index and `config.json`, which two fine-tunes of one architecture can share, so change it whenever the weights, or anything else that changes the KV (a quantization setting outside `config.json`, say), change. A request's wait starts when it asks the store, so time queued behind other store calls counts. A call that fails or runs past its deadline is a miss, and the request recomputes; five in a row skip the store for 30 s. After a read fails, the Mooncake client is closed and reopened: Mooncake keeps a failed transfer going after reporting it, and closing the client is what stops it from writing into host pages that are reused next. Pages of a request moved to the host when the GPU pool runs short aren't written to the store yet. A hit longer than `read_share` of `cpu_offload_pages` is cut (logged once) and its rest recomputed, so for whole hits size the two together: at the default of an eighth, the host pool needs about eight times the pages of the longest prompt the store should serve. A store read pays off only where copying the pages beats recomputing them. Over Mooncake's TCP transport on one H100, with `MC_TCP_LANES_PER_PEER` (Mooncake's TCP connections to each peer, 1 by default) at 4, a store hit reached the first token of Bagel's LLM 1.6x sooner than recomputing a 32K-token prompt, 1.3x at 17K, about as soon at 9K, and later at 2K; one connection read at about half that speed. Run the Mooncake cluster where only this deployment's processes can reach it: pages are trusted after a size check, so a client that can write to the store can plant KV for prompts it can guess, and one that can read it gets the KV of every cached prompt.
 
 A node on `sp_size` above 1 shares each step over its SP ranks along two axes. A model that declares a sequence shard (a `SeqShard`: Qwen3.5's LLM, Qwen3-Omni's Thinker and the DiTs of LTX-2.5, Wan2.2 and MiniMax-H3; a `SeqShardSpec`: Cosmos3's DiT and MiniMax-H3's video decoder) splits a step's tokens over them; its `min_tokens` runs smaller steps copied on every rank instead (default 0: every step that can split does). A captured step decides from its bucket's size, not its prompt's. A node with a resource whose split steps run eagerly only (a ring, `kv_gather`, a recurrent layer such as Qwen3.5's) never splits a captured step: the shard sets its own floor at load, for each walk it splits, one past that walk's largest captured bucket (from the node's capture configs, so the same on every rank). A step that fits a bucket runs copied in its graph, and a bigger one runs eagerly and splits; `min_tokens` only raises that floor, as a measured crossover does (Qwen3-Omni's Thinker, whose all_gather split replays in a graph). Separately, `context_parallel: true` stores a paged pool's K/V by position rather than by head: each request's positions split over the ranks that would otherwise hold the same KV heads, the TP ranks that share a KV head or the node's SP ranks, which is how a model whose attention takes no split steps runs on `sp_size` above 1. Raise `max_num_pages` by that factor to turn the freed memory into context. A node on SP ranks needs at least one of the two.
 
