@@ -112,6 +112,8 @@ class RollingKVSpec(NodeResourceSpec):
         self, requests: int, request: ResourceReqConfig | None, axis_sizes: Sequence[Mapping[str, int]] = (),
     ) -> str | None:
         del axis_sizes
+        if not self.episode_lifetime and not isinstance(request, RollingKVReqConfig):
+            return None
         need = requests * request.tokens if isinstance(request, RollingKVReqConfig) else requests
         if need <= self.config.pool_tokens:
             return None
