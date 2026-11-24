@@ -617,6 +617,133 @@ def test_corrupt_headerless_flac_still_raises(tmp_path, monkeypatch):
         media_io.read_soundfile_capped(str(path), max_seconds=5)
 
 
+def test_truncated_trailing_garbage_and_midstream_corrupt_headerless_flac_raises(tmp_path, monkeypatch):
+    """Truncated, trailing-garbage, and mid-stream-corrupted headerless FLACs
+    where libsndfile raises ``Internal psf_fseek() failed.`` must raise
+    LibsndfileError (and UndecodableMediaError inside decoding_upload) rather
+    than silently returning partial audio."""
+    import os
+
+    sf = pytest.importorskip("soundfile")
+    from mstar.model.media_limits import UndecodableMediaError, decoding_upload
+    from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
+
+    monkeypatch.setitem(sys.modules, "torchcodec", None)
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)
+
+    src = tmp_path / "source.flac"
+    _flac_without_length(src, 3, rate=16000)
+    raw = src.read_bytes()
+    assert sf.info(src).frames == 2**63 - 1
+
+    # Valid empty 42-byte FLAC (is_last=1 in STREAMINFO) vs truncated metadata (is_last=0)
+    empty42 = bytearray(raw[:42])
+    empty42[4] |= 0x80
+
+    flip_2086 = bytearray(raw)
+    for idx in range(2086, 2106):
+        flip_2086[idx] ^= 0xFF
+    flip_10939 = bytearray(raw)
+    for idx in range(10939, 10959):
+        flip_10939[idx] ^= 0xFF
+    flip_mid_single = bytearray(raw)
+    flip_mid_single[2086] ^= 0x01
+    flip_last_byte = bytearray(raw)
+    flip_last_byte[-1] ^= 0x01
+
+    bad_payloads = {
+        "trunc_1B": raw[:-1],
+        "trunc_10000B": raw[:-10000],
+        "trunc_metadata": raw[:42],
+        "frame0_plus_garbage": raw[:2200] + os.urandom(20000),
+        "empty42_plus_1B": bytes(empty42) + b"\x00",
+        "valid_plus_1B": raw + b"\x00",
+        "flip20_2086": bytes(flip_2086),
+        "flip20_10939": bytes(flip_10939),
+        "flip1_2086": bytes(flip_mid_single),
+        "flip_last_byte_crc16": bytes(flip_last_byte),
+    }
+
+    duplex = object.__new__(NemotronDuplexModel)
+    duplex.max_session_s = 10.0
+
+    for name, payload in bad_payloads.items():
+        bad_path = tmp_path / f"{name}.flac"
+        bad_path.write_bytes(payload)
+        with pytest.raises(sf.LibsndfileError):
+            media_io.read_soundfile_capped(str(bad_path), max_seconds=10.0)
+        with pytest.raises(UndecodableMediaError), decoding_upload(str(bad_path), "the audio"):
+            media_io.read_soundfile_capped(str(bad_path), max_seconds=10.0)
+        with pytest.raises(UndecodableMediaError):
+            duplex.load_audio(str(bad_path), "cpu")
+
+
+def test_valid_headerless_flac_block_aligned_non_aligned_and_empty_decode(tmp_path, monkeypatch):
+    """Valid headerless FLACs across block-aligned, non-block-aligned, empty,
+    constant/verbatim subframes, multi-channel, and exact max_seconds bounds
+    decode sample-identically without torchcodec."""
+    sf = pytest.importorskip("soundfile")
+    monkeypatch.setitem(sys.modules, "torchcodec", None)
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)
+
+    rng = np.random.default_rng(7)
+    cases = [
+        (16000, 1, 1, "PCM_16", "sine"),
+        (16000, 100, 1, "PCM_16", "sine"),
+        (16000, 4095, 1, "PCM_16", "sine"),
+        (16000, 4096, 1, "PCM_16", "sine"),
+        (16000, 4097, 1, "PCM_16", "sine"),
+        (16000, 8192, 1, "PCM_16", "sine"),
+        (16000, 8193, 1, "PCM_16", "sine"),
+        (16000, 8192, 1, "PCM_16", "silence"),
+        (16000, 5000, 1, "PCM_16", "noise"),
+        (44100, 12345, 2, "PCM_24", "noise"),
+        (48000, 8192, 6, "PCM_16", "noise"),
+    ]
+
+    for idx, (rate, n_frames, channels, subtype, kind) in enumerate(cases):
+        ref = tmp_path / f"ref_{idx}.flac"
+        if kind == "silence":
+            arr = np.zeros((n_frames, channels) if channels > 1 else n_frames, dtype=np.float32)
+        elif kind == "noise":
+            arr = (0.2 * rng.standard_normal((n_frames, channels) if channels > 1 else n_frames)).astype(np.float32)
+        else:
+            t = np.arange(n_frames) / rate
+            arr = (0.15 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+            if channels > 1:
+                arr = np.stack([arr] * channels, axis=1)
+        sf.write(ref, arr, rate, subtype=subtype)
+
+        raw = bytearray(ref.read_bytes())
+        shift = 34 * 8 - 108 - 36
+        si = int.from_bytes(raw[8:42], "big") & ~(((1 << 36) - 1) << shift)
+        raw[8:42] = si.to_bytes(34, "big")
+        hl = tmp_path / f"hl_{idx}.flac"
+        hl.write_bytes(bytes(raw))
+        assert sf.info(hl).frames == 2**63 - 1
+
+        expected, _ = sf.read(ref, dtype="float32", always_2d=True)
+        expected_mono = expected[:, 0] if channels == 1 else expected.mean(axis=1)
+        max_s = (n_frames + 1e-6) / rate
+        assert int(max_s * rate) == n_frames
+        decoded, got_rate = media_io.read_soundfile_capped(str(hl), max_seconds=max_s)
+        assert got_rate == rate
+        np.testing.assert_array_equal(decoded, expected_mono)
+        if n_frames > 1:
+            too_short_s = (n_frames - 1 + 1e-6) / rate
+            assert int(too_short_s * rate) == n_frames - 1
+            with pytest.raises(AudioTooLongError):
+                media_io.read_soundfile_capped(str(hl), max_seconds=too_short_s)
+
+    # Empty valid 42-byte headerless FLAC
+    empty42 = bytearray((tmp_path / "hl_3.flac").read_bytes()[:42])
+    empty42[4] |= 0x80
+    empty_path = tmp_path / "empty.flac"
+    empty_path.write_bytes(bytes(empty42))
+    decoded, got_rate = media_io.read_soundfile_capped(str(empty_path), max_seconds=5.0)
+    assert decoded.shape == (0,) and got_rate == 16000
+
+
 def test_flac_without_a_length_is_measured_by_decoding_it(client, tmp_path, monkeypatch):
     # main read libsndfile's "unknown" frame count as a duration of about
     # 5.8e14 s and refused a 2 minute clip with a 413
@@ -825,6 +952,41 @@ def test_live_http_serving_decodes_headerless_flac_without_torchcodec(tmp_path, 
             assert [base64.b64decode(o["data"]) for o in r2.json()["outputs"]["text"]] == [b"ok"]
             assert len(model.recorded_audio) == 3
             np.testing.assert_array_equal(model.recorded_audio[-1].numpy(), expected)
+
+            # 3. Truncated and mid-stream-corrupt headerless FLAC uploads must be
+            #    rejected with HTTP 400 (never silently returning partial audio).
+            #    Mock torchcodec as a failing FFmpeg decoder so Model.load_audio
+            #    -> load_speech_file rejects corrupt uploads with HTTP 400.
+            class _FailingAudioDecoder:
+                def __init__(self, *args, **kwargs):
+                    raise RuntimeError("Invalid data found when processing input")
+
+            decoders = types.ModuleType("torchcodec.decoders")
+            decoders.AudioDecoder = _FailingAudioDecoder
+            fake_tc = types.ModuleType("torchcodec")
+            fake_tc.decoders = decoders
+            fake_tc.ffmpeg_major_version = 7
+            monkeypatch.setitem(sys.modules, "torchcodec", fake_tc)
+            monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
+
+            short_raw = short_flac.read_bytes()
+            trunc_bytes = short_raw[:-1]
+            r3 = http.post(
+                "/generate",
+                data={"text": "transcribe", "output_modalities": "text", "streaming": "false"},
+                files={"files": ("trunc.flac", trunc_bytes, "audio/flac")},
+            )
+            assert r3.status_code == 400, r3.text
+
+            corrupt_bytes = bytearray(short_raw)
+            corrupt_bytes[2086] ^= 0x01
+            r4 = http.post(
+                "/generate",
+                data={"text": "transcribe", "output_modalities": "text", "streaming": "false"},
+                files={"files": ("corrupt.flac", bytes(corrupt_bytes), "audio/flac")},
+            )
+            assert r4.status_code == 400, r4.text
+            assert len(model.recorded_audio) == 3
     finally:
         http_server.should_exit = True
         http_thread.join(timeout=10)
