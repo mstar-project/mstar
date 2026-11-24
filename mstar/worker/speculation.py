@@ -506,16 +506,38 @@ class Speculator:
         # A capture-group yield can stay on the same scheduling key.
         self._built_chain_key: tuple[str, str] | None = None
 
+    def _cap_key_for(self, node_name: str, graph_walk: str) -> tuple[str, str]:
+        """The cap's key for ``(node_name, graph_walk)``: a mixing chain's
+        scheduling key so mixed yield-aways count toward it, else the pair
+        itself so unmixed combined walks still reset across walks."""
+        scheduler = self.scheduler
+        speculation_mixes = getattr(scheduler, "speculation_mixes", None)
+        key_fn = getattr(scheduler, "_key", None)
+        if speculation_mixes is None or key_fn is None:
+            return (node_name, graph_walk)
+        if speculation_mixes(node_name, graph_walk):
+            return key_fn(node_name, graph_walk)
+        walks_of_key = getattr(scheduler, "_walks_of_key", None)
+        if walks_of_key is not None:
+            walks = walks_of_key.get((node_name, graph_walk))
+            if walks and any(speculation_mixes(node_name, walk) for walk in walks):
+                return key_fn(node_name, graph_walk)
+        return (node_name, graph_walk)
+
     def note_launched(self, speculation: Speculation) -> None:
         """Count a launched step for the peek and the consecutive-step cap."""
         if speculation.is_yield_away and not speculation.gave_way:
             self._consecutive = 0
         else:
             self._consecutive += 1
-        launched_key = self._built_chain_key
-        if speculation.is_yield_away:
+        if speculation.is_yield_away and not speculation.gave_way:
             batch = speculation.scheduled_batch
-            launched_key = (batch.node_name, batch.graph_walk)
+            launched_key = self._cap_key_for(batch.node_name, batch.graph_walk)
+        elif self._built_chain_key is not None:
+            launched_key = self._cap_key_for(*self._built_chain_key)
+        else:
+            batch = speculation.scheduled_batch
+            launched_key = self._cap_key_for(batch.node_name, batch.graph_walk)
         if launched_key == self._cap_key:
             self._since_other += 1
         else:
@@ -1186,7 +1208,7 @@ class Speculator:
                 chain_key, self._consecutive,
                 chain_key in self.chunk_loops.speculated and self.scheduler.chunks(*chain_key),
             )
-            cap_steps = self._since_other if self._cap_key == chain_key else 0
+            cap_steps = self._since_other if self._cap_key == self._cap_key_for(*chain_key) else 0
             must_yield_away = cap_steps >= self._max_consecutive or other_ready
             if target is not None and not must_yield_away and not admit_refused:
                 if self.enable_nvtx:

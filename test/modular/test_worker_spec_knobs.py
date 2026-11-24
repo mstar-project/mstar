@@ -30,6 +30,7 @@ from mstar.worker.worker import Worker
 
 LAUNCH = "MSTAR_LAUNCH_WAIT_MS"
 CAP = "MSTAR_MAX_CONSECUTIVE_SPEC_STEPS"
+PEEK = "MSTAR_SPEC_PEEK_FOR_FAIRNESS"
 
 
 def _build(monkeypatch) -> Worker:
@@ -62,20 +63,31 @@ def _build(monkeypatch) -> Worker:
 def _unset(monkeypatch):
     monkeypatch.delenv(LAUNCH, raising=False)
     monkeypatch.delenv(CAP, raising=False)
+    monkeypatch.delenv(PEEK, raising=False)
 
 
 def test_defaults(monkeypatch):
     worker = _build(monkeypatch)
     assert worker.pipeline._launch_wait_s == pytest.approx(0.005)
     assert worker.speculator._max_consecutive == 1024
+    assert worker.speculator._peek is True
 
 
 def test_valid_values_are_used(monkeypatch):
     monkeypatch.setenv(LAUNCH, "0.5")
     monkeypatch.setenv(CAP, "8")
+    monkeypatch.setenv(PEEK, "0")
     worker = _build(monkeypatch)
     assert worker.pipeline._launch_wait_s == pytest.approx(0.0005)
     assert worker.speculator._max_consecutive == 8
+    assert worker.speculator._peek is False
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("1", True), ("0", False), ("anything", False)])
+def test_peek_for_fairness_env_controls_speculator_peek(monkeypatch, raw, expected):
+    monkeypatch.setenv(PEEK, raw)
+    worker = _build(monkeypatch)
+    assert worker.speculator._peek is expected
 
 
 @pytest.mark.parametrize(("var", "raw"), [
