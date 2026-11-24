@@ -11,7 +11,11 @@ starts the second piece while the first is still streaming (see
 from __future__ import annotations
 
 import re
-import unicodedata
+from bisect import bisect_right
+
+from .unicode_marks import MARK_RANGES
+
+_MARK_STARTS = tuple(low for low, _ in MARK_RANGES)
 
 # One sentence: a lazy body up to a Latin terminator (with any closing quotes
 # or brackets) that precedes whitespace or the end, a CJK terminator, a
@@ -32,6 +36,12 @@ _SOFT_BREAKS = (
 )
 
 
+def _is_mark(c: str) -> bool:
+    code = ord(c)
+    after = bisect_right(_MARK_STARTS, code)
+    return after > 0 and code <= MARK_RANGES[after - 1][1]
+
+
 def _cut_evenly(text: str, max_chars: int) -> list[str]:
     """Near-equal pieces of at most ``max_chars``, none starting on a combining mark."""
     pieces: list[str] = []
@@ -40,7 +50,7 @@ def _cut_evenly(text: str, max_chars: int) -> list[str]:
         left = len(text) - start
         n = -(-left // max_chars)  # pieces still needed
         end = cut = start + -(-left // n)
-        while cut > start and unicodedata.category(text[cut]).startswith("M"):
+        while cut > start and _is_mark(text[cut]):
             cut -= 1
         if cut == start:  # nothing but marks: cut anyway
             cut = end
