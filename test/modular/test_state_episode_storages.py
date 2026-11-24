@@ -357,6 +357,9 @@ def test_usable_slots_and_capacity_problem_match_across_configs():
     assert roll_spec.capacity_problem(17, None) is not None
     assert roll_spec.capacity_problem(2, RollingKVReqConfig(tokens=8)) is None
     assert roll_spec.capacity_problem(3, RollingKVReqConfig(tokens=8)) is not None
+    assert RollingKVSpec(
+        resource_key="roll", nodes={"llm"}, config=roll_cfg, episode_lifetime=False,
+    ).capacity_problem(1000, None) is None
 
     bnd_cfg = BoundedKVConfig(
         num_layers=1, num_heads=2, head_dim=8, rows_per_request=1, max_source_len=0,
