@@ -112,6 +112,8 @@ class DeepSeekV41MoE(Glm5NextSparseMoeBlock):
             (self.experts, "gate_up_proj_scale_inv", self.experts.gate_up_proj_scale_inv.detach()),
             (self.experts, "down_proj_scale_inv", self.experts.down_proj_scale_inv.detach()),
         ]
+        if self.gate.bias_vl is not None:
+            kept.append((self.gate, "bias_vl", self.gate.bias_vl.detach()))
         result = super()._apply(fn, recurse=recurse)
         for module, name, original in kept:
             param = getattr(module, name)

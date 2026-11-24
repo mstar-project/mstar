@@ -120,6 +120,8 @@ class DeepSeekV41TextCache:
             self.compress_k[src_layer] = next_ck
             if next_partial is not None:
                 self.partials[lid] = next_partial
+        if layer_id is None:
+            self._current_layer = None
 
 
 class DeepSeekV41TextBackbone(nn.Module):

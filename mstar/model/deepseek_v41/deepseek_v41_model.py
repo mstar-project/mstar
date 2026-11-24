@@ -18,12 +18,13 @@ from mstar.distributed.base import ShardingConfig
 from mstar.engine.state import Array, Entry, Sampler, TensorType, Value
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import KVLabel, Model, ProcessPromptOutput, WalkStep
+from mstar.model.base import MAX_OUTPUT_TOKENS, KVLabel, Model, ProcessPromptOutput, WalkStep
 from mstar.model.components.deepseek_v41.backbone import DeepSeekV41TextBackbone
 from mstar.model.components.deepseek_v41.compressor_source import compressor_partial_value
 from mstar.model.components.deepseek_v41.engram_hash import build_compressed_token_map
 from mstar.model.components.request_kwargs import (
     SAMPLING_KEYS,
+    checked_request_kwargs,
     generation_config_dir,
     sample_settings,
     sampling_config,
@@ -48,6 +49,7 @@ from mstar.model.utils import ByteLevelTextOutput, load_snapshot_tokenizer, reso
 logger = logging.getLogger(__name__)
 
 DEFAULT_SAMPLING: Mapping[str, object] = MappingProxyType({"temperature": 1.0, "top_p": 1.0})
+QUANT_METHODS = ("fp8",)
 
 
 def _positive_int(name: str, value: Any) -> int:
@@ -223,22 +225,19 @@ class DeepSeekV41Model(ByteLevelTextOutput, Model):
     def get_default_sharding_config(self) -> ShardingConfig:
         return ShardingConfig(groups=[], tp_enabled_nodes={"LLM"}, shard_dim={})
 
-    def get_loop_caps(self, max_output_tokens: int | None = None) -> dict[str, int]:
-        budget = self.config.max_seq_len if max_output_tokens is None else max_output_tokens
-        return {self.DECODE_LOOP: max(0, min(int(budget), self.config.max_seq_len) - 1)}
+    def get_max_output_tokens(self, **model_kwargs: Any) -> int:
+        default = self.config.max_output_tokens or min(MAX_OUTPUT_TOKENS, self.config.max_seq_len)
+        return checked_request_kwargs(model_kwargs).get("max_output_tokens", default)
 
     def _resolve_token_map(self) -> torch.Tensor | None:
         if self._token_map is not None:
             return torch.as_tensor(self._token_map, dtype=torch.long)
         if self._tokenizer_mode == "byte" or not self.config.engram_layer_ids:
             return None
-        try:
-            tok = self.tokenizer
-            return torch.from_numpy(
-                build_compressed_token_map(tok, self.config.engram_compressed_vocab_size)
-            )
-        except Exception:  # noqa: BLE001
-            return None
+        tok = self.tokenizer
+        return torch.from_numpy(
+            build_compressed_token_map(tok, self.config.engram_compressed_vocab_size)
+        )
 
     def get_submodule(
         self,
@@ -262,7 +261,7 @@ class DeepSeekV41Model(ByteLevelTextOutput, Model):
             backbone.to_empty(device=device)
             load_deepseek_v41_weights(
                 backbone,
-                iter_safetensors_shards(checkpoint_dir, device="cpu"),
+                iter_safetensors_shards(checkpoint_dir, device="cpu", quant_methods=QUANT_METHODS),
                 device=device,
             )
             backbone.eval()
@@ -280,6 +279,9 @@ class DeepSeekV41Model(ByteLevelTextOutput, Model):
     ) -> ProcessPromptOutput:
         if input_modalities != ["text"] or output_modalities != ["text"]:
             raise ValueError("DeepSeek-V4.1 Phase 1 supports text input and text output only")
+        kw = checked_request_kwargs(kwargs)
+        self.get_request_resource_configs([], [], kw)
+        self.get_max_output_tokens(**kw)
         tensors = tensors or {}
         if "text_inputs" in tensors:
             raw = tensors["text_inputs"]
@@ -323,10 +325,10 @@ class DeepSeekV41Model(ByteLevelTextOutput, Model):
 
         if ids.numel() == 0 or ids.numel() > self.config.max_seq_len:
             raise ValueError(f"Prompt must contain 1..{self.config.max_seq_len} token IDs, got {ids.numel()}")
-        max_output_tokens = self.get_max_output_tokens(**kwargs)
-        if ids.numel() + max_output_tokens > self.config.max_seq_len:
+        explicit_max = kw.get("max_output_tokens")
+        if explicit_max is not None and ids.numel() + explicit_max > self.config.max_seq_len:
             raise ValueError(
-                f"prompt ({ids.numel()} tokens) + max_output_tokens ({max_output_tokens}) "
+                f"prompt ({ids.numel()} tokens) + max_output_tokens ({explicit_max}) "
                 f"exceeds max_seq_len ({self.config.max_seq_len})"
             )
         if bool(((ids < 0) | (ids >= self.config.vocab_size)).any()):

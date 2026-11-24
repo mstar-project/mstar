@@ -168,12 +168,14 @@ def test_forward_packed_isolates_multiple_requests() -> None:
 
     cache_a = DeepSeekV41TextCache(cfg, 1, 32, torch.device("cpu"), torch.float32)
     cache_b = DeepSeekV41TextCache(cfg, 1, 32, torch.device("cpu"), torch.float32)
-    cache_a.bind_layer(1)
-    cache_b.bind_layer(1)
     with torch.no_grad():
+        cache_a.bind_layer(1)
         ref_a_1 = attn(x_a[:, :5], 0, rope, cache_a, SharedSelection())[0]
+        cache_b.bind_layer(1)
         ref_b_1 = attn(x_b[:, :3], 0, rope, cache_b, SharedSelection())[0]
+        cache_a.bind_layer(1)
         ref_a_2 = attn(x_a[:, 5:6], 5, rope, cache_a, SharedSelection())[0]
+        cache_b.bind_layer(1)
         ref_b_2 = attn(x_b[:, 3:4], 3, rope, cache_b, SharedSelection())[0]
 
         # Packed step 1: req 0 (5 toks at pos 0..4), req 1 (3 toks at pos 0..2)
@@ -214,3 +216,22 @@ def test_forward_packed_isolates_multiple_requests() -> None:
         )
         torch.testing.assert_close(out2[0:1], ref_a_2, rtol=1e-5, atol=1e-5)
         torch.testing.assert_close(out2[1:2], ref_b_2, rtol=1e-5, atol=1e-5)
+
+
+def test_text_cache_clears_bound_layer_after_write_layer() -> None:
+    import pytest
+
+    cfg = DeepSeekV41Config.reduced()
+    rope = DeepSeekV41Rope(cfg)
+    layers = [DeepSeekV41Attention(cfg, i).eval() for i in range(3)]
+    cache = DeepSeekV41TextCache(cfg, 1, 32, torch.device("cpu"), torch.float32)
+    x = torch.randn(1, 3, cfg.hidden_size, dtype=torch.float32)
+
+    with torch.no_grad():
+        cache.bind_layer(0)
+        layers[0](x, 0, rope, cache, SharedSelection())
+        # Calling layer 1 or layer 2 without another bind_layer must fail loudly instead of reusing layer 0.
+        with pytest.raises(RuntimeError, match="bind_layer"):
+            layers[1](x, 0, rope, cache, SharedSelection())
+        with pytest.raises(RuntimeError, match="bind_layer"):
+            layers[2](x, 0, rope, cache, SharedSelection())

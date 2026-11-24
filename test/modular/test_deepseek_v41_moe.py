@@ -237,3 +237,19 @@ def test_config_reads_published_text_fields_and_refuses_drift() -> None:
     bad["quantization_config"]["scale_fmt"] = "other"
     with pytest.raises(ValueError, match="unsupported"):
         DeepSeekV41MoeConfig.from_hf(bad)
+
+
+def test_moe_apply_preserves_bias_vl_in_fp32_under_bfloat16() -> None:
+    cfg = DeepSeekV41MoeConfig(32, 32, 4, 2, 1.5, 10.0, vision_enabled=True)
+    moe = DeepSeekV41MoE(0, cfg)
+    expected_bias_vl = torch.full_like(moe.gate.bias_vl, 0.7654321, dtype=torch.float32)
+    with torch.no_grad():
+        moe.gate.bias_vl.copy_(expected_bias_vl)
+    moe.to(torch.bfloat16)
+    assert moe.gate.bias_vl.dtype == torch.float32
+    assert torch.equal(moe.gate.bias_vl, expected_bias_vl)
+
+    with torch.device("meta"):
+        meta_moe = DeepSeekV41MoE(0, cfg).to(dtype=torch.bfloat16)
+    assert meta_moe.gate.bias_vl.dtype == torch.float32
+    assert meta_moe.gate.e_score_correction_bias.dtype == torch.float32

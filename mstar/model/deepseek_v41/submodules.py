@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from typing import Any
 
@@ -9,10 +10,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL, CurrentForwardPassInfo
-from mstar.engine.accelerator_graph_config import (
-    AcceleratorGraphConfig,
-    BatchedAcceleratorGraphConfig,
-)
+from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig
 from mstar.engine.state import (
     ArrayStep,
     SampleStep,
@@ -45,6 +43,8 @@ from mstar.model.submodule_base import (
     TokenStop,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class DeepSeekV41LLMSubmodule(TokenStepNode, ARNodeSubmodule):
     """Causal text LLM node for DeepSeek-V4.1-Flash on ``mstar.engine.state``."""
@@ -54,7 +54,6 @@ class DeepSeekV41LLMSubmodule(TokenStepNode, ARNodeSubmodule):
     DECODE_LOOP = "decode_loop"
     SAMPLER = SAMPLER
     MAX_PREFILL_BATCH_SIZE = 16
-    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
     # Decode reads routed tokens from postprocess so CPU/stub samplers work seamlessly.
     device_loopback = None
 
@@ -106,18 +105,12 @@ class DeepSeekV41LLMSubmodule(TokenStepNode, ARNodeSubmodule):
         device: torch.device,
         tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
-        del tp_world_size
-        return [
-            BatchedAcceleratorGraphConfig(
-                capture_graph_walk=self.DECODE_WALK,
-                single_request_inputs=ARNodeInputs(
-                    input_ids=torch.zeros(1, dtype=torch.long, device=device),
-                    input_seq_len=1,
-                ),
-                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
-                compile=False,
-            )
-        ]
+        del device, tp_world_size
+        logger.warning(
+            "deepseek_v41: reference MoE dispatch and host-sync decode ops are active; "
+            "decode runs eager without CUDA graph capture"
+        )
+        return []
 
     def step_is_input_free(self, graph_walk: str) -> bool:
         del graph_walk

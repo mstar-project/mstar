@@ -272,6 +272,141 @@ def test_model_contract_registration_loop_caps_and_prompt_validation() -> None:
         model.process_prompt("a" * 200, ["text"], ["text"], max_output_tokens=100)
 
 
+def test_conductor_loop_caps_and_process_prompt_validation() -> None:
+    from mstar.conductor.conductor import Conductor
+
+    model = DeepSeekV41Model("", config_variant="reduced", tokenizer_mode="byte")
+    c = Conductor.__new__(Conductor)
+    c.model = model
+    c._loop_max_iters = {
+        name: loop.max_iters for w in model.get_graph_walk_graphs().values() for name, loop in w.get_loops().items()
+    }
+
+    assert c._loop_caps({"temperature": 0.7, "top_p": 0.9, "state_layout": {}, "max_output_tokens": 8}) == {
+        "decode_loop": 7
+    }
+    assert c._loop_caps({"max_output_tokens": 1}) == {"decode_loop": 1}
+    assert c._loop_caps({"max_output_tokens": None, "temperature": 0.5, "state_layout": {}}) == {
+        "decode_loop": model.config.max_seq_len - 1
+    }
+    with pytest.raises(ValueError, match="runs at most"):
+        c._loop_caps({"max_output_tokens": model.config.max_seq_len + 2})
+
+    # process_prompt accepts max_output_tokens=None and rejects invalid sampling / length knobs
+    none_out = model.process_prompt("hi", ["text"], ["text"], max_output_tokens=None)
+    assert none_out.new_input_tensors["text_inputs"][0].tolist() == list(b"hi")
+    with pytest.raises(ValueError, match="temperature"):
+        model.process_prompt("hi", ["text"], ["text"], temperature=-1.0, max_output_tokens=4)
+    with pytest.raises(ValueError, match="max_output_tokens"):
+        model.process_prompt("hi", ["text"], ["text"], max_output_tokens=0)
+    with pytest.raises(ValueError, match="max_output_tokens"):
+        model.process_prompt("hi", ["text"], ["text"], max_output_tokens=True)
+
+
+def test_resolve_token_map_propagates_errors_when_not_byte_mode(monkeypatch) -> None:
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    model = DeepSeekV41Model("", config_variant="reduced", tokenizer_mode="hf")
+
+    tok_backend = Tokenizer(models.WordLevel(vocab={"<pad>": 0, "hello": 1, "world": 2}, unk_token="<pad>"))
+    tok_backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    fast_tok = PreTrainedTokenizerFast(tokenizer_object=tok_backend, pad_token="<pad>")
+
+    monkeypatch.setattr(DeepSeekV41Model, "tokenizer", property(lambda self: fast_tok))
+    with pytest.raises(ValueError, match="tokenizer compressed to 3 tokens, expected 512"):
+        model._resolve_token_map()
+
+    def _missing_tokenizer(self):
+        raise FileNotFoundError("no tokenizer.json")
+
+    monkeypatch.setattr(DeepSeekV41Model, "tokenizer", property(_missing_tokenizer))
+    with pytest.raises(FileNotFoundError, match="no tokenizer.json"):
+        model._resolve_token_map()
+
+
+def test_get_accelerator_graph_configs_returns_empty() -> None:
+    cfg = DeepSeekV41Config.reduced()
+    with torch.device("meta"):
+        backbone = DeepSeekV41TextBackbone(cfg)
+    sub = DeepSeekV41LLMSubmodule(backbone, cfg)
+    assert sub.get_accelerator_graph_configs(torch.device("cpu")) == []
+    assert sub.get_accelerator_graph_configs(torch.device("cuda")) == []
+
+
+def test_get_submodule_loads_hf_fp8_config_json_and_preserves_fp32_bias_vl(tmp_path: Path) -> None:
+    from safetensors.torch import save_file
+
+    cfg = DeepSeekV41Config.reduced(vision_enabled=True)
+    hf = json.loads((Path(__file__).parent / "data/deepseek_v41_pinned_config.json").read_text())
+    text = hf["text_config"]
+    text.update(
+        {
+            "vocab_size": cfg.vocab_size,
+            "hidden_size": cfg.hidden_size,
+            "moe_intermediate_size": cfg.moe_intermediate_size,
+            "num_hidden_layers": cfg.num_hidden_layers,
+            "num_attention_heads": cfg.num_attention_heads,
+            "num_key_value_heads": cfg.num_key_value_heads,
+            "head_dim": cfg.head_dim,
+            "qk_rope_head_dim": cfg.qk_rope_head_dim,
+            "q_lora_rank": cfg.q_lora_rank,
+            "o_lora_rank": cfg.o_lora_rank,
+            "o_groups": cfg.o_groups,
+            "sliding_window": cfg.sliding_window,
+            "compress_ratios": list(cfg.compress_ratios),
+            "kv_source_layer_ids": list(cfg.kv_source_layer_ids),
+            "index_source_layer_ids": list(cfg.index_source_layer_ids),
+            "index_n_heads": cfg.index_n_heads,
+            "index_head_dim": cfg.index_head_dim,
+            "index_topk": cfg.index_topk,
+            "candidate_source_layer_id": cfg.candidate_source_layer_id,
+            "candidate_topk_blocks": cfg.candidate_topk_blocks,
+            "candidate_block_size": cfg.candidate_block_size,
+            "max_position_embeddings": cfg.max_position_embeddings,
+            "n_routed_experts": cfg.n_routed_experts,
+            "num_experts_per_tok": cfg.num_experts_per_tok,
+            "engram_layer_ids": list(cfg.engram_layer_ids),
+            "engram_num_embeddings": list(cfg.engram_num_embeddings),
+            "engram_max_ngram_size": cfg.engram_max_ngram_size,
+            "engram_vocab_size": cfg.engram_vocab_size,
+            "engram_n_heads": cfg.engram_n_heads,
+            "engram_head_dim": cfg.engram_head_dim,
+            "engram_pad_token_id": cfg.engram_pad_token_id,
+            "engram_compressed_vocab_size": cfg.engram_compressed_vocab_size,
+            "num_nextn_predict_layers": cfg.num_nextn_predict_layers,
+            "dspark_block_size": cfg.dspark_block_size,
+            "dspark_noise_token_id": cfg.dspark_noise_token_id,
+            "dspark_target_layer_ids": list(cfg.dspark_target_layer_ids),
+            "dspark_markov_rank": cfg.dspark_markov_rank,
+            "dspark_n_routed_experts": cfg.dspark_n_routed_experts,
+            "dspark_num_experts_per_tok": cfg.dspark_num_experts_per_tok,
+        }
+    )
+    text["rope_scaling"].update(
+        {
+            "factor": cfg.rope_factor,
+            "beta_fast": cfg.rope_beta_fast,
+            "beta_slow": cfg.rope_beta_slow,
+            "original_max_position_embeddings": cfg.rope_original_max_position_embeddings,
+        }
+    )
+    (tmp_path / "config.json").write_text(json.dumps(hf))
+
+    tensors = dict(_synthetic_hf_checkpoint(cfg, seed=77))
+    expected_bias_vl = torch.full((cfg.n_routed_experts,), 0.1234567, dtype=torch.float32)
+    tensors["layers.0.ffn.gate.bias_vl"] = expected_bias_vl.clone()
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+
+    model = DeepSeekV41Model(str(tmp_path), tokenizer_mode="byte")
+    sub = model.get_submodule("LLM", device="cpu", autocast_dtype=torch.bfloat16)
+    assert isinstance(sub, DeepSeekV41LLMSubmodule)
+    bias_vl = sub.model.layers[0].ffn.gate.bias_vl
+    assert bias_vl is not None
+    assert bias_vl.dtype == torch.float32
+    assert torch.equal(bias_vl, expected_bias_vl)
+
+
 class _GreedySampler(StubResource):
     def sample(self, request_ids, logits, **kwargs):
         del request_ids, kwargs
