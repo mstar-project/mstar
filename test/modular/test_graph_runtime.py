@@ -1999,3 +1999,123 @@ def test_failed_new_request_drops_and_acks_parked_input_signals(fail_in):
     assert ingest._pending_walk_reads == {}
     assert ingest._pending_walk_transitions == {}
     assert runtime.pop_rids("n_b", "walk_b", [rid], check_ready=True) is None
+
+
+@pytest.mark.parametrize("fail_in", ["engine_add", "start_read", "pending_remove"])
+def test_multipartition_second_new_request_after_failure_or_remove_acks_unread(fail_in):
+    """When one worker serves >= 2 partitions (p1, p2) and NewRequest(p1) fails
+    intake (engines.add_request or start_read_tensors) or a REMOVE_REQUEST is
+    already pending, a subsequent NewRequest(p2) arriving before teardown must
+    NOT open streams, record pending walk reads, call start_read_tensors, or
+    ingest signal_only edges; it must ACK p2's tensor initial_inputs unread."""
+    from mstar.graph.base import GraphNode
+    from mstar.streaming.chunk_policy import FixedChunkPolicy
+    from mstar.streaming.topology import Connection
+    from mstar.utils.ipc_format import (
+        CurrentForwardPassInfo,
+        NewRequest,
+        RemoveRequest,
+        WorkerMessage,
+        WorkerMessageType,
+    )
+    from mstar.worker.stream_buffers import StreamBufferManager
+
+    runtime, req_state, lifecycle, ingest, _, started_reads, book = _make_ingest_for_walk_tests(
+        [
+            ("w_p1", GraphNode(name="n_p1", input_names=["x1"], outputs=[])),
+            ("w_p2", GraphNode(name="n_p2", input_names=["x2", "s2"], outputs=[])),
+        ],
+        {"n_p1": "p1", "n_p2": "p2"},
+    )
+    ingest._streams = StreamBufferManager(
+        request_state=req_state,
+        tensor_manager=ingest._tensors,
+        connections=[Connection(
+            from_partition="p1",
+            to_partition="p2",
+            edge_name="s_p1_p2",
+            chunk_policy_factory=lambda: FixedChunkPolicy(1),
+        )],
+        graph_runtime=runtime,
+    )
+    acked = []
+    ingest._tensors.ack_unread_tensors = lambda edges: acked.extend(
+        info.uuid for e in edges for info in e.tensor_info
+    )
+    orig_start_read = ingest._tensors.start_read_tensors
+
+    def _maybe_fail_start_read(rid, edges, graph_walk=None):
+        if fail_in == "start_read" and graph_walk == "w_p1":
+            raise RuntimeError("OOM in p1 start_read_tensors")
+        return orig_start_read(rid, edges, graph_walk=graph_walk)
+
+    ingest._tensors.start_read_tensors = _maybe_fail_start_read
+    engine_rids = set()
+
+    def _engine_add(rid, cfgs, info):
+        if fail_in == "engine_add":
+            raise RuntimeError("over capacity")
+        engine_rids.add(rid)
+
+    ingest._engines = SimpleNamespace(
+        engine=SimpleNamespace(publisher_nodes={}),
+        add_request=_engine_add,
+    )
+
+    for u in (70, 71):
+        book.put_tensor(u, _info_with_uuid(u))
+        book.increment_ref(u, 1)
+
+    p1_req = NewRequest(
+        request_id="r_multi",
+        request_info=CurrentForwardPassInfo(
+            request_id="r_multi", graph_walk="w_p1", fwd_index=0, random_seed=0,
+            max_tokens=8, partition_name="p1",
+        ),
+        initial_inputs=[GraphEdge(name="x1", next_node="n_p1", tensor_info=[_info_with_uuid(70)])],
+        partition_worker_graph_ids=[0],
+        worker_graph_to_workers={0: ["worker_0"], 1: ["worker_0"]},
+        loop_caps={},
+    )
+    ingest._dispatch([WorkerMessage(message_type=WorkerMessageType.NEW_REQUEST, body=p1_req)])
+
+    rid = runtime.get_rid_handle("r_multi")
+    assert rid is not None
+    if fail_in == "pending_remove":
+        ingest._dispatch([WorkerMessage(
+            message_type=WorkerMessageType.REMOVE_REQUEST,
+            body=RemoveRequest(request_id="r_multi"),
+        )])
+        assert rid in lifecycle.pending_removes
+    else:
+        assert rid in lifecycle.failed_rids
+        assert rid in ingest._failed_intake_rids
+
+    # Back-to-back NewRequest(p2) with BOTH tensor-backed and signal_only initial_inputs.
+    p2_req = NewRequest(
+        request_id="r_multi",
+        request_info=CurrentForwardPassInfo(
+            request_id="r_multi", graph_walk="w_p2", fwd_index=0, random_seed=0,
+            max_tokens=8, partition_name="p2",
+        ),
+        initial_inputs=[
+            GraphEdge(name="x2", next_node="n_p2", tensor_info=[_info_with_uuid(71)]),
+            GraphEdge(name="s2", next_node="n_p2", tensor_info=[]),
+        ],
+        partition_worker_graph_ids=[1],
+        worker_graph_to_workers={0: ["worker_0"], 1: ["worker_0"]},
+        loop_caps={},
+    )
+    ingest._dispatch([WorkerMessage(message_type=WorkerMessageType.NEW_REQUEST, body=p2_req)])
+
+    assert started_reads == ([(rid, "w_p1", ["x1"])] if fail_in == "pending_remove" else [])
+    assert acked == [71]
+    assert (rid, "p2") not in ingest._pending_walk_reads
+    if fail_in != "pending_remove":
+        assert ingest._pending_walk_reads == {}
+    assert runtime.pop_rids("n_p2", "w_p2", [rid], check_ready=True) is None
+    assert "p2" not in req_state.per_request_info[rid].per_partition_info
+    assert rid not in req_state._fwd_by_partition.get("p2", {})
+    if fail_in == "engine_add":
+        assert engine_rids == set()
+        assert rid not in ingest._streams._rids

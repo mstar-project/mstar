@@ -201,69 +201,74 @@ class InputIngest:
         lifecycle.add(rid, wire_rid)
         laps.lap("runtime_add")
 
+        blocked = rid in self._failed_intake_rids or rid in lifecycle.pending_removes
         # One NewRequest comes per partition this worker serves, and a later one
         # can land after a step already ran. The tensor manager and the engine
         # hold request-wide state, so only the first opens it. Opening it again
         # would reset that state under the partition that is running.
         first = rid not in self._request_state.per_request_info
-        self._request_state.add_request(rid, body.request_info)
-        runtime.register_stop_limits(rid, body.request_info)
-        if first:
-            self._tensors.register_request(rid, runtime.get_sharding_config(rid))
+        if not blocked:
+            self._request_state.add_request(rid, body.request_info)
+            runtime.register_stop_limits(rid, body.request_info)
+            if first:
+                self._tensors.register_request(rid, runtime.get_sharding_config(rid))
         laps.lap("worker_state")
         try:
-            if first:
-                unheld = () if self._set_rebuildable is None else self._set_rebuildable(
-                    rid, body.request_info.resource_configs,
-                )
-                self._engines.add_request(
-                    rid, body.request_info.resource_configs, body.request_info,
-                )
-                # Rank 0 journals each refused log once the engine holds the request, since a follower's replay
-                # changes the request's KV config.
-                for node in unheld:
-                    self._engines.get_engine(node).keeps_no_ids(node, rid)
-                laps.lap("engine_add")
-                self._skip_unshared_publish(rid, body.worker_graph_to_workers)
-                laps.lap("skip_publish")
-            body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
+            if not blocked:
+                if first:
+                    unheld = () if self._set_rebuildable is None else self._set_rebuildable(
+                        rid, body.request_info.resource_configs,
+                    )
+                    self._engines.add_request(
+                        rid, body.request_info.resource_configs, body.request_info,
+                    )
+                    # Rank 0 journals each refused log once the engine holds the request, since a follower's replay
+                    # changes the request's KV config.
+                    for node in unheld:
+                        self._engines.get_engine(node).keeps_no_ids(node, rid)
+                    laps.lap("engine_add")
+                    self._skip_unshared_publish(rid, body.worker_graph_to_workers)
+                    laps.lap("skip_publish")
+                body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
 
-            if not unread:
-                self._streams.add_request(rid, body.request_info)
-                laps.lap("stream_buffers")
+                if not unread:
+                    self._streams.add_request(rid, body.request_info)
+                    laps.lap("stream_buffers")
 
-                # Track non-streaming initial tensor reads so a concurrent or
-                # parked INPUT_SIGNALS for another walk cannot call set_walk
-                # before initial_inputs finish arriving.
-                non_streaming_initial = [
-                    edge for edge in body.initial_inputs if not edge.is_streaming
-                ]
-                self._record_pending_walk_reads(
-                    rid, body.request_info.partition_name, non_streaming_initial,
-                )
-                try:
-                    # Start RDMA reads for tensors that have tensor_info
-                    self._wakeup_event.register_futures(self._tensors.start_read_tensors(
-                        rid, body.initial_inputs, graph_walk=body.request_info.graph_walk,
-                    ))
-                except Exception:
-                    self._discard_pending_walk_reads(
+                    # Track non-streaming initial tensor reads so a concurrent or
+                    # parked INPUT_SIGNALS for another walk cannot call set_walk
+                    # before initial_inputs finish arriving.
+                    non_streaming_initial = [
+                        edge for edge in body.initial_inputs if not edge.is_streaming
+                    ]
+                    self._record_pending_walk_reads(
                         rid, body.request_info.partition_name, non_streaming_initial,
                     )
-                    raise
-                laps.lap("start_reads")
+                    try:
+                        # Start RDMA reads for tensors that have tensor_info
+                        self._wakeup_event.register_futures(self._tensors.start_read_tensors(
+                            rid, body.initial_inputs, graph_walk=body.request_info.graph_walk,
+                        ))
+                    except Exception:
+                        self._discard_pending_walk_reads(
+                            rid, body.request_info.partition_name, non_streaming_initial,
+                        )
+                        raise
+                    laps.lap("start_reads")
 
-                # Signal-only edges (tensor_info is None) can be processed immediately
-                signal_only = [edge for edge in body.initial_inputs if len(edge.tensor_info) == 0]
-                if signal_only:
-                    self._ingest_normal_edges(rid, signal_only)
-                laps.lap("ingest_signals")
+                    # Signal-only edges (tensor_info is None) can be processed immediately
+                    signal_only = [edge for edge in body.initial_inputs if len(edge.tensor_info) == 0]
+                    if signal_only:
+                        self._ingest_normal_edges(rid, signal_only)
+                    laps.lap("ingest_signals")
+            elif not unread and body.initial_inputs:
+                self._tensors.ack_unread_tensors(body.initial_inputs)
         except Exception as err:
             # a failed engine ingest rolled itself back; the conductor's REMOVE
             # tears down what else the request has here
             self._fail_intake([rid], err, f"ingest of request {wire_rid} failed")
         parked = lifecycle.take_parked(wire_rid)
-        if unread or rid in self._failed_intake_rids:
+        if unread or rid in self._failed_intake_rids or rid in lifecycle.pending_removes:
             # its parked inputs are never read, so they are ACKed unread as for a removed request
             filtered = []
             for message in parked:
