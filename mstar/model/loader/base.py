@@ -116,6 +116,9 @@ def _dispatch_loader(
         loader(param, loaded_weight, shard_id)
 
 
+dispatch_weight = _dispatch_loader
+
+
 def apply_stacked(
     name: str, stacked: list[StackedParamRule],
 ) -> tuple[str, str | int | None]:
@@ -164,6 +167,9 @@ class _StackedMatcher:
             if rule.source_suffix in name:
                 return name.replace(rule.source_suffix, rule.target_suffix), rule.shard_id
         return name, None
+
+
+StackedMatcher = _StackedMatcher
 
 
 def load_weights_into(

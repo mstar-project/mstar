@@ -23,6 +23,7 @@ the SNAC decoder emits the audio of each window's own frames.
 import dataclasses
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 from transformers import AutoTokenizer
@@ -44,7 +45,7 @@ from mstar.engine.state import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import KVLabel, Model, PrefixKeys, ProcessPromptOutput, WalkStep
+from mstar.model.base import KVLabel, Model, PrefixKeys, ProcessPromptOutput, ReloadTarget, WalkStep
 from mstar.model.components.lora.modules import PER_SEGMENT, LoraRoot
 from mstar.model.keys import MIXED
 from mstar.model.orpheus.config import ATTN, KV_CACHE, SAMPLER, OrpheusModelConfig
@@ -52,6 +53,9 @@ from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.model.utils import load_generation_defaults
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
+
+if TYPE_CHECKING:
+    from mstar.model.loader.reload import CheckpointSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -110,10 +114,25 @@ def _resolve_local_hf_snapshot(
     return str(Path(local_dir))
 
 
+def _snapshot_for_reload(local_dir: str) -> "CheckpointSnapshot | str":
+    """The loaded checkpoint as a reload is checked against it, or why it could
+    not be read; serving goes on either way, only reloads are refused."""
+    from mstar.model.loader import HF_DEFAULT_SKIP_FRAGMENTS
+    from mstar.model.loader.reload import snapshot_for_reload
+
+    return snapshot_for_reload(
+        local_dir, skip_fragments=HF_DEFAULT_SKIP_FRAGMENTS, label="Orpheus",
+    )
+
+
 class OrpheusModel(Model):
     """Orpheus TTS model: Llama 3.2 3B + SNAC 24kHz decoder."""
 
     DECODE_LOOP = "decode_loop"
+    # What the LLM's weights were loaded from, read when it is built; a reload
+    # is checked against this, not against the directory, which a trainer may
+    # since have deleted or saved over. A string says why it could not be read.
+    _llm_checkpoint: "CheckpointSnapshot | str | None" = None
 
     def __init__(
         self,
@@ -459,8 +478,30 @@ class OrpheusModel(Model):
 
         load_weights(language_model, local_dir, device=device)
         language_model.eval()
+        self._llm_checkpoint = _snapshot_for_reload(local_dir)
 
         return OrpheusLLMSubmodule(language_model, self.config)
+
+    def _get_reload_targets(self) -> tuple[ReloadTarget, ...]:
+        """Reload the language model in place from an HF Llama checkpoint with
+        the loaded one's tensor names and shapes. The SNAC decoder's weights come
+        from their own repo and stay as they are."""
+        from mstar.model.loader import HF_DEFAULT_SKIP_FRAGMENTS, load_weights
+
+        return (
+            ReloadTarget(
+                nodes=("LLM",),
+                snapshot=lambda: self._llm_checkpoint,
+                # Read on the host: the KV pool may leave no device room for a whole
+                # tensor. load_weights routes q/k/v and gate/up into the fused
+                # parameters through their weight_loaders, as the startup load does.
+                apply_fn=lambda path, submodules: load_weights(
+                    submodules["LLM"].model, path, device="cpu",
+                ),
+                skip_fragments=HF_DEFAULT_SKIP_FRAGMENTS,
+                label="the Orpheus LLM",
+            ),
+        )
 
     def _create_snac_submodule(self, device: str) -> NodeSubmodule:
         from mstar.model.orpheus.components.snac import SNAC
