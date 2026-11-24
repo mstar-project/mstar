@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 
@@ -94,28 +95,70 @@ class DeepSeekV41Compressor(nn.Module):
         if self.ratio == 1:
             if state is not None:
                 raise ValueError("ratio-one compression has no partial state")
-            return self.norm(self.wkv(x)), None
+            proj = self.wkv(x) if x.dtype == self.wkv.weight.dtype else F.linear(x, self.wkv.weight.to(x.dtype))
+            return self.norm(proj), None
         if start_pos and state is None:
             raise ValueError("decode compression needs the request's partial state")
 
         kv_state, score_state = self._state(state, x.shape[0], x.device)
-        projected, scores = self.wkv(x.float()), self.wgate(x.float())
-        if start_pos == 0:
-            complete, remainder = divmod(x.shape[1], self.ratio)
-            cutoff = complete * self.ratio
-            if remainder:
-                kv_state[:, :remainder] = projected[:, cutoff:]
-                score_state[:, :remainder] = scores[:, cutoff:]
-            if not complete:
-                return None, (kv_state, score_state)
-            grouped_kv = projected[:, :cutoff].unflatten(1, (complete, self.ratio))
-            grouped_scores = scores[:, :cutoff].unflatten(1, (complete, self.ratio))
-            pooled = (grouped_kv * grouped_scores.softmax(dim=2)).sum(dim=2)
-        else:
-            slot = start_pos % self.ratio
-            kv_state[:, slot] = projected[:, 0]
-            score_state[:, slot] = scores[:, 0]
-            if (start_pos + 1) % self.ratio:
-                return None, (kv_state, score_state)
-            pooled = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
+        with torch.amp.autocast(x.device.type, enabled=False):
+            projected, scores = self.wkv(x.float()), self.wgate(x.float())
+            if start_pos == 0:
+                complete, remainder = divmod(x.shape[1], self.ratio)
+                cutoff = complete * self.ratio
+                if remainder:
+                    kv_state[:, :remainder] = projected[:, cutoff:]
+                    score_state[:, :remainder] = scores[:, cutoff:]
+                if not complete:
+                    return None, (kv_state, score_state)
+                grouped_kv = projected[:, :cutoff].unflatten(1, (complete, self.ratio))
+                grouped_scores = scores[:, :cutoff].unflatten(1, (complete, self.ratio))
+                pooled = (grouped_kv * grouped_scores.softmax(dim=2)).sum(dim=2)
+            else:
+                slot = start_pos % self.ratio
+                kv_state[:, slot] = projected[:, 0]
+                score_state[:, slot] = scores[:, 0]
+                if (start_pos + 1) % self.ratio:
+                    return None, (kv_state, score_state)
+                pooled = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
         return self.norm(pooled.to(x.dtype)), (kv_state, score_state)
+
+    def forward_packed(
+        self,
+        x: torch.Tensor,
+        pos: torch.Tensor,
+        row_req: torch.Tensor,
+        req_first: torch.Tensor,
+        req_end_pos: torch.Tensor,
+        held_kv: torch.Tensor | None = None,
+        held_score: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Packed multi-request / chunked-prefill compression returning ``(latents, next_kv, next_score)``.
+
+        ``latents`` has shape ``[T, head_dim]``; rows where ``(pos + 1) % ratio == 0`` hold
+        the completed group's unrotated latent.
+        """
+        if self.ratio == 1:
+            proj = self.wkv(x) if x.dtype == self.wkv.weight.dtype else F.linear(x, self.wkv.weight.to(x.dtype))
+            return self.norm(proj), None, None
+        assert held_kv is not None and held_score is not None
+        with torch.amp.autocast(x.device.type, enabled=False):
+            proj, scores = self.wkv(x.float()), self.wgate(x.float())
+            row = torch.arange(x.shape[0], device=x.device)
+            in_span = row - req_first
+            members_kv, members_score = [], []
+            for back in range(self.ratio - 1, -1, -1):
+                here = (in_span >= back)[:, None]
+                src = (row - back).clamp_min(0)
+                slot = (pos - back) % self.ratio
+                members_kv.append(torch.where(here, proj[src], held_kv[row_req, slot]))
+                members_score.append(torch.where(here, scores[src], held_score[row_req, slot]))
+            pooled = (torch.stack(members_kv, dim=1) * torch.stack(members_score, dim=1).softmax(dim=1)).sum(dim=1)
+            next_kv, next_score = held_kv.clone(), held_score.clone()
+            tail = pos >= (req_end_pos[row_req] - self.ratio)
+            if tail.any():
+                req_t, slot_t = row_req[tail], pos[tail] % self.ratio
+                next_kv[req_t, slot_t] = proj[tail]
+                next_score[req_t, slot_t] = scores[tail]
+        latents = self.norm(pooled.to(x.dtype))
+        return latents, next_kv, next_score

@@ -18,6 +18,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "cosmos3_super_i2v_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super_t2i_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosyvoice3": ("mstar.model.cosyvoice3.cosyvoice3_model", "CosyVoice3Model"),
+    "deepseek_v41": ("mstar.model.deepseek_v41.deepseek_v41_model", "DeepSeekV41Model"),
     "flux2_klein": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "flux2_klein_9b": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "fish_s2_pro": ("mstar.model.fish_s2_pro.fish_s2_pro_model", "FishS2ProModel"),
@@ -129,6 +130,9 @@ HF_MODELS: dict[str, dict] = {
     # GLM-5.3-Flash: 34 KDA linear-attention + 11 MLA layers with mHC residuals,
     # fp8 checkpoint, text only (the ViT is skipped). TP8 on 8xH100.
     "glm5_next": {"model_path_hf": "zai-org/GLM-5.3-Flash"},
+    # DeepSeek-V4.1-Flash: 40 layers with 1-site-lagged mHC, CSA2 compressed
+    # attention, FP4 MoE experts (upcast to FP8 in Phase 1), and Engram.
+    "deepseek_v41": {"model_path_hf": "deepseek-ai/DeepSeek-V4.1-Flash"},
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},

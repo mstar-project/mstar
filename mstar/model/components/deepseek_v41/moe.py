@@ -106,6 +106,18 @@ class DeepSeekV41MoE(Glm5NextSparseMoeBlock):
         self._needed.update(f"experts.{i}.{proj}" for i in range(config.n_routed_experts) for proj in _SHARD)
         self._loaded: set[str] = set()
 
+    def _apply(self, fn, recurse=True):
+        kept = [
+            (self.gate, "e_score_correction_bias", self.gate.e_score_correction_bias.detach()),
+            (self.experts, "gate_up_proj_scale_inv", self.experts.gate_up_proj_scale_inv.detach()),
+            (self.experts, "down_proj_scale_inv", self.experts.down_proj_scale_inv.detach()),
+        ]
+        result = super()._apply(fn, recurse=recurse)
+        for module, name, original in kept:
+            param = getattr(module, name)
+            param.data = param.data.float() if original.is_meta else original.to(param.device, dtype=torch.float32)
+        return result
+
     def _mark_loaded(self, key: str) -> None:
         if key in self._loaded:
             raise ValueError(f"duplicate V4.1 MoE weight {key}")

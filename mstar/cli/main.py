@@ -84,6 +84,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "z_image_turbo": "z_image_turbo.yaml",
     "glm52": "glm52_tp8.yaml",
     "glm5_next": "glm5_next_tp8.yaml",
+    "deepseek_v41": "deepseek_v41_tp8.yaml",
 }
 
 # qwen 3.5 series (dense)

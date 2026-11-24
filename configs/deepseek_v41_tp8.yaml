@@ -1,0 +1,20 @@
+model: "deepseek_v41"
+# DeepSeek-V4.1-Flash causal LM (text-only Phase 1, TP8).
+max_seq_len: 65536
+max_concurrent_requests: 8
+model_kwargs:
+  max_seq_len: 65536
+resources:
+  window_state:
+    max_slots: 9
+  compress_state:
+    max_slots: 9
+  compressor_partial:
+    max_slots: 9
+  ngram_state:
+    max_slots: 9
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]
