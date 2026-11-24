@@ -329,6 +329,16 @@ mod tests {
     }
 
     #[test]
+    fn a_form_field_with_a_lone_surrogate_escape_stays_literal_text() {
+        for raw in [r#""\ud800""#, r#"{"nested":"\ud800"}"#] {
+            assert_eq!(
+                FieldValue::from_form(raw.to_string()),
+                FieldValue::Json(Value::String(raw.to_string()))
+            );
+        }
+    }
+
+    #[test]
     fn lax_coercion_matches_pydantic() {
         let req = validate(fields(json!({"temperature": " 1.5 ", "seed": "1_0", "stream": "TRUE", "x": [1]})), URL).unwrap();
         assert_eq!((req.temperature, req.seed, req.stream), (Some(1.5), Some(10), Some(true)));

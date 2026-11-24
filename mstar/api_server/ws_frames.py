@@ -34,6 +34,7 @@ from pathlib import Path
 import msgpack
 
 from mstar.api_server.media_io import _decode_base64_payload
+from mstar.api_server.unicode_input import reject_lone_surrogates
 from mstar.utils.orphan import watch_parent
 
 logger = logging.getLogger(__name__)
@@ -86,8 +87,11 @@ def _unlink(path: str) -> None:
 def parse(payload: bytes | str):
     """A frame's message: msgpack for bytes, JSON for text."""
     if isinstance(payload, (bytes, bytearray, memoryview)):
-        return msgpack.unpackb(payload, raw=False)
-    return json.loads(payload)
+        message = msgpack.unpackb(payload, raw=False)
+    else:
+        message = json.loads(payload)
+    reject_lone_surrogates(message)
+    return message
 
 
 def _files(message) -> list[dict]:
