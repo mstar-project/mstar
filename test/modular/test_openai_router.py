@@ -16,6 +16,7 @@ import threading
 import time
 import types
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -375,6 +376,57 @@ def test_a_slow_remote_fetch_does_not_stall_other_requests(client_and_stub, monk
         upstream.server_close()
     assert slow["r"].status_code == 400
     assert slow["r"].json()["error"]["message"] == "remote media fetch failed: upstream returned 404"
+
+
+def test_full_remote_fetch_cap_keeps_plain_chat_moving(client_and_stub, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from mstar.api_server import media_io
+
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    arrived = threading.Barrier(media_io.REMOTE_FETCH_SLOTS + 1)
+    release = threading.Event()
+
+    class Slow(BaseHTTPRequestHandler):
+        def do_GET(self):
+            arrived.wait(timeout=5)
+            release.wait(timeout=5)
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+    upstream.daemon_threads = True
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    monkeypatch.setenv("MSTAR_ALLOW_REMOTE", "1")
+    monkeypatch.setenv("MSTAR_REMOTE_ALLOWED_HOSTS", "127.0.0.1")
+    remote = {"model": "bagel", "messages": [{"role": "user", "content": [{
+        "type": "image_url", "image_url": {"url": f"http://127.0.0.1:{upstream.server_address[1]}/slow.png"},
+    }]}]}
+    plain = {"model": "bagel", "messages": [{"role": "user", "content": "hello"}]}
+    try:
+        with TestClient(client.app) as shared, ThreadPoolExecutor(max_workers=media_io.REMOTE_FETCH_SLOTS) as pool:
+            slow = [pool.submit(shared.post, "/v1/chat/completions", json=remote)
+                    for _ in range(media_io.REMOTE_FETCH_SLOTS)]
+            try:
+                arrived.wait(timeout=5)
+                start = time.monotonic()
+                overloaded = shared.post("/v1/chat/completions", json=remote)
+                assert time.monotonic() - start < 1.0
+                assert overloaded.status_code == 400
+                assert overloaded.json()["error"]["message"] == "remote media fetch failed: too many concurrent fetches"
+                assert shared.post("/v1/chat/completions", json=plain).status_code == 200
+            finally:
+                release.set()
+            assert all(f.result(timeout=5).status_code == 400 for f in slow)
+    finally:
+        release.set()
+        upstream.shutdown()
+        upstream.server_close()
 
 
 def test_chat_audio_output(client_and_stub):

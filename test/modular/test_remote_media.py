@@ -6,6 +6,7 @@ import socket
 import ssl
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -223,6 +224,34 @@ def test_allowlisted_host_is_fetched(upstream, uploads, monkeypatch):
     modality, path = media_io.save_remote_url(up.url("/a.png"), uploads)
     assert modality == "image" and path.endswith(".png") and open(path, "rb").read() == PNG
     assert up.requests[0][1]["User-Agent"] == "mstar"
+
+
+def test_remote_fetch_cap_refuses_without_queueing(upstream, uploads, monkeypatch):
+    up = upstream()
+    arrived = threading.Barrier(media_io.REMOTE_FETCH_SLOTS + 1)
+    release = threading.Event()
+
+    def hold(h):
+        if not release.is_set():
+            arrived.wait(timeout=5)
+            release.wait(timeout=5)
+        reply(body=PNG)(h)
+
+    up.routes["/hold"] = hold
+    monkeypatch.setenv("MSTAR_REMOTE_ALLOWED_HOSTS", "127.0.0.1")
+    with ThreadPoolExecutor(max_workers=media_io.REMOTE_FETCH_SLOTS) as pool:
+        futures = [pool.submit(media_io.save_remote_url, up.url("/hold"), uploads)
+                   for _ in range(media_io.REMOTE_FETCH_SLOTS)]
+        try:
+            arrived.wait(timeout=5)
+            start = time.monotonic()
+            with pytest.raises(media_io.RemoteFetchError, match="too many concurrent fetches"):
+                media_io.save_remote_url(up.url("/hold"), uploads)
+            assert time.monotonic() - start < 0.5
+        finally:
+            release.set()
+        assert all(result.result(timeout=5)[0] == "image" for result in futures)
+    assert media_io.save_remote_url(up.url("/hold"), uploads)[0] == "image"
 
 
 def test_hosts_outside_the_allowlist_are_refused(upstream, uploads, monkeypatch):

@@ -875,6 +875,55 @@ def test_remote_media_failures_are_short_400s(monkeypatch):
     assert hits == ["/a.png"] and not stub.submitted
 
 
+def test_remote_fetch_cap_keeps_plain_chat_moving():
+    from concurrent.futures import ThreadPoolExecutor
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    slots = 8
+    arrived = threading.Barrier(slots + 1)
+    release = threading.Event()
+
+    class Slow(BaseHTTPRequestHandler):
+        def do_GET(self):
+            arrived.wait(timeout=10)
+            release.wait(timeout=10)
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+    upstream.daemon_threads = True
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    remote = json.dumps({"model": "qwen3_omni", "messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": f"http://127.0.0.1:{upstream.server_address[1]}/slow.png"}},
+    ]}]}).encode()
+    stub = _StubAPIServer()
+    env = {"MSTAR_ALLOW_REMOTE": "1", "MSTAR_REMOTE_ALLOWED_HOSTS": "127.0.0.1"}
+    try:
+        with _model_stack("qwen3_omni", stub, env=env) as (port, _up), ThreadPoolExecutor(max_workers=slots) as pool:
+            slow = [pool.submit(_post_raw, port, "/v1/chat/completions", remote) for _ in range(slots)]
+            try:
+                arrived.wait(timeout=10)
+                start = time.monotonic()
+                status, overloaded = _post_raw(port, "/v1/chat/completions", remote)
+                assert time.monotonic() - start < 1.0
+                assert status == 400, (status, overloaded)
+                assert overloaded["error"]["message"] == "remote media fetch failed: too many concurrent fetches"
+                assert _chat(port, "hello")["choices"][0]["message"]["content"] == "Hello world"
+            finally:
+                release.set()
+            results = [f.result(timeout=10) for f in slow]
+            assert all(code == 400 and body["error"]["message"] == "remote media fetch failed: upstream returned 404"
+                       for code, body in results), results
+    finally:
+        release.set()
+        upstream.shutdown()
+        upstream.server_close()
+
+
 class _ErrorChunkStub(_StubAPIServer):
     """Deliver a backend failure the way the data plane does: a terminal chunk
     with modality 'error' + metadata.status that ends cleanly (no raise) — the
