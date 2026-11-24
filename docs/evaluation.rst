@@ -311,6 +311,12 @@ the PR keeps its outputs and does not get slower::
     python -m benchmark.eval compare --base main --head 548 --hosts bench@gpu1,bench@gpu2:1
     python -m benchmark.eval compare --list                                    # models, tags, cases
 
+``--review`` adds ``report/review.html``, with saved base and head outputs at the case's lowest configured
+concurrency beside each other for changed rows. It shows both the first run and an ABBA rerun when one was judged.
+It is a page for listening and looking, not a quality score. Saved media stays on remote hosts by default;
+add ``--review-fetch`` to copy it for the page (this can be large). For a run whose media is already local,
+``compare --render RUN_DIR --review`` rebuilds the page without serving again.
+
 ``--head`` and ``--base`` take a branch (fetched fresh from ``mstar-project/mstar``, then ``origin``), a PR
 number, a commit, or another local ref such as ``HEAD`` or a tag (this checkout's commit). Both trees are exported from the checkout
 running ``compare`` (each arm imports its own tree and builds its own ``rust/`` extension, in one Python
