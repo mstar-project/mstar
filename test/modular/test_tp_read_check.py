@@ -429,20 +429,26 @@ def test_a_read_that_fails_after_its_request_failed_still_goes_to_the_check(tmp_
 
 def test_a_read_that_raises_as_it_starts_goes_to_the_check_and_fails_once():
     """r1's read raises as this rank starts it (a CUDA OOM in the H2D copy,
-    say), and again for an input replayed behind it. r1 is reported failed once
-    and recorded for the check, so rank 0's read-checked step naming r1 is built
+    say), and a later input arrives behind it. r1 is reported failed once,
+    recorded for the check, and the later input is ACKed unread without
+    starting another read, so rank 0's read-checked step naming r1 is built
     with r1 empty rather than this rank waiting on r1 for good."""
     sched, manager = _follower_scheduler(ready=["r0"])
     sched.lifecycle.add("r1", "r1")
     manager.per_request_info["r1"] = SimpleNamespace(stream_buffers={"audio": None})
-    reads = []
+    reads, acked = [], []
     w = make_worker(
         worker_id="w1", scheduler=sched, lockstep=sched.lockstep, admission=sched.admission,
         request_state=manager,
         graph_runtime=SimpleNamespace(get_rid_handle=lambda r: r, get_rid_string=lambda h: h),
-        tensor_manager=SimpleNamespace(start_read_tensors=lambda *a, **kw: reads.append(a[0]) or (_ for _ in ()).throw(
-            RuntimeError("CUDA out of memory"),
-        )),
+        tensor_manager=SimpleNamespace(
+            start_read_tensors=lambda *a, **kw: reads.append(a[0]) or (_ for _ in ()).throw(
+                RuntimeError("CUDA out of memory"),
+            ),
+            ack_unread_tensors=lambda edges: acked.extend(
+                info.uuid for e in edges for info in e.tensor_info
+            ),
+        ),
         wakeup_event=SimpleNamespace(register_futures=lambda futures: None),
     )
     edge = _input(18, "audio")
@@ -453,7 +459,8 @@ def test_a_read_that_raises_as_it_starts_goes_to_the_check_and_fails_once():
             request_id="r1", inputs=[edge], request_info=None, producer_done=set(),
         ))
         reported.append(list(w.lifecycle.take_failures()))
-    assert reads == ["r1", "r1"]  # the read itself raised, both times
+    assert reads == ["r1"]
+    assert acked == [18]
     assert reported == [["r1"], []]
     assert sched.lockstep.read_failed_rids == {"r1"}
 

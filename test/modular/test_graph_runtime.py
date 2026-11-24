@@ -1838,3 +1838,164 @@ def test_new_request_initial_inputs_read_gates_walk_transition():
     ingest.check_ready_tensors()
     assert runtime.get_walk(rid, "default") == "walk_b"
     assert runtime.pop_rids("n_b", "walk_b", [rid], check_ready=True) is not None
+
+
+@pytest.mark.parametrize("via", ["failed_reads", "fail_intake"])
+def test_late_input_signals_after_failure_ack_unread_without_walk_change(via):
+    """Late INPUT_SIGNALS for walk_b arriving after take_failed_reads() or
+    _fail_intake (before REMOVE_REQUEST) must leave the walk at walk_a, ACK
+    unread tensors, not call start_read_tensors, and leave _pending_walk_reads empty."""
+    from mstar.graph.base import GraphNode
+    from mstar.utils.ipc_format import CurrentForwardPassInfo, InputSignals
+
+    runtime, req_state, lifecycle, ingest, _, started_reads, book = _make_ingest_for_walk_tests(
+        [
+            ("walk_a", GraphNode(name="n_a", input_names=["x"], outputs=[])),
+            ("walk_b", GraphNode(name="n_b", input_names=["y"], outputs=[])),
+        ],
+        {"n_a": "default", "n_b": "default"},
+    )
+    acked = []
+    failed_queue = []
+    ingest._tensors.ack_unread_tensors = lambda edges: acked.extend(
+        info.uuid for e in edges for info in e.tensor_info
+    )
+    ingest._tensors.take_failed_reads = lambda: [failed_queue.pop(0)] if failed_queue else []
+
+    rid = runtime.add_request(
+        request_id="r1", partition="default", graph_walk="walk_a",
+        partition_worker_graph_ids=[0, 1],
+        worker_graph_to_workers=ParallelList([0, 1], [["worker_0"], ["worker_0"]]),
+        loop_caps={},
+    )
+    fwd_a = CurrentForwardPassInfo(
+        request_id="r1", graph_walk="walk_a", fwd_index=0, random_seed=0,
+        max_tokens=8, partition_name="default",
+    )
+    req_state.add_request(rid, fwd_a)
+    lifecycle.add(rid, "r1")
+    for u in (1, 2):
+        book.put_tensor(u, _info_with_uuid(u))
+        book.increment_ref(u, 1)
+
+    if via == "failed_reads":
+        ingest._process_new_inputs(InputSignals(
+            request_id="r1", partition_name="default",
+            inputs=[GraphEdge(name="x", next_node="n_a", tensor_info=[_info_with_uuid(1)])],
+            request_info=fwd_a,
+        ))
+        failed_queue.append(SimpleNamespace(request_id=rid, error=RuntimeError("rdma fail")))
+        ingest.check_ready_tensors()
+        expected_started = [(rid, "walk_a", ["x"])]
+    else:
+        ingest._fail_intake([rid], RuntimeError("intake oom"), "intake failed")
+        expected_started = []
+
+    assert rid in lifecycle.failed_rids
+    assert rid in ingest._failed_intake_rids
+    assert runtime.is_partition_idle(rid, "default")
+    assert ingest._pending_walk_reads == {}
+
+    # Late INPUT_SIGNALS for walk_b arrives before REMOVE_REQUEST: must be ACKed
+    # unread without changing walk or starting reads.
+    ingest._process_new_inputs(InputSignals(
+        request_id="r1", partition_name="default",
+        inputs=[GraphEdge(name="y", next_node="n_b", tensor_info=[_info_with_uuid(2)])],
+        request_info=CurrentForwardPassInfo(
+            request_id="r1", graph_walk="walk_b", fwd_index=1, random_seed=0,
+            max_tokens=8, partition_name="default",
+        ),
+    ))
+    assert runtime.get_walk(rid, "default") == "walk_a"
+    assert acked == [2]
+    assert started_reads == expected_started
+    assert ingest._pending_walk_reads == {}
+    assert ingest._pending_walk_transitions == {}
+    assert runtime.pop_rids("n_b", "walk_b", [rid], check_ready=True) is None
+
+
+@pytest.mark.parametrize("fail_in", ["start_read", "engine_add"])
+def test_failed_new_request_drops_and_acks_parked_input_signals(fail_in):
+    """Parked INPUT_SIGNALS for walk_b arriving before a failing NewRequest
+    (start_read_tensors or engines.add_request raising) must be dropped and
+    ACKed unread rather than dispatched to _process_new_inputs."""
+    from mstar.graph.base import GraphNode
+    from mstar.utils.ipc_format import (
+        CurrentForwardPassInfo,
+        InputSignals,
+        NewRequest,
+        WorkerMessage,
+        WorkerMessageType,
+    )
+
+    runtime, _, lifecycle, ingest, _, started_reads, book = _make_ingest_for_walk_tests(
+        [
+            ("walk_a", GraphNode(name="n_a", input_names=["x"], outputs=[])),
+            ("walk_b", GraphNode(name="n_b", input_names=["y"], outputs=[])),
+        ],
+        {"n_a": "default", "n_b": "default"},
+    )
+    acked = []
+    ingest._tensors.ack_unread_tensors = lambda edges: acked.extend(
+        info.uuid for e in edges for info in e.tensor_info
+    )
+    orig_start_read = ingest._tensors.start_read_tensors
+
+    def _maybe_fail_start_read(rid, edges, graph_walk=None):
+        if fail_in == "start_read" and graph_walk == "walk_a":
+            raise RuntimeError("OOM in NewRequest start_read_tensors")
+        return orig_start_read(rid, edges, graph_walk=graph_walk)
+
+    ingest._tensors.start_read_tensors = _maybe_fail_start_read
+    ingest._engines = SimpleNamespace(
+        engine=SimpleNamespace(publisher_nodes={}),
+        add_request=lambda *a, **k: (
+            (_ for _ in ()).throw(RuntimeError("over capacity")) if fail_in == "engine_add" else None
+        ),
+    )
+
+    for u in (20, 21):
+        book.put_tensor(u, _info_with_uuid(u))
+        book.increment_ref(u, 1)
+
+    # Park INPUT_SIGNALS for walk_b before NewRequest arrives.
+    ingest._dispatch([WorkerMessage(
+        message_type=WorkerMessageType.INPUT_SIGNALS,
+        body=InputSignals(
+            request_id="r2", partition_name="default",
+            inputs=[GraphEdge(name="y", next_node="n_b", tensor_info=[_info_with_uuid(21)])],
+            request_info=CurrentForwardPassInfo(
+                request_id="r2", graph_walk="walk_b", fwd_index=1, random_seed=0,
+                max_tokens=8, partition_name="default",
+            ),
+        ),
+    )])
+    assert "r2" in lifecycle._parked
+
+    fwd_a = CurrentForwardPassInfo(
+        request_id="r2", graph_walk="walk_a", fwd_index=0, random_seed=0,
+        max_tokens=8, partition_name="default",
+    )
+    ingest._dispatch([WorkerMessage(
+        message_type=WorkerMessageType.NEW_REQUEST,
+        body=NewRequest(
+            request_id="r2",
+            request_info=fwd_a,
+            initial_inputs=[GraphEdge(name="x", next_node="n_a", tensor_info=[_info_with_uuid(20)])],
+            partition_worker_graph_ids=[0, 1],
+            worker_graph_to_workers={0: ["worker_0"], 1: ["worker_0"]},
+            loop_caps={},
+        ),
+    )])
+
+    rid = runtime.get_rid_handle("r2")
+    assert rid is not None
+    assert rid in lifecycle.failed_rids
+    assert rid in ingest._failed_intake_rids
+    assert "r2" not in lifecycle._parked
+    assert runtime.get_walk(rid, "default") == "walk_a"
+    assert acked == [21]
+    assert started_reads == []
+    assert ingest._pending_walk_reads == {}
+    assert ingest._pending_walk_transitions == {}
+    assert runtime.pop_rids("n_b", "walk_b", [rid], check_ready=True) is None

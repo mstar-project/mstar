@@ -263,12 +263,18 @@ class InputIngest:
             # tears down what else the request has here
             self._fail_intake([rid], err, f"ingest of request {wire_rid} failed")
         parked = lifecycle.take_parked(wire_rid)
-        if unread:
+        if unread or rid in self._failed_intake_rids:
             # its parked inputs are never read, so they are ACKed unread as for a removed request
+            filtered = []
             for message in parked:
-                if message.message_type == WorkerMessageType.INPUT_SIGNALS:
+                if getattr(message, "message_type", None) in (
+                    WorkerMessageType.INPUT_SIGNALS,
+                    WorkerMessageType.EDGE_ITEMS,
+                ):
                     self.drop_for_removed(message)
-            parked = [message for message in parked if message.message_type != WorkerMessageType.INPUT_SIGNALS]
+                else:
+                    filtered.append(message)
+            parked = filtered
         self._dispatch(parked)
 
     def _remove_request(self, body: RemoveRequest) -> None:
@@ -330,7 +336,7 @@ class InputIngest:
                 self._worker_id, body.request_id,
             )
             return
-        if rid in self._lifecycle.pending_removes:
+        if self._is_walk_transition_blocked(rid):
             self._tensors.ack_unread_tensors(body.inputs)
             return
         req_info = self._request_state.per_request_info.get(rid)
@@ -613,7 +619,7 @@ class InputIngest:
                 next_node=row.next_node, name=row.signal,
                 tensor_info=row_infos(frame, row, dtypes), is_streaming=True,
             )
-            if rid in self._lifecycle.pending_removes:
+            if self._is_walk_transition_blocked(rid):
                 self._tensors.ack_unread_tensors([edge])
                 continue
             stream_buf = per_request_info[rid].stream_buffers.get(row.signal)
@@ -645,7 +651,7 @@ class InputIngest:
                     message_type=WorkerMessageType.EDGE_ITEMS, body=row_values_frame(frame, row),
                 ))
                 continue
-            if not self._lifecycle.takes_input(row.request_id) or rid in self._lifecycle.pending_removes:
+            if not self._lifecycle.takes_input(row.request_id) or self._is_walk_transition_blocked(rid):
                 continue
             stream_buf = per_request_info[rid].stream_buffers.get(row.signal)
             if stream_buf is not None:
@@ -734,11 +740,17 @@ class InputIngest:
 
         pending_rids = list(self._pending_normal_inputs)
         for rid in pending_rids:
-            if rid not in self._request_state.per_request_info or rid in self._lifecycle.pending_removes:
+            if (
+                rid not in self._request_state.per_request_info
+                or rid in self._lifecycle.pending_removes
+                or rid in self._failed_intake_rids
+            ):
                 self._pending_normal_inputs.pop(rid, None)
                 continue
             self._ingest_normal_edges(rid, normal_by_rid.pop(rid, []))
         for rid, normal in normal_by_rid.items():
+            if rid in self._lifecycle.pending_removes or rid in self._failed_intake_rids:
+                continue
             self._ingest_normal_edges(rid, normal)
         self._drain_pending_walk_transitions()
 
