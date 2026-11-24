@@ -66,6 +66,55 @@ class ReloadTarget:
         dict[str, tuple[tuple[int, ...], str]],
     ] | None = None
     label: str = "model"
+    subdir: str = ""
+    resolve_path: Callable[[str], str | Path | None] | None = None
+
+
+def _resolve_reload_targets(
+    model: Any, path: str, submodules: dict[str, torch.nn.Module],
+) -> list[tuple[ReloadTarget, str]]:
+    """Validate and resolve matching :class:`ReloadTarget` entries without mutating weights."""
+    get_targets = getattr(model, "_get_reload_targets", None)
+    targets = (
+        tuple(get_targets())
+        if get_targets is not None
+        else tuple(getattr(model, "_reload_targets", ()))
+    )
+    if not targets:
+        del path, submodules
+        raise WeightReloadRefusedError(f"{type(model).__name__} does not support reloading weights in place")
+
+    matching = [target for target in targets if any(node in submodules for node in target.nodes)]
+    if not matching:
+        return []
+
+    from mstar.model.loader.reload import check_reload_compatible
+
+    resolved: list[tuple[ReloadTarget, str]] = []
+    for target in matching:
+        if target.resolve_path is not None:
+            raw_target_path = target.resolve_path(path)
+            if raw_target_path is None:
+                continue
+            target_path = str(raw_target_path)
+        elif target.subdir:
+            target_path = str(Path(path) / target.subdir)
+        else:
+            target_path = path
+
+        loaded = target.snapshot() if callable(target.snapshot) else target.snapshot
+        if loaded is None:
+            raise WeightReloadRefusedError(f"{target.label} was not loaded from a checkpoint directory")
+        if isinstance(loaded, str):
+            raise WeightReloadRefusedError(f"the loaded checkpoint could not be read at startup: {loaded}")
+        check_reload_compatible(
+            target_path,
+            loaded,
+            skip_fragments=target.skip_fragments,
+            normalize_specs=target.normalize_specs,
+        )
+        resolved.append((target, target_path))
+    return resolved
 
 
 def _wrap_node_in_loop(
@@ -906,6 +955,8 @@ class Model(ABC):
             dict[str, tuple[tuple[int, ...], str]],
         ] | None = None,
         label: str | None = None,
+        subdir: str = "",
+        resolve_path: Callable[[str], str | Path | None] | None = None,
     ) -> ReloadTarget:
         """Enroll one or more nodes for shared opt-in :meth:`reload_weights`."""
         node_tuple = (nodes,) if isinstance(nodes, str) else tuple(nodes)
@@ -916,8 +967,9 @@ class Model(ABC):
         if snapshot is None and checkpoint_dir is not None:
             from mstar.model.loader.reload import snapshot_for_reload
 
+            snap_dir = Path(checkpoint_dir) / subdir if subdir else checkpoint_dir
             snapshot = snapshot_for_reload(
-                checkpoint_dir,
+                snap_dir,
                 skip_fragments=skip_tuple,
                 normalize_specs=normalize_specs,
                 label=target_label,
@@ -942,6 +994,8 @@ class Model(ABC):
             skip_fragments=skip_tuple,
             normalize_specs=normalize_specs,
             label=target_label,
+            subdir=subdir,
+            resolve_path=resolve_path,
         )
         targets = getattr(self, "_reload_targets", None)
         if targets is None:
@@ -960,40 +1014,11 @@ class Model(ABC):
         engine calls ``check_only=True`` before any copy and keeps module
         storage stable for captured graphs.
         """
-        get_targets = getattr(self, "_get_reload_targets", None)
-        targets = (
-            tuple(get_targets())
-            if get_targets is not None
-            else tuple(getattr(self, "_reload_targets", ()))
-        )
-        if not targets:
-            del path, submodules, check_only
-            raise WeightReloadRefusedError(f"{type(self).__name__} does not support reloading weights in place")
-
-        matching = [target for target in targets if any(node in submodules for node in target.nodes)]
-        if not matching:
+        resolved = _resolve_reload_targets(self, path, submodules)
+        if check_only or not resolved:
             return
-
-        from mstar.model.loader.reload import check_reload_compatible
-
-        for target in matching:
-            loaded = target.snapshot() if callable(target.snapshot) else target.snapshot
-            if loaded is None:
-                raise WeightReloadRefusedError(f"{target.label} was not loaded from a checkpoint directory")
-            if isinstance(loaded, str):
-                raise WeightReloadRefusedError(f"the loaded checkpoint could not be read at startup: {loaded}")
-            check_reload_compatible(
-                path,
-                loaded,
-                skip_fragments=target.skip_fragments,
-                normalize_specs=target.normalize_specs,
-            )
-
-        if check_only:
-            return
-
-        for target in matching:
-            target.apply_fn(path, submodules)
+        for target, target_path in resolved:
+            target.apply_fn(target_path, submodules)
 
     def preprocess_fingerprint(self) -> str:
         """What this model's preprocessing contributes to the cache's root.

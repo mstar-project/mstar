@@ -100,6 +100,12 @@ class SessionStore:
         """Forget the session, stored state and pin alike."""
         self._entries.pop(session_id, None)
 
+    def clear(self) -> int:
+        """Drop every stored and pinned session (e.g., on in-place weight reload)."""
+        count = len(self._entries)
+        self._entries.clear()
+        return count
+
     def release(self, request_id: str) -> None:
         """Unpin whatever ``request_id`` holds (the request was removed before
         it stored or ended its session). A session it never stored goes."""

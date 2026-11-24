@@ -47,8 +47,8 @@ _CONFIG_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json",
                  "special_tokens_map.json", "tokenizer.model")
 _IGNORED_KEYS = {
     "config.json": frozenset({
-        "_name_or_path", "transformers_version", "torch_dtype", "dtype", "_commit_hash",
-        "use_cache", "_attn_implementation", "attn_implementation",
+        "_name_or_path", "transformers_version", "_diffusers_version", "torch_dtype", "dtype",
+        "_commit_hash", "use_cache", "_attn_implementation", "attn_implementation",
         "output_attentions", "output_hidden_states", "return_dict", "torchscript",
         "device",
     }),
@@ -57,34 +57,52 @@ _IGNORED_KEYS = {
         "model_max_length", "padding_side", "truncation_side", "clean_up_tokenization_spaces",
     }),
 }
+_TOP_LEVEL_JSON_IGNORED = frozenset({
+    "_name_or_path", "transformers_version", "_diffusers_version",
+    "torch_dtype", "dtype", "_commit_hash",
+})
+
+
+def _index_files(path: Path, index: Path) -> list[Path]:
+    try:
+        weight_map = json.loads(index.read_text())["weight_map"]
+        if not isinstance(weight_map, dict):
+            raise TypeError("weight_map must be a JSON object")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise WeightReloadRefusedError(f"unreadable {index.name}: {exc}") from exc
+    files = []
+    for name in sorted(set(weight_map.values())):
+        if not isinstance(name, str) or not name or Path(name).is_absolute() or ".." in Path(name).parts:
+            raise WeightReloadRefusedError(f"{index.name} names {name!r}, outside {path}")
+        files.append(path / name)
+    return files
 
 
 def safetensors_files(path: str | Path) -> list[Path]:
     """The files the loader reads for ``path``: the file itself, the shards an
-    index names, or a lone ``model.safetensors``. Index names must stay within
-    the checkpoint directory lexically; Hugging Face snapshot shard symlinks
-    may resolve into its shared blobs directory."""
+    index names, or a lone ``model.safetensors`` / ``diffusion_pytorch_model.safetensors``.
+    Index names must stay within the checkpoint directory lexically; Hugging Face
+    snapshot shard symlinks may resolve into its shared blobs directory."""
     path = Path(path)
     if path.is_file():
         return [path]
     if not path.is_dir():
         raise WeightReloadRefusedError(f"no checkpoint at {path}")
-    index = path / "model.safetensors.index.json"
-    if index.is_file():
-        try:
-            weight_map = json.loads(index.read_text())["weight_map"]
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise WeightReloadRefusedError(f"unreadable {index.name}: {exc}") from exc
-        files = []
-        for name in sorted(set(weight_map.values())):
-            if not isinstance(name, str) or not name or Path(name).is_absolute() or ".." in Path(name).parts:
-                raise WeightReloadRefusedError(f"{index.name} names {name!r}, outside {path}")
-            files.append(path / name)
-        return files
-    single = path / "model.safetensors"
-    if single.is_file():
-        return [single]
-    raise WeightReloadRefusedError(f"no model.safetensors or model.safetensors.index.json in {path}")
+    for index_name, single_name in (
+        ("model.safetensors.index.json", "model.safetensors"),
+        ("diffusion_pytorch_model.safetensors.index.json", "diffusion_pytorch_model.safetensors"),
+    ):
+        index = path / index_name
+        if index.is_file():
+            return _index_files(path, index)
+        single = path / single_name
+        if single.is_file():
+            return [single]
+    raise WeightReloadRefusedError(
+        "no model.safetensors, model.safetensors.index.json, "
+        "diffusion_pytorch_model.safetensors, or "
+        f"diffusion_pytorch_model.safetensors.index.json in {path}"
+    )
 
 
 def tensor_specs(
@@ -251,3 +269,49 @@ def check_reload_compatible(
     problems += _config_mismatches(new, reference)
     if problems:
         raise WeightReloadRefusedError(f"{new} does not match the loaded checkpoint: " + "; ".join(problems))
+
+
+def snapshot_json_configs(
+    root: str | Path,
+    relpaths: Iterable[str],
+) -> dict[str, dict[str, Any]]:
+    """Read present JSON object files at ``root / relpath`` (runtime/exporter
+    keys stripped) for later :func:`check_json_configs_compatible`."""
+    root_path = Path(root)
+    out: dict[str, dict[str, Any]] = {}
+    for relpath in relpaths:
+        file = root_path / relpath
+        if not file.is_file():
+            continue
+        try:
+            content = json.loads(file.read_text())
+        except (OSError, ValueError) as exc:
+            raise WeightReloadRefusedError(f"unreadable {relpath}: {exc}") from exc
+        if not isinstance(content, dict):
+            raise WeightReloadRefusedError(f"{relpath} is not a JSON object")
+        ignored = _IGNORED_KEYS["config.json"] if relpath == "config.json" else _TOP_LEVEL_JSON_IGNORED
+        out[relpath] = _without(content, ignored)
+    return out
+
+
+def check_json_configs_compatible(
+    new_root: str | Path,
+    reference: dict[str, dict[str, Any]],
+) -> None:
+    """Raise ``WeightReloadRefusedError`` if any JSON config shipped by both
+    ``new_root`` and ``reference`` disagrees."""
+    if not reference:
+        return
+    new_configs = snapshot_json_configs(new_root, reference.keys())
+    problems = []
+    for relpath, ref_cfg in reference.items():
+        if relpath not in new_configs:
+            continue
+        new_cfg = new_configs[relpath]
+        differ = sorted(k for k in new_cfg.keys() | ref_cfg.keys() if new_cfg.get(k) != ref_cfg.get(k))
+        if differ:
+            problems.append(f"{relpath} differs in {differ[:5]}")
+    if problems:
+        raise WeightReloadRefusedError(
+            f"{new_root} does not match the loaded checkpoint: " + "; ".join(problems)
+        )

@@ -90,7 +90,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, ReloadTarget, Span, WalkStep
 from mstar.model.components.diffusion.unipc import SOLVER_STATE
 from mstar.model.components.mrope import layout_extent
 from mstar.model.components.video_encode import encode_mp4, encode_mp4_chunked
@@ -146,6 +146,7 @@ from mstar.model.multimodal import (
     media_walks,
     parts_from_modalities,
 )
+from mstar.model.reload_errors import WeightReloadRefusedError
 from mstar.model.submodule_base import ChunkingPolicy
 from mstar.model.utils import load_generation_defaults
 from mstar.streaming.chunk_policy import FixedChunkPolicy
@@ -246,8 +247,23 @@ def _parse_size(size) -> tuple[int, int]:
     raise ValueError(f"Cosmos3 size must be 'WIDTHxHEIGHT' with positive integers; got {size!r}.")
 
 
+_TOP_LEVEL_CONFIG_FILES = (
+    "config.json",
+    "model_index.json",
+    "modular_model_index.json",
+    "checkpoint.json",
+    "scheduler/scheduler_config.json",
+)
+
+
 class Cosmos3Model(Model):
     """NVIDIA Cosmos3 generator implementation."""
+
+    _transformer_checkpoint = None
+    _vae_checkpoint = None
+    _vision_checkpoint = None
+    _sound_checkpoint = None
+    _top_level_configs = None
 
     PREPROCESS_ONLY_KWARGS = ("action", "robot_state")
     # Requests prepare at once: the loaders and process_prompt keep no shared
@@ -315,6 +331,11 @@ class Cosmos3Model(Model):
         self._decoder_only_vaes: dict[str, torch.nn.Module] = {}
         self._encode_vaes: dict[str, torch.nn.Module] = {}
         self._transformer = None
+        self._transformer_checkpoint = None
+        self._vae_checkpoint = None
+        self._vision_checkpoint = None
+        self._sound_checkpoint = None
+        self._top_level_configs = None
 
     # ------------------------------------------------------------------
     # Config + tokenizer
@@ -2030,13 +2051,15 @@ class Cosmos3Model(Model):
         if self.skip_weight_loading:
             return model.to_empty(device=device)
 
+        repo = self._ensure_repo()
         model.to_empty(device=device)
-        load_transformer_weights(model, self._ensure_repo(), device=device)
+        load_transformer_weights(model, repo, device=device)
         # Keep the timestep embedder in fp32, like diffusers'
         # ``_keep_in_fp32_modules=["time_embedder"]`` (the upcast is lossless from
         # the bf16 checkpoint and matches diffusers' numerics).
         model.time_embedder.to(torch.float32)
         model.eval()
+        self._record_transformer_snapshot(repo)
         return model
 
     def _build_vae(self, device: str):
@@ -2046,8 +2069,10 @@ class Cosmos3Model(Model):
             return self._vae
         from diffusers import AutoencoderKLWan
 
-        vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"))
+        repo = self._ensure_repo()
+        vae = AutoencoderKLWan.from_pretrained(str(repo / "vae"))
         self._vae = vae.to(device).eval()
+        self._record_vae_snapshot(repo)
         return self._vae
 
     def _build_streaming_decode_vae(self, device: str):
@@ -2074,9 +2099,12 @@ class Cosmos3Model(Model):
             return None
         from diffusers import AutoencoderKLWan
 
-        vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"))
+        repo = self._ensure_repo()
+        vae = AutoencoderKLWan.from_pretrained(str(repo / "vae"))
         vae.encoder = None
-        return vae.to(device).eval()
+        out = vae.to(device).eval()
+        self._record_vae_snapshot(repo)
+        return out
 
     def _build_encode_vae(self, device: str):
         # The encoder node keeps its own instance instead of sharing the
@@ -2090,8 +2118,10 @@ class Cosmos3Model(Model):
         if device not in self._encode_vaes:
             from diffusers import AutoencoderKLWan
 
-            vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"), torch_dtype=torch.bfloat16)
+            repo = self._ensure_repo()
+            vae = AutoencoderKLWan.from_pretrained(str(repo / "vae"), torch_dtype=torch.bfloat16)
             self._encode_vaes[device] = vae.to(device).eval()
+            self._record_vae_snapshot(repo)
         return self._encode_vaes[device]
 
     def _build_vision_model(self, device: str):
@@ -2104,9 +2134,11 @@ class Cosmos3Model(Model):
         model = model.to(torch.bfloat16)
         if self.skip_weight_loading:
             return model.to_empty(device=device)
+        repo = self._ensure_repo()
         model.to_empty(device=device)
-        load_vision_encoder_weights(model, self._ensure_repo(), device=device)
+        load_vision_encoder_weights(model, repo, device=device)
         model.eval()
+        self._record_vision_snapshot(repo)
         return model
 
     def _build_sound_tokenizer(self, device: str):
@@ -2114,11 +2146,277 @@ class Cosmos3Model(Model):
             return None
         from mstar.model.cosmos3.components.sound_tokenizer import Cosmos3SoundTokenizer
 
+        repo = self._ensure_repo()
         tokenizer = Cosmos3SoundTokenizer.from_pretrained(
-            self._ensure_repo(), device=device, dtype=torch.bfloat16
+            repo, device=device, dtype=torch.bfloat16
         )
+        self._record_sound_snapshot(repo)
         logger.info(
             "Loaded Cosmos3 sound tokenizer (sr=%d, channels=%d, latent_ch=%d, hop=%d)",
             tokenizer.sample_rate, tokenizer.audio_channels, tokenizer.latent_ch, tokenizer.hop_size,
         )
         return tokenizer
+
+    # ------------------------------------------------------------------
+    # In-place weight reload
+    # ------------------------------------------------------------------
+
+    def _record_top_level_configs(self, repo_dir: Path) -> None:
+        if self._top_level_configs is not None:
+            return
+        from mstar.model.loader.reload import snapshot_json_configs
+
+        try:
+            self._top_level_configs = snapshot_json_configs(repo_dir, _TOP_LEVEL_CONFIG_FILES)
+        except WeightReloadRefusedError as exc:
+            logger.warning("Cosmos3: top-level config snapshot failed: %s", exc)
+            self._top_level_configs = {}
+
+    def _transformer_spec_normalizer(self):
+        if self.config.serves_reasoner:
+            return None
+        from mstar.model.cosmos3.loader import DROP_KEYS
+
+        return lambda specs: {k: v for k, v in specs.items() if k not in DROP_KEYS}
+
+    @staticmethod
+    def _normalize_sound_specs(
+        specs: dict[str, tuple[tuple[int, ...], str]],
+    ) -> dict[str, tuple[tuple[int, ...], str]]:
+        return {k: v for k, v in specs.items() if k.startswith("decoder.")}
+
+    def _record_transformer_snapshot(self, repo_dir: Path) -> None:
+        from mstar.model.loader import HF_DEFAULT_SKIP_FRAGMENTS
+        from mstar.model.loader.reload import snapshot_for_reload
+
+        self._transformer_checkpoint = snapshot_for_reload(
+            repo_dir / "transformer",
+            skip_fragments=HF_DEFAULT_SKIP_FRAGMENTS,
+            normalize_specs=self._transformer_spec_normalizer(),
+            label="Cosmos3 transformer",
+        )
+        self._record_top_level_configs(repo_dir)
+
+    def _record_vae_snapshot(self, repo_dir: Path) -> None:
+        if self._vae_checkpoint is None:
+            from mstar.model.loader.reload import snapshot_for_reload
+
+            self._vae_checkpoint = snapshot_for_reload(
+                repo_dir / "vae",
+                label="Cosmos3 VAE",
+            )
+        self._record_top_level_configs(repo_dir)
+
+    def _record_vision_snapshot(self, repo_dir: Path) -> None:
+        from mstar.model.loader import HF_DEFAULT_SKIP_FRAGMENTS
+        from mstar.model.loader.reload import snapshot_for_reload
+
+        self._vision_checkpoint = snapshot_for_reload(
+            repo_dir / "vision_encoder",
+            skip_fragments=HF_DEFAULT_SKIP_FRAGMENTS,
+            label="Cosmos3 vision encoder",
+        )
+        self._record_top_level_configs(repo_dir)
+
+    def _record_sound_snapshot(self, repo_dir: Path) -> None:
+        from mstar.model.loader.reload import snapshot_for_reload
+
+        self._sound_checkpoint = snapshot_for_reload(
+            repo_dir / "sound_tokenizer",
+            normalize_specs=self._normalize_sound_specs,
+            label="Cosmos3 sound tokenizer",
+        )
+        self._record_top_level_configs(repo_dir)
+
+    @staticmethod
+    def _transformer_reload_path(path: str) -> Path:
+        p = Path(path)
+        tdir = p / "transformer"
+        return tdir if tdir.is_dir() else p
+
+    @staticmethod
+    def _optional_subdir_path(path: str, subdir: str) -> Path | None:
+        p = Path(path)
+        if not p.is_dir():
+            return None
+        sub = p / subdir
+        return sub if sub.is_dir() else None
+
+    @staticmethod
+    def _is_checkpoint_root(path: Path) -> bool:
+        return path.is_dir() and any(
+            (path / d).is_dir() for d in ("transformer", "vae", "vision_encoder", "sound_tokenizer")
+        )
+
+    def _get_reload_targets(self) -> tuple[ReloadTarget, ...]:
+        from mstar.model.loader import HF_DEFAULT_SKIP_FRAGMENTS
+
+        vae_nodes: tuple[str, ...] = (VAE_ENCODER_NODE, VAE_DECODER_NODE, VAE_DECODER_AR_NODE)
+        if self._windowed_serving_enabled():
+            vae_nodes = vae_nodes + (DIT_NODE,)
+
+        return (
+            ReloadTarget(
+                nodes=(DIT_NODE, REASONER_NODE),
+                snapshot=lambda: self._transformer_checkpoint,
+                apply_fn=self._apply_transformer_reload,
+                skip_fragments=HF_DEFAULT_SKIP_FRAGMENTS,
+                normalize_specs=self._transformer_spec_normalizer(),
+                label="Cosmos3 transformer",
+                subdir="transformer",
+                resolve_path=self._transformer_reload_path,
+            ),
+            ReloadTarget(
+                nodes=vae_nodes,
+                snapshot=lambda: self._vae_checkpoint,
+                apply_fn=self._apply_vae_reload,
+                label="Cosmos3 VAE",
+                subdir="vae",
+                resolve_path=lambda path: self._optional_subdir_path(path, "vae"),
+            ),
+            ReloadTarget(
+                nodes=(VISION_ENCODER_NODE,),
+                snapshot=lambda: self._vision_checkpoint,
+                apply_fn=self._apply_vision_reload,
+                skip_fragments=HF_DEFAULT_SKIP_FRAGMENTS,
+                label="Cosmos3 vision encoder",
+                subdir="vision_encoder",
+                resolve_path=lambda path: self._optional_subdir_path(path, "vision_encoder"),
+            ),
+            ReloadTarget(
+                nodes=(AUDIO_DECODER_NODE,),
+                snapshot=lambda: self._sound_checkpoint,
+                apply_fn=self._apply_sound_reload,
+                normalize_specs=self._normalize_sound_specs,
+                label="Cosmos3 sound tokenizer",
+                subdir="sound_tokenizer",
+                resolve_path=lambda path: self._optional_subdir_path(path, "sound_tokenizer"),
+            ),
+        )
+
+    def _check_auxiliary_snapshots(self, active_nodes: set[str]) -> None:
+        checks = []
+        if active_nodes & {VAE_ENCODER_NODE, VAE_DECODER_NODE, VAE_DECODER_AR_NODE}:
+            checks.append(("Cosmos3 VAE", self._vae_checkpoint))
+        if VISION_ENCODER_NODE in active_nodes:
+            checks.append(("Cosmos3 vision encoder", self._vision_checkpoint))
+        if AUDIO_DECODER_NODE in active_nodes:
+            checks.append(("Cosmos3 sound tokenizer", self._sound_checkpoint))
+        for label, loaded in checks:
+            if loaded is None:
+                raise WeightReloadRefusedError(f"{label} was not loaded from a checkpoint directory")
+            if isinstance(loaded, str):
+                raise WeightReloadRefusedError(f"the loaded checkpoint could not be read at startup: {loaded}")
+
+    @staticmethod
+    def _clear_weight_derived_state(
+        submodules: dict[str, torch.nn.Module],
+        *,
+        clear_vision_cache: bool,
+    ) -> None:
+        for node_name in (DIT_NODE, VAE_DECODER_AR_NODE):
+            sub = submodules.get(node_name)
+            sessions = getattr(sub, "_sessions", None)
+            if sessions is not None:
+                sessions.clear()
+        if clear_vision_cache:
+            vis = submodules.get(VISION_ENCODER_NODE)
+            tables = getattr(vis, "_position_tables", None)
+            if tables is not None:
+                tables.clear()
+                vis._position_table_bytes = 0
+
+    def _apply_transformer_reload(self, target_path: str, submodules: dict[str, torch.nn.Module]) -> None:
+        from mstar.model.cosmos3.loader import load_transformer_path
+
+        seen: set[int] = set()
+        transformers = []
+        dit = submodules.get(DIT_NODE)
+        if dit is not None and getattr(dit, "transformer", None) is not None:
+            transformers.append(dit.transformer)
+        reasoner = submodules.get(REASONER_NODE)
+        if reasoner is not None:
+            tower = getattr(reasoner, "model", None)
+            tf = getattr(tower, "transformer", None)
+            if tf is not None:
+                transformers.append(tf)
+        for tf in transformers:
+            if id(tf) in seen:
+                continue
+            seen.add(id(tf))
+            load_transformer_path(tf, target_path, device="cpu")
+
+    def _apply_vae_reload(self, target_path: str, submodules: dict[str, torch.nn.Module]) -> None:
+        from mstar.model.cosmos3.loader import load_vae_path
+
+        seen: set[int] = set()
+        vaes = []
+        for node_name in (VAE_ENCODER_NODE, VAE_DECODER_NODE, VAE_DECODER_AR_NODE):
+            sub = submodules.get(node_name)
+            vae = getattr(sub, "vae", None)
+            if vae is not None:
+                vaes.append(vae)
+        dit = submodules.get(DIT_NODE)
+        head = getattr(dit, "_window_head", None) if dit is not None else None
+        if head is not None:
+            dec = getattr(head, "decoder", None)
+            if getattr(dec, "vae", None) is not None:
+                vaes.append(dec.vae)
+            if getattr(head, "encode_vae", None) is not None:
+                vaes.append(head.encode_vae)
+        for vae in vaes:
+            if id(vae) in seen:
+                continue
+            seen.add(id(vae))
+            load_vae_path(vae, target_path, device="cpu")
+
+    def _apply_vision_reload(self, target_path: str, submodules: dict[str, torch.nn.Module]) -> None:
+        from mstar.model.cosmos3.loader import load_vision_encoder_path
+
+        vis = submodules.get(VISION_ENCODER_NODE)
+        if vis is not None and getattr(vis, "model", None) is not None:
+            load_vision_encoder_path(vis.model, target_path, device="cpu")
+
+    def _apply_sound_reload(self, target_path: str, submodules: dict[str, torch.nn.Module]) -> None:
+        from mstar.model.cosmos3.loader import load_sound_tokenizer_path
+
+        aud = submodules.get(AUDIO_DECODER_NODE)
+        if aud is not None and getattr(aud, "sound_tokenizer", None) is not None:
+            load_sound_tokenizer_path(aud.sound_tokenizer, target_path, device="cpu")
+
+    def reload_weights(
+        self, path: str, submodules: dict[str, torch.nn.Module], *, check_only: bool = False,
+    ) -> None:
+        from mstar.model.base import _resolve_reload_targets
+        from mstar.model.loader.reload import check_json_configs_compatible
+
+        cosmos_nodes = {
+            DIT_NODE, REASONER_NODE, VAE_ENCODER_NODE, VAE_DECODER_NODE,
+            VAE_DECODER_AR_NODE, VISION_ENCODER_NODE, AUDIO_DECODER_NODE,
+        }
+        active_nodes = cosmos_nodes & set(submodules)
+        if not active_nodes:
+            return
+
+        if getattr(self, "skip_weight_loading", False):
+            raise WeightReloadRefusedError("Cosmos3Model was not loaded from a checkpoint directory")
+
+        resolved = _resolve_reload_targets(self, path, submodules)
+
+        p = Path(path)
+        if not resolved:
+            if not p.is_dir():
+                raise WeightReloadRefusedError(f"no checkpoint at {path}")
+            self._check_auxiliary_snapshots(active_nodes)
+
+        if self._is_checkpoint_root(p) and self._top_level_configs:
+            check_json_configs_compatible(p, self._top_level_configs)
+
+        if check_only:
+            return
+
+        reload_vision = any(target.subdir == "vision_encoder" for target, _ in resolved)
+        self._clear_weight_derived_state(submodules, clear_vision_cache=reload_vision)
+
+        for target, target_path in resolved:
+            target.apply_fn(target_path, submodules)
