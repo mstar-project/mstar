@@ -463,10 +463,13 @@ def test_other_owners_keep_their_cells(drawn, ingraph):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the cell gather kernel needs CUDA")
-def test_the_cell_kernel_matches_the_torch_ops_under_capture():
+@pytest.mark.parametrize("fields", [
+    scalar_fields(True, True, True, True, True, True, True),
+    scalar_fields(windowed=True, enable_ras=True, enable_repetition_penalty=False),
+], ids=["all_fields", "ras_only"])
+def test_the_cell_kernel_matches_the_torch_ops_under_capture(fields):
     """Every field a spec can enable, each dtype, a padding row: the captured
     kernel writes what the CPU path does."""
-    fields = scalar_fields(True, True, True, True, True, True)
     sizes = tuple(torch.empty((), dtype=f.dtype).element_size() for f in fields)
     enc = [sampler_resident._encoder(f.dtype) for f in fields]
     defaults = [e(f.default) for e, f in zip(enc, fields, strict=True)]

@@ -35,6 +35,8 @@ import torch
 import triton
 import triton.language as tl
 
+from mstar.engine.resources.sampler.utils import GREEDY_TEMPERATURE
+
 # Largest top_k the fixed-shape nucleus covers (the reference uses 25).
 MAX_TOP_K = 128
 
@@ -194,18 +196,18 @@ def ras_sample_plain(
     top_k: torch.Tensor,
     window: torch.Tensor,
     repeat_threshold: torch.Tensor,
-    blocked: torch.Tensor,
+    blocked: torch.Tensor | None = None,
     fused: bool = False,
     history_is_ring: bool = False,
 ) -> torch.Tensor:
     """One token per row.
 
-    ``logits`` ``[B, V]`` float32. Per row: ``seed``/``step`` (int64) key the
+    ``logits`` ``[B, V]`` (cast to float32). Per row: ``seed``/``step`` (int64) key the
     noise; ``history`` ``[B, W]`` holds the last W generated tokens (-1 where
-    fewer exist); ``temperature`` (0 = greedy), ``top_p``, ``top_k`` (<=
+    fewer exist); ``temperature`` (< ``GREEDY_TEMPERATURE`` = greedy), ``top_p``, ``top_k`` (<=
     ``MAX_TOP_K``), ``window`` (the row's RAS window, <= W: repeats count in
     its last ``window`` history slots only) and ``repeat_threshold``
-    (``window * tau``; <= 0 disables the redraw) are ``[B]``; ``blocked``
+    (``window * tau``; <= 0 disables the redraw) are ``[B]``; optional ``blocked``
     ``[B, V]`` bool marks ids that may not be drawn this step (the
     reference's minimum-length rule).
 
@@ -213,10 +215,13 @@ def ras_sample_plain(
     circular ring: a request with window W owns its first W columns. Counting
     repetitions does not depend on their chronological order.
     """
+    logits = logits.float()
     vocab = logits.shape[-1]
-    greedy = temperature <= 0
+    greedy = temperature < GREEDY_TEMPERATURE
     scale = torch.where(greedy, torch.ones_like(temperature), temperature).to(logits.dtype)
-    scores = (logits / scale[:, None]).masked_fill(blocked, float("-inf"))
+    scores = logits / scale[:, None]
+    if blocked is not None:
+        scores = scores.masked_fill(blocked, float("-inf"))
     log_probs = torch.log_softmax(scores, dim=-1)
 
     k = min(MAX_TOP_K, vocab)

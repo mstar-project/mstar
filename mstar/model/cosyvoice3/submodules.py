@@ -279,6 +279,7 @@ class LMSubmodule(ARNodeSubmodule):
         self.lm = config.lm
         self._bool_stager = PinnedStager(torch.bool, numel=2 * self.MAX_BATCH_SIZE)
         self._eos_flags: dict[bool, torch.Tensor] = {}
+        self._vocab_ids: dict[tuple[torch.device, int], torch.Tensor] = {}
 
     # -- request knobs -------------------------------------------------------
 
@@ -396,6 +397,16 @@ class LMSubmodule(ARNodeSubmodule):
             },
         )
 
+    def _vocab_ids_for(self, vocab_size: int, device: torch.device) -> torch.Tensor:
+        key = (device, vocab_size)
+        ids = self._vocab_ids.get(key)
+        if ids is not None:
+            return ids
+        ids = torch.arange(vocab_size, device=device)[None, :]
+        if device.type != "cuda" or not torch.cuda.is_current_stream_capturing():
+            self._vocab_ids[key] = ids
+        return ids
+
     def _forward(
         self,
         graph_walk,
@@ -409,7 +420,7 @@ class LMSubmodule(ARNodeSubmodule):
         if graph_walk in PREFILL_WALKS:
             hidden = engine_inputs.resources[LM_ATTN].select_last_hidden(hidden, label=LM_LABEL)
         logits = self.model.logits(hidden)
-        ids = torch.arange(logits.shape[-1], device=logits.device)[None, :]
+        ids = self._vocab_ids_for(logits.shape[-1], logits.device)
         blocked = (block_sos & (ids == self.lm.sos_token)) | (block_stop & (ids >= self.lm.speech_token_size))
         blocked = torch.where(force_eos, ids != self.lm.eos_token, blocked)
         return engine_inputs.resources[LM_SAMPLER].sample(

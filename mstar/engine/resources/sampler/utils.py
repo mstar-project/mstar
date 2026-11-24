@@ -997,6 +997,11 @@ class GenerationHistory:
         self.step_count: torch.Tensor | None = None
         self.step_tokens: torch.Tensor | None = None
         self._step_idx: torch.Tensor | None = None
+        self._step_idx_cpu: torch.Tensor | None = None
+        self._step_idx_np: np.ndarray | None = None
+        self._step_key: tuple[tuple, int, int] | None = None
+        self._step_has_trash = False
+        self._rid_version = 0
         self._step_real_bs = 0
 
     def register(self, rid) -> None:
@@ -1010,6 +1015,8 @@ class GenerationHistory:
             slot = self._free.pop()
             self._rid_to_slot[rid] = slot
             self._pending_reset.add(slot)
+            self._rid_version += 1
+            self._step_key = None
 
     def unregister(self, rid) -> None:
         with self._lock:
@@ -1017,12 +1024,15 @@ class GenerationHistory:
             if slot is not None:
                 self._pending_reset.discard(slot)
                 self._free.append(slot)
+                self._rid_version += 1
+                self._step_key = None
 
-    def _sync_device(self) -> None:
+    def _sync_device(self) -> int:
         """Apply the deferred device writes. GPU thread only."""
         with self._lock:
             capacity = self._capacity
             resets, self._pending_reset = self._pending_reset, set()
+            rid_version = self._rid_version
         if capacity > self.count.shape[0]:
             n = self.count.shape[0]
             count = torch.zeros(capacity, dtype=self.count.dtype, device=self.device)
@@ -1034,6 +1044,9 @@ class GenerationHistory:
             self.count[slot:slot + 1].zero_()
             if self.window:
                 self.tokens[slot:slot + 1].fill_(-1)
+        if resets:
+            self._step_key = None
+        return rid_version
 
     def _slots(self, request_ids, padded_bs: int) -> list[int]:
         get = self._rid_to_slot.get
@@ -1064,25 +1077,51 @@ class GenerationHistory:
         self.step_count = torch.zeros(max_bs, dtype=torch.int32, device=self.device)
         self.step_tokens = torch.full((max_bs, self.window), -1, dtype=torch.long, device=self.device)
         self._step_idx = torch.zeros(max_bs, dtype=torch.long, device=self.device)
+        self._step_idx_cpu = torch.zeros(max_bs, dtype=torch.long)
+        self._step_idx_np = self._step_idx_cpu.numpy()
+        self._step_key = None
+        self._step_has_trash = False
 
     def gather_step(self, request_ids, padded_bs: int) -> None:
         """This step's rows into the per-step buffers. Inline on the GPU
         thread, after the previous step's ``scatter_step``: like the RNG
         offset, these are single-buffered and read what that step wrote."""
-        self._sync_device()
+        rid_version = self._sync_device()
         idx = self._step_idx[:padded_bs]
-        self._stager.copy_(idx, self._slots(request_ids, padded_bs))
+        rids_tuple = tuple(request_ids)
+        key = (rids_tuple, padded_bs, rid_version)
+        if self._step_key != key:
+            host = self._step_idx_np
+            has_trash = False
+            with self._lock:
+                get = self._rid_to_slot.get
+                for i, rid in enumerate(rids_tuple):
+                    slot = get(rid, 0)
+                    host[i] = slot
+                    if slot == 0:
+                        has_trash = True
+            n = len(rids_tuple)
+            if n < padded_bs:
+                host[n:padded_bs] = 0
+            self._stager.copy_(idx, host[:padded_bs])
+            self._step_key = key
+            self._step_has_trash = has_trash
         torch.index_select(self.count, 0, idx, out=self.step_count[:padded_bs])
         if self.window:
             torch.index_select(self.tokens, 0, idx, out=self.step_tokens[:padded_bs])
-        self._step_real_bs = len(request_ids)
+        self._step_real_bs = len(rids_tuple)
 
     def scatter_step(self, keep: torch.Tensor | None = None) -> None:
         """The replay's advanced rows back to their masters; real rows only, and
         of those only ``keep``'s (``SamplerBuffers.keep_mask``; None: all)."""
         n = self._step_real_bs
+        if n == 0:
+            return
         idx = self._step_idx[:n]
         count, tokens = self.step_count[:n], self.step_tokens[:n]
+        if self._step_has_trash:
+            valid = idx != 0
+            keep = valid if keep is None else (keep & valid)
         if keep is not None:
             count = torch.where(keep, count, self.count.index_select(0, idx))
             tokens = torch.where(keep[:, None], tokens, self.tokens.index_select(0, idx))
@@ -1163,8 +1202,12 @@ def samples_greedy(cfg: "SamplingConfig") -> bool:
     top-k, top-p or min-p filter keeps, so a greedy row with top_p < 1 draws
     the same token. What does move it is a penalty (the seen-token mask or the
     window) or the min-tokens floor, both applied to the logits first, and a
-    row asking for log-probs needs the full sampler's scoring.
+    row asking for log-probs needs the full sampler's scoring. RAS requests
+    always run the RAS path (redraw + per-step blocked tokens) so they never
+    take the lean argmax path.
     """
+    if cfg.ras_mode:
+        return False
     temperature = canonical_sampling_values(cfg.temperature, cfg.top_k, cfg.top_p, cfg.min_p)[0]
     return (
         temperature == 0 and cfg.repetition_penalty == 1 and cfg.min_tokens == 0 and not cfg.return_logprobs
@@ -1199,20 +1242,25 @@ def scalar_fields(
     enable_top_p_first: bool = False, enable_logprobs: bool = False,
     enable_processed_logprobs: bool = False,
     enable_ras: bool = False,
+    enable_repetition_penalty: bool = True,
 ) -> tuple[ScalarField, ...]:
     """The scalars a sampler's spec enables, in the order its per-step rows
     pack them. Every field defaults to what ``SamplingConfig()`` reads as."""
+    ras_only = enable_ras and not enable_repetition_penalty
     fields = [
         ScalarField("temperature", torch.float32, 1.0),
         ScalarField("top_k", torch.int32, 0),
         ScalarField("top_p", torch.float32, 1.0),
         ScalarField("seed", torch.long, 0),
-        ScalarField("rep_penalty", torch.float32, 1.0),
     ]
+    if not ras_only:
+        fields.append(ScalarField("rep_penalty", torch.float32, 1.0))
     if enable_min_p:
         fields.append(ScalarField("min_p", torch.float32, 0.0))
     if windowed:
-        fields += [ScalarField("window", torch.int32, 0), ScalarField("window_penalty", torch.float32, 1.0)]
+        fields.append(ScalarField("window", torch.int32, 0))
+        if not ras_only:
+            fields.append(ScalarField("window_penalty", torch.float32, 1.0))
     if enable_ras:
         fields.append(ScalarField("ras_threshold", torch.float32, 0.0))
     if min_tokens:
@@ -1562,10 +1610,13 @@ class Sampler(BaseSampler):
         new_tokens, count = history.tokens, history.count
         if kept_rids is not None:
             # only the kept rows' draws count
-            sel = torch.tensor([i for i, rid in enumerate(request_ids) if rid in kept_rids],
-                               dtype=torch.long, device=rows.device)
-            rows, count = rows.index_select(0, sel), count.index_select(0, sel)
-            new_tokens = None if new_tokens is None else new_tokens.index_select(0, sel)
+            kept_idx = [i for i, rid in enumerate(request_ids) if rid in kept_rids]
+            if len(kept_idx) < len(request_ids):
+                if not kept_idx:
+                    return
+                sel = to_device_nonblocking(kept_idx, rows.device, dtype=torch.long)
+                rows, count = rows.index_select(0, sel), count.index_select(0, sel)
+                new_tokens = None if new_tokens is None else new_tokens.index_select(0, sel)
         self.history.write(rows, new_tokens, count)
 
     def _advance_offsets(self, request_ids, kept_rids, logits: torch.Tensor) -> None:
@@ -2525,7 +2576,6 @@ class SamplerBuffers:
     top_k: HostBuffer
     top_p: HostBuffer
     seed: HostBuffer
-    rep_penalty: HostBuffer
     # Per-request RNG offset: gathered by slot, advanced in graph, scattered
     # back after replay (all on GPU). Not a config value, so it's kept out of
     # ``_scalar_buffers`` (never written from a SamplingConfig) and reset to 0
@@ -2550,6 +2600,8 @@ class SamplerBuffers:
     # garbled audio for Talker, premature EOS for Thinker. Defaults to
     # ``None`` for non-TP submodules (trivial broadcast is a cheap no-op).
     tp_group: "CommGroup | None" = None  # noqa: F821
+    # Allocated unless RAS-only (``enable_ras=True`` and ``enable_repetition_penalty=False``).
+    rep_penalty: "HostBuffer | None" = None
     # Per-request seen-token mask buffer for the repetition penalty. Present
     # only for submodules that opt in by declaring a vocab size (e.g. the
     # Qwen3-Omni Talker). ``None`` => the CUDA-graph path applies no penalty.
@@ -2585,6 +2637,7 @@ class SamplerBuffers:
     _device_capacity: int = field(default=0, repr=False)
     ingraph_scatter: bool = False
     fused_draw: bool = True  # the samplers' ``fused_draw``
+    enable_ras: bool = False
     # With ``ingraph_scatter``: request rows of the offset and last-token masters, which
     # the captured graphs index and so never grow; the other masters grow up to it.
     _ingraph_capacity: int = field(default=0, repr=False)
@@ -2684,6 +2737,7 @@ class SamplerBuffers:
         enable_processed_logprobs: bool = False,
         fused_draw: bool = True,
         enable_ras: bool = False,
+        enable_repetition_penalty: bool = True,
     ) -> "SamplerBuffers":
         """Allocate sampling buffers for ``max_batch_size``.
 
@@ -2731,6 +2785,7 @@ class SamplerBuffers:
             enable_min_p=enable_min_p, history=history, stop_ids=stop_ids,
             enable_top_p_first=enable_top_p_first, enable_logprobs=enable_logprobs,
             enable_processed_logprobs=enable_processed_logprobs, enable_ras=enable_ras,
+            enable_repetition_penalty=enable_repetition_penalty,
         )
         buffers = cls(
             max_batch_size=max_batch_size,
@@ -2753,6 +2808,7 @@ class SamplerBuffers:
             _device_capacity=cap,
             ingraph_scatter=ingraph_scatter,
             fused_draw=fused_draw,
+            enable_ras=enable_ras,
             _ingraph_capacity=ingraph_cap,
             cg_slots=cg_slots,
             _slot_idx_cpu=torch.zeros(cg_slots, idx_cols, dtype=torch.long, pin_memory=pinned),
@@ -2772,13 +2828,14 @@ class SamplerBuffers:
         enable_logprobs: bool = False,
         enable_processed_logprobs: bool = False,
         enable_ras: bool = False,
+        enable_repetition_penalty: bool = True,
     ) -> tuple[ScalarField, ...]:
         """The scalars ``allocate`` gives these options a buffer each."""
         return scalar_fields(
             enable_min_p=enable_min_p, windowed=history is not None and history.window > 0,
             min_tokens=stop_ids is not None, enable_top_p_first=enable_top_p_first,
             enable_logprobs=enable_logprobs, enable_processed_logprobs=enable_processed_logprobs,
-            enable_ras=enable_ras,
+            enable_ras=enable_ras, enable_repetition_penalty=enable_repetition_penalty,
         )
 
     def slice_for_bs(
@@ -3136,25 +3193,27 @@ class SamplerBuffers:
             self._stage_slot_idx(request_ids, padded_bs, cg_slot)
         if self.ingraph_scatter:
             self._stage_scatter_idx(request_ids, padded_bs, cg_slot, kept)
-        self._drain_offset_resets()
+        if not self.enable_ras:
+            self._drain_offset_resets()
         idx_view = self._upload_slot_idx(padded_bs, cg_slot)
-        if not self.ingraph_scatter:
+        if not self.ingraph_scatter and not self.enable_ras:
             # with it on, the captured sample gathers off the master itself
             self.offset.gather(idx_view, padded_bs, cg_slot)
         if self.seen_tokens is not None and gather_seen_tokens:
             self.seen_tokens.gather(idx_view, padded_bs, cg_slot)
 
     def gather_rows(
-        self, index: torch.Tensor, padded_bs: int, cg_slot: int, gather_seen_tokens: bool = True,
+        self, index: torch.Tensor, padded_bs: int, cg_slot: int,
+        gather_seen_tokens: bool = True,
     ) -> None:
         """``gather_dynamic`` for a resident step: the same per-step state, by
         ``index``, the step's rows its resident stage uploaded. Inline, for the
         reason ``gather_dynamic`` gives; with ``ingraph_scatter`` and no
         penalty, only a new row's offset reset is left to do."""
         self._sync_device_capacity()
-        if self._pending_offset_reset:
+        if not self.enable_ras and self._pending_offset_reset:
             self._drain_offset_resets()
-        if not self.ingraph_scatter:
+        if not self.ingraph_scatter and not self.enable_ras:
             self.offset.gather(index, padded_bs, cg_slot)
         if self.seen_tokens is not None and gather_seen_tokens:
             self.seen_tokens.gather(index, padded_bs, cg_slot)

@@ -118,6 +118,21 @@ class SamplerSpec(NodeResourceSpec):
     # samples greedily turns them off in its ``resources:`` block.
     greedy_capture: bool | None = None
 
+    def __post_init__(self) -> None:
+        check_int_knob("max_repetition_window", self.max_repetition_window, ">= 0", lambda v: v >= 0)
+        if self.enable_ras and (
+            self.enable_repetition_penalty
+            or self.enable_min_p
+            or self.enable_logprobs
+            or self.enable_processed_logprobs
+            or self.enable_top_p_first
+            or self.min_tokens_stop_ids
+        ):
+            raise ValueError(
+                "enable_ras cannot combine with enable_repetition_penalty, enable_min_p, "
+                "enable_logprobs, enable_top_p_first, or min_tokens_stop_ids"
+            )
+
     def apply_yaml_overrides(
         self, enable_logprobs: bool | None = None, enable_processed_logprobs: bool | None = None,
         greedy_capture: bool | None = None,
@@ -133,6 +148,8 @@ class SamplerSpec(NodeResourceSpec):
             self.enable_processed_logprobs = enable_processed_logprobs
         if self.enable_processed_logprobs and not self.enable_logprobs:
             raise ValueError("enable_processed_logprobs needs enable_logprobs")
+        if self.enable_ras and self.enable_logprobs:
+            raise ValueError("enable_ras cannot combine with enable_logprobs")
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -207,19 +224,34 @@ class SamplingReqConfig(ResourceReqConfig):
         for name in BOOL_KNOBS:
             if (value := getattr(self, name)) is not None:
                 check_bool_knob(name, value)
+        check_int_knob("repetition_window", self.repetition_window, ">= 0 (0 is off)", lambda v: v >= 0)
         if self.logprobs_mode not in (None, "raw", "processed"):
             raise ValueError(f"logprobs_mode must be 'raw' or 'processed'; got {self.logprobs_mode!r}")
+        if self.ras_mode:
+            if self.top_k is None or isinstance(self.top_k, bool) or not 1 <= self.top_k <= 128:
+                raise ValueError("RAS top_k must be in [1, 128]")
+            if (
+                (self.repetition_penalty is not None
+                 and (isinstance(self.repetition_penalty, bool) or self.repetition_penalty != 1))
+                or self.min_p
+                or self.return_logprobs
+            ):
+                raise ValueError("RAS cannot combine with repetition_penalty, min_p or logprobs")
+            if (
+                (self.min_tokens is not None
+                 and (isinstance(self.min_tokens, bool) or self.min_tokens != 0))
+                or self.top_p_first
+                or (self.top_p_min_keep is not None
+                    and (isinstance(self.top_p_min_keep, bool) or self.top_p_min_keep != 1))
+            ):
+                raise ValueError("RAS cannot combine with min_tokens, top_p_first or top_p_min_keep")
         if spec is None:
             return
         if self.ras_mode:
             if not spec.enable_ras:
                 raise ValueError("this model does not declare RAS sampling")
-            if self.top_k is None or not 1 <= self.top_k <= 128:
-                raise ValueError("RAS top_k must be in [1, 128]")
             if self.repetition_window > spec.max_repetition_window:
                 raise ValueError("RAS window exceeds the sampler's declared history")
-            if self.repetition_penalty not in (None, 1) or self.min_p or self.return_logprobs:
-                raise ValueError("RAS cannot combine with repetition_penalty, min_p or logprobs")
         # refused here, not ignored: the node's sampler has no such filter
         if self.min_p and not spec.enable_min_p:
             raise ValueError("this model does not support min_p; send 0 or leave it unset")
