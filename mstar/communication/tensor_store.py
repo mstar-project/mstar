@@ -155,6 +155,12 @@ class TensorBookkeeping(ABC):
         pass
 
     @abstractmethod
+    def set_addresses(self, uuids: list[int], addresses: list[int]):
+        """Update transfer addresses on descriptors already held (e.g.
+        host-staged Mooncake TCP send buffers)."""
+        pass
+
+    @abstractmethod
     def set_shm_placement(
         self, uuids: list[int], segment_idxs: list[int],
         offsets: list[int],
@@ -288,6 +294,12 @@ class PythonTensorBookkeeping(TensorBookkeeping):
                 [None] * (index + 1 - len(self._shm_segments))
             )
         self._shm_segments[index] = name
+
+    def set_addresses(self, uuids: list[int], addresses: list[int]):
+        for uuid, address in zip(uuids, addresses, strict=True):
+            info = self._tensor_info.get(uuid)
+            if info is not None:
+                info.address = address
 
     def set_shm_placement(
         self, uuids: list[int], segment_idxs: list[int],
@@ -489,6 +501,9 @@ class RustTensorBookkeeping(TensorBookkeeping):
 
     def register_shm_segment(self, index: int, name: str):
         self._rust.register_shm_segment(index, name)
+
+    def set_addresses(self, uuids: list[int], addresses: list[int]):
+        self._rust.set_addresses(uuids, addresses)
 
     def set_shm_placement(
         self, uuids: list[int], segment_idxs: list[int],
@@ -753,6 +768,9 @@ class TensorStore:
 
     def register_shm_segment(self, index: int, name: str):
         self.bookkeeping.register_shm_segment(index, name)
+
+    def set_addresses(self, uuids: list[int], addresses: list[int]):
+        self.bookkeeping.set_addresses(uuids, addresses)
 
     def set_shm_placement(
         self, uuids: list[int], segment_idxs: list[int],
