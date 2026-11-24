@@ -58,6 +58,8 @@ class NewRequest(MessageBody):
     initial_inputs: list[GraphEdge]
     request_info: CurrentForwardPassInfo
     loop_caps: dict[str, int]
+    # Active API request span context. Omitted when tracing is off.
+    traceparent: str | None = None
 
 
 class MessageSource(IntEnum):
@@ -380,6 +382,8 @@ class NewRequestConductor(MessageBody):
     streaming: bool = False
     # the prompt's token count, echoed on RequestComplete for the response's usage
     prompt_tokens: int | None = None
+    # Active API request span context. Omitted when tracing is off.
+    traceparent: str | None = None
 
 
 @dataclass
