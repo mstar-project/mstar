@@ -52,7 +52,7 @@ from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.sized.config import SizedField, SizedValueConfig, SizedValueReqConfig, SizedValueSpec
 from mstar.engine.resources.sized.store import SizedValueStore
-from mstar.engine.resources.step import ASKS, AllocationFailed, Segment, StepContext, SubmoduleStep
+from mstar.engine.resources.step import ASKS, AdmitRuntimeError, AllocationFailed, Segment, StepContext, SubmoduleStep
 from mstar.engine.state import (
     Array,
     ArrayStep,
@@ -1854,3 +1854,150 @@ def test_engine_episode_clear_sized_and_rolling_without_overrides():
     engine.remove_request(2)
     assert engine.end_episode("ep-clr", 0) is True
     assert roll.num_free_tokens() == 16 and sz._used == 0 and val.num_free_slots == 3
+
+
+@pytest.mark.parametrize("debug_asserts", [False, True])
+def test_paged_kv_warm_resume_without_layout_clears_footprint_and_span_cursor(monkeypatch, debug_asserts):
+    monkeypatch.setattr(kv_manager_module, "_DEBUG_ASSERTS", debug_asserts)
+    kv = _paged_kv_manager(max_num_pages=8, page_size=PAGE_SIZE, prefix_cache=False, episode_lifetime=True)
+
+    # A. Committed kv_layout -> warm resume with overrides=None grows past Turn 1's 1-page footprint
+    kv.ingest_request(1, _kv_req(list(range(PAGE_SIZE))))
+    kv.bind_episode(1, 0, "ep-layout-grow", cold=True, reset=False)
+    assert kv._streams[1]["main"].footprint == 1
+    assert kv.ask(1, "llm", "prefill") is ASKS
+    assert kv.reserve(1, "llm", "prefill", None) is None
+    _kv_step(kv, 1, PAGE_SIZE)
+    kv.remove_request(1)
+
+    kv.ingest_request(2, None)
+    kv.bind_episode(2, 0, "ep-layout-grow", cold=False, reset=False)
+    stream2 = kv._streams[2]["main"]
+    assert stream2.footprint is None and stream2.span_cursor is None
+    assert kv.ask(2, "llm", "prefill") is ASKS
+    assert kv.reserve(2, "llm", "prefill", None) is None
+    _kv_step(kv, 2, PAGE_SIZE)
+    assert kv.held(2) == 2 * PAGE_SIZE and not kv._overran
+    kv.remove_request(2)
+    kv.end_episode(0)
+    kv.assert_pages_conserved()
+
+    # B. Uncommitted kv_layout (stored_len == 0, released == 0) -> warm resume with overrides=None -> commit
+    kv.ingest_request(3, _kv_req(list(range(PAGE_SIZE))))
+    kv.bind_episode(3, 1, "ep-layout-uncommitted", cold=True, reset=False)
+    assert kv._streams[3]["main"].span_cursor is not None
+    kv.remove_request(3)
+
+    kv.ingest_request(4, None)
+    kv.bind_episode(4, 1, "ep-layout-uncommitted", cold=False, reset=False)
+    stream4 = kv._streams[4]["main"]
+    assert stream4.span_cursor is None and stream4.footprint is None
+    assert kv.ask(4, "llm", "prefill") is ASKS
+    assert kv.reserve(4, "llm", "prefill", None) is None
+    _kv_step(kv, 4, PAGE_SIZE)
+    assert kv.held(4) == PAGE_SIZE and not kv._overran
+    kv.remove_request(4)
+    kv.end_episode(1)
+    kv.assert_pages_conserved()
+
+    # C. Uncommitted kv_layout on "main" -> warm resume with kv_layout omitting "main"
+    kv.ingest_request(5, _kv_req(list(range(PAGE_SIZE))))
+    kv.bind_episode(5, 2, "ep-layout-other", cold=True, reset=False)
+    assert kv._streams[5]["main"].span_cursor is not None
+    kv.remove_request(5)
+
+    other_layout = KVReqConfig(
+        kv_layout={"other": StreamLayout(spans=(PrefixSpan(PAGE_SIZE, PAGE_SIZE, "prefill"),))}
+    )
+    kv.ingest_request(6, other_layout)
+    kv.bind_episode(6, 2, "ep-layout-other", cold=False, reset=False)
+    stream6 = kv._streams[6]["main"]
+    assert stream6.span_cursor is None and stream6.footprint == 0
+    _kv_step(kv, 6, PAGE_SIZE)
+    assert ("main", False) in kv._overran
+    kv.remove_request(6)
+    kv.end_episode(2)
+    kv.assert_pages_conserved()
+
+    # D. _report_overrun defense-in-depth when overrides.kv_layout is None
+    kv._overran.clear()
+    kv.ingest_request(7, None)
+    kv._streams[7]["main"].footprint = 0
+    _kv_step(kv, 7, PAGE_SIZE)
+    assert ("main", False) in kv._overran
+    kv.remove_request(7)
+    kv.assert_pages_conserved()
+
+
+def test_ring_kv_admit_duplicate_mixed_int_and_tuple_keys_returns_admit_error():
+    frame = 128
+    cfg = RingKVConfig(
+        num_layers=1,
+        num_qo_heads=2,
+        num_kv_heads=2,
+        head_dim=8,
+        tokens_per_frame=frame,
+        num_sessions=2,
+        layers=(RingKVLayerConfig(ring_frames=2, ring_buckets=2, pinned_dilation=1),),
+    )
+    ring = RingKVManager(cfg, "ring", CPU, torch.float32, episode_lifetime=True)
+    rids = [10, ("ep", 0), 10, ("ep", 0)]
+    outcome = ring.admit(RingKVStep(segments=(Segment(10, "main", frame),)), StepContext(rids, "step", 0, False))
+    assert not outcome.ok and not outcome.ready
+    assert isinstance(outcome.reason, AdmitRuntimeError)
+    assert "('ep', 0)" in outcome.reason.message and "10" in outcome.reason.message
+
+
+def test_rolling_kv_remove_request_before_admit_after_reset_preserves_wants():
+    cfg = RollingKVConfig(num_layers=1, num_heads=2, head_dim=8, pool_tokens=16, dtype=torch.float32)
+    store = RollingKVManager(cfg, CPU, name="roll", episode_lifetime=True)
+
+    # Turn 1 commits on slot 0
+    store.ingest_request(1, RollingKVReqConfig(tokens=8, sink=1))
+    store.bind_episode(1, 0, "ep-roll-cancel", cold=True, reset=False)
+    assert store.reserve(1, "llm", "step", None) is None
+    st1 = RollingKVStep(segments=(Segment(1, "main", 3),), positions={1: RollingPosition(0, 1, 7)})
+    ctx1 = StepContext([1], "step", 0, False)
+    assert store.admit(st1, ctx1).ok
+    store.plan(st1, ctx1)
+    store.commit(st1, ctx1)
+    store.remove_request(1)
+
+    # Turn 2 resets with overrides=None, then is removed BEFORE admit()
+    store.ingest_request(2, None)
+    store.bind_episode(2, 0, "ep-roll-cancel", cold=False, reset=True)
+    assert store.declared(2) == RollingKVReqConfig(tokens=8, sink=1)
+    store.remove_request(2)
+    assert store._kept == 0 and store._reserved == {}
+    assert store._owner_wants[("episode", 0)] == RollingKVReqConfig(tokens=8, sink=1)
+
+    # Turn 3 with overrides=None still inherits preserved RollingKVReqConfig and runs cleanly
+    store.ingest_request(3, None)
+    store.bind_episode(3, 0, "ep-roll-cancel", cold=False, reset=False)
+    assert store.declared(3) == RollingKVReqConfig(tokens=8, sink=1)
+    assert store.ask(3, "llm", "step") is ASKS
+    assert store.reserve(3, "llm", "step", None) is None
+    st3 = RollingKVStep(segments=(Segment(3, "main", 3),), positions={3: RollingPosition(0, 1, 7)})
+    ctx3 = StepContext([3], "step", 0, False)
+    assert store.admit(st3, ctx3).ok
+    store.plan(st3, ctx3)
+    store.commit(st3, ctx3)
+    assert store.held(3) == 3
+    store.remove_request(3)
+    store.end_episode(0)
+    assert ("episode", 0) not in store._owner_wants
+    assert store.num_free_tokens() == 16
+
+    # Cold episode removed before admit() is cleaned up by end_episode()
+    store.ingest_request(4, RollingKVReqConfig(tokens=6, sink=0))
+    store.bind_episode(4, 1, "ep-roll-cold-cancel", cold=True, reset=False)
+    store.remove_request(4)
+    assert ("episode", 1) in store._owner_wants
+    store.end_episode(1)
+    assert ("episode", 1) not in store._owner_wants
+
+    # Non-episode request removed before admit() never leaks into _owner_wants
+    store.ingest_request(5, RollingKVReqConfig(tokens=6, sink=0))
+    store.bind_episode(5, 2, None, cold=True, reset=False)
+    store.remove_request(5)
+    assert not store._owner_wants and not store._wants and store.num_free_tokens() == 16

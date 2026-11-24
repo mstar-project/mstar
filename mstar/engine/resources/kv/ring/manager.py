@@ -278,7 +278,7 @@ class RingKVManager(AttentionResource):
                 ok=False, ready=False,
                 reason=AdmitRuntimeError(
                     f"ring KV {self.name!r} was handed a batch naming "
-                    f"{sorted({rid for rid in rids if rids.count(rid) > 1})} more "
+                    f"{sorted({rid for rid in rids if rids.count(rid) > 1}, key=str)} more "
                     "than once; a step batches distinct sessions, one row per request."
                 ),
             )

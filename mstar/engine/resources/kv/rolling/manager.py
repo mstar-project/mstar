@@ -276,7 +276,7 @@ class RollingKVManager(Resource):
                 req = self._requests.pop(rid, None)
                 if req is not None:
                     self._requests[owner] = req
-                if wants is not None and (req is not None or owner in self._requests):
+                if wants is not None:
                     self._owner_wants[owner] = wants
                 return
             self._release(rid)

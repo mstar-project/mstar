@@ -1901,8 +1901,13 @@ class KVManager(AttentionResource):
             caps = self._overrides[rid].loop_caps
             stream.footprint = len(stream.page_indices) + self._stream_extra_pages(stream, layout, caps)
             stream.span_cursor = SpanCursor(layout.spans) if stream.stored_len == 0 else None
-        elif self._overrides.get(rid) is not None and self._overrides[rid].kv_layout:
-            stream.footprint = len(stream.page_indices) if stream.stored_len else 0
+        else:
+            stream.span_cursor = None
+            overrides = self._overrides.get(rid)
+            if overrides is not None and overrides.kv_layout:
+                stream.footprint = len(stream.page_indices) if stream.stored_len else 0
+            else:
+                stream.footprint = None
 
     def _stream_extra_pages(
         self, stream: CacheStream | None, layout: StreamLayout, caps: Mapping[str, int] | None,
@@ -5852,15 +5857,17 @@ class KVManager(AttentionResource):
         doesn't open is reported on its own, so the pages a batch writes there
         for every row don't hide a real overrun.
         """
-        overrides = self._overrides[rid]
-        reported = (label, label in overrides.kv_layout)
+        overrides = self._overrides.get(rid)
+        kv_layout = (overrides.kv_layout or {}) if overrides is not None else {}
+        loop_caps = overrides.loop_caps if overrides is not None else {}
+        reported = (label, label in kv_layout)
         if reported in self._overran:
             return
         self._overran.add(reported)
         logger.error(
             "KV %s: request %s took %d pages on label %s against a footprint of %d: layout %s, loop caps %s",
             self.name, rid, len(stream.page_indices), label, stream.footprint,
-            overrides.kv_layout.get(label), overrides.loop_caps,
+            kv_layout.get(label), loop_caps,
         )
 
     ### Submodule-level functionality
