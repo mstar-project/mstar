@@ -66,6 +66,18 @@ class _Conductor:
                 result = GenerationControlResult(
                     op_id=body.op_id, status=200, state="paused", paused=True, weight_version=self.weight_version,
                 )
+            elif message.message_type == ConductorMessageType.CHECK_WEIGHTS:
+                resident = {"worker_0": "a" * 64}
+                mismatch = body.mode == "compare" and body.checksums != resident
+                result = GenerationControlResult(
+                    op_id=body.op_id,
+                    status=409 if mismatch else 200,
+                    state="paused",
+                    paused=True,
+                    weight_version=self.weight_version,
+                    error_message="weight checksum mismatch" if mismatch else None,
+                    rank_checksums=resident,
+                )
             else:
                 result = GenerationControlResult(op_id=body.op_id, status=400, error_message="unexpected op")
             self.admin.on_result(result)
@@ -166,6 +178,7 @@ def test_generation_admin_routes_parity(tmp_path, monkeypatch):
     calls = [
         ("POST", "/pause_generation", {"mode": "wait"}, {}),
         ("GET", "/is_paused", None, {}),
+        ("POST", "/weight_checker", {"mode": "checksum"}, {}),
         ("POST", "/pause_generation", b"", auth),
         ("POST", "/pause_generation", {}, auth),
         ("POST", "/pause_generation", {"mode": ""}, auth),
@@ -178,6 +191,11 @@ def test_generation_admin_routes_parity(tmp_path, monkeypatch):
         ("POST", "/update_weights_from_disk", {"model_path": str(ckpt), "weight_version": ""}, auth),
         ("POST", "/update_weights_from_disk", {"model_path": str(ckpt), "weight_version": "v2"}, auth),
         ("GET", "/is_paused", None, auth),
+        ("POST", "/weight_checker", {"mode": "bad"}, auth),
+        ("POST", "/weight_checker", {"mode": "compare", "checksums": {"worker_0": 1}}, auth),
+        ("POST", "/weight_checker", {"mode": "checksum"}, auth),
+        ("POST", "/weight_checker", {"mode": "compare", "checksums": {"worker_0": "a" * 64}}, auth),
+        ("POST", "/weight_checker", {"mode": "compare", "checksums": {"worker_0": "b" * 64}}, auth),
         ("POST", "/continue_generation", {}, auth),
     ]
 
@@ -197,14 +215,18 @@ def test_generation_admin_routes_parity(tmp_path, monkeypatch):
 
     assert rust_answers == py_answers
     assert rust_sent == py_sent
-    assert py_answers[0][0] == 401 and py_answers[1][0] == 401
-    for idx in range(2, 8):
+    assert py_answers[0][0] == 401 and py_answers[1][0] == 401 and py_answers[2][0] == 401
+    for idx in range(3, 9):
         assert py_answers[idx] == (400, "application/json", {"detail": "mode must be 'abort' or 'wait'"})
-    assert py_answers[8][0] == 200 and py_answers[9][0] == 200
-    assert py_answers[10][0] == 400 and py_answers[11][0] == 400
-    assert py_answers[12][0] == 200 and py_answers[12][2]["weight_version"] == "v2"
-    assert py_answers[13][2]["weight_version"] == "v2"
-    assert py_answers[14][0] == 200 and py_answers[14][2]["paused"] is False
+    assert py_answers[9][0] == 200 and py_answers[10][0] == 200
+    assert py_answers[11][0] == 400 and py_answers[12][0] == 400
+    assert py_answers[13][0] == 200 and py_answers[13][2]["weight_version"] == "v2"
+    assert py_answers[14][2]["weight_version"] == "v2"
+    assert py_answers[15][0] == 400 and py_answers[16][0] == 400
+    assert py_answers[17][0] == 200 and py_answers[17][2]["rank_checksums"] == {"worker_0": "a" * 64}
+    assert py_answers[18][0] == 200
+    assert py_answers[19][0] == 409 and py_answers[19][2]["error_message"] == "weight checksum mismatch"
+    assert py_answers[20][0] == 200 and py_answers[20][2]["paused"] is False
 
 
 @pytest.mark.parametrize(
@@ -226,6 +248,7 @@ def test_generation_admin_routes_disabled_404_parity(tmp_path, monkeypatch, api_
             ("POST", "/update_weights_from_disk", {"model_path": str(root), "weight_version": "v2"}),
             ("POST", "/continue_generation", {}),
             ("GET", "/is_paused", None),
+            ("POST", "/weight_checker", {"mode": "checksum"}),
         ):
             assert _py_http(client, method, path, body, headers)[0] == 404
             assert _rust_http(port, method, path, body, headers)[0] == 404
