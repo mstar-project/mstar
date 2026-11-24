@@ -2976,6 +2976,14 @@ async def generate(
             _schedule_upload_cleanup(file_paths)
 
 
+@app.post("/v1/actions/generations")
+async def actions_generations(request: Request):
+    """Synchronous action generation endpoint (``application/msgpack``)."""
+    from mstar.api_server.actions import create_actions
+
+    return await create_actions(api_server, request)
+
+
 @app.get("/health")
 async def health_check():
     # Report unhealthy while shutting down, so a load balancer stops sending here.
@@ -3333,6 +3341,7 @@ def main(argv: list[str] | None = None):
             from mstar.api_server.openai.adapters import get_adapter
             from mstar.api_server.rust_frontend import (
                 RustFrontendBridge,
+                actions_facts,
                 launch_rust_server,
                 openpi_facts,
                 realtime_facts,
@@ -3354,7 +3363,8 @@ def main(argv: list[str] | None = None):
                 openpi=openpi_facts(api_server.openpi_policy),
                 ws_max_bytes=_ws_max_size(config),
                 client_streams=api_server.client_streams,
-                realtime=realtime_facts(api_server, get_adapter(model_name), bridge_dir))
+                realtime=realtime_facts(api_server, get_adapter(model_name), bridge_dir),
+                actions=actions_facts(api_server))
             logger.info("Starting mstar API server (mstar-server) on port %s",
                         args.port)
             bridge = RustFrontendBridge(api_server, bridge_dir)

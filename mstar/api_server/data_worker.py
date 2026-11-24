@@ -1953,6 +1953,23 @@ class PreprocessWorkerThread:
                     "video_frame payload length does not match its RGB24 shape: "
                     f"expected {expected_bytes} bytes, got {len(postprocessed)}"
                 )
+        elif (
+            modality == "action"
+            and "shape" not in chunk_metadata
+            and tensor.ndim >= 2
+            and len(postprocessed) > 0
+            and len(postprocessed) % 4 == 0
+        ):
+            action_dim = int(tensor.shape[-1])
+            n_floats = len(postprocessed) // 4
+            if action_dim > 0 and n_floats % action_dim == 0:
+                chunk_metadata = {**chunk_metadata, "shape": [n_floats // action_dim, action_dim]}
+        elif (
+            modality == "tensor"
+            and "rollout_state" not in chunk_metadata
+            and isinstance((self.request_model_kwargs.get(request_id) or {}).get("rollout"), dict)
+        ):
+            chunk_metadata = {**chunk_metadata, "rollout_state": True}
 
         num_tokens = text_tokens(modality, tensor)
         stopped = num_tokens > 0 and ends_reply(

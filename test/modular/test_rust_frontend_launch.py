@@ -63,22 +63,24 @@ def test_the_transcription_facts_are_the_launchers_and_never_inherited(launched,
 def test_the_websocket_facts_are_the_launchers_and_never_inherited(launched, monkeypatch):
     import json
 
-    for name in ("MSTAR_OPENPI", "MSTAR_WS_MAX_BYTES", "MSTAR_REALTIME"):
+    for name in ("MSTAR_OPENPI", "MSTAR_WS_MAX_BYTES", "MSTAR_REALTIME", "MSTAR_ACTIONS"):
         monkeypatch.setenv(name, "stale")
     monkeypatch.setenv("MSTAR_CLIENT_STREAMS", '["stale"]')
     rust_frontend.launch_rust_server("bin", "kokoro", 8000, "/b", "/u")
     env = launched["env"]
-    assert not {"MSTAR_OPENPI", "MSTAR_WS_MAX_BYTES", "MSTAR_REALTIME"} & env.keys()
+    assert not {"MSTAR_OPENPI", "MSTAR_WS_MAX_BYTES", "MSTAR_REALTIME", "MSTAR_ACTIONS"} & env.keys()
     assert json.loads(env["MSTAR_CLIENT_STREAMS"]) == []
     openpi = {"image_keys": ["cam"], "metadata": ""}
     realtime = {"onnxruntime": None, "silero": None, "smart_turn_problem": "x", "tokenizer": None}
+    actions = {"family": "pi05", "action_horizon": 10, "action_dim": 32, "num_cameras": 3, "num_flow_steps": 3}
     rust_frontend.launch_rust_server("bin", "qwen3_asr", 8000, "/b", "/u", openpi=openpi, ws_max_bytes=1 << 20,
-                                     client_streams={"text", "audio"}, realtime=realtime)
+                                     client_streams={"text", "audio"}, realtime=realtime, actions=actions)
     env = launched["env"]
     assert json.loads(env["MSTAR_OPENPI"]) == openpi
     assert env["MSTAR_WS_MAX_BYTES"] == str(1 << 20)
     assert json.loads(env["MSTAR_CLIENT_STREAMS"]) == ["audio", "text"]
     assert json.loads(env["MSTAR_REALTIME"]) == realtime
+    assert json.loads(env["MSTAR_ACTIONS"]) == actions
 
 
 def test_mstar_server_gets_the_libsndfile_soundfile_loaded(launched, monkeypatch):

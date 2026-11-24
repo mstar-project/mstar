@@ -215,6 +215,8 @@ WS_MAX_BYTES_ENV = "MSTAR_WS_MAX_BYTES"
 CLIENT_STREAMS_ENV = "MSTAR_CLIENT_STREAMS"
 #: What ``/v1/realtime`` runs with, as JSON (``realtime_facts``).
 REALTIME_ENV = "MSTAR_REALTIME"
+#: Action generation capabilities for ``POST /v1/actions/generations``, as JSON (``actions_facts``).
+ACTIONS_ENV = "MSTAR_ACTIONS"
 
 
 class WindowOp(StrEnum):
@@ -380,21 +382,72 @@ def realtime_facts(server, adapter, directory: str) -> dict | None:
     return facts
 
 
+def actions_facts(server) -> dict | None:
+    """``ACTIONS_ENV``'s value for a model that serves ``POST /v1/actions/generations``.
+
+    Supports ``Pi05Model`` (via ``robot_io()``), non-distilled ``Cosmos3Model``
+    with ``action_gen``, and an ``openpi_policy`` fallback when ``server.model``
+    is absent (test doubles). Returns ``None`` for any non-action model or
+    minimal server stub lacking ``.model`` and ``.openpi_policy``.
+    """
+    model = getattr(server, "model", None)
+    if model is not None:
+        io = model.robot_io() if hasattr(model, "robot_io") else None
+        if io is not None:
+            cfg = getattr(model, "config", None)
+            max_files = model.max_input_files() if hasattr(model, "max_input_files") else {}
+            num_cameras = max_files.get("image", getattr(cfg, "num_cameras", 3))
+            return {
+                "family": "pi05",
+                "action_horizon": int(io.action_horizon),
+                "action_dim": int(io.action_dim),
+                "state_kwarg": str(io.state_kwarg),
+                "state_dim": int(getattr(cfg, "state_dim", io.action_dim)),
+                "num_cameras": int(num_cameras),
+                "num_flow_steps": int(getattr(cfg, "num_flow_steps", 10)),
+            }
+        if hasattr(model, "ACTION_GEN_WALK"):
+            cfg = getattr(model, "config", None)
+            if getattr(cfg, "action_gen", False) and not getattr(cfg, "is_distilled", False):
+                return {
+                    "family": "cosmos3",
+                    "action_horizon": int(getattr(cfg, "policy_action_chunk_size", None) or 16),
+                    "action_dim": int(getattr(cfg, "max_action_dim", 64)),
+                    "num_cameras": 1,
+                    "num_flow_steps": int(getattr(cfg, "num_inference_steps_action", 30)),
+                    "policy_domain_name": getattr(cfg, "policy_domain_name", None),
+                }
+        return None
+    policy = getattr(server, "openpi_policy", None)
+    if policy is not None:
+        return {
+            "family": "pi05",
+            "action_horizon": int(policy.action_horizon),
+            "action_dim": int(policy.action_dim),
+            "state_kwarg": str(policy.state_kwarg),
+            "state_dim": int(policy.action_dim),
+            "num_cameras": int(len(policy.image_keys)),
+            "num_flow_steps": 10,
+        }
+    return None
+
+
 def launch_rust_server(binary: str, model_name: str, port: int,
                        bridge_dir: str, upload_dir: str,
                        api_key: str | None = None, timeout_s: float | None = None,
                        sample_rate: int | None = None, served_models=None,
                        transcription: dict | None = None, openpi: dict | None = None,
                        ws_max_bytes: int | None = None, client_streams=(),
-                       realtime: dict | None = None) -> subprocess.Popen:
+                       realtime: dict | None = None, actions: dict | None = None) -> subprocess.Popen:
     """``timeout_s`` is ``--timeout`` and ``sample_rate`` the model's audio output rate
     (``get_output_sample_rate``); ``None`` leaves the frontend's own default.
     ``served_models`` is the API server's ``ServedModels``, whose LoRA adapters a
     request's ``model`` selects; ``None`` serves the base model alone.
     ``transcription`` is ``transcription_facts``' for the served model, ``openpi``
     ``openpi_facts``' for its policy, ``ws_max_bytes`` the config's WebSocket
-    message limit, ``client_streams`` the model's (``APIServer.client_streams``), and
-    ``realtime`` ``realtime_facts``' for its realtime surface."""
+    message limit, ``client_streams`` the model's (``APIServer.client_streams``),
+    ``realtime`` ``realtime_facts``' for its realtime surface, and ``actions``
+    ``actions_facts``' for ``/v1/actions/generations``."""
     # The key goes through the environment, not argv, which any local user
     # can read from the process list. ``api_key`` is the resolved setting, so
     # an inherited MSTAR_API_KEY must not override it.
@@ -424,6 +477,9 @@ def launch_rust_server(binary: str, model_name: str, port: int,
     env.pop(REALTIME_ENV, None)
     if realtime is not None:
         env[REALTIME_ENV] = json.dumps(realtime)
+    env.pop(ACTIONS_ENV, None)
+    if actions is not None:
+        env[ACTIONS_ENV] = json.dumps(actions)
     env.pop(LIBSNDFILE_ENV, None)
     if (libsndfile := soundfile_library()) is not None:
         env[LIBSNDFILE_ENV] = libsndfile
