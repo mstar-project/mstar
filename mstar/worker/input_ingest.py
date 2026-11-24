@@ -16,6 +16,7 @@ from mstar.engine.resources.kv.config import without_layouts
 from mstar.graph.base import GraphEdge
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.runtime.base import ColumnarEdgeSpecs
+from mstar.observability.tracing import trace_id_from_parent
 from mstar.utils.client_errors import client_error_text
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import (
@@ -31,6 +32,7 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
+from mstar.utils.logging_config import REQUEST_LOGGER
 from mstar.utils.profiler import PhaseLaps, phase_end, phase_start, range_pop, range_push
 from mstar.worker.lockstep import Lockstep
 from mstar.worker.lora_loads import LoraLoads
@@ -42,6 +44,7 @@ if TYPE_CHECKING:
     from mstar.engine.resources import ResourceReqConfig
 
 logger = logging.getLogger(__name__)
+request_log = logging.getLogger(REQUEST_LOGGER)
 
 # worker_phases span per message type
 _MSG_SPANS = {t: f"worker.msg.{t.name.lower()}" for t in WorkerMessageType}
@@ -179,7 +182,12 @@ class InputIngest:
         # READS_DONE the worker still takes the request in, without reads, since on a follower rank 0's moves for the
         # request wait until it holds the request.
         unread = not lifecycle.takes_input(wire_rid)
-        logger.debug("Worker %s received request %s", self._worker_id, wire_rid)
+        if request_log.isEnabledFor(logging.DEBUG):
+            trace_id = trace_id_from_parent(getattr(body, "traceparent", None))
+            if trace_id is None:
+                request_log.debug("Worker %s received request %s", self._worker_id, wire_rid)
+            else:
+                request_log.debug("Worker %s received request %s trace_id=%s", self._worker_id, wire_rid, trace_id)
         laps = PhaseLaps("worker.msg.new_request.")
         runtime = self._runtime
         # The one place a handle is minted; a request with several partitions

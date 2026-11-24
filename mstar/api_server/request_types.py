@@ -189,6 +189,8 @@ class PreprocessInput:
     # in place of that modality's files (an image is RGB uint8 ``[3, H, W]``):
     # each goes to ``Model.load_decoded_<modality>``, with no file between.
     raw_inputs: dict[str, list["torch.Tensor"]] | None = None
+    # The API server's active request span, omitted on the wire when tracing is off.
+    traceparent: str | None = None
 
 
 @dataclass
