@@ -1,0 +1,28 @@
+model: "pi05"
+max_seq_len: 2048
+
+# pi0.5 fine-tuned on LIBERO (RLinf/RLinf-Pi05-LIBERO-SFT). The trainer owns
+# openpi input/output transforms and expects raw model-space actions [10, 32],
+# so norm_stats is intentionally unset.
+model_kwargs:
+  model_path_hf: "RLinf/RLinf-Pi05-LIBERO-SFT"
+  action_horizon: 10
+  num_flow_steps: 3
+  num_cameras: 3
+
+# FA2, not the FA3 kernel "auto" picks on SM90.
+resources:
+  attn:
+    flashinfer_backend: fa2
+
+node_groups:
+  - node_names:
+      - vit_encoder
+    ranks:
+      - 0
+
+  - node_names:
+      - LLM
+      - action_expert
+    ranks:
+      - 0

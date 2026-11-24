@@ -244,12 +244,16 @@ def test_pi05_load_image_ships_uint8_with_unchanged_vit_input(tmp_path):
 # ----------------------------------------------------------------------
 
 
-def test_pi05_runs_one_graph_walk():
-    assert set(_make_model().get_graph_walk_graphs()) == {Pi05Model.CHUNK_WALK}
+def test_pi05_runs_two_graph_walks():
+    assert set(_make_model().get_graph_walk_graphs()) == {
+        Pi05Model.CHUNK_WALK,
+        Pi05Model.ROLLOUT_WALK,
+    }
 
 
 def test_pi05_chunk_walk_is_vit_then_llm_then_action_expert():
-    walk = _make_model().get_graph_walk_graphs()[Pi05Model.CHUNK_WALK]
+    graphs = _make_model().get_graph_walk_graphs()
+    walk = graphs[Pi05Model.CHUNK_WALK]
     assert isinstance(walk, Sequential)
     vit, llm, action = walk.sections
     assert (vit.name, llm.name, action.name) == ("vit_encoder", "LLM", "action_expert")
@@ -263,6 +267,14 @@ def test_pi05_chunk_walk_is_vit_then_llm_then_action_expert():
     out = action.outputs[0]
     assert out.next_node == EMIT_TO_CLIENT
     assert out.output_modality == "action"
+
+    rollout_walk = graphs[Pi05Model.ROLLOUT_WALK]
+    assert isinstance(rollout_walk, Sequential)
+    r_action = rollout_walk.sections[-1]
+    assert [(e.next_node, e.name, e.output_modality) for e in r_action.outputs] == [
+        (EMIT_TO_CLIENT, "actions", "action"),
+        (EMIT_TO_CLIENT, "rollout", "tensor"),
+    ]
 
 
 def test_pi05_kv_cache_config_matches_pi05_config():
@@ -279,7 +291,7 @@ def test_pi05_kv_cache_config_matches_pi05_config():
     assert kv.num_qo_heads == model.config.num_qo_heads
 
 
-@pytest.mark.parametrize("config_name", ["pi05.yaml", "pi05_droid.yaml"])
+@pytest.mark.parametrize("config_name", ["pi05.yaml", "pi05_droid.yaml", "pi05_libero.yaml"])
 def test_pi05_deployments_pin_flashinfer_fa2(config_name):
     """The model keeps FlashInfer's "auto" kernel; the pi05 deployments pin
     FA2, and the override has to reach the LLM node's attention."""
@@ -301,7 +313,10 @@ def test_pi05_deployments_pin_flashinfer_fa2(config_name):
 def test_pi05_worker_graphs_from_yaml():
     model = _make_model()
     worker_graphs = model.get_worker_graphs(CONFIG_PATH)
-    assert {tuple(sorted(wg.graph_walks)) for wg in worker_graphs} == {(Pi05Model.CHUNK_WALK,)}
+    assert {tuple(sorted(wg.graph_walks)) for wg in worker_graphs} == {
+        (Pi05Model.CHUNK_WALK,),
+        (Pi05Model.ROLLOUT_WALK,),
+    }
 
 
 # ----------------------------------------------------------------------
@@ -831,10 +846,22 @@ def test_lerobot_remap_routes_keys_to_llm_wrapper_paths():
 # ----------------------------------------------------------------------
 
 
-def test_pi05_request_kwargs_are_only_the_robot_state():
+def test_pi05_request_kwargs_match_supported_contract():
     model = _make_model()
-    # flow steps are deployment YAML; a client num_steps is reported as ignored
-    assert model.request_kwargs() == {"robot_state"}
+    # flow steps come from deployment YAML; request kwargs cover state, mask, prompt IDs, and rollout
+    assert model.request_kwargs() == {
+        "robot_state",
+        "camera_mask",
+        "tokenized_prompt",
+        "tokenized_prompt_mask",
+        "rollout",
+    }
+    assert set(Pi05Model.PREPROCESS_ONLY_KWARGS) == {
+        "robot_state",
+        "camera_mask",
+        "tokenized_prompt",
+        "tokenized_prompt_mask",
+    }
 
 
 @pytest.mark.parametrize("state", [
@@ -933,7 +960,7 @@ def test_pi05_refuses_experts_in_separate_node_groups(action_ranks):
 
 
 def test_pi05_shipped_configs_keep_the_experts_together():
-    for name in ("pi05.yaml", "pi05_droid.yaml"):
+    for name in ("pi05.yaml", "pi05_droid.yaml", "pi05_libero.yaml"):
         groups = yaml.safe_load((Path(CONFIG_PATH).parent / name).read_text())["node_groups"]
         assert any({"LLM", "action_expert"} <= set(group["node_names"]) for group in groups)
 
@@ -1029,3 +1056,328 @@ def test_pi05_denoises_an_eager_batch_past_the_capture_sizes():
     noise = torch.randn((max(action.ACTION_GEN_CAPTURE_BATCH_SIZES) + 1) * config.action_horizon, config.action_dim)
     actions = action._denoise(noise, fraction=action._get_timestep_emb_fraction())
     torch.testing.assert_close(actions, noise * (1 - 0.5 / config.num_flow_steps) ** config.num_flow_steps)
+
+
+# ----------------------------------------------------------------------
+# Feature #1: Camera mask (camera_mask)
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("camera_mask", "kept_vals"),
+    [
+        ([True, True, False], [0.25, 0.5]),
+        ([True, False, True], [0.25, 1.0]),
+        ([False, True, True], [0.5, 1.0]),
+        ([False, True, False], [0.5]),
+    ],
+)
+def test_pi05_vision_camera_mask_fills_masked_slots_and_drops_tokens(camera_mask, kept_vals):
+    submodule = Pi05ViTEncoderSubmodule(_TwoTokensPerImage(), Pi05Config(vit_image_size=4, num_cameras=3))
+    cameras = [torch.full((3, 4, 4), v) for v in (0.25, 0.5, 1.0)]
+    inputs = submodule.prepare_inputs("prefill", None, {"image_inputs": cameras}, camera_mask=camera_mask)
+    pixels = inputs.tensor_inputs["pixel_values"]
+    assert pixels.shape == (3, 3, 4, 4)
+    for i, keep in enumerate(camera_mask):
+        if keep:
+            torch.testing.assert_close(pixels[i], cameras[i] * 2 - 1)
+        else:
+            assert pixels[i].eq(-1.0).all()
+
+    batch_pixels = submodule.preprocess("prefill", None, [inputs])["pixel_values"]
+    outputs = submodule.forward("prefill", None, batch_pixels)
+    submodule.postprocess("r", None, outputs, inputs=inputs)
+    expected = torch.tensor([[v * 2 - 1] * 2 for v in kept_vals]).reshape(-1, 1)
+    assert torch.equal(outputs["img_emb"][0], expected)
+
+
+def test_pi05_vision_camera_mask_fewer_images_and_mixed_batch():
+    from mstar.conductor.request_info import CurrentForwardPassInfo
+
+    submodule = Pi05ViTEncoderSubmodule(_TwoTokensPerImage(), Pi05Config(vit_image_size=4, num_cameras=3))
+    cams_a = [torch.full((3, 4, 4), v) for v in (0.25, 0.5, 1.0)]
+    cams_b = [torch.full((3, 4, 4), v) for v in (0.1, 0.8)]
+    fwd_a = CurrentForwardPassInfo(
+        "a", Pi05Model.CHUNK_WALK, 0, 1, 1, step_metadata={"camera_mask": [True, False, True]}
+    )
+    fwd_b = CurrentForwardPassInfo(
+        "b", Pi05Model.CHUNK_WALK, 0, 2, 1, step_metadata={"camera_mask": [False, True]}
+    )
+
+    inp_a = submodule.prepare_inputs(Pi05Model.CHUNK_WALK, fwd_a, {"image_inputs": cams_a})
+    inp_b = submodule.prepare_inputs(Pi05Model.CHUNK_WALK, fwd_b, {"image_inputs": cams_b})
+    assert submodule.can_batch(None, [inp_a, inp_b])
+    engine_inputs = ModelInputsFromEngine(request_ids=["a", "b"], per_request_info={"a": fwd_a, "b": fwd_b})
+    pixels = submodule.preprocess(Pi05Model.CHUNK_WALK, engine_inputs, [inp_a, inp_b])["pixel_values"]
+    outputs = submodule.forward_batched(Pi05Model.CHUNK_WALK, engine_inputs, pixels)
+    submodule.postprocess("a", fwd_a, outputs["a"], inputs=inp_a)
+    submodule.postprocess("b", fwd_b, outputs["b"], inputs=inp_b)
+
+    torch.testing.assert_close(outputs["a"]["img_emb"][0], torch.tensor([[-0.5], [-0.5], [1.0], [1.0]]))
+    torch.testing.assert_close(outputs["b"]["img_emb"][0], torch.tensor([[0.6], [0.6]]))
+
+
+@pytest.mark.parametrize(
+    "mask_factory",
+    [
+        lambda: [True, True, False],
+        lambda: (1, 0, 1),
+        lambda: __import__("numpy").array([True, False, True]),
+        lambda: __import__("numpy").array([0, 1, 1], dtype="int32"),
+        lambda: torch.tensor([True, True, False]),
+        lambda: torch.tensor([1, 0, 0], dtype=torch.int64),
+    ],
+)
+def test_pi05_process_prompt_and_walk_plan_camera_mask_forms(mask_factory):
+    model = _make_model()
+    model.tokenizer = _StubTokenizer()
+    mask_in = mask_factory()
+    out = model.process_prompt(
+        "pick", ["image", "text"], ["action"],
+        tensors={"image_inputs": [torch.zeros(3, 4, 4)] * 3},
+        camera_mask=mask_in,
+    )
+    expected_mask = [bool(x) for x in (mask_in.tolist() if hasattr(mask_in, "tolist") else mask_in)]
+    active = sum(expected_mask)
+    image_span, text_span = out.metadata["state_layout"][LLM_KV]["main"].spans
+    assert (image_span.length, image_span.advance) == (active * 256, active * 256)
+    assert text_span.length == 1
+    assert out.metadata["active_camera_mask"] == expected_mask
+
+    plan = model.walk_plan(
+        "default", ["image", "text"], ["action"],
+        {"image_inputs": [_pointer()], "text_inputs": [_pointer()]},
+        {"active_camera_mask": out.metadata["active_camera_mask"]},
+    )
+    assert [step.walk for step in plan] == [Pi05Model.CHUNK_WALK]
+    assert plan[0].step_metadata == {"camera_mask": expected_mask}
+
+
+@pytest.mark.parametrize(
+    "bad_mask",
+    [
+        [True, False],
+        [True, False, True, True],
+        [False, False, False],
+        [[True, False, True]],
+        [1.0, 0.0, 1.0],
+        ["1", "0", "1"],
+        [2, 0, 1],
+        [-1, 1, 1],
+        [None, True, True],
+        "101",
+        torch.tensor([1.0, 0.0, 1.0]),
+        torch.tensor([2, 0, 1]),
+        torch.tensor([[True, False, True]]),
+    ],
+)
+def test_pi05_process_prompt_rejects_invalid_camera_mask(bad_mask):
+    model = _make_model()
+    model.tokenizer = _StubTokenizer()
+    with pytest.raises(ValueError, match="camera_mask"):
+        model.process_prompt(
+            "pick", ["image", "text"], ["action"],
+            tensors={"image_inputs": [torch.zeros(3, 4, 4)] * 3},
+            camera_mask=bad_mask,
+        )
+
+
+# ----------------------------------------------------------------------
+# Feature #2: Pre-tokenized prompt IDs (tokenized_prompt, tokenized_prompt_mask)
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("use_tokenizer", [False, True])
+@pytest.mark.parametrize(
+    ("ids_factory", "mask_factory", "expected_ids"),
+    [
+        (lambda: [2, 10, 20, 108], None, [2, 10, 20, 108]),
+        (lambda: (5, 6, 7), [True, True, False], [5, 6]),
+        (
+            lambda: __import__("numpy").array([9, 8, 7, 0], dtype="int32"),
+            lambda: __import__("numpy").array([1, 1, 0, 0], dtype="int64"),
+            [9, 8],
+        ),
+        (
+            lambda: torch.tensor([11, 22, 33, 999999], dtype=torch.int32),
+            lambda: torch.tensor([True, True, True, False]),
+            [11, 22, 33],
+        ),
+    ],
+)
+def test_pi05_process_prompt_accepts_tokenized_prompt_and_skips_tokenizer(
+    use_tokenizer, ids_factory, mask_factory, expected_ids
+):
+    model = _make_model()
+    stub = _StubTokenizer()
+    model.tokenizer = stub if use_tokenizer else None
+
+    ids_in = ids_factory()
+    mask_in = mask_factory() if callable(mask_factory) else mask_factory
+    out = model.process_prompt(
+        prompt=None,
+        input_modalities=["image", "text"],
+        output_modalities=["action"],
+        tensors={"image_inputs": [torch.zeros(3, 4, 4)] * 2},
+        tokenized_prompt=ids_in,
+        tokenized_prompt_mask=mask_in,
+        robot_state=[0.1, -0.2, 0.3],
+    )
+    assert stub.last_prompt is None
+    got_ids = out.new_input_tensors["text_inputs"][0]
+    assert got_ids.dtype == torch.long
+    assert got_ids.tolist() == expected_ids
+    image_span, text_span = out.metadata["state_layout"][LLM_KV]["main"].spans
+    assert image_span.length == 2 * 256
+    assert text_span.length == len(expected_ids)
+
+
+@pytest.mark.parametrize(
+    ("bad_ids", "bad_mask"),
+    [
+        ([], None),
+        ([[1, 2]], None),
+        ([True, False], None),
+        (torch.tensor([True, False]), None),
+        (torch.tensor([1.0, 2.0]), None),
+        ([1.0, 2.0], None),
+        (["1", "2"], None),
+        ([-1, 5], None),
+        ([257152, 5], None),
+        (list(range(201)), None),
+        (None, [True, False]),
+        ([1, 2, 3], [True, True]),
+        ([1, 2, 3], [False, False, False]),
+        ([1, 2, 3], [False, True, True]),
+        ([1, 2, 3], [True, False, True]),
+        ([1, 2, 3], [1.0, 1.0, 0.0]),
+        ([1, 2, 3], [2, 1, 0]),
+    ],
+)
+def test_pi05_process_prompt_rejects_invalid_tokenized_prompt(bad_ids, bad_mask):
+    model = _make_model()
+    with pytest.raises(ValueError):
+        model.process_prompt(
+            prompt=None,
+            input_modalities=["image", "text"],
+            output_modalities=["action"],
+            tensors={"image_inputs": [torch.zeros(3, 4, 4)]},
+            tokenized_prompt=bad_ids,
+            tokenized_prompt_mask=bad_mask,
+        )
+
+
+def test_pi05_process_prompt_rejects_prefix_exceeding_max_position_embeddings():
+    model = _make_model()
+    model.config.max_position_embeddings = 300
+    with pytest.raises(ValueError, match="max_position_embeddings"):
+        model.process_prompt(
+            prompt="",
+            input_modalities=["image", "text"],
+            output_modalities=["action"],
+            tensors={"image_inputs": [torch.zeros(3, 4, 4)]},
+            tokenized_prompt=list(range(50)),  # 256 + 50 = 306 > 300
+        )
+
+
+# ----------------------------------------------------------------------
+# Feature #3: LIBERO config and missing-config.json fallback
+# ----------------------------------------------------------------------
+
+
+def test_pi05_libero_config_constructs_pinned_model():
+    cfg = yaml.safe_load(Path(CONFIG_PATH).with_name("pi05_libero.yaml").read_text())
+    model = Pi05Model(skip_weight_loading=True, **cfg["model_kwargs"])
+    assert model.model_path_hf == "RLinf/RLinf-Pi05-LIBERO-SFT"
+    assert model.config.action_horizon == 10
+    assert model.config.num_flow_steps == 3
+    assert model.config.num_cameras == 3
+    assert model.norm_stats is None
+
+
+def test_pi05_load_config_fallback_for_missing_config_json_only_when_horizon_pinned(tmp_path, monkeypatch):
+    import json
+
+    import httpx
+    import huggingface_hub
+    from huggingface_hub.errors import EntryNotFoundError, HfHubHTTPError, LocalEntryNotFoundError
+
+    libero_kwargs = yaml.safe_load(Path(CONFIG_PATH).with_name("pi05_libero.yaml").read_text())["model_kwargs"]
+    repo = libero_kwargs.pop("model_path_hf")
+
+    # Local directory without config.json succeeds when action_horizon is pinned.
+    local_dir = tmp_path / "local_libero"
+    local_dir.mkdir()
+    cfg = _unloaded_model(str(local_dir), libero_kwargs)._load_config()
+    assert (cfg.action_horizon, cfg.num_flow_steps, cfg.num_cameras) == (10, 3, 3)
+
+    # Local directory without config.json still refuses when action_horizon is not pinned.
+    unpinned = {k: v for k, v in libero_kwargs.items() if k != "action_horizon"}
+    with pytest.raises(RuntimeError, match="config.json"):
+        _unloaded_model(str(local_dir), unpinned)._load_config()
+
+    # Local directory with config.json reads it and overlays YAML overrides.
+    (local_dir / "config.json").write_text(json.dumps({"chunk_size": 50, "num_flow_steps": 10}))
+    cfg_local = _unloaded_model(str(local_dir), libero_kwargs)._load_config()
+    assert (cfg_local.action_horizon, cfg_local.num_flow_steps) == (10, 3)
+
+    # _ensure_repo returns local directory directly without snapshot_download.
+    model = _unloaded_model(str(local_dir), libero_kwargs)
+    model._repo_dir = None
+    monkeypatch.setattr(
+        huggingface_hub,
+        "snapshot_download",
+        lambda **kw: (_ for _ in ()).throw(AssertionError("snapshot_download must not be called")),
+    )
+    assert model._ensure_repo() == local_dir
+
+    # HF missing config.json errors (not uncached offline misses) fall back when action_horizon is pinned.
+    resp_404 = httpx.Response(404, request=httpx.Request("GET", "https://huggingface.co/test"))
+    for exc in (
+        EntryNotFoundError("missing"),
+        FileNotFoundError("missing"),
+        HfHubHTTPError("404", response=resp_404),
+    ):
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda *a, _e=exc, **kw: (_ for _ in ()).throw(_e))
+        cfg_fb = _unloaded_model(repo, libero_kwargs)._load_config()
+        assert (cfg_fb.action_horizon, cfg_fb.num_flow_steps, cfg_fb.num_cameras) == (10, 3, 3)
+
+    # LocalEntryNotFoundError refuses when no local snapshot exists (offline/uncached), even if pinned.
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            huggingface_hub,
+            "hf_hub_download",
+            lambda *a, **kw: (_ for _ in ()).throw(LocalEntryNotFoundError("not cached")),
+        )
+        mp.setattr(
+            huggingface_hub,
+            "snapshot_download",
+            lambda *a, **kw: (_ for _ in ()).throw(LocalEntryNotFoundError("no snapshot")),
+        )
+        with pytest.raises(RuntimeError, match="config.json"):
+            _unloaded_model(repo, libero_kwargs)._load_config()
+
+        # When a local snapshot DOES exist without config.json, pinned horizon falls back and unpinned refuses.
+        cached_snap = tmp_path / "cached_configless_snap"
+        cached_snap.mkdir()
+        mp.setattr(huggingface_hub, "snapshot_download", lambda *a, **kw: str(cached_snap))
+        cfg_cached = _unloaded_model(repo, libero_kwargs)._load_config()
+        assert (cfg_cached.action_horizon, cfg_cached.num_flow_steps, cfg_cached.num_cameras) == (10, 3, 3)
+        with pytest.raises(RuntimeError, match="config.json"):
+            _unloaded_model(repo, unpinned)._load_config()
+
+    # Non-missing HF errors (500, generic OSError, invalid JSON) must still raise RuntimeError even if pinned.
+    resp_500 = httpx.Response(500, request=httpx.Request("GET", "https://huggingface.co/test"))
+    for exc in (
+        HfHubHTTPError("500", response=resp_500),
+        OSError("generic network error"),
+    ):
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda *a, _e=exc, **kw: (_ for _ in ()).throw(_e))
+        with pytest.raises(RuntimeError, match="config.json"):
+            _unloaded_model(repo, libero_kwargs)._load_config()
+
+    bad_json = tmp_path / "bad_config.json"
+    bad_json.write_text("{not valid json")
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda *a, **kw: str(bad_json))
+    with pytest.raises(RuntimeError, match="config.json"):
+        _unloaded_model(repo, libero_kwargs)._load_config()

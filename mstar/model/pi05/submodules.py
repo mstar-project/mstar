@@ -25,10 +25,17 @@ from mstar.engine.accelerator_graph_config import (
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.state import ArrayStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
-from mstar.model.pi05.components.flow_matching import euler_step, sincos_timestep_embedding
+from mstar.model.pi05.components.flow_matching import (
+    euler_step,
+    flow_sde_sigmas,
+    flow_sde_timesteps,
+    gaussian_logprob,
+    sample_mean_var,
+    sincos_timestep_embedding,
+)
 from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mstar.model.pi05.components.siglip import Pi05SiglipEncoder
-from mstar.model.pi05.config import CHUNK_WALK, LLM_KV, Pi05Config
+from mstar.model.pi05.config import CHUNK_WALK, LLM_KV, ROLLOUT_WALK, Pi05Config
 from mstar.model.pi05.kernels.image_normalize import normalize_float_images
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
@@ -154,6 +161,7 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         return [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk=CHUNK_WALK,
+                replay_graph_walks=[CHUNK_WALK, ROLLOUT_WALK],
                 single_request_inputs=ARNodeInputs(
                     input_seq_len=0,  # not used by StatelessCudaGraphRunner
                     tensor_inputs={
@@ -176,14 +184,29 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         **kwargs
     ) -> NodeInputs:
         # Each camera is letterboxed on its own, since cameras may differ in resolution.
-        # Free camera slots get blank frames whose tokens postprocess drops, the same as
-        # openpi's image mask (masked tokens get no attention and no positions). More
-        # images than slots never get here, max_input_files refuses them.
+        # Free or masked camera slots get blank frames whose tokens postprocess drops,
+        # matching openpi's image mask. More images than slots never get here,
+        # max_input_files refuses them.
+        camera_mask = kwargs.get("camera_mask")
+        if camera_mask is None:
+            camera_mask = (getattr(fwd_info, "step_metadata", None) or {}).get("camera_mask")
         pixels = torch.cat([self._prepare_one(image) for image in inputs["image_inputs"]])
-        num_images, missing = pixels.shape[0], self.config.num_cameras - pixels.shape[0]
+        num_images = pixels.shape[0]
+        missing = self.config.num_cameras - num_images
+        if camera_mask is not None:
+            if len(camera_mask) != num_images:
+                raise ValueError(f"camera_mask length {len(camera_mask)} != num_images {num_images}")
+            if not any(camera_mask):
+                raise ValueError("camera_mask must enable at least one camera")
+            for i, keep in enumerate(camera_mask):
+                if not keep:
+                    pixels[i].fill_(-1.0)
         if missing > 0:
             pixels = torch.cat([pixels, pixels.new_full((missing, *pixels.shape[1:]), -1.0)])
-        return NodeInputs(tensor_inputs={"pixel_values": pixels}, kwargs={"num_images": num_images})
+        kw: dict[str, Any] = {"num_images": num_images}
+        if camera_mask is not None:
+            kw["camera_mask"] = tuple(bool(m) for m in camera_mask) + (False,) * missing
+        return NodeInputs(tensor_inputs={"pixel_values": pixels}, kwargs=kw)
 
     def postprocess(
         self,
@@ -193,9 +216,31 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         inputs: NodeInputs | None = None,
         **kwargs,
     ):
-        """Drop the tokens of the blank frames ``prepare_inputs`` padded the request with,
-        so the prefix holds the images the KV layout was counted for."""
-        cameras, num_images = self.config.num_cameras, inputs.kwargs["num_images"]
+        """Drop the tokens of masked or blank frames so the prefix holds only active cameras."""
+        cameras = self.config.num_cameras
+        if "camera_mask" in inputs.kwargs:
+            mask = tuple(bool(m) for m in inputs.kwargs["camera_mask"])
+            if len(mask) < cameras:
+                mask = mask + (False,) * (cameras - len(mask))
+            if not all(mask):
+                emb = outputs["img_emb"][0]
+                tokens_per_image = emb.shape[0] // cameras
+                active = sum(mask)
+                if mask == (True,) * active + (False,) * (cameras - active):
+                    outputs["img_emb"] = [emb[: tokens_per_image * active]]
+                else:
+                    outputs["img_emb"] = [
+                        torch.cat(
+                            [
+                                emb[i * tokens_per_image : (i + 1) * tokens_per_image]
+                                for i, keep in enumerate(mask)
+                                if keep
+                            ],
+                            dim=0,
+                        )
+                    ]
+            return
+        num_images = inputs.kwargs["num_images"]
         if num_images < cameras:
             emb = outputs["img_emb"][0]
             outputs["img_emb"] = [emb[: emb.shape[0] // cameras * num_images]]
@@ -341,6 +386,7 @@ class Pi05LLMSubmodule(_Pi05ExpertSubmodule):
                 # max-autotune until the default compile level (mstar serve -O) is measured on this model
                 compile_mode="max-autotune-no-cudagraphs",
                 capture_graph_walk=CHUNK_WALK,
+                replay_graph_walks=[CHUNK_WALK, ROLLOUT_WALK],
                 make_node_input=lambda n: ARNodeInputs(
                     input_seq_len=n,
                     input_embeds=torch.zeros(
@@ -429,10 +475,11 @@ class Pi05LLMSubmodule(_Pi05ExpertSubmodule):
 
 
 class Pi05ActionSubmodule(_Pi05ExpertSubmodule):
-    """The action expert: runs every Euler step of flow-matching denoising in one
-    step, attending to the prefix KV the LLM node committed, and emits ``actions``."""
+    """The action expert: runs every Euler or Flow-SDE step of flow-matching denoising
+    in one step, attending to the prefix KV the LLM node committed, and emits ``actions``."""
 
     ACTION_GEN_CAPTURE_BATCH_SIZES = [1, 2, 4]
+    _ROLLOUT_MAGIC = b"MSTARR01"
 
     def __init__(
         self,
@@ -465,6 +512,32 @@ class Pi05ActionSubmodule(_Pi05ExpertSubmodule):
             dtype=torch.float64
         )
         return self._fraction
+
+    def split_batches_by_capture_key(self, graph_walk: str) -> bool:
+        return graph_walk == CHUNK_WALK
+
+    def cg_key_info(
+        self,
+        graph_walk: str,
+        per_request_info: dict[str, CurrentForwardPassInfo],
+        per_request_input_metadata: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        del per_request_input_metadata, kwargs
+        if graph_walk == CHUNK_WALK and any(
+            (getattr(info, "step_metadata", None) or {}).get("rollout") is not None
+            for info in per_request_info.values()
+        ):
+            return "rollout"
+        return None
+
+    def can_batch(
+        self,
+        batch: ExecutingBatch,
+        model_inputs: list[NodeInputs],
+    ) -> bool:
+        del batch
+        return bool(model_inputs) and len({bool(inp.kwargs.get("rollout")) for inp in model_inputs}) == 1
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -503,7 +576,35 @@ class Pi05ActionSubmodule(_Pi05ExpertSubmodule):
         noisy = torch.randn(
             action_horizon, self.config.action_dim, device=device, generator=generator
         )
-        return ARNodeInputs(input_seq_len=action_horizon, tensor_inputs={"noisy_actions": noisy})
+        rollout = (getattr(fwd_info, "step_metadata", None) or {}).get("rollout")
+        if rollout is None:
+            return ARNodeInputs(input_seq_len=action_horizon, tensor_inputs={"noisy_actions": noisy})
+
+        num_steps = self.config.num_flow_steps
+        sde_step = rollout["sde_step"]
+        if rollout["sde_type"] == "flow_ode":
+            denoise_ind = int(sde_step) if isinstance(sde_step, int) else 0
+        elif isinstance(sde_step, int):
+            denoise_ind = int(sde_step)
+        else:
+            high = (num_steps - 1) if (rollout.get("ignore_last") and num_steps > 1) else num_steps
+            cpu_gen = torch.Generator(device="cpu").manual_seed(fwd_info.random_seed)
+            denoise_ind = int(torch.randint(0, high, (1,), generator=cpu_gen).item())
+
+        step_noise = torch.randn(
+            action_horizon, self.config.action_dim, device=device, dtype=torch.float32, generator=generator
+        )
+        return ARNodeInputs(
+            input_seq_len=action_horizon,
+            tensor_inputs={"noisy_actions": noisy, "step_noise": step_noise},
+            kwargs={
+                "rollout": {
+                    **rollout,
+                    "denoise_ind": denoise_ind,
+                    "seed": int(fwd_info.random_seed),
+                }
+            },
+        )
 
     def declare_step(
         self,
@@ -530,10 +631,14 @@ class Pi05ActionSubmodule(_Pi05ExpertSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         del engine_inputs
-        return {
+        out: dict[str, torch.Tensor | Any] = {
             "noisy_actions": torch.cat([inp.tensor_inputs["noisy_actions"] for inp in inputs], dim=0),
             "fraction": self._get_timestep_emb_fraction(),
         }
+        if any("rollout" in inp.kwargs for inp in inputs):
+            out["step_noise"] = torch.cat([inp.tensor_inputs["step_noise"] for inp in inputs], dim=0)
+            out["rollout_configs"] = [inp.kwargs["rollout"] for inp in inputs]
+        return out
 
     def forward(
         self,
@@ -541,10 +646,20 @@ class Pi05ActionSubmodule(_Pi05ExpertSubmodule):
         engine_inputs: ModelInputsFromEngine,
         noisy_actions: torch.Tensor,
         fraction: torch.Tensor,
+        step_noise: torch.Tensor | None = None,
+        rollout_configs: list[dict[str, Any]] | None = None,
         **kwargs,
     ) -> NameToTensorList:
         del engine_inputs
-        return {"actions": [self._denoise(noisy_actions, fraction=fraction)]}
+        if rollout_configs is None:
+            return {"actions": [self._denoise(noisy_actions, fraction=fraction)]}
+        actions, chain, logprobs, logprobs_mask = self._denoise_rollout(
+            noisy_actions, fraction=fraction, step_noise=step_noise, rollout_configs=rollout_configs
+        )
+        out: NameToTensorList = {"actions": [actions]}
+        if rollout_configs[0]["return_state"]:
+            out["rollout"] = [self._pack_rollout_state(chain[0], logprobs[0], logprobs_mask[0], rollout_configs[0])]
+        return out
 
     def forward_batched(
         self,
@@ -552,15 +667,138 @@ class Pi05ActionSubmodule(_Pi05ExpertSubmodule):
         engine_inputs: ModelInputsFromEngine,
         noisy_actions: torch.Tensor,
         fraction: torch.Tensor,
+        step_noise: torch.Tensor | None = None,
+        rollout_configs: list[dict[str, Any]] | None = None,
         **kwargs,
     ) -> dict[str, NameToTensorList]:
         """The denoising loop over the concatenated rows, then split per request."""
         horizon = self.config.action_horizon
-        actions = self._denoise(noisy_actions, fraction=fraction)
-        return {
-            rid: {"actions": [actions[i * horizon:(i + 1) * horizon]]}
-            for i, rid in enumerate(engine_inputs.request_ids)
-        }
+        if rollout_configs is None:
+            actions = self._denoise(noisy_actions, fraction=fraction)
+            return {
+                rid: {"actions": [actions[i * horizon:(i + 1) * horizon]]}
+                for i, rid in enumerate(engine_inputs.request_ids)
+            }
+        actions, chain, logprobs, logprobs_mask = self._denoise_rollout(
+            noisy_actions, fraction=fraction, step_noise=step_noise, rollout_configs=rollout_configs
+        )
+        out: dict[str, NameToTensorList] = {}
+        for i, rid in enumerate(engine_inputs.request_ids):
+            entry: NameToTensorList = {"actions": [actions[i * horizon:(i + 1) * horizon]]}
+            if rollout_configs[i]["return_state"]:
+                entry["rollout"] = [
+                    self._pack_rollout_state(chain[i], logprobs[i], logprobs_mask[i], rollout_configs[i])
+                ]
+            out[rid] = entry
+        return out
+
+    def _denoise_rollout(
+        self,
+        noisy_actions: torch.Tensor,
+        fraction: torch.Tensor,
+        step_noise: torch.Tensor,
+        rollout_configs: list[dict[str, Any]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run ``num_flow_steps`` in fp32 step math with opt-in Flow-SDE and log-prob scoring."""
+        config = self.config
+        num_steps = config.num_flow_steps
+        horizon = config.action_horizon
+        action_dim = config.action_dim
+        batch_size = len(rollout_configs)
+        device = noisy_actions.device
+
+        with torch.autocast(device.type, enabled=False):
+            timesteps = flow_sde_timesteps(num_steps, device=device)
+            time_emb = sincos_timestep_embedding(
+                timesteps[:num_steps],
+                dim=config.action_hidden_size,
+                fraction=fraction,
+                output_buffer=timesteps.new_empty(num_steps, config.action_hidden_size),
+                min_period=config.timestep_min_period,
+                max_period=config.timestep_max_period,
+            )
+            modulations = self.action_expert.modulations(self.time_mlp(time_emb))
+            noise_levels = torch.tensor(
+                [r["noise_level"] for r in rollout_configs], device=device, dtype=torch.float32
+            ).view(batch_size, 1)
+            is_sde_req = torch.tensor(
+                [r["sde_type"] == "flow_sde" for r in rollout_configs], device=device, dtype=torch.bool
+            ).view(batch_size, 1, 1)
+            denoise_inds = torch.tensor(
+                [r["denoise_ind"] for r in rollout_configs], device=device, dtype=torch.long
+            ).view(batch_size, 1, 1)
+            sigmas = flow_sde_sigmas(timesteps, noise_levels)
+
+        x_t = noisy_actions.to(torch.float32).view(batch_size, horizon, action_dim)
+        eps = step_noise.to(torch.float32).view(batch_size, horizon, action_dim)
+        chain_steps = [x_t]
+        logprobs = torch.zeros(batch_size, horizon, action_dim, device=device, dtype=torch.float32)
+
+        in_weight = getattr(self.action_in_proj, "weight", None)
+        out_weight = getattr(self.action_out_proj, "weight", None)
+
+        for step in range(num_steps):
+            x_in = x_t.reshape(batch_size * horizon, action_dim)
+            if in_weight is not None and x_in.dtype != in_weight.dtype:
+                x_in = x_in.to(in_weight.dtype)
+            suffix_out = self.action_expert(
+                query_sequence=self.action_in_proj(x_in),
+                layer_modulations=[mod[step] for mod in modulations.per_layer],
+                final_modulation=modulations.final[step],
+            )
+            if out_weight is not None and suffix_out.dtype != out_weight.dtype:
+                suffix_out = suffix_out.to(out_weight.dtype)
+            v_t = self.action_out_proj(suffix_out).to(torch.float32).view(batch_size, horizon, action_dim)
+
+            with torch.autocast(device.type, enabled=False):
+                t = timesteps[step]
+                t_next = timesteps[step + 1]
+                is_sde_step = is_sde_req & (denoise_inds == step)
+                sigma_i = sigmas[:, step].view(batch_size, 1, 1)
+                x_mean, x_std = sample_mean_var(x_t, v_t, t, t_next, sigma_i, is_sde_step)
+                x_next = x_mean + x_std * eps
+                step_lp = gaussian_logprob(x_next, x_mean, x_std)
+                logprobs = logprobs + step_lp
+                x_t = x_next
+                chain_steps.append(x_t)
+
+        chain = torch.stack(chain_steps, dim=1)
+        logprobs_mask = (is_sde_req & (noise_levels.view(batch_size, 1, 1) > 0.0)).expand(
+            batch_size, horizon, action_dim
+        )
+        return x_t.reshape(batch_size * horizon, action_dim), chain, logprobs, logprobs_mask
+
+    def _pack_rollout_state(
+        self,
+        chain: torch.Tensor,
+        logprobs: torch.Tensor,
+        logprobs_mask: torch.Tensor,
+        rollout_cfg: dict[str, Any],
+    ) -> torch.Tensor:
+        device = chain.device
+        seed_u64 = int(rollout_cfg["seed"]) & ((1 << 64) - 1)
+        seed_i64 = seed_u64 - (1 << 64) if seed_u64 >= (1 << 63) else seed_u64
+        magic = torch.tensor(list(self._ROLLOUT_MAGIC), dtype=torch.uint8, device=device)
+        meta = torch.tensor(
+            [
+                self.config.num_flow_steps,
+                self.config.action_horizon,
+                self.config.action_dim,
+                int(rollout_cfg["denoise_ind"]),
+                seed_i64,
+            ],
+            dtype=torch.int64,
+            device=device,
+        ).view(torch.uint8)
+        return torch.cat(
+            [
+                magic,
+                meta,
+                chain.contiguous().view(torch.uint8).reshape(-1),
+                logprobs.contiguous().view(torch.uint8).reshape(-1),
+                logprobs_mask.to(torch.uint8).contiguous().view(torch.uint8).reshape(-1),
+            ]
+        )
 
     def _denoise(self, noisy_actions: torch.Tensor, fraction: torch.Tensor) -> torch.Tensor:
         """Run all ``num_flow_steps`` Euler steps from t=1 to t=0.

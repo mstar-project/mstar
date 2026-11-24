@@ -10,8 +10,11 @@ LLM_ATTN = "attn"
 LLM_POS = "rope"
 # The prefix expert and the action expert read and write one KV cache.
 LLM_NODES = ("LLM", "action_expert")
-# The one graph walk: camera images and prompt in, an action chunk out.
+# The default graph walk: camera images and prompt in, an action chunk out.
 CHUNK_WALK = "action_chunk"
+# Opt-in rollout graph walk: identical nodes plus a tensor edge carrying
+# packed fp32 chain/logprobs/denoise_ind/seed state.
+ROLLOUT_WALK = "action_chunk_rollout"
 
 
 @dataclass
