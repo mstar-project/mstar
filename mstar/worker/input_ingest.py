@@ -6,6 +6,7 @@ teardown point, and TP-follow messages go to ``Lockstep``."""
 from __future__ import annotations
 
 import logging
+from collections import deque
 from collections.abc import Callable, Collection
 from typing import TYPE_CHECKING
 
@@ -86,6 +87,10 @@ class InputIngest:
         # marks each paged KV cache of a request's first NewRequest rebuildable or not, before the engine adds it,
         # and returns the nodes whose log of the request the rebuild pool couldn't hold
         self._set_rebuildable = set_rebuildable
+        self._pending_normal_inputs: dict[int, deque[GraphEdge]] = {}
+        self._pending_walk_transitions: dict[tuple[int, str], deque[tuple[object, list[GraphEdge]]]] = {}
+        self._pending_walk_reads: dict[tuple[int, str], set[object]] = {}
+        self._failed_intake_rids: set[int] = set()
         self.lora_loads = LoraLoads(services)
         self._handlers = {
             WorkerMessageType.NEW_REQUEST: self._add_new_request,
@@ -196,59 +201,85 @@ class InputIngest:
         lifecycle.add(rid, wire_rid)
         laps.lap("runtime_add")
 
+        blocked = rid in self._failed_intake_rids or rid in lifecycle.pending_removes
         # One NewRequest comes per partition this worker serves, and a later one
         # can land after a step already ran. The tensor manager and the engine
         # hold request-wide state, so only the first opens it. Opening it again
         # would reset that state under the partition that is running.
         first = rid not in self._request_state.per_request_info
-        self._request_state.add_request(rid, body.request_info)
-        runtime.register_stop_limits(rid, body.request_info)
-        if first:
-            self._tensors.register_request(rid, runtime.get_sharding_config(rid))
+        if not blocked:
+            self._request_state.add_request(rid, body.request_info)
+            runtime.register_stop_limits(rid, body.request_info)
+            if first:
+                self._tensors.register_request(rid, runtime.get_sharding_config(rid))
         laps.lap("worker_state")
         try:
-            if first:
-                unheld = () if self._set_rebuildable is None else self._set_rebuildable(
-                    rid, body.request_info.resource_configs,
-                )
-                self._engines.add_request(
-                    rid, body.request_info.resource_configs, body.request_info,
-                )
-                # Rank 0 journals each refused log once the engine holds the request, since a follower's replay
-                # changes the request's KV config.
-                for node in unheld:
-                    self._engines.get_engine(node).keeps_no_ids(node, rid)
-                laps.lap("engine_add")
-                self._skip_unshared_publish(rid, body.worker_graph_to_workers)
-                laps.lap("skip_publish")
-            body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
+            if not blocked:
+                if first:
+                    unheld = () if self._set_rebuildable is None else self._set_rebuildable(
+                        rid, body.request_info.resource_configs,
+                    )
+                    self._engines.add_request(
+                        rid, body.request_info.resource_configs, body.request_info,
+                    )
+                    # Rank 0 journals each refused log once the engine holds the request, since a follower's replay
+                    # changes the request's KV config.
+                    for node in unheld:
+                        self._engines.get_engine(node).keeps_no_ids(node, rid)
+                    laps.lap("engine_add")
+                    self._skip_unshared_publish(rid, body.worker_graph_to_workers)
+                    laps.lap("skip_publish")
+                body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
 
-            if not unread:
-                self._streams.add_request(rid, body.request_info)
-                laps.lap("stream_buffers")
+                if not unread:
+                    self._streams.add_request(rid, body.request_info)
+                    laps.lap("stream_buffers")
 
-                # Start RDMA reads for tensors that have tensor_info
-                self._wakeup_event.register_futures(self._tensors.start_read_tensors(
-                    rid, body.initial_inputs, graph_walk=body.request_info.graph_walk,
-                ))
-                laps.lap("start_reads")
+                    # Track non-streaming initial tensor reads so a concurrent or
+                    # parked INPUT_SIGNALS for another walk cannot call set_walk
+                    # before initial_inputs finish arriving.
+                    non_streaming_initial = [
+                        edge for edge in body.initial_inputs if not edge.is_streaming
+                    ]
+                    self._record_pending_walk_reads(
+                        rid, body.request_info.partition_name, non_streaming_initial,
+                    )
+                    try:
+                        # Start RDMA reads for tensors that have tensor_info
+                        self._wakeup_event.register_futures(self._tensors.start_read_tensors(
+                            rid, body.initial_inputs, graph_walk=body.request_info.graph_walk,
+                        ))
+                    except Exception:
+                        self._discard_pending_walk_reads(
+                            rid, body.request_info.partition_name, non_streaming_initial,
+                        )
+                        raise
+                    laps.lap("start_reads")
 
-                # Signal-only edges (tensor_info is None) can be processed immediately
-                signal_only = [edge for edge in body.initial_inputs if len(edge.tensor_info) == 0]
-                if signal_only:
-                    runtime.ingest_inputs_batch(_one_rids_edges(rid, signal_only), can_buffer=True)
-                laps.lap("ingest_signals")
+                    # Signal-only edges (tensor_info is None) can be processed immediately
+                    signal_only = [edge for edge in body.initial_inputs if len(edge.tensor_info) == 0]
+                    if signal_only:
+                        self._ingest_normal_edges(rid, signal_only)
+                    laps.lap("ingest_signals")
+            elif not unread and body.initial_inputs:
+                self._tensors.ack_unread_tensors(body.initial_inputs)
         except Exception as err:
             # a failed engine ingest rolled itself back; the conductor's REMOVE
             # tears down what else the request has here
             self._fail_intake([rid], err, f"ingest of request {wire_rid} failed")
         parked = lifecycle.take_parked(wire_rid)
-        if unread:
+        if unread or rid in self._failed_intake_rids or rid in lifecycle.pending_removes:
             # its parked inputs are never read, so they are ACKed unread as for a removed request
+            filtered = []
             for message in parked:
-                if message.message_type == WorkerMessageType.INPUT_SIGNALS:
+                if getattr(message, "message_type", None) in (
+                    WorkerMessageType.INPUT_SIGNALS,
+                    WorkerMessageType.EDGE_ITEMS,
+                ):
                     self.drop_for_removed(message)
-            parked = [message for message in parked if message.message_type != WorkerMessageType.INPUT_SIGNALS]
+                else:
+                    filtered.append(message)
+            parked = filtered
         self._dispatch(parked)
 
     def _remove_request(self, body: RemoveRequest) -> None:
@@ -310,7 +341,7 @@ class InputIngest:
                 self._worker_id, body.request_id,
             )
             return
-        if rid in self._lifecycle.pending_removes:
+        if self._is_walk_transition_blocked(rid):
             self._tensors.ack_unread_tensors(body.inputs)
             return
         req_info = self._request_state.per_request_info.get(rid)
@@ -345,21 +376,31 @@ class InputIngest:
         # a conductor-triggered forward pass, not just streaming data from another
         # partition). Streaming-only InputSignals must not overwrite the current
         # partition's fwd_info.
+        deferred_non_streaming = False
         if non_streaming:
-            # A fwd_info off the wire carries only the string (or the sender's
-            # handle); stamp this worker's so submodules keying per-request
-            # state can use it directly.
-            body.request_info.rid_handle = rid
-            runtime.set_walk(rid, body.partition_name, body.request_info.graph_walk)
-            for _rid, _iters in runtime.get_dynamic_loop_iters(
-                [rid], partition=body.partition_name,
+            walk_key = (rid, body.partition_name)
+            has_pending_walk = walk_key in self._pending_walk_transitions
+            if (
+                hasattr(runtime, "get_walk")
+                and hasattr(runtime, "is_partition_idle")
+                and (cur_walk := runtime.get_walk(rid, body.partition_name)) is not None
+                and (
+                    body.request_info.graph_walk != cur_walk
+                    or has_pending_walk
+                )
+                and (
+                    not runtime.is_partition_idle(rid, body.partition_name)
+                    or self._has_pending_normal_inputs(rid, body.partition_name)
+                    or walk_key in self._pending_walk_reads
+                    or has_pending_walk
+                )
             ):
-                body.request_info.dynamic_loop_iter_counts.update(_iters)
-            self._request_state.update_request_info(
-                rid, current_fwd_info=body.request_info,
-                partition_name=body.partition_name,
-            )
-            runtime.register_stop_limits(rid, body.request_info)
+                self._pending_walk_transitions.setdefault(walk_key, deque()).append(
+                    (body.request_info, non_streaming)
+                )
+                deferred_non_streaming = True
+            else:
+                self._apply_non_streaming_walk_info(rid, body.partition_name, body.request_info)
 
         if enable_nvtx:
             range_pop(synchronize=False)
@@ -368,7 +409,8 @@ class InputIngest:
         # streamed row of an EDGE_ITEMS replayed from the park has none, and
         # no forward-pass info either
         try:
-            if non_streaming:
+            if non_streaming and not deferred_non_streaming:
+                self._record_pending_walk_reads(rid, body.partition_name, non_streaming)
                 self._wakeup_event.register_futures(self._tensors.start_read_tensors(
                     rid, non_streaming, graph_walk=body.request_info.graph_walk,
                 ))
@@ -388,6 +430,8 @@ class InputIngest:
                         [info.uuid for info in edge.tensor_info], walks.get(walk_driven.get(edge.name)),
                     )
         except Exception as err:
+            if non_streaming and not deferred_non_streaming:
+                self._discard_pending_walk_reads(rid, body.partition_name, non_streaming)
             if enable_nvtx:
                 range_pop(synchronize=False)
             self._fail_intake([rid], err, f"input read of request {body.request_id} failed")
@@ -397,11 +441,162 @@ class InputIngest:
             range_push("process_new_inputs.process_inputs")
 
         # Signal-only non-streaming edges can be processed immediately
-        signal_only = [edge for edge in non_streaming if len(edge.tensor_info) == 0]
-        if signal_only:
-            runtime.ingest_inputs_batch(_one_rids_edges(rid, signal_only), can_buffer=True)
+        if non_streaming and not deferred_non_streaming:
+            signal_only = [edge for edge in non_streaming if len(edge.tensor_info) == 0]
+            if signal_only:
+                self._ingest_normal_edges(rid, signal_only)
         if enable_nvtx:
             range_pop()
+
+    def remove_request(self, rid: int) -> None:
+        self._pending_normal_inputs.pop(rid, None)
+        self._clear_pending_walk_transitions_for_rid(rid)
+        self._clear_pending_walk_reads_for_rid(rid)
+        self._failed_intake_rids.discard(rid)
+
+    def _edge_partition(self, node_name: str) -> str | None:
+        part = self._layout.node_to_partition.get(node_name)
+        if part is None:
+            ntp = getattr(self._request_state, "node_to_partition", None)
+            if ntp is not None:
+                part = ntp.get(node_name)
+        return part
+
+    def _has_pending_normal_inputs(self, rid: int, partition_name: str) -> bool:
+        pending = self._pending_normal_inputs.get(rid)
+        if not pending:
+            return False
+        return any(
+            (part := self._edge_partition(edge.next_node)) is None or part == partition_name
+            for edge in pending
+        )
+
+    def _record_pending_walk_reads(self, rid: int, partition_name: str, edges: list[GraphEdge]) -> None:
+        uuids = {info.uuid for edge in edges for info in edge.tensor_info}
+        if uuids:
+            self._pending_walk_reads.setdefault((rid, partition_name), set()).update(uuids)
+
+    def _discard_pending_walk_reads(self, rid: int, partition_name: str, edges: list[GraphEdge]) -> None:
+        key = (rid, partition_name)
+        pending = self._pending_walk_reads.get(key)
+        if not pending:
+            return
+        pending.difference_update(info.uuid for edge in edges for info in edge.tensor_info)
+        if not pending:
+            del self._pending_walk_reads[key]
+
+    def _clear_pending_walk_reads_for_rid(self, rid: int) -> None:
+        for key in [k for k in self._pending_walk_reads if k[0] == rid]:
+            del self._pending_walk_reads[key]
+
+    def _clear_pending_walk_transitions_for_rid(self, rid: int, ack_unread: bool = False) -> None:
+        for key in [k for k in self._pending_walk_transitions if k[0] == rid]:
+            queue = self._pending_walk_transitions.pop(key)
+            if ack_unread:
+                for _, edges in queue:
+                    self._tensors.ack_unread_tensors(edges)
+
+    def _is_walk_transition_blocked(self, rid: int) -> bool:
+        if rid not in self._request_state.per_request_info or rid in self._lifecycle.pending_removes:
+            return True
+        if rid in self._failed_intake_rids:
+            return True
+        if rid in self._lifecycle.failed_rids:
+            if not self._lifecycle._is_tp_follower:
+                return True
+            wire_rid = self._runtime.get_rid_string(rid)
+            if not wire_rid or not self._lifecycle.takes_input(wire_rid):
+                return True
+        return False
+
+    def _clear_pending_walk_reads_for_edges(self, rid: int, edges: list[GraphEdge]) -> None:
+        if not self._pending_walk_reads:
+            return
+        for edge in edges:
+            if not edge.tensor_info:
+                continue
+            uuids = {info.uuid for info in edge.tensor_info}
+            part = self._edge_partition(edge.next_node)
+            if part is not None:
+                key = (rid, part)
+                pending = self._pending_walk_reads.get(key)
+                if pending:
+                    pending.difference_update(uuids)
+                    if not pending:
+                        del self._pending_walk_reads[key]
+            else:
+                for key in [k for k in self._pending_walk_reads if k[0] == rid]:
+                    pending = self._pending_walk_reads[key]
+                    pending.difference_update(uuids)
+                    if not pending:
+                        del self._pending_walk_reads[key]
+
+    def _apply_non_streaming_walk_info(self, rid: int, partition_name: str, request_info) -> None:
+        runtime = self._runtime
+        request_info.rid_handle = rid
+        runtime.set_walk(rid, partition_name, request_info.graph_walk)
+        for _rid, _iters in runtime.get_dynamic_loop_iters([rid], partition=partition_name):
+            request_info.dynamic_loop_iter_counts.update(_iters)
+        self._request_state.update_request_info(
+            rid, current_fwd_info=request_info, partition_name=partition_name,
+        )
+        runtime.register_stop_limits(rid, request_info)
+
+    def _ingest_normal_edges(self, rid: int, edges: list[GraphEdge]) -> None:
+        pending = self._pending_normal_inputs.get(rid)
+        if pending:
+            all_edges = [*pending, *edges]
+        else:
+            all_edges = edges
+        if not all_edges:
+            return
+        refused = self._runtime.ingest_inputs_batch(_one_rids_edges(rid, all_edges), can_buffer=True)
+        if refused:
+            self._pending_normal_inputs[rid] = deque(all_edges[i] for i in refused)
+        elif rid in self._pending_normal_inputs:
+            del self._pending_normal_inputs[rid]
+
+    def _drain_pending_walk_transitions(self) -> None:
+        if not self._pending_walk_transitions:
+            return
+        for key in list(self._pending_walk_transitions):
+            rid, partition_name = key
+            if self._is_walk_transition_blocked(rid):
+                queue = self._pending_walk_transitions.pop(key, None)
+                if queue:
+                    for _, edges in queue:
+                        self._tensors.ack_unread_tensors(edges)
+                continue
+            queue = self._pending_walk_transitions[key]
+            while queue:
+                if (
+                    not self._runtime.is_partition_idle(rid, partition_name)
+                    or self._has_pending_normal_inputs(rid, partition_name)
+                    or key in self._pending_walk_reads
+                ):
+                    break
+                req_info, edges = queue.popleft()
+                self._apply_non_streaming_walk_info(rid, partition_name, req_info)
+                has_tensor_reads = any(edge.tensor_info for edge in edges)
+                if has_tensor_reads:
+                    self._record_pending_walk_reads(rid, partition_name, edges)
+                try:
+                    self._wakeup_event.register_futures(self._tensors.start_read_tensors(
+                        rid, edges, graph_walk=req_info.graph_walk,
+                    ))
+                except Exception as err:
+                    if has_tensor_reads:
+                        self._discard_pending_walk_reads(rid, partition_name, edges)
+                    wire_rid = self._runtime.get_rid_string(rid) or str(rid)
+                    self._fail_intake([rid], err, f"input read of request {wire_rid} failed")
+                    break
+                signal_only = [edge for edge in edges if len(edge.tensor_info) == 0]
+                if signal_only:
+                    self._ingest_normal_edges(rid, signal_only)
+                if has_tensor_reads:
+                    break
+            if not queue:
+                self._pending_walk_transitions.pop(key, None)
 
     def _process_edge_items(self, frame: EdgeItems) -> None:
         """A step's streamed tensors from one producer (EDGE_ITEMS): each
@@ -429,7 +624,7 @@ class InputIngest:
                 next_node=row.next_node, name=row.signal,
                 tensor_info=row_infos(frame, row, dtypes), is_streaming=True,
             )
-            if rid in self._lifecycle.pending_removes:
+            if self._is_walk_transition_blocked(rid):
                 self._tensors.ack_unread_tensors([edge])
                 continue
             stream_buf = per_request_info[rid].stream_buffers.get(row.signal)
@@ -461,7 +656,7 @@ class InputIngest:
                     message_type=WorkerMessageType.EDGE_ITEMS, body=row_values_frame(frame, row),
                 ))
                 continue
-            if not self._lifecycle.takes_input(row.request_id) or rid in self._lifecycle.pending_removes:
+            if not self._lifecycle.takes_input(row.request_id) or self._is_walk_transition_blocked(rid):
                 continue
             stream_buf = per_request_info[rid].stream_buffers.get(row.signal)
             if stream_buf is not None:
@@ -473,6 +668,10 @@ class InputIngest:
         nothing else would fail them, and the rest of the drained messages
         would be lost. Recorded for a TP step's read check, as a failed read
         is (see ``check_ready_tensors``), and reported once per request."""
+        for rid in rids:
+            self._failed_intake_rids.add(rid)
+            self._clear_pending_walk_reads_for_rid(rid)
+            self._clear_pending_walk_transitions_for_rid(rid, ack_unread=True)
         self._lockstep.record_read_failures(
             r for r in rids if r in self._request_state.per_request_info
         )
@@ -501,6 +700,10 @@ class InputIngest:
         ready = self._tensors.get_ready_tensors()
         failed_reads = self._tensors.take_failed_reads()
         if failed_reads:
+            for f in failed_reads:
+                self._failed_intake_rids.add(f.request_id)
+                self._clear_pending_walk_reads_for_rid(f.request_id)
+                self._clear_pending_walk_transitions_for_rid(f.request_id, ack_unread=True)
             self._lockstep.record_read_failures(
                 f.request_id for f in failed_reads
                 if f.request_id in self._request_state.per_request_info
@@ -520,6 +723,7 @@ class InputIngest:
         if ready:
             self._lockstep.note_reads(ready)
         enable_nvtx = self._enable_nvtx
+        normal_by_rid: dict[int, list[GraphEdge]] = {}
         for rid, edges in ready.items():
             streaming = [e for e in edges if e.is_streaming]
             normal = [e for e in edges if not e.is_streaming]
@@ -534,9 +738,26 @@ class InputIngest:
                 range_push("process_new_inputs.process_inputs")
 
             if normal:
-                self._runtime.ingest_inputs_batch(_one_rids_edges(rid, normal), can_buffer=True)
+                self._clear_pending_walk_reads_for_edges(rid, normal)
+                normal_by_rid[rid] = normal
             if enable_nvtx:
                 range_pop(synchronize=False)
+
+        pending_rids = list(self._pending_normal_inputs)
+        for rid in pending_rids:
+            if (
+                rid not in self._request_state.per_request_info
+                or rid in self._lifecycle.pending_removes
+                or rid in self._failed_intake_rids
+            ):
+                self._pending_normal_inputs.pop(rid, None)
+                continue
+            self._ingest_normal_edges(rid, normal_by_rid.pop(rid, []))
+        for rid, normal in normal_by_rid.items():
+            if rid in self._lifecycle.pending_removes or rid in self._failed_intake_rids:
+                continue
+            self._ingest_normal_edges(rid, normal)
+        self._drain_pending_walk_transitions()
 
     def poll_stream_buffers(self) -> None:
         """Check all active StreamBuffers; when a chunk is ready, feed it as a normal input."""

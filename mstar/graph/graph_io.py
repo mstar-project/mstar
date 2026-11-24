@@ -188,7 +188,7 @@ class WorkerGraphIO:
     def is_idle(self) -> bool:
         """No node holds an input or is in flight, and no loop is mid-run:
         the state a pass leaves behind once the graph completes and resets."""
-        if self.wg_state_registry._num_completed_entities:
+        if self.wg_state_registry._completed_entities:
             return False
         for node in self.nodes.values():
             if (node._in_flight or node.ready_signals.ready_names

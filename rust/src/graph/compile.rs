@@ -103,7 +103,7 @@ pub fn compile_one(
             held_mask: 0,
             async_enabled: n.async_enabled,
             only_streaming: full != 0 && streaming_mask == full,
-            outputs, loop_id: None,
+            outputs, loop_id: None, entity_idx: 0,
         });
     }
 
@@ -135,6 +135,7 @@ pub fn compile_one(
             output_names: outputs.iter().map(|e| e.name).collect(),
             accum_names: accumulated.iter().map(|e| e.name).collect(),
             outputs, accumulated, loop_back, external_inputs,
+            entity_idx: 0,
         });
     }
     for i in 0..loop_specs.len() {
@@ -197,6 +198,25 @@ pub fn compile_one(
         .filter(|n| !owned.contains(n)).collect();
     let root_loops: Vec<LoopId> = loop_specs.iter().enumerate()
         .filter(|(_, l)| l.parent.is_none()).map(|(i, _)| i as LoopId).collect();
+
+    for (idx, &nid) in root_nodes.iter().enumerate() {
+        node_specs[nid as usize].entity_idx = idx as u32;
+    }
+    let root_base = root_nodes.len() as u32;
+    for (idx, &lid) in root_loops.iter().enumerate() {
+        loop_specs[lid as usize].entity_idx = root_base + idx as u32;
+    }
+    for l_idx in 0..loop_specs.len() {
+        let members = loop_specs[l_idx].member_nodes.clone();
+        let children = loop_specs[l_idx].child_loops.clone();
+        for (idx, &nid) in members.iter().enumerate() {
+            node_specs[nid as usize].entity_idx = idx as u32;
+        }
+        let child_base = members.len() as u32;
+        for (idx, &clid) in children.iter().enumerate() {
+            loop_specs[clid as usize].entity_idx = child_base + idx as u32;
+        }
+    }
 
     let by_name = node_specs.iter().enumerate().map(|(i, n)| (n.name, i as NodeId)).collect();
     let loop_by_name = loop_specs.iter().enumerate().map(|(i, l)| (l.name, i as LoopId)).collect();

@@ -1,16 +1,20 @@
 //! Per-request walk state — the mutable half of Python's GraphNode / Loop /
-//! GraphStateRegistry objects, as one flat allocation per request.
+//! GraphStateRegistry objects, as one pipeline of `PassState`s per request.
 //!
 //! Field-for-field with Python except where noted:
 //!   Loop + its LoopStateRegistry merge into one `LoopState` (strictly 1:1).
 //!   `_managing_registry` pointers become `loop_id` / `parent` indices.
-//!   `WorkerGraphStateRegistry.reset_for_iter` and its `ready_next_iter` /
-//!   `ready_streaming_next_iter` sets are NOT ported: they are dead
-//!   (reset_for_iter is only ever called on a LoopStateRegistry).
+//!   Each active pass of a `(wg, rid)` lives in its own `PassState` in a
+//!   `VecDeque<PassState>`, enforcing per-node FIFO pass ordering while letting
+//!   upstream entities pipeline ahead without losing `next`-pass inputs on pass
+//!   retirement.
+
+use std::collections::VecDeque;
 
 use crate::graph::spec::{
     CompiledGraph, Dest, EdgeSpec, GraphRef, LoopId, NodeId, Sym,
 };
+use rustc_hash::FxHashMap;
 use serde::Serialize;
 
 /// The only per-edge payload that crosses the boundary. `uuid` is a dense u64
@@ -74,14 +78,13 @@ struct NodeState {
     next: Slot,      // ready_next_iter
     spec: Slot,      // speculative_signals
     completed: bool,
-    in_flight: bool, // GraphNode._in_flight
 }
 
 impl NodeState {
     fn new(n: usize) -> Self {
         NodeState {
             cur: Slot::new(n), next: Slot::new(n), spec: Slot::new(n),
-            completed: false, in_flight: false,
+            completed: false,
         }
     }
     fn clear(&mut self) {
@@ -89,7 +92,6 @@ impl NodeState {
         self.next.clear();
         self.spec.clear();
         self.completed = false;
-        self.in_flight = false;
     }
 }
 
@@ -99,7 +101,8 @@ struct LoopState {
     curr_iter: u32,          // Loop.curr_iter
     finish_signal: bool,     // Loop._finish_signal
     done: bool,              // Loop.is_done
-    completed_entities: u32, // inner registry's _num_completed_entities
+    completed_mask: Vec<u64>,
+    completed_count: u32,
     cached: Vec<(Sym, Vec<TensorRef>)>, // _cached_outputs (extends within an iter)
     accum: Vec<(Sym, Vec<TensorRef>)>,  // _accumulated_cache (extends across iters)
     ext_inputs: Vec<(Sym, NodeId, Vec<TensorRef>)>, // _ingested_external_inputs
@@ -107,6 +110,14 @@ struct LoopState {
 }
 
 impl LoopState {
+    fn new(max_iters: u32, mask_words: usize) -> Self {
+        Self {
+            max_iters,
+            completed_mask: vec![0; mask_words],
+            ..Self::default()
+        }
+    }
+
     /// Python's `Loop._reset_metadata`.
     fn reset_metadata(&mut self) {
         self.ext_inputs.clear();
@@ -114,6 +125,8 @@ impl LoopState {
         self.curr_iter = 0;
         self.finish_signal = false;
         self.done = false;
+        self.completed_mask.fill(0);
+        self.completed_count = 0;
     }
 }
 
@@ -132,7 +145,7 @@ pub struct RoutedEdge {
     /// Python's `GraphEdge._persist_for_loop`: a loop's saved external input
     /// being re-injected; the tensor manager must not dereference it.
     pub persist_for_loop: bool,
-    /// A `Dest::Local` consumer refused the edge (its slots were full), so it
+    /// A local consumer refused the edge (its slots were full), so it
     /// goes out on the wire instead -- staged, counted and sent like any
     /// remote edge, as Python does.
     pub declined_local: bool,
@@ -162,6 +175,9 @@ pub struct Completed {
     pub taken: Vec<u64>,
     /// Finished-loop cache holds to exchange for routed readers AFTER fanout.
     pub transferred: Vec<u64>,
+    /// The `(walk, walk_pass_id)` of the pass in which this node completed.
+    pub pass_walk: Sym,
+    pub walk_pass_id: u32,
 }
 
 /// Python's `SpeculativeNodeInfo`.
@@ -171,179 +187,158 @@ pub struct SpecNode {
     pub loop_id: Option<LoopId>,
 }
 
-pub struct RequestState {
-    pub graph: GraphRef,
+/// One active pass of a `(worker_graph, rid)`.
+#[derive(Clone)]
+struct PassState {
+    walk: Sym,
+    walk_pass_id: u32,
+    wg_pass_id: Option<u32>,
     nodes: Vec<NodeState>,
     loops: Vec<LoopState>,
-    /// WorkerGraphStateRegistry.ready_names / .ready_for_streaming as bitsets.
-    pub ready: Vec<u64>,
-    pub ready_streaming: Vec<u64>,
-    root_completed: u32,
-    pub is_done: bool,
-    pub num_times_run: u32, // WorkerGraphIO.num_times_run
-    spec_dirty: Vec<NodeId>, // _nodes_with_speculative_inputs
-    /// Reference changes a completion makes that Python makes through the
-    /// tensor manager, for the caller to apply to the bookkeeper: one
-    /// increment per tensor a loop caches (`Loop.maybe_cache_output`), one
-    /// release per tensor a reset drops (`ReadySignals.clear`,
-    /// `Loop._uncache_outputs`, `Loop._uncache_accumulated_outputs`).
-    refs_taken: Vec<u64>,
-    refs_released: Vec<u64>,
-    refs_transferred: Vec<u64>,
+    ready: Vec<u64>,
+    ready_streaming: Vec<u64>,
+    root_completed_mask: Vec<u64>,
+    root_completed_count: u32,
+    is_done: bool,
+    spec_dirty: Vec<NodeId>,
 }
 
-impl RequestState {
-    pub fn new(graph: GraphRef) -> Self {
-        let nodes = graph.nodes.iter().map(|n| NodeState::new(n.inputs.len())).collect();
-        let loops = graph
+impl PassState {
+    fn new(
+        g: &CompiledGraph,
+        walk: Sym,
+        walk_pass_id: u32,
+        loop_max_iters: &[u32],
+    ) -> Self {
+        let nodes = g.nodes.iter().map(|n| NodeState::new(n.inputs.len())).collect();
+        let loops = g
             .loops
             .iter()
-            .map(|l| LoopState { max_iters: l.max_iters, ..LoopState::default() })
+            .enumerate()
+            .map(|(i, l)| LoopState::new(loop_max_iters[i], l.n_mask_words()))
             .collect();
-        let w = graph.n_ready_words();
-        let mut s = Self {
-            nodes, loops, ready: vec![0; w], ready_streaming: vec![0; w],
-            root_completed: 0, is_done: false, num_times_run: 0,
-            spec_dirty: Vec::new(), refs_taken: Vec::new(),
-            refs_released: Vec::new(), refs_transferred: Vec::new(), graph,
+        let w = g.n_ready_words();
+        let mut p = Self {
+            walk,
+            walk_pass_id,
+            wg_pass_id: None,
+            nodes,
+            loops,
+            ready: vec![0; w],
+            ready_streaming: vec![0; w],
+            root_completed_mask: vec![0; g.n_root_mask_words()],
+            root_completed_count: 0,
+            is_done: false,
+            spec_dirty: Vec::new(),
         };
-        s.seed_streaming_ready();
-        s
+        p.seed_streaming_ready(g);
+        p
     }
-
-    /// Nodes whose inputs are all streaming start ready-for-streaming
-    /// (Python's `only_streaming_inputs`).
-    fn seed_streaming_ready(&mut self) {
-        for (i, n) in self.graph.nodes.iter().enumerate() {
-            if n.only_streaming {
-                self.ready_streaming[i / 64] |= 1 << (i % 64);
-            }
-        }
-    }
-
-    // -- ready bitsets -------------------------------------------------------
 
     #[inline]
     fn bit(id: NodeId) -> (usize, u32) {
         ((id / 64) as usize, id % 64)
     }
 
-    #[inline]
-    /// Python's `ReadySignals.is_ready_for_streaming`: every non-streaming
-    /// input has arrived, so a streaming chunk can be taken now.
-    pub fn is_ready_for_streaming(&self, id: NodeId) -> bool {
-        let (w, b) = Self::bit(id);
-        self.ready_streaming[w] >> b & 1 == 1
+    fn seed_streaming_ready(&mut self, g: &CompiledGraph) {
+        for (i, n) in g.nodes.iter().enumerate() {
+            if n.only_streaming {
+                self.ready_streaming[i / 64] |= 1 << (i % 64);
+            }
+        }
     }
 
-    pub fn is_ready(&self, id: NodeId) -> bool {
-        let (w, b) = Self::bit(id);
-        self.ready[w] >> b & 1 == 1
+    fn is_node_loop_done(&self, g: &CompiledGraph, id: NodeId) -> bool {
+        let mut cur = g.node(id).loop_id;
+        while let Some(lid) = cur {
+            if self.loops[lid as usize].done {
+                return true;
+            }
+            cur = g.lp(lid).parent;
+        }
+        false
     }
 
-    /// Recompute both ready bits for a node from its current slot. Replaces
-    /// `WorkerGraphStateRegistry.register_ingested_input`'s branchy updates.
-    fn refresh_ready(&mut self, id: NodeId) {
-        let spec = self.graph.node(id);
+    fn shares_active_loop(&self, g: &CompiledGraph, a: NodeId, b: NodeId) -> bool {
+        let mut cur_a = g.node(a).loop_id;
+        while let Some(lid_a) = cur_a {
+            if !self.loops[lid_a as usize].done {
+                let mut cur_b = g.node(b).loop_id;
+                while let Some(lid_b) = cur_b {
+                    if lid_b == lid_a {
+                        return true;
+                    }
+                    cur_b = g.lp(lid_b).parent;
+                }
+            }
+            cur_a = g.lp(lid_a).parent;
+        }
+        false
+    }
+
+    fn is_node_finished(&self, g: &CompiledGraph, id: NodeId) -> bool {
+        if g.node(id).loop_id.is_some() {
+            self.is_node_loop_done(g, id)
+        } else {
+            self.nodes[id as usize].completed
+        }
+    }
+
+    fn refresh_ready(&mut self, g: &CompiledGraph, id: NodeId, in_flight: bool) {
+        let spec = g.node(id);
         let st = &self.nodes[id as usize];
-        let live = !st.completed;
+        let live = !st.completed && !self.is_node_loop_done(g, id);
         let ready = st.cur.mask == spec.full_mask && live;
         let (w, b) = Self::bit(id);
-        // `in_flight` gates the ADD only, never a removal. Python's
-        // register_ingested_input skips the queue add for a
-        // speculatively-scheduled node -- so it does not get double-queued
-        // while its spec batch runs -- but a node already queued stays
-        // queued. Folding the flag into the predicate (`live`) instead made
-        // marking a node withdraw it from the ready set, and unmarking put it
-        // back. The streaming half of this rule lives in
-        // note_ingested_for_streaming.
         if ready {
-            if !st.in_flight {
-                self.ready[w] |= 1 << b
+            if !in_flight {
+                self.ready[w] |= 1 << b;
             }
         } else {
-            self.ready[w] &= !(1 << b)
+            self.ready[w] &= !(1 << b);
         }
     }
 
-    /// Python's `ReadySignals.is_ready_for_streaming`, folded into the
-    /// registry set `register_ingested_input` maintains.
-    ///
-    /// "Streaming-ready" means every input still missing is a streaming one,
-    /// which arrives incrementally -- so the node can run on what it has.
-    /// Python expressed that with an `issuperset` that was a tautology (both
-    /// operands are subsets of input_names), which made any node with any
-    /// input at all read as streaming-ready; fixed there, mirrored here.
-    fn note_ingested_for_streaming(&mut self, id: NodeId) {
-        let spec = self.graph.node(id);
+    fn note_ingested_for_streaming(
+        &mut self,
+        g: &CompiledGraph,
+        id: NodeId,
+        in_flight: bool,
+    ) {
+        let spec = g.node(id);
         let st = &self.nodes[id as usize];
-        // The mask alone, no liveness: Python's `ReadySignals.is_ready`.
+        let (w, b) = Self::bit(id);
+        if st.completed || self.is_node_loop_done(g, id) {
+            self.ready_streaming[w] &= !(1 << b);
+            return;
+        }
         let full = st.cur.mask == spec.full_mask;
-        // input_names ⊆ ready_names ∪ streaming_inputs, as bits: nothing is
-        // missing except streaming slots.
         let only_streaming_missing =
             spec.full_mask & !st.cur.mask & !spec.streaming_mask == 0;
-        let sched = st.in_flight;
-        let (w, b) = Self::bit(id);
         if full {
             self.ready_streaming[w] &= !(1 << b);
-        } else if only_streaming_missing && !sched {
-            // Only the add is gated on _in_flight, as in Python.
+        } else if only_streaming_missing && !in_flight {
             self.ready_streaming[w] |= 1 << b;
         }
     }
 
-    /// Back to seeded membership for a node whose inputs were just cleared: a
-    /// loop member on advance or finish (Python's
-    /// `LoopStateRegistry._reseed_streaming_ready`), or any node on reset.
-    fn reseed_streaming_ready(&mut self, id: NodeId) {
-        let only = self.graph.node(id).only_streaming;
+    fn reseed_streaming_ready(&mut self, g: &CompiledGraph, id: NodeId) {
+        let only = g.node(id).only_streaming;
         let (w, b) = Self::bit(id);
-        if only {
+        if only && !self.nodes[id as usize].completed && !self.is_node_loop_done(g, id) {
             self.ready_streaming[w] |= 1 << b;
         } else {
             self.ready_streaming[w] &= !(1 << b);
         }
-    }
-
-    // -- ingest --------------------------------------------------------------
-
-    /// Python's `GraphNode.ingest_input` + the registry chain's
-    /// `register_ingested_input`. Returns false when the edge is rejected
-    /// (both slots already hold this input), i.e. "try the next destination".
-    /// A SLICE, not an owned vec: the caller offers the same tensors to each
-    /// live worker graph in turn and only one claims them, so taking ownership
-    /// meant an allocation per attempt -- and then another, because the slot
-    /// cloned it again on the way in.
-    pub fn ingest(
-        &mut self, g: &CompiledGraph, node: NodeId, slot: u8,
-        tensors: &[TensorRef], can_buffer: bool, final_chunk: bool,
-    ) -> bool {
-        let name = g.node(node).inputs[slot as usize];
-        {
-            let st = &mut self.nodes[node as usize];
-            if !st.cur.has(slot) {
-                st.cur.set(slot, tensors.to_vec(), final_chunk);
-            } else if can_buffer && !st.next.has(slot) {
-                st.next.set(slot, tensors.to_vec(), final_chunk);
-            } else {
-                return false;
-            }
-        }
-        // An ingest bubbles through every enclosing loop, each recording it if
-        // it is external at that level (Loop.ingest_external_input recursing
-        // via _managing_registry), then reaches the root's ready sets.
-        self.record_external(g, node, name, tensors);
-        self.refresh_ready(node);
-        self.note_ingested_for_streaming(node);
-        true
     }
 
     fn record_external(
-        &mut self, g: &CompiledGraph, node: NodeId, name: Sym, t: &[TensorRef],
+        &mut self,
+        g: &CompiledGraph,
+        node: NodeId,
+        name: Sym,
+        t: &[TensorRef],
     ) {
-        // Never a streamed input: each iteration takes the NEXT chunk, and
-        // re-injecting this one on advance would feed it again.
         let spec = g.node(node);
         if spec.slot_of(name).is_some_and(|i| spec.streaming_mask >> i & 1 == 1) {
             return;
@@ -362,217 +357,88 @@ impl RequestState {
         }
     }
 
-    /// Python's `ReadySignals.remove` — speculation rollback. No dereference.
-    pub fn remove_input(&mut self, node: NodeId, slot: u8, from_next: bool) -> Option<Vec<TensorRef>> {
-        let st = &mut self.nodes[node as usize];
-        let t = if from_next { st.next.take(slot) } else { st.cur.take(slot) };
-        self.refresh_ready(node);
-        t
+    fn is_loop_back_input(&self, g: &CompiledGraph, node: NodeId, name: Sym) -> bool {
+        let node_name = g.node(node).name;
+        let mut cur = g.node(node).loop_id;
+        while let Some(lid) = cur {
+            let ls = g.lp(lid);
+            if !self.loops[lid as usize].done
+                && ls.loop_back.iter().any(|&(n, d)| n == name && d == node_name)
+            {
+                return true;
+            }
+            cur = ls.parent;
+        }
+        false
     }
 
-    /// Whether a slot is already filled, for inferring which slot an ingest
-    /// will land in before making it.
-    pub fn has_input(&self, node: NodeId, slot: u8, next_iter: bool) -> bool {
-        let st = &self.nodes[node as usize];
-        if next_iter { st.next.has(slot) } else { st.cur.has(slot) }
-    }
-
-    /// The node's inputs for a run: the current slot, or for a same-node
-    /// next-iteration speculation the next-iter slot plus the held inputs
-    /// still sitting in the current slot -- Python's `_prep_spec_rid` carries
-    /// those over because an enclosing loop re-injects them unchanged every
-    /// iteration and they never land in `ready_next_iter`.
-    pub fn input_tensors(
-        &self, node: NodeId, next_iter: bool,
-    ) -> Vec<(Sym, Vec<TensorRef>, bool)> {
-        let spec = self.graph.node(node);
-        let st = &self.nodes[node as usize];
-        let slot = if next_iter { &st.next } else { &st.cur };
-        let carried = if next_iter { spec.held_mask & st.cur.mask & !st.next.mask } else { 0 };
-        spec.inputs.iter().enumerate()
-            .filter_map(|(i, &n)| {
-                if carried >> i & 1 == 1 {
-                    return st.cur.tensors[i].as_ref().map(
-                        |t| (n, t.clone(), st.cur.is_final_chunk(i as u8)));
-                }
-                slot.tensors[i].as_ref().map(
-                    |t| (n, t.clone(), slot.is_final_chunk(i as u8)))
-            })
-            .collect()
-    }
-
-    /// Unconditional, as Python's `pop_ready_nodes` is. Gating on readiness
-    /// dropped the rid from a batch the caller had already committed to.
-    pub fn take_for_schedule(&mut self, node: NodeId) {
-        let (w, b) = Self::bit(node);
-        self.ready[w] &= !(1 << b);
-    }
-
-    /// Undo `take_for_schedule`: put the node back in the ready set.
-    ///
-    /// Unconditional, as Python's `ready_node_names.add(node_name)` is. A
-    /// recompute is wrong here: cleanup_consumed_inputs normally runs before
-    /// the push back, so the input slots are already empty and the node would
-    /// silently stay unready -- losing the batch the caller is handing back.
-    pub fn push_back(&mut self, node: NodeId) {
-        let (w, b) = Self::bit(node);
-        self.ready[w] |= 1 << b;
-    }
-
-    /// `ReadySignals.clear` on one of a node's slots: every tensor it holds
-    /// is released, except a held loop input's.
-    fn release_slot(&mut self, g: &CompiledGraph, node: NodeId, next: bool) {
+    fn release_slot(
+        &self,
+        g: &CompiledGraph,
+        node: NodeId,
+        next: bool,
+        refs_released: &mut Vec<u64>,
+    ) {
         let spec = g.node(node);
         let held = spec.held_mask;
         let st = &self.nodes[node as usize];
         let slot = if next { &st.next } else { &st.cur };
         for i in 0..spec.inputs.len() {
             if held >> i & 1 == 1 {
-                continue; // an enclosing loop re-injects this one
+                continue;
             }
             if let Some(tensors) = &slot.tensors[i] {
-                self.refs_released.extend(tensors.iter().map(|t| t.uuid));
+                refs_released.extend(tensors.iter().map(|t| t.uuid));
             }
         }
     }
 
-    /// Python's `ReadySignals.clear` on the CURRENT slot: release the inputs
-    /// the just-executed node consumed.
-    ///
-    /// Returns the uuids to dereference. A loop's external inputs are held
-    /// for re-injection on the next iteration (Python's `_persist_for_loop`),
-    /// so they are excluded -- and that is structural, from the spec's
-    /// `external_inputs`, not per-request state.
-    pub fn clear_consumed_inputs(
-        &mut self, g: &CompiledGraph, node: NodeId,
-    ) -> Vec<u64> {
-        let spec = g.node(node);
-        let held = spec.held_mask;
-
-        let st = &mut self.nodes[node as usize];
-        let mut freed = Vec::new();
-        for i in 0..spec.inputs.len() {
-            if held >> i & 1 == 1 {
-                continue; // an enclosing loop re-injects this one
-            }
-            if let Some(tensors) = st.cur.tensors[i].take() {
-                freed.extend(tensors.iter().map(|t| t.uuid));
-            }
-            st.cur.mask &= !(1 << i);
-            st.cur.final_chunk &= !(1 << i);
-        }
-        self.refresh_ready(node);
-        freed
-    }
-
-    /// The flag alone: it gates future ingests, and touching readiness here
-    /// is what made marking withdraw an already-ready node.
-    pub fn set_in_flight(&mut self, node: NodeId, on: bool) {
-        self.nodes[node as usize].in_flight = on;
-    }
-
-    pub fn is_in_flight(&self, node: NodeId) -> bool {
-        self.nodes[node as usize].in_flight
-    }
-
-    // -- completion ----------------------------------------------------------
-
-    /// Python's `WorkerGraphIO.mark_node_complete`. Returns the edges to route,
-    /// with loop-back edges of any finishing loop already filtered out, and
-    /// the reference changes the completion made (see `Completed`).
-    ///
-    /// Python's `mark_entity_complete` clears a top-level entity's ready
-    /// signals THROUGH the tensor manager, so the dereference happens whether
-    /// or not the caller already cleaned up. Clearing here without reporting
-    /// them would leak a reference on any path where completion precedes the
-    /// explicit cleanup.
-    pub fn complete(
-        &mut self, g: &CompiledGraph, node: NodeId,
-        out_tensors: &[Vec<TensorRef>],
-    ) -> Completed {
-        self.complete_strided(g, node, out_tensors, 1)
-    }
-
-    /// `complete`, the node's enclosing loop counting `loop_stride` on if
-    /// this completion ends its iteration (Python's `GraphNode.complete`).
-    pub fn complete_strided(
-        &mut self, g: &CompiledGraph, node: NodeId,
-        out_tensors: &[Vec<TensorRef>], loop_stride: u32,
-    ) -> Completed {
-        let spec = g.node(node);
-        let prev_done = self.is_done;
-        let mut out: Vec<RoutedEdge> = Vec::with_capacity(spec.outputs.len() + 2);
-
-        let mut freed: Vec<u64> = Vec::new();
-        {
-            let st = &mut self.nodes[node as usize];
-            // NOTE: this cannot clear .scheduled, or else refresh_ready re-adds
-            // a node while its rids are still in flight as a speculative batch.
-            st.completed = true;
-
-            // A loop member keeps `cur` until its loop advances, so later
-            // loop-back arrivals land in `next` — Python only clears
-            // ready_signals for top-level entities (base.py:758-767).
-            if spec.loop_id.is_none() {
-                for t in st.cur.tensors.iter().flatten() {
-                    freed.extend(t.iter().map(|x| x.uuid));
-                }
-                st.cur.clear();
-            }
-        }
-        self.refresh_ready(node);
-        // The slot was just cleared, so streaming membership goes back to its
-        // seed; Python's `WorkerGraphStateRegistry.mark_entity_complete`
-        // does exactly this right after `entity.ready_signals.clear()`.
-        if spec.loop_id.is_none() {
-            self.reseed_streaming_ready(node);
-        }
-
-        for (i, e) in spec.outputs.iter().enumerate() {
-            out.push(routed(e, out_tensors.get(i).cloned().unwrap_or_default()));
-        }
-
-        match spec.loop_id {
-            None => self.root_entity_done(),
-            Some(lid) => self.entity_completed(g, lid, 0, &mut out, loop_stride),
-        }
-
-        if self.is_done && !prev_done {
-            self.num_times_run += 1;
-        }
-        freed.append(&mut self.refs_released);
-        Completed {
-            edges: out,
-            freed,
-            taken: std::mem::take(&mut self.refs_taken),
-            transferred: std::mem::take(&mut self.refs_transferred),
-        }
-    }
-
-    fn root_entity_done(&mut self) {
+    fn root_entity_done(&mut self, g: &CompiledGraph, entity_idx: u32) {
         if self.is_done {
             return;
         }
-        self.root_completed += 1;
-        self.is_done = self.root_completed == self.graph.n_root_entities();
+        let w = (entity_idx / 64) as usize;
+        let b = entity_idx % 64;
+        if self.root_completed_mask[w] >> b & 1 == 0 {
+            self.root_completed_mask[w] |= 1 << b;
+            self.root_completed_count += 1;
+            self.is_done = self.root_completed_count == g.n_root_entities();
+        }
     }
 
-    /// One entity of loop `lid` finished; `out[edges_from..]` are its outputs.
-    /// Mirrors `LoopStateRegistry.mark_entity_complete` + `Loop.complete_iter`.
+    #[allow(clippy::too_many_arguments)]
     fn entity_completed(
-        &mut self, g: &CompiledGraph, lid: LoopId, edges_from: usize,
-        out: &mut Vec<RoutedEdge>, stride: u32,
+        &mut self,
+        g: &CompiledGraph,
+        lid: LoopId,
+        child_entity_idx: u32,
+        edges_from: usize,
+        out: &mut Vec<RoutedEdge>,
+        stride: u32,
+        in_flight: &[bool],
+        refs_taken: &mut Vec<u64>,
+        refs_released: &mut Vec<u64>,
+        refs_transferred: &mut Vec<u64>,
     ) {
+        if self.loops[lid as usize].done {
+            return;
+        }
         let lspec = g.lp(lid);
-        self.cache_outputs(g, lid, edges_from, out);
+        self.cache_outputs(g, lid, edges_from, out, refs_taken);
 
         {
             let st = &mut self.loops[lid as usize];
-            st.completed_entities += 1;
-            if st.completed_entities < lspec.n_entities() {
+            let w = (child_entity_idx / 64) as usize;
+            let b = child_entity_idx % 64;
+            if st.completed_mask[w] >> b & 1 == 0 {
+                st.completed_mask[w] |= 1 << b;
+                st.completed_count += 1;
+            }
+            if st.completed_count < lspec.n_entities() {
                 return;
             }
-            st.completed_entities = 0;
+            st.completed_mask.fill(0);
+            st.completed_count = 0;
         }
 
         let finishing = {
@@ -580,19 +446,21 @@ impl RequestState {
             st.finish_signal || st.curr_iter.saturating_add(stride) >= st.max_iters
         };
         if finishing {
-            self.finish_loop(g, lid, out);
+            self.finish_loop(
+                g, lid, out, in_flight, refs_taken, refs_released, refs_transferred,
+            );
         } else {
-            self.advance_loop(g, lid, out, stride);
+            self.advance_loop(g, lid, out, stride, in_flight, refs_released);
         }
     }
 
-    /// Python's `Loop.maybe_cache_output`: snapshot tensor_info for any edge
-    /// matching a declared loop output, deduped by name. Regular outputs
-    /// *extend* within an iteration (cleared on advance); accumulated outputs
-    /// extend across iterations.
     fn cache_outputs(
-        &mut self, g: &CompiledGraph, lid: LoopId, from: usize,
+        &mut self,
+        g: &CompiledGraph,
+        lid: LoopId,
+        from: usize,
         out: &[RoutedEdge],
+        refs_taken: &mut Vec<u64>,
     ) {
         let lspec = g.lp(lid);
         let mut seen: Vec<Sym> = Vec::new();
@@ -613,147 +481,158 @@ impl RequestState {
                 Some((_, v)) => v.extend_from_slice(&e.tensors),
                 None => bucket.push((e.name, e.tensors.clone())),
             }
-            // `maybe_cache_output` holds each cached tensor until the loop
-            // hands it on (finish) or drops it (advance / clear).
-            self.refs_taken.extend(e.tensors.iter().map(|t| t.uuid));
+            refs_taken.extend(e.tensors.iter().map(|t| t.uuid));
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_loop(
-        &mut self, g: &CompiledGraph, lid: LoopId, out: &mut Vec<RoutedEdge>,
+        &mut self,
+        g: &CompiledGraph,
+        lid: LoopId,
+        out: &mut Vec<RoutedEdge>,
+        in_flight: &[bool],
+        refs_taken: &mut Vec<u64>,
+        refs_released: &mut Vec<u64>,
+        refs_transferred: &mut Vec<u64>,
     ) {
         let lspec = g.lp(lid);
         self.loops[lid as usize].done = true;
 
-        // Drop loop-back edges: the loop is over, nothing re-enters it. By
-        // (name, dest name) as Python's filtered_signals, so a loop-back into
-        // another worker graph is dropped too.
         let lb = &lspec.loop_back;
         out.retain(|e| !lb.contains(&(e.name, e.dest_sym)));
 
-        // Clear the body subtree. The loop's OWN curr_iter survives until a
-        // parent advance (Python: inner_registry.clear() doesn't touch it).
-        self.clear_subtree(g, lid);
+        self.clear_subtree(g, lid, in_flight, refs_released);
 
         let (cached, accum) = {
             let st = &mut self.loops[lid as usize];
             (std::mem::take(&mut st.cached), std::mem::take(&mut st.accum))
         };
-        // Keep the holds alive through fanout/persist marking. Nested loops
-        // can transfer the same UUID more than once; preserve multiplicity.
         for (_, tensors) in cached.iter().chain(accum.iter()) {
-            self.refs_transferred.extend(tensors.iter().map(|t| t.uuid));
+            refs_transferred.extend(tensors.iter().map(|t| t.uuid));
         }
         let own_edges_from = out.len();
         for o in &lspec.outputs {
-            let t = cached.iter().find(|(n, _)| *n == o.name)
-                .map(|(_, t)| t.clone()).unwrap_or_default();
+            let t = cached
+                .iter()
+                .find(|(n, _)| *n == o.name)
+                .map(|(_, t)| t.clone())
+                .unwrap_or_default();
             out.push(routed(o, t));
         }
         for o in &lspec.accumulated {
-            let t = accum.iter().find(|(n, _)| *n == o.name)
-                .map(|(_, t)| t.clone()).unwrap_or_default();
+            let t = accum
+                .iter()
+                .find(|(n, _)| *n == o.name)
+                .map(|(_, t)| t.clone())
+                .unwrap_or_default();
             out.push(routed(o, t));
         }
 
-        // Cascade. NOTE two deliberate divergences from Python, both of which
-        // only bite for NESTED loops:
-        //   * Python cascades BEFORE populating its own outputs, so a parent
-        //     caches the child's still-empty tensor_info. We populate first.
-        //   * Python discards the cascade's return value, so a parent that
-        //     finishes in the same event never routes its outputs. We append
-        //     to the same `out`.
         match lspec.parent {
-            None => self.root_entity_done(),
-            Some(p) => self.entity_completed(g, p, own_edges_from, out, 1),
+            None => self.root_entity_done(g, lspec.entity_idx),
+            Some(p) => self.entity_completed(
+                g,
+                p,
+                lspec.entity_idx,
+                own_edges_from,
+                out,
+                1,
+                in_flight,
+                refs_taken,
+                refs_released,
+                refs_transferred,
+            ),
         }
     }
 
     fn advance_loop(
-        &mut self, g: &CompiledGraph, lid: LoopId, out: &mut Vec<RoutedEdge>,
+        &mut self,
+        g: &CompiledGraph,
+        lid: LoopId,
+        out: &mut Vec<RoutedEdge>,
         stride: u32,
+        in_flight: &[bool],
+        refs_released: &mut Vec<u64>,
     ) {
         {
             let st = &mut self.loops[lid as usize];
             st.curr_iter = st.curr_iter.saturating_add(stride);
         }
-        self.reset_subtree_for_iter(g, lid);
-        // Loop._uncache_outputs, after the reset as in `_advance_one_iter`.
+        self.reset_subtree_for_iter(g, lid, in_flight, refs_released);
         let cached = std::mem::take(&mut self.loops[lid as usize].cached);
         for (_, t) in &cached {
-            self.refs_released.extend(t.iter().map(|x| x.uuid));
+            refs_released.extend(t.iter().map(|x| x.uuid));
         }
 
-        // Emit the loop's saved external inputs for the caller to route, like
-        // Python's `complete_iter` returning `_ingested_external_inputs`.
-        // Ingesting them here instead would double-ingest on the per-event
-        // path, where the caller mirrors Python and routes them too.
         let ext = self.loops[lid as usize].ext_inputs.clone();
         for (name, dest, t) in ext {
             out.push(RoutedEdge {
-                name, dest: Dest::Local(dest),
-                // The dest node's interned NAME, not its NodeId: `dest_sym`
-                // is what the sharding fanout looks a group up by, and the
-                // two are different namespaces that happen to share a repr.
+                name,
+                dest: Dest::Local(dest),
                 dest_sym: g.node(dest).name,
-                persist: false, new_token: false,
-                streaming: false, modality: 0, tensors: t,
-                persist_for_loop: true, declined_local: false,
+                persist: false,
+                new_token: false,
+                streaming: false,
+                modality: 0,
+                tensors: t,
+                persist_for_loop: true,
+                declined_local: false,
                 worker: None,
             });
         }
     }
 
-    /// Python's `GraphStateRegistry.reset_for_iter` on a loop's inner registry:
-    /// member nodes promote next-iter slots; child loops reset recursively AND
-    /// have their metadata cleared (`Loop.reset_for_outer_iter`).
-    fn reset_subtree_for_iter(&mut self, g: &CompiledGraph, lid: LoopId) {
+    fn reset_subtree_for_iter(
+        &mut self,
+        g: &CompiledGraph,
+        lid: LoopId,
+        in_flight: &[bool],
+        refs_released: &mut Vec<u64>,
+    ) {
         let lspec = g.lp(lid);
         for &n in &lspec.member_nodes {
-            // GraphNode.reset_for_outer_iter: ready_signals.clear(), then
-            // promote the next-iter slot.
-            self.release_slot(g, n, false);
+            self.release_slot(g, n, false, refs_released);
             {
                 let st = &mut self.nodes[n as usize];
                 st.cur.clear();
                 std::mem::swap(&mut st.cur, &mut st.next);
                 st.completed = false;
             }
-            self.refresh_ready(n);
-            self.reseed_streaming_ready(n);
+            self.refresh_ready(g, n, in_flight[n as usize]);
+            self.reseed_streaming_ready(g, n);
         }
         for &c in &lspec.child_loops {
-            self.reset_subtree_for_iter(g, c);
-            let st = &mut self.loops[c as usize];
-            st.completed_entities = 0;
-            st.reset_metadata();
+            self.reset_subtree_for_iter(g, c, in_flight, refs_released);
+            self.loops[c as usize].reset_metadata();
         }
     }
 
-    /// Python's `GraphStateRegistry.clear()` on a loop's inner registry:
-    /// members fully cleared; child loops cleared and metadata reset
-    /// (`Loop.clear`, which also drops the accumulated cache).
-    fn clear_subtree(&mut self, g: &CompiledGraph, lid: LoopId) {
+    /// Clear a finished loop's inner state in this pass. Importantly, DO NOT
+    /// reseed `ready_streaming` for a finished loop in this pass — a finished
+    /// loop stays finished in this `PassState`, while Pass `p+1` gets a fresh
+    /// `PassState` with seeded `ready_streaming`.
+    fn clear_subtree(
+        &mut self,
+        g: &CompiledGraph,
+        lid: LoopId,
+        in_flight: &[bool],
+        refs_released: &mut Vec<u64>,
+    ) {
         let lspec = g.lp(lid);
         for &n in &lspec.member_nodes {
-            // GraphNode.clear: both registered slots release their tensors;
-            // the speculative slot never held a reference.
-            self.release_slot(g, n, false);
-            self.release_slot(g, n, true);
+            self.release_slot(g, n, false, refs_released);
+            self.release_slot(g, n, true, refs_released);
             self.nodes[n as usize].clear();
-            self.refresh_ready(n);
-            self.reseed_streaming_ready(n);
+            self.refresh_ready(g, n, in_flight[n as usize]);
+            let (w, b) = Self::bit(n);
+            self.ready_streaming[w] &= !(1 << b);
         }
         for &c in &lspec.child_loops {
-            self.clear_subtree(g, c);
+            self.clear_subtree(g, c, in_flight, refs_released);
             let st = &mut self.loops[c as usize];
-            st.completed_entities = 0;
-            // Loop.clear un-caches the accumulated outputs. It leaves the
-            // regular cache -- and its references -- alone; dropping the
-            // entries here without releasing keeps the counts where
-            // Python's are.
             for (_, t) in std::mem::take(&mut st.accum) {
-                self.refs_released.extend(t.iter().map(|x| x.uuid));
+                refs_released.extend(t.iter().map(|x| x.uuid));
             }
             let st = &mut self.loops[c as usize];
             st.cached.clear();
@@ -761,70 +640,901 @@ impl RequestState {
         }
     }
 
+    fn is_idle(&self) -> bool {
+        self.root_completed_count == 0
+            && self.nodes.iter().all(|n| {
+                !n.completed && n.cur.mask == 0 && n.next.mask == 0 && n.spec.mask == 0
+            })
+            && self
+                .loops
+                .iter()
+                .all(|l| l.curr_iter == 0 && l.ext_inputs.is_empty() && !l.done && l.completed_count == 0)
+    }
+}
+
+pub struct RequestState {
+    pub graph: GraphRef,
+    passes: VecDeque<PassState>,
+    loop_max_iters: Vec<u32>,
+    next_pass_by_walk: FxHashMap<Sym, u32>,
+    in_flight: Vec<bool>,
+    /// Active-pass summary of ready nodes (O(set bits) scan in `GraphRuntime::scan_ready`).
+    pub ready: Vec<u64>,
+    pub is_done: bool,
+    pub num_times_run: u32, // WorkerGraphIO.num_times_run
+    refs_taken: Vec<u64>,
+    refs_released: Vec<u64>,
+    refs_transferred: Vec<u64>,
+}
+
+impl RequestState {
+    pub fn new(graph: GraphRef) -> Self {
+        let loop_max_iters = graph.loops.iter().map(|l| l.max_iters).collect();
+        let w = graph.n_ready_words();
+        let in_flight = vec![false; graph.nodes.len()];
+        Self {
+            passes: VecDeque::new(),
+            loop_max_iters,
+            next_pass_by_walk: FxHashMap::default(),
+            in_flight,
+            ready: vec![0; w],
+            is_done: false,
+            num_times_run: 0,
+            refs_taken: Vec::new(),
+            refs_released: Vec::new(),
+            refs_transferred: Vec::new(),
+            graph,
+        }
+    }
+
+    #[inline]
+    fn bit(id: NodeId) -> (usize, u32) {
+        ((id / 64) as usize, id % 64)
+    }
+
+    fn alloc_pass(&mut self, walk: Sym) -> usize {
+        let entry = self.next_pass_by_walk.entry(walk).or_insert(0);
+        let walk_pass_id = *entry;
+        *entry += 1;
+        let idx = self.passes.len();
+        self.passes.push_back(PassState::new(
+            &self.graph,
+            walk,
+            walk_pass_id,
+            &self.loop_max_iters,
+        ));
+        idx
+    }
+
+    pub fn alloc_pass_idx(&mut self, walk: Sym) -> usize {
+        self.alloc_pass(walk)
+    }
+
+    pub fn pop_empty_pass_if_tail(&mut self, idx: usize) {
+        if idx + 1 == self.passes.len() && self.passes[idx].is_idle() {
+            if let Some(p) = self.passes.pop_back() {
+                if let Some(entry) = self.next_pass_by_walk.get_mut(&p.walk) {
+                    if *entry == p.walk_pass_id + 1 {
+                        *entry = p.walk_pass_id;
+                    }
+                }
+                self.is_done = self.passes.iter().any(|pass| pass.is_done);
+                self.refresh_summary_all();
+            }
+        }
+    }
+
+    pub fn pop_empty_pass_by_id(&mut self, walk: Sym, walk_pass_id: u32) {
+        let Some(idx) = self
+            .passes
+            .iter()
+            .position(|p| p.walk == walk && p.walk_pass_id == walk_pass_id)
+        else {
+            return;
+        };
+        if !self.passes[idx].is_idle() {
+            return;
+        }
+        if let Some(p) = self.passes.remove(idx) {
+            if let Some(entry) = self.next_pass_by_walk.get_mut(&p.walk) {
+                if *entry == p.walk_pass_id + 1 {
+                    *entry = p.walk_pass_id;
+                }
+            }
+            self.is_done = self.passes.iter().any(|pass| pass.is_done);
+            self.refresh_summary_all();
+        }
+    }
+
+    pub fn clear_idle_passes(&mut self) {
+        if !self.is_idle() || self.passes.is_empty() {
+            return;
+        }
+        while let Some(p) = self.passes.pop_back() {
+            if let Some(entry) = self.next_pass_by_walk.get_mut(&p.walk) {
+                if *entry == p.walk_pass_id + 1 {
+                    *entry = p.walk_pass_id;
+                }
+            }
+        }
+        self.is_done = false;
+        self.refresh_summary_all();
+    }
+
+    pub fn pass_walk_id(&self, idx: usize) -> Option<(Sym, u32)> {
+        self.passes.get(idx).map(|p| (p.walk, p.walk_pass_id))
+    }
+
+    pub fn is_node_completed_in_pass(&self, idx: usize, node: NodeId) -> bool {
+        self.passes
+            .get(idx)
+            .is_some_and(|p| p.nodes[node as usize].completed)
+    }
+
+    pub fn has_loop_back_edge_in_pass(&self, idx: usize, source: NodeId, dest: NodeId) -> bool {
+        let Some(p) = self.passes.get(idx) else {
+            return false;
+        };
+        if !p.shares_active_loop(&self.graph, source, dest) {
+            return false;
+        }
+        let dest_name = self.graph.node(dest).name;
+        let mut cur = self.graph.node(source).loop_id;
+        while let Some(lid) = cur {
+            let ls = self.graph.lp(lid);
+            if !p.loops[lid as usize].done
+                && self
+                    .graph
+                    .node(source)
+                    .outputs
+                    .iter()
+                    .any(|e| {
+                        matches!(e.dest, Dest::Local(d) if d == dest)
+                            && ls.loop_back.contains(&(e.name, dest_name))
+                    })
+            {
+                return true;
+            }
+            cur = ls.parent;
+        }
+        false
+    }
+
+    /// Index of the oldest `PassState` in which `node` is not yet finished
+    /// (FIFO pass ordering invariant per node).
+    pub fn active_pass_idx(&self, node: NodeId) -> Option<usize> {
+        self.passes
+            .iter()
+            .position(|p| !p.is_node_finished(&self.graph, node))
+    }
+
+    pub fn active_pass_info(&self, node: NodeId) -> Option<(Sym, u32)> {
+        self.active_pass_idx(node)
+            .map(|idx| (self.passes[idx].walk, self.passes[idx].walk_pass_id))
+    }
+
+    /// Pass index of `node`'s active pass for `nested_idxs_interned` / `wg_fwd_pass_idx`.
+    pub fn active_wg_pass_idx(&self, node: NodeId) -> u32 {
+        match self.active_pass_idx(node) {
+            Some(idx) => {
+                // Passes ahead of retired ones have sequential wg pass indices.
+                let unretired_done = self.passes.iter().take(idx).filter(|p| p.is_done).count() as u32;
+                self.num_times_run + idx as u32 - unretired_done
+            }
+            None => self.num_times_run,
+        }
+    }
+
+    fn active_loop_pass_idx(&self, lid: LoopId) -> Option<usize> {
+        self.passes
+            .iter()
+            .position(|p| !p.loops[lid as usize].done)
+    }
+
+    fn refresh_summary_node(&mut self, node: NodeId) {
+        let (w, b) = Self::bit(node);
+        let ready = self
+            .active_pass_idx(node)
+            .is_some_and(|idx| self.passes[idx].ready[w] >> b & 1 == 1);
+        if ready {
+            self.ready[w] |= 1 << b;
+        } else {
+            self.ready[w] &= !(1 << b);
+        }
+    }
+
+    fn refresh_summary_all(&mut self) {
+        self.ready.fill(0);
+        for node in 0..self.graph.nodes.len() as NodeId {
+            self.refresh_summary_node(node);
+        }
+    }
+
+    // -- ready bitsets -------------------------------------------------------
+
+    /// Python's `ReadySignals.is_ready_for_streaming`: every non-streaming
+    /// input has arrived, so a streaming chunk can be taken now.
+    pub fn is_ready_for_streaming(&self, id: NodeId) -> bool {
+        let spec = self.graph.node(id);
+        match self.active_pass_idx(id) {
+            Some(idx) => {
+                if spec.only_streaming && self.graph.n_root_entities() > 1 && idx >= 2 {
+                    return false;
+                }
+                let (w, b) = Self::bit(id);
+                self.passes[idx].ready_streaming[w] >> b & 1 == 1
+            }
+            None => {
+                if !spec.only_streaming {
+                    return false;
+                }
+                if self.graph.n_root_entities() > 1 && self.passes.len() >= 2 {
+                    return false;
+                }
+                true
+            }
+        }
+    }
+
+    pub fn is_ready(&self, id: NodeId) -> bool {
+        let (w, b) = Self::bit(id);
+        self.ready[w] >> b & 1 == 1
+    }
+
+    // -- ingest --------------------------------------------------------------
+
+    fn count_unconsumed_for(&self, g: &CompiledGraph, node: NodeId, slot: u8) -> u32 {
+        let spec = g.node(node);
+        let mut count = 0u32;
+        for p in &self.passes {
+            if p.is_node_loop_done(g, node)
+                || (spec.loop_id.is_none() && p.nodes[node as usize].completed)
+            {
+                continue;
+            }
+            let st = &p.nodes[node as usize];
+            if st.cur.has(slot) {
+                count += 1;
+            }
+            if st.next.has(slot) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Convenience wrapper for unit tests that operate on a single default walk `0`.
+    pub fn ingest(
+        &mut self,
+        g: &CompiledGraph,
+        node: NodeId,
+        slot: u8,
+        tensors: &[TensorRef],
+        can_buffer: bool,
+        final_chunk: bool,
+    ) -> bool {
+        self.ingest_for_walk(g, node, slot, tensors, can_buffer, final_chunk, 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest_for_walk(
+        &mut self,
+        g: &CompiledGraph,
+        node: NodeId,
+        slot: u8,
+        tensors: &[TensorRef],
+        can_buffer: bool,
+        final_chunk: bool,
+        walk: Sym,
+    ) -> bool {
+        let spec = g.node(node);
+        let name = spec.inputs[slot as usize];
+
+        let (target_idx, to_next) = if !can_buffer {
+            let idx = match self.active_pass_idx(node) {
+                Some(idx) => {
+                    if spec.only_streaming && g.n_root_entities() > 1 && idx >= 2 {
+                        return false;
+                    }
+                    let st = &self.passes[idx].nodes[node as usize];
+                    if st.cur.has(slot) || st.completed {
+                        return false;
+                    }
+                    idx
+                }
+                None => {
+                    if spec.only_streaming && g.n_root_entities() > 1 && self.passes.len() >= 2 {
+                        return false;
+                    }
+                    self.alloc_pass(walk)
+                }
+            };
+            (idx, false)
+        } else {
+            // Bounded 2-pass buffering per (node, slot): keeps `test_a_second_signal_buffers_then_refuses`
+            // and StreamBuffer/InputIngest backpressure bounded at 2 buffered slots.
+            if self.count_unconsumed_for(g, node, slot) >= 2 {
+                return false;
+            }
+            if let Some(lb_idx) = self.passes.iter().position(|p| {
+                !p.is_node_loop_done(g, node)
+                    && p.is_loop_back_input(g, node, name)
+                    && (p.nodes[node as usize].cur.has(slot) || p.nodes[node as usize].completed)
+                    && !p.nodes[node as usize].next.has(slot)
+            }) {
+                (lb_idx, true)
+            } else {
+                match self.active_pass_idx(node) {
+                    Some(idx) => {
+                        let st = &self.passes[idx].nodes[node as usize];
+                        if !st.cur.has(slot) && !st.completed {
+                            (idx, false)
+                        } else {
+                            let next_free = ((idx + 1)..self.passes.len()).find(|&j| {
+                                !self.passes[j].is_node_finished(g, node)
+                                    && !self.passes[j].nodes[node as usize].cur.has(slot)
+                                    && !self.passes[j].nodes[node as usize].completed
+                            });
+                            let j = next_free.unwrap_or_else(|| self.alloc_pass(walk));
+                            (j, false)
+                        }
+                    }
+                    None => {
+                        let idx = self.alloc_pass(walk);
+                        (idx, false)
+                    }
+                }
+            }
+        };
+
+        let in_flight = self.in_flight[node as usize];
+        {
+            let pass = &mut self.passes[target_idx];
+            let st = &mut pass.nodes[node as usize];
+            if to_next {
+                st.next.set(slot, tensors.to_vec(), final_chunk);
+            } else {
+                st.cur.set(slot, tensors.to_vec(), final_chunk);
+                pass.record_external(g, node, name, tensors);
+            }
+            pass.refresh_ready(g, node, in_flight);
+            pass.note_ingested_for_streaming(g, node, in_flight);
+        }
+        self.refresh_summary_node(node);
+        true
+    }
+
+    /// Route a local edge directly into the pass `(walk, walk_pass_id)` where
+    /// the producer ran, keeping intra-pass loop-back in `next` and isolating
+    /// cross-pass deliveries into their exact `PassState`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest_in_pass(
+        &mut self,
+        g: &CompiledGraph,
+        walk: Sym,
+        walk_pass_id: u32,
+        node: NodeId,
+        slot: u8,
+        tensors: &[TensorRef],
+        can_buffer: bool,
+        final_chunk: bool,
+    ) -> bool {
+        let Some(idx) = self
+            .passes
+            .iter()
+            .position(|p| p.walk == walk && p.walk_pass_id == walk_pass_id)
+        else {
+            return false;
+        };
+        let spec = g.node(node);
+        if self.passes[idx].is_node_loop_done(g, node)
+            || (spec.loop_id.is_none() && self.passes[idx].nodes[node as usize].completed)
+        {
+            return false;
+        }
+        let name = spec.inputs[slot as usize];
+        let in_flight = self.in_flight[node as usize];
+        let pass = &mut self.passes[idx];
+        let st = &mut pass.nodes[node as usize];
+        let to_next = if !st.cur.has(slot) && !st.completed {
+            false
+        } else if can_buffer && !st.next.has(slot) {
+            true
+        } else {
+            return false;
+        };
+        if to_next {
+            st.next.set(slot, tensors.to_vec(), final_chunk);
+        } else {
+            st.cur.set(slot, tensors.to_vec(), final_chunk);
+            pass.record_external(g, node, name, tensors);
+        }
+        pass.refresh_ready(g, node, in_flight);
+        pass.note_ingested_for_streaming(g, node, in_flight);
+        self.refresh_summary_node(node);
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest_into_pass(
+        &mut self,
+        g: &CompiledGraph,
+        idx: usize,
+        node: NodeId,
+        slot: u8,
+        tensors: &[TensorRef],
+        to_next: bool,
+        final_chunk: bool,
+    ) -> bool {
+        if idx >= self.passes.len() {
+            return false;
+        }
+        let spec = g.node(node);
+        if self.passes[idx].is_node_loop_done(g, node)
+            || (spec.loop_id.is_none() && self.passes[idx].nodes[node as usize].completed)
+        {
+            return false;
+        }
+        let name = spec.inputs[slot as usize];
+        let in_flight = self.in_flight[node as usize];
+        let pass = &mut self.passes[idx];
+        let st = &mut pass.nodes[node as usize];
+        if to_next {
+            if st.next.has(slot) {
+                return false;
+            }
+            st.next.set(slot, tensors.to_vec(), final_chunk);
+        } else {
+            if st.cur.has(slot) || st.completed {
+                return false;
+            }
+            st.cur.set(slot, tensors.to_vec(), final_chunk);
+            pass.record_external(g, node, name, tensors);
+        }
+        pass.refresh_ready(g, node, in_flight);
+        pass.note_ingested_for_streaming(g, node, in_flight);
+        self.refresh_summary_node(node);
+        true
+    }
+
+    pub fn remove_input_by_pass_id(
+        &mut self,
+        walk: Sym,
+        walk_pass_id: u32,
+        node: NodeId,
+        slot: u8,
+        from_next: bool,
+    ) -> Option<Vec<TensorRef>> {
+        let idx = self
+            .passes
+            .iter()
+            .position(|p| p.walk == walk && p.walk_pass_id == walk_pass_id)?;
+        self.remove_input_at_pass(idx, node, slot, from_next)
+    }
+
+    fn remove_input_at_pass(
+        &mut self,
+        idx: usize,
+        node: NodeId,
+        slot: u8,
+        from_next: bool,
+    ) -> Option<Vec<TensorRef>> {
+        let in_flight = self.in_flight[node as usize];
+        let pass = self.passes.get_mut(idx)?;
+        let st = &mut pass.nodes[node as usize];
+        let t = if from_next {
+            st.next.take(slot)
+        } else {
+            st.cur.take(slot)
+        };
+        pass.refresh_ready(&self.graph, node, in_flight);
+        if !from_next {
+            pass.note_ingested_for_streaming(&self.graph, node, in_flight);
+        }
+        self.refresh_summary_node(node);
+        t
+    }
+
+    /// Python's `ReadySignals.remove` — speculation rollback. No dereference.
+    pub fn remove_input(
+        &mut self,
+        node: NodeId,
+        slot: u8,
+        from_next: bool,
+    ) -> Option<Vec<TensorRef>> {
+        let idx = self.active_pass_idx(node)?;
+        if from_next && self.graph.node(node).loop_id.is_none() {
+            let walk = self.passes[idx].walk;
+            if self.passes.get(idx + 1).is_some_and(|p| p.walk == walk) {
+                return self.remove_input_at_pass(idx + 1, node, slot, false);
+            }
+            return None;
+        }
+        self.remove_input_at_pass(idx, node, slot, from_next)
+    }
+
+    /// Whether a slot is already filled, for inferring which slot an ingest
+    /// will land in before making it.
+    pub fn has_input(&self, node: NodeId, slot: u8, next_iter: bool) -> bool {
+        let Some(idx) = self.active_pass_idx(node) else {
+            return false;
+        };
+        if next_iter {
+            if self.graph.node(node).loop_id.is_some() {
+                self.passes[idx].nodes[node as usize].next.has(slot)
+            } else {
+                let walk = self.passes[idx].walk;
+                self.passes
+                    .get(idx + 1)
+                    .filter(|p| p.walk == walk)
+                    .is_some_and(|p| p.nodes[node as usize].cur.has(slot))
+            }
+        } else {
+            self.passes[idx].nodes[node as usize].cur.has(slot)
+        }
+    }
+
+    pub fn input_tensors(
+        &self,
+        node: NodeId,
+        next_iter: bool,
+    ) -> Vec<(Sym, Vec<TensorRef>, bool)> {
+        let Some(idx) = self.active_pass_idx(node) else {
+            return Vec::new();
+        };
+        self.input_tensors_in_pass(idx, node, next_iter)
+    }
+
+    pub fn input_tensors_in_pass(
+        &self,
+        idx: usize,
+        node: NodeId,
+        next_iter: bool,
+    ) -> Vec<(Sym, Vec<TensorRef>, bool)> {
+        if idx >= self.passes.len() {
+            return Vec::new();
+        }
+        let spec = self.graph.node(node);
+        if next_iter && spec.loop_id.is_none() {
+            let walk = self.passes[idx].walk;
+            let Some(next_pass) = self.passes.get(idx + 1).filter(|p| p.walk == walk) else {
+                return Vec::new();
+            };
+            let st = &next_pass.nodes[node as usize];
+            return spec
+                .inputs
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &n)| {
+                    st.cur.tensors[i]
+                        .as_ref()
+                        .map(|t| (n, t.clone(), st.cur.is_final_chunk(i as u8)))
+                })
+                .collect();
+        }
+        let st = &self.passes[idx].nodes[node as usize];
+        let slot = if next_iter { &st.next } else { &st.cur };
+        let carried = if next_iter {
+            spec.held_mask & st.cur.mask & !st.next.mask
+        } else {
+            0
+        };
+        spec.inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &n)| {
+                if carried >> i & 1 == 1 {
+                    return st
+                        .cur
+                        .tensors[i]
+                        .as_ref()
+                        .map(|t| (n, t.clone(), st.cur.is_final_chunk(i as u8)));
+                }
+                slot.tensors[i]
+                    .as_ref()
+                    .map(|t| (n, t.clone(), slot.is_final_chunk(i as u8)))
+            })
+            .collect()
+    }
+
+    pub fn take_for_schedule(&mut self, node: NodeId) {
+        let (w, b) = Self::bit(node);
+        if let Some(idx) = self.active_pass_idx(node) {
+            self.passes[idx].ready[w] &= !(1 << b);
+        }
+        self.ready[w] &= !(1 << b);
+    }
+
+    pub fn push_back(&mut self, node: NodeId) {
+        let (w, b) = Self::bit(node);
+        if let Some(idx) = self.active_pass_idx(node) {
+            self.passes[idx].ready[w] |= 1 << b;
+        }
+        self.ready[w] |= 1 << b;
+    }
+
+    pub fn clear_consumed_inputs(&mut self, g: &CompiledGraph, node: NodeId) -> Vec<u64> {
+        let Some(idx) = self.active_pass_idx(node) else {
+            return Vec::new();
+        };
+        let spec = g.node(node);
+        let held = spec.held_mask;
+        let in_flight = self.in_flight[node as usize];
+        let mut freed = Vec::new();
+        {
+            let pass = &mut self.passes[idx];
+            let st = &mut pass.nodes[node as usize];
+            for i in 0..spec.inputs.len() {
+                if held >> i & 1 == 1 {
+                    continue;
+                }
+                if let Some(tensors) = st.cur.tensors[i].take() {
+                    freed.extend(tensors.iter().map(|t| t.uuid));
+                }
+                st.cur.mask &= !(1 << i);
+                st.cur.final_chunk &= !(1 << i);
+            }
+            pass.refresh_ready(g, node, in_flight);
+        }
+        self.refresh_summary_node(node);
+        freed
+    }
+
+    pub fn set_in_flight(&mut self, node: NodeId, on: bool) {
+        self.in_flight[node as usize] = on;
+    }
+
+    pub fn is_in_flight(&self, node: NodeId) -> bool {
+        self.in_flight[node as usize]
+    }
+
+    // -- completion ----------------------------------------------------------
+
+    pub fn complete(
+        &mut self,
+        g: &CompiledGraph,
+        node: NodeId,
+        out_tensors: &[Vec<TensorRef>],
+    ) -> Completed {
+        self.complete_strided(g, node, out_tensors, 1)
+    }
+
+    pub fn complete_strided(
+        &mut self,
+        g: &CompiledGraph,
+        node: NodeId,
+        out_tensors: &[Vec<TensorRef>],
+        loop_stride: u32,
+    ) -> Completed {
+        self.complete_strided_for_walk(g, node, out_tensors, loop_stride, 0)
+    }
+
+    pub fn complete_strided_for_walk(
+        &mut self,
+        g: &CompiledGraph,
+        node: NodeId,
+        out_tensors: &[Vec<TensorRef>],
+        loop_stride: u32,
+        walk: Sym,
+    ) -> Completed {
+        let idx = self
+            .active_pass_idx(node)
+            .unwrap_or_else(|| self.alloc_pass(walk));
+        let spec = g.node(node);
+        let mut out: Vec<RoutedEdge> = Vec::with_capacity(spec.outputs.len() + 2);
+        let mut freed: Vec<u64> = Vec::new();
+
+        let (pass_walk, walk_pass_id, became_done) = {
+            let pass = &mut self.passes[idx];
+            let prev_done = pass.is_done;
+            let in_flight = self.in_flight[node as usize];
+            {
+                let st = &mut pass.nodes[node as usize];
+                st.completed = true;
+                if spec.loop_id.is_none() {
+                    for t in st.cur.tensors.iter().flatten() {
+                        freed.extend(t.iter().map(|x| x.uuid));
+                    }
+                    st.cur.clear();
+                }
+            }
+            pass.refresh_ready(g, node, in_flight);
+            if spec.loop_id.is_none() {
+                pass.reseed_streaming_ready(g, node);
+            }
+            for (i, e) in spec.outputs.iter().enumerate() {
+                out.push(routed(e, out_tensors.get(i).cloned().unwrap_or_default()));
+            }
+            match spec.loop_id {
+                None => pass.root_entity_done(g, spec.entity_idx),
+                Some(lid) => pass.entity_completed(
+                    g,
+                    lid,
+                    spec.entity_idx,
+                    0,
+                    &mut out,
+                    loop_stride,
+                    &self.in_flight,
+                    &mut self.refs_taken,
+                    &mut self.refs_released,
+                    &mut self.refs_transferred,
+                ),
+            }
+            (pass.walk, pass.walk_pass_id, pass.is_done && !prev_done)
+        };
+
+        if became_done {
+            self.passes[idx].wg_pass_id = Some(self.num_times_run);
+            self.num_times_run += 1;
+        }
+        self.is_done = self.passes.iter().any(|p| p.is_done);
+        self.refresh_summary_all();
+
+        freed.append(&mut self.refs_released);
+        Completed {
+            edges: out,
+            freed,
+            taken: std::mem::take(&mut self.refs_taken),
+            transferred: std::mem::take(&mut self.refs_transferred),
+            pass_walk,
+            walk_pass_id,
+        }
+    }
+
+    /// Retire completed passes from the front of the queue, returning
+    /// `(walk, walk_pass_id, wg_pass_id)` for each retired pass while preserving
+    /// any pipelined future passes intact.
+    pub fn retire_done_passes(&mut self) -> Vec<(Sym, u32, u32)> {
+        let mut retired = Vec::new();
+        while self.passes.front().is_some_and(|p| p.is_done) {
+            let p = self.passes.pop_front().expect("checked");
+            let wg_pass_id = p.wg_pass_id.unwrap_or_else(|| {
+                let id = self.num_times_run;
+                self.num_times_run += 1;
+                id
+            });
+            retired.push((p.walk, p.walk_pass_id, wg_pass_id));
+        }
+        if !retired.is_empty() {
+            self.is_done = self.passes.iter().any(|p| p.is_done);
+            self.refresh_summary_all();
+        }
+        retired
+    }
+
     // -- loops ---------------------------------------------------------------
 
-    /// Python's `register_loop_finish_signal`. The loop-back edges are
-    /// dropped when the loop next completes an iteration, in `finish_loop`.
     pub fn register_loop_finish(&mut self, lid: LoopId) {
-        self.loops[lid as usize].finish_signal = true;
+        if let Some(idx) = self.active_loop_pass_idx(lid) {
+            self.passes[idx].loops[lid as usize].finish_signal = true;
+        }
     }
 
     pub fn loop_iter(&self, lid: LoopId) -> u32 {
-        self.loops[lid as usize].curr_iter
+        self.active_loop_pass_idx(lid)
+            .map_or(0, |idx| self.passes[idx].loops[lid as usize].curr_iter)
     }
 
-    /// True once the loop is done or its finish signal is set. Setting the
-    /// finish signal leaves `done` false, and Python's `_can_continue_loop`
-    /// reads the finish signal too.
+    pub fn loop_iter_for_node(&self, node: NodeId, lid: LoopId) -> u32 {
+        self.active_pass_idx(node)
+            .map_or(0, |idx| self.passes[idx].loops[lid as usize].curr_iter)
+    }
+
     pub fn loop_finished(&self, lid: LoopId) -> bool {
-        let st = &self.loops[lid as usize];
-        st.done || st.finish_signal
+        self.active_loop_pass_idx(lid).is_some_and(|idx| {
+            let st = &self.passes[idx].loops[lid as usize];
+            st.done || st.finish_signal
+        })
     }
 
     pub fn loop_max_iters(&self, lid: LoopId) -> u32 {
-        self.loops[lid as usize].max_iters
+        self.loop_max_iters[lid as usize]
     }
 
     pub fn cap_loop(&mut self, lid: LoopId, cap: u32) {
-        let st = &mut self.loops[lid as usize];
-        st.max_iters = st.max_iters.min(cap);
+        self.loop_max_iters[lid as usize] = self.loop_max_iters[lid as usize].min(cap);
+        for p in &mut self.passes {
+            p.loops[lid as usize].max_iters = p.loops[lid as usize].max_iters.min(cap);
+        }
     }
 
-    /// `GraphRuntime.set_loop_caps`: assigns, unlike `cap_loop`.
     pub fn set_loop_cap(&mut self, lid: LoopId, cap: u32) {
-        self.loops[lid as usize].max_iters = cap;
+        self.loop_max_iters[lid as usize] = cap;
+        for p in &mut self.passes {
+            p.loops[lid as usize].max_iters = cap;
+        }
     }
 
     pub fn loop_indices(&self) -> Vec<u32> {
-        self.loops.iter().map(|l| l.curr_iter).collect()
+        (0..self.graph.loops.len())
+            .map(|lid| self.loop_iter(lid as LoopId))
+            .collect()
     }
 
-    /// Python's `WorkerGraphIO.is_idle`: no input held, nothing in flight, no
-    /// loop mid-run -- what `reset` leaves behind.
+    pub fn loop_indices_for_node(&self, node: NodeId) -> Vec<u32> {
+        match self.active_pass_idx(node) {
+            Some(idx) => self.passes[idx].loops.iter().map(|l| l.curr_iter).collect(),
+            None => vec![0; self.graph.loops.len()],
+        }
+    }
+
     pub fn is_idle(&self) -> bool {
-        self.root_completed == 0
-            && self.nodes.iter().all(|n| {
-                n.cur.mask == 0 && n.next.mask == 0 && n.spec.mask == 0 && !n.in_flight
-            })
-            && self.loops.iter().all(|l| l.curr_iter == 0 && l.ext_inputs.is_empty())
+        self.passes.iter().all(|p| p.is_idle())
     }
 
     // -- speculation ---------------------------------------------------------
 
-    /// Python's `WorkerGraphIO.ingest_for_speculation`.
+    pub fn shares_active_loop_in_pass(&self, idx: usize, a: NodeId, b: NodeId) -> bool {
+        self.passes
+            .get(idx)
+            .is_some_and(|p| p.shares_active_loop(&self.graph, a, b))
+    }
+
     pub fn ingest_for_speculation(
-        &mut self, g: &CompiledGraph, source: NodeId, edges: &[RoutedEdge],
+        &mut self,
+        g: &CompiledGraph,
+        source: NodeId,
+        edges: &[RoutedEdge],
     ) -> Vec<SpecNode> {
         let src_loop = g.node(source).loop_id;
         let mut dests: Vec<NodeId> = Vec::new();
         let mut next_iter: Vec<NodeId> = Vec::new();
 
+        let Some(src_pass) = self.active_pass_idx(source) else {
+            let mut spec_masks: Vec<(NodeId, u64)> = Vec::new();
+            for e in edges {
+                let Dest::Local(d) = e.dest else { continue };
+                let Some(slot) = g.node(d).slot_of(e.name) else { continue };
+                if d != source && self.active_pass_idx(d).is_some() {
+                    continue;
+                }
+                match spec_masks.iter_mut().find(|(n, _)| *n == d) {
+                    Some((_, m)) => *m |= 1 << slot,
+                    None => spec_masks.push((d, 1 << slot)),
+                }
+                if !dests.contains(&d) {
+                    dests.push(d);
+                }
+                if let Some(lid) = src_loop {
+                    if g.lp(lid).loop_back.contains(&(e.name, e.dest_sym))
+                        && !next_iter.contains(&d)
+                    {
+                        next_iter.push(d);
+                    }
+                }
+            }
+            return dests
+                .into_iter()
+                .filter(|&d| {
+                    let spec = g.node(d);
+                    let needed = spec.full_mask & !spec.streaming_mask;
+                    let have = spec_masks
+                        .iter()
+                        .find(|(n, _)| *n == d)
+                        .map_or(0, |&(_, m)| m);
+                    needed & !have == 0
+                })
+                .map(|d| SpecNode {
+                    node: d,
+                    is_new_loop_iter: next_iter.contains(&d),
+                    loop_id: g.node(d).loop_id,
+                })
+                .collect();
+        };
+
         for e in edges {
             let Dest::Local(d) = e.dest else { continue };
             let Some(slot) = g.node(d).slot_of(e.name) else { continue };
-            self.nodes[d as usize].spec.set(slot, e.tensors.clone(), false);
-            if !self.spec_dirty.contains(&d) {
-                self.spec_dirty.push(d);
+            let same_pass = d == source
+                || self.active_pass_idx(d) == Some(src_pass)
+                || self.passes[src_pass].shares_active_loop(g, source, d);
+            if !same_pass {
+                continue;
+            }
+            let pass = &mut self.passes[src_pass];
+            pass.nodes[d as usize].spec.set(slot, e.tensors.clone(), false);
+            if !pass.spec_dirty.contains(&d) {
+                pass.spec_dirty.push(d);
             }
             if !dests.contains(&d) {
                 dests.push(d);
@@ -838,8 +1548,16 @@ impl RequestState {
             }
         }
 
-        dests.into_iter()
-            .filter(|&d| self.ready_for_speculation(d, d == source, true))
+        dests
+            .into_iter()
+            .filter(|&d| {
+                self.ready_for_speculation_in_pass(
+                    Some(src_pass),
+                    d,
+                    d == source || next_iter.contains(&d),
+                    true,
+                )
+            })
             .map(|d| SpecNode {
                 node: d,
                 is_new_loop_iter: next_iter.contains(&d),
@@ -848,47 +1566,70 @@ impl RequestState {
             .collect()
     }
 
-    /// Python's `GraphNode.is_ready_for_speculation`.
-    pub fn ready_for_speculation(&self, node: NodeId, check_next_iter: bool, allow_streaming: bool) -> bool {
+    pub fn ready_for_speculation(
+        &self,
+        node: NodeId,
+        check_next_iter: bool,
+        allow_streaming: bool,
+    ) -> bool {
+        self.ready_for_speculation_in_pass(
+            self.active_pass_idx(node),
+            node,
+            check_next_iter,
+            allow_streaming,
+        )
+    }
+
+    pub fn ready_for_speculation_in_pass(
+        &self,
+        pass_idx: Option<usize>,
+        node: NodeId,
+        check_next_iter: bool,
+        allow_streaming: bool,
+    ) -> bool {
         let spec = self.graph.node(node);
         let mut needed = spec.full_mask;
         if allow_streaming {
             needed &= !spec.streaming_mask;
         }
-        let st = &self.nodes[node as usize];
+        let Some(idx) = pass_idx else {
+            return needed == 0;
+        };
+        if check_next_iter && spec.loop_id.is_none() {
+            let walk = self.passes[idx].walk;
+            if self.passes.get(idx + 1).is_some_and(|p| p.walk != walk) {
+                return false;
+            }
+            let next_mask = self
+                .passes
+                .get(idx + 1)
+                .map_or(0, |p| p.nodes[node as usize].cur.mask);
+            let spec_mask = self.passes[idx].nodes[node as usize].spec.mask;
+            return needed & !(next_mask | spec_mask) == 0;
+        }
+        let st = &self.passes[idx].nodes[node as usize];
         let mut have = if check_next_iter { st.next.mask } else { st.cur.mask } | st.spec.mask;
         if check_next_iter {
-            // Held (loop-external) inputs are re-injected into the current
-            // slot every iteration and never reach the next-iter slot, so a
-            // same-node speculation must not wait on them (Python's
-            // `is_ready_for_speculation` counts `_persist_for_loop` edges).
             have |= st.cur.mask & spec.held_mask;
         }
         needed & !have == 0
     }
 
     pub fn clear_speculative_inputs(&mut self) {
-        for n in std::mem::take(&mut self.spec_dirty) {
-            self.nodes[n as usize].spec.clear();
+        for p in &mut self.passes {
+            for n in std::mem::take(&mut p.spec_dirty) {
+                p.nodes[n as usize].spec.clear();
+            }
         }
     }
 
     // -- lifecycle -----------------------------------------------------------
 
-    /// Python's `WorkerGraphIO.clear()` — end of a full forward pass.
+    /// Full wipe of all active passes.
     pub fn reset(&mut self) {
-        for n in self.nodes.iter_mut() {
-            n.clear();
-        }
-        for l in self.loops.iter_mut() {
-            *l = LoopState { max_iters: l.max_iters, ..LoopState::default() };
-        }
-        for w in self.ready.iter_mut() { *w = 0 }
-        for w in self.ready_streaming.iter_mut() { *w = 0 }
-        self.root_completed = 0;
+        self.passes.clear();
+        self.ready.fill(0);
         self.is_done = false;
-        self.spec_dirty.clear();
-        self.seed_streaming_ready();
     }
 }
 
@@ -993,8 +1734,8 @@ mod tests {
                 assert!(reinjected.persist_for_loop);
                 assert_eq!(reinjected.dest_sym, it.get("dec").unwrap());
                 assert_eq!(uuids(reinjected), vec![2]);
-                st.ingest(&g, dec, 0, &reinjected.tensors, true, false);
-                st.ingest(&g, dec, 1, &done.edges[0].tensors, true, false);
+                st.ingest_in_pass(&g, done.pass_walk, done.walk_pass_id, dec, 0, &reinjected.tensors, true, false);
+                st.ingest_in_pass(&g, done.pass_walk, done.walk_pass_id, dec, 1, &done.edges[0].tensors, true, false);
                 last_tok = new_tok;
             } else {
                 // Finishing hands the caches to the loop's output edges: no
@@ -1009,7 +1750,7 @@ mod tests {
                     (Dest::EmitToClient, vec![30]),
                     (Dest::EmitToClient, vec![11, 21, 31]),
                 ]);
-                assert!(st.loop_finished(0));
+                assert!(st.passes[0].loops[0].done);
                 assert!(st.is_done);
                 assert_eq!(st.num_times_run, 1);
             }
@@ -1048,7 +1789,7 @@ mod tests {
         st.register_loop_finish(0);
         st.clear_consumed_inputs(&g, dec);
         let done = st.complete(&g, dec, &[vec![t(10)], vec![t(11)]]);
-        assert!(st.loops[0].done);
+        assert!(st.passes[0].loops[0].done);
         assert_eq!(st.loop_iter(0), 0);
         assert!(done.freed.is_empty());
         let out: Vec<Vec<u64>> = done.edges.iter()
@@ -1066,13 +1807,9 @@ mod tests {
         let g = compile_one(&mut it, &nodes, &[]).unwrap();
         let (talker, vocoder) = (0, 1);
         let mut st = RequestState::new(g.clone());
-        // Seeded: all-streaming nodes start streaming-ready.
         assert!(st.is_ready_for_streaming(vocoder));
         assert!(!st.is_ready_for_streaming(talker));
 
-        // A streaming chunk alone does not make the node streaming-ready
-        // while a regular input is still missing -- the old `issuperset`
-        // tautology said it did.
         st.ingest(&g, talker, 1, &[t(1)], false, false);
         assert!(!st.is_ready_for_streaming(talker));
         st.remove_input(talker, 1, false);
@@ -1087,10 +1824,6 @@ mod tests {
 
     #[test]
     fn an_only_streaming_node_is_streaming_ready_again_after_completing() {
-        // The stall this guards: chunk 1 fills the node, which drops the
-        // streaming bit; completing clears the inputs but `refresh_ready`
-        // only writes `ready`, so without the re-seed chunk 2 is refused and
-        // the stream never advances. Python re-seeds on the same path.
         let mut it = StrToId::default();
         let nodes = vec![node("vocoder", &["codes"], &["codes"], vec![])];
         let g = compile_one(&mut it, &nodes, &[]).unwrap();
@@ -1105,8 +1838,6 @@ mod tests {
         st.clear_consumed_inputs(&g, snac);
         st.complete(&g, snac, &[vec![t(100)]]);
 
-        // Inputs are gone, so it is no longer plain-ready -- but it takes
-        // only streaming inputs, so it must be open to the next chunk.
         assert!(!st.is_ready(snac));
         assert!(
             st.is_ready_for_streaming(snac),
@@ -1116,9 +1847,219 @@ mod tests {
     }
 
     #[test]
+    fn pipelined_consumer_and_successor_preserve_next_chunk_across_pass_retirement() {
+        let mut it = StrToId::default();
+        let nodes = vec![
+            node("vocoder", &["codes"], &["codes"], vec![edge("wave", "post")]),
+            node("post", &["wave"], &[], vec![edge("audio", "emit_to_client")]),
+        ];
+        let g = compile_one(&mut it, &nodes, &[]).unwrap();
+        let (vocoder, post) = (0, 1);
+        let mut st = RequestState::new(g.clone());
+
+        // Chunk 1 -> vocoder (Pass 0).
+        assert!(st.is_ready_for_streaming(vocoder));
+        assert!(st.ingest(&g, vocoder, 0, &[t(1)], false, false));
+        st.clear_consumed_inputs(&g, vocoder);
+        let first = st.complete(&g, vocoder, &[vec![t(2)]]);
+        assert!(!st.is_done);
+        assert!(st.ingest_in_pass(
+            &g, first.pass_walk, first.walk_pass_id, post, 0, &first.edges[0].tensors, true, false
+        ));
+
+        // Chunk 2 pipelines into vocoder (Pass 1) BEFORE post finishes Pass 0.
+        assert!(st.is_ready_for_streaming(vocoder), "chunk 2 pipelines into Pass 1");
+        assert!(st.ingest(&g, vocoder, 0, &[t(4)], false, true));
+        st.clear_consumed_inputs(&g, vocoder);
+        let second = st.complete(&g, vocoder, &[vec![t(5)]]);
+        assert!(!st.is_done, "consumer running twice must not finish the WG");
+        assert!(st.ingest_in_pass(
+            &g, second.pass_walk, second.walk_pass_id, post, 0, &second.edges[0].tensors, true, false
+        ));
+
+        // Bounded 2-deep pipeline: chunk 3 waits in StreamBuffer until Pass 0 retires.
+        assert!(!st.is_ready_for_streaming(vocoder), "ahead >= 2 gates chunk 3");
+        assert!(!st.ingest(&g, vocoder, 0, &[t(7)], false, false));
+
+        // Post completes Pass 0 (wave_1 = t(2)); Pass 0 retires, preserving Pass 1's wave_2 = t(5)!
+        assert_eq!(st.input_tensors(post, false)[0].1[0].uuid, 2);
+        st.clear_consumed_inputs(&g, post);
+        st.complete(&g, post, &[vec![t(3)]]);
+        assert!(st.is_done);
+        assert_eq!(st.num_times_run, 1);
+        assert_eq!(st.retire_done_passes(), vec![(0, 0, 0)]);
+
+        // Pass 1's wave_2 survived retirement intact, and vocoder is unblocked for chunk 3.
+        assert!(!st.is_done);
+        assert!(st.is_ready(post));
+        assert_eq!(st.input_tensors(post, false)[0].1[0].uuid, 5);
+        assert!(st.is_ready_for_streaming(vocoder));
+
+        st.clear_consumed_inputs(&g, post);
+        st.complete(&g, post, &[vec![t(6)]]);
+        assert!(st.is_done);
+        assert_eq!(st.num_times_run, 2);
+        assert_eq!(st.retire_done_passes(), vec![(0, 1, 1)]);
+        assert!(st.is_idle());
+    }
+
+    #[test]
+    fn distinct_entity_counting_prevents_double_completion_at_root_and_loop() {
+        let mut it = StrToId::default();
+        let nodes = vec![
+            node("a", &["x"], &[], vec![]),
+            node("b", &["y"], &[], vec![]),
+        ];
+        let g = compile_one(&mut it, &nodes, &[]).unwrap();
+        let mut st = RequestState::new(g.clone());
+        // Completing `a` twice in two passes keeps Pass 0 waiting on `b` (FIFO per node).
+        st.ingest(&g, 0, 0, &[t(1)], true, false);
+        st.complete(&g, 0, &[]);
+        assert!(!st.is_done);
+        st.ingest(&g, 0, 0, &[t(2)], true, false);
+        st.complete(&g, 0, &[]);
+        assert!(!st.is_done, "b still has not completed Pass 0");
+
+        // Completing `b` for Pass 0 finishes Pass 0, leaving Pass 1 active on `a`.
+        st.ingest(&g, 1, 0, &[t(3)], true, false);
+        st.complete(&g, 1, &[]);
+        assert!(st.is_done);
+        assert_eq!(st.retire_done_passes(), vec![(0, 0, 0)]);
+        assert!(!st.is_done);
+        st.ingest(&g, 1, 0, &[t(4)], true, false);
+        st.complete(&g, 1, &[]);
+        assert!(st.is_done);
+        assert_eq!(st.retire_done_passes(), vec![(0, 1, 1)]);
+
+        // Also test distinct entities inside a 2-node Loop.
+        let mut it2 = StrToId::default();
+        let nodes2 = vec![
+            node("m1", &["x"], &[], vec![]),
+            node("m2", &["y"], &[], vec![]),
+        ];
+        let loops2 = vec![LoopArg {
+            name: "L".into(), max_iters: 1, parent: None,
+            member_nodes: vec!["m1".into(), "m2".into()],
+            outputs: vec![], accumulated: vec![],
+            loop_back: vec![], external_inputs: vec![],
+        }];
+        let g2 = compile_one(&mut it2, &nodes2, &loops2).unwrap();
+        let mut st2 = RequestState::new(g2.clone());
+        st2.ingest(&g2, 0, 0, &[t(1)], true, false);
+        st2.complete(&g2, 0, &[]);
+        assert!(!st2.loop_finished(0));
+        // Double-completing entity 0 inside the same pass cannot finish the 2-entity loop.
+        let mut dummy_edges = Vec::new();
+        let (mut tk, mut rel, mut tr) = (Vec::new(), Vec::new(), Vec::new());
+        st2.passes[0].entity_completed(
+            &g2, 0, 0, 0, &mut dummy_edges, 1, &[false, false], &mut tk, &mut rel, &mut tr,
+        );
+        assert!(!st2.loop_finished(0));
+        assert!(!st2.is_done);
+        // Completing m1 again in Pass 1 also cannot finish Pass 0 while m2 is pending.
+        st2.ingest(&g2, 0, 0, &[t(9)], true, false);
+        st2.complete(&g2, 0, &[]);
+        assert!(!st2.is_done);
+        st2.ingest(&g2, 1, 0, &[t(2)], true, false);
+        st2.complete(&g2, 1, &[]);
+        assert!(st2.passes[0].loops[0].done);
+        assert!(st2.is_done);
+    }
+
+    #[test]
+    fn consumer_loop_pipelined_with_successor_in_one_wg() {
+        let mut it = StrToId::default();
+        let nodes = vec![
+            node("vocoder", &["codes"], &["codes"], vec![edge("wave", "")]),
+            node("post", &["wave"], &[], vec![edge("audio", "emit_to_client")]),
+        ];
+        let loops = vec![LoopArg {
+            name: "chunk_loop".into(), max_iters: 2, parent: None,
+            member_nodes: vec!["vocoder".into()],
+            outputs: vec![edge("wave", "post")],
+            accumulated: vec![],
+            loop_back: vec![], external_inputs: vec![],
+        }];
+        let g = compile_one(&mut it, &nodes, &loops).unwrap();
+        let (vocoder, post) = (0, 1);
+        let mut st = RequestState::new(g.clone());
+
+        // Pass 0: Loop runs 2 chunks -> finishes -> emits wave_0 to post, does NOT reseed inside Pass 0!
+        assert!(st.ingest(&g, vocoder, 0, &[t(1)], false, false));
+        st.clear_consumed_inputs(&g, vocoder);
+        st.complete(&g, vocoder, &[vec![t(10)]]);
+        assert!(st.is_ready_for_streaming(vocoder), "iter 1 in Pass 0");
+        assert!(st.ingest(&g, vocoder, 0, &[t(2)], false, false));
+        st.clear_consumed_inputs(&g, vocoder);
+        let loop_done = st.complete(&g, vocoder, &[vec![t(11)]]);
+        assert!(!st.is_done, "post hasn't run Pass 0");
+        assert!(st.passes[0].loops[0].done);
+        assert!(st.ingest_in_pass(
+            &g, loop_done.pass_walk, loop_done.walk_pass_id, post, 0,
+            &loop_done.edges[0].tensors, true, false
+        ));
+
+        // Pass 1: chunk 3 starts a fresh Loop pass BEFORE post runs Pass 0!
+        assert!(st.is_ready_for_streaming(vocoder), "Pass 1 starts cleanly");
+        assert!(st.ingest(&g, vocoder, 0, &[t(3)], false, false));
+        assert_eq!(st.passes.len(), 2);
+        assert!(st.passes[0].loops[0].done);
+        assert!(!st.passes[1].loops[0].done);
+
+        // Post completes Pass 0 -> Pass 0 retires without disturbing Pass 1's Loop!
+        st.clear_consumed_inputs(&g, post);
+        st.complete(&g, post, &[vec![t(100)]]);
+        assert_eq!(st.retire_done_passes(), vec![(0, 0, 0)]);
+        assert_eq!(st.passes.len(), 1);
+        assert!(!st.passes[0].loops[0].done);
+        assert!(st.is_ready(vocoder), "Pass 1 vocoder input preserved");
+    }
+
+    #[test]
+    fn pipelined_producer_into_successor_loop_isolates_external_inputs() {
+        let mut it = StrToId::default();
+        let nodes = vec![
+            node("vocoder", &["codes"], &["codes"], vec![edge("wave", "post")]),
+            node("post", &["wave"], &[], vec![edge("audio", "emit_to_client")]),
+        ];
+        let loops = vec![LoopArg {
+            name: "post_loop".into(), max_iters: 2, parent: None,
+            member_nodes: vec!["post".into()],
+            outputs: vec![], accumulated: vec![],
+            loop_back: vec![], external_inputs: vec![("wave".into(), "post".into())],
+        }];
+        let g = compile_one(&mut it, &nodes, &loops).unwrap();
+        let (vocoder, post) = (0, 1);
+        let mut st = RequestState::new(g.clone());
+
+        // Pass 0 vocoder feeds wave_0 into post_loop Pass 0.
+        st.ingest(&g, vocoder, 0, &[t(1)], false, false);
+        let c0 = st.complete(&g, vocoder, &[vec![t(10)]]);
+        assert!(st.ingest_in_pass(&g, c0.pass_walk, c0.walk_pass_id, post, 0, &c0.edges[0].tensors, true, false));
+
+        // Pass 1 vocoder feeds wave_1 into post_loop Pass 1 while Pass 0 is at iter 0!
+        st.ingest(&g, vocoder, 0, &[t(2)], false, false);
+        let c1 = st.complete(&g, vocoder, &[vec![t(20)]]);
+        assert!(st.ingest_in_pass(&g, c1.pass_walk, c1.walk_pass_id, post, 0, &c1.edges[0].tensors, true, false));
+
+        // Pass 0 post_loop advances iter 0 -> iter 1: Pass 1's wave_1 stays untouched!
+        st.clear_consumed_inputs(&g, post);
+        let p0_i0 = st.complete(&g, post, &[vec![t(100)]]);
+        assert_eq!(st.loop_iter_for_node(post, 0), 1);
+        let reinjected = p0_i0.edges.iter().find(|e| e.persist_for_loop).unwrap();
+        assert!(st.ingest_in_pass(&g, p0_i0.pass_walk, p0_i0.walk_pass_id, post, 0, &reinjected.tensors, true, false));
+        assert_eq!(st.input_tensors(post, false)[0].1[0].uuid, 10);
+
+        // Pass 0 post_loop finishes iter 1 and retires -> Pass 1 post_loop runs with wave_1 = 20!
+        st.clear_consumed_inputs(&g, post);
+        st.complete(&g, post, &[vec![t(101)]]);
+        assert_eq!(st.retire_done_passes(), vec![(0, 0, 0)]);
+        assert_eq!(st.loop_iter_for_node(post, 0), 0);
+        assert_eq!(st.input_tensors(post, false)[0].1[0].uuid, 20);
+    }
+
+    #[test]
     fn a_node_with_a_regular_input_is_not_streaming_ready_after_completing() {
-        // The other half of the re-seed: it CLEARS the bit for a node that
-        // still needs a non-streaming input, rather than leaving it set.
         let mut it = StrToId::default();
         let nodes = vec![node("talker", &["text", "audio"], &["audio"], vec![])];
         let g = compile_one(&mut it, &nodes, &[]).unwrap();
@@ -1164,10 +2105,6 @@ mod tests {
         assert!(!st.is_done);
     }
 
-    /// `dec`'s external input `h` is held in the current slot and never
-    /// promoted to next-iter, so a same-node speculation onto the next
-    /// iteration must count it as present and hand it over with the inputs
-    /// (mirrors test_speculation_external_inputs.py).
     #[test]
     fn a_held_external_input_satisfies_next_iter_speculation() {
         let (it, g) = decode_loop();
@@ -1200,8 +2137,48 @@ mod tests {
         assert!(!st.has_input(dec, 0, true));
     }
 
-    /// Outside any loop nothing is held, so an external input in the current
-    /// slot does not make the next iteration ready.
+    #[test]
+    fn two_node_loop_accepts_loop_back_and_speculates_while_first_member_completed() {
+        let mut it = StrToId::default();
+        let nodes = vec![
+            node("a", &["tok"], &[], vec![edge("tok", "a"), edge("tick", "b")]),
+            node("b", &["tick"], &[], vec![]),
+        ];
+        let loops = vec![LoopArg {
+            name: "L".into(), max_iters: 2, parent: None,
+            member_nodes: vec!["a".into(), "b".into()],
+            outputs: vec![edge("tok", "emit_to_client")],
+            accumulated: vec![],
+            loop_back: vec![("tok".into(), "a".into())],
+            external_inputs: vec![],
+        }];
+        let g = compile_one(&mut it, &nodes, &loops).unwrap();
+        let (a, b) = (0, 1);
+        let mut st = RequestState::new(g.clone());
+
+        // Fresh request: speculation on `a` sees loop-back edge with `is_new_loop_iter = true`.
+        let fresh_edges = vec![routed(&g.node(a).outputs[0], vec![])];
+        let spec_fresh = st.ingest_for_speculation(&g, a, &fresh_edges);
+        assert_eq!(spec_fresh.len(), 1);
+        assert_eq!(spec_fresh[0].node, a);
+        assert!(spec_fresh[0].is_new_loop_iter);
+
+        // Iter 0: `a` completes -> `a.completed = true`, loop still active waiting on `b`.
+        st.ingest(&g, a, 0, &[t(1)], true, false);
+        st.clear_consumed_inputs(&g, a);
+        let done_a = st.complete(&g, a, &[vec![t(10)], vec![t(20)]]);
+        assert!(st.ingest_in_pass(&g, done_a.pass_walk, done_a.walk_pass_id, a, 0, &[t(10)], true, false));
+        assert!(st.ingest_in_pass(&g, done_a.pass_walk, done_a.walk_pass_id, b, 0, &[t(20)], true, false));
+
+        // While `a` is completed in iter 0, `b` completing iter 0 advances the loop cleanly.
+        assert!(!st.passes[0].loops[0].done);
+        st.clear_consumed_inputs(&g, b);
+        st.complete(&g, b, &[]);
+        assert_eq!(st.loop_iter(0), 1);
+        assert!(st.is_ready(a), "loop-back token promoted to a.cur");
+        assert_eq!(st.input_tensors(a, false)[0].1[0].uuid, 10);
+    }
+
     #[test]
     fn a_top_level_external_input_is_not_carried_into_next_iter() {
         let mut it = StrToId::default();
@@ -1216,5 +2193,135 @@ mod tests {
         assert!(st.ingest(&g, top, 1, &[t(3)], true, false));
         assert!(!st.ready_for_speculation(top, true, false));
         assert_eq!(st.input_tensors(top, true).len(), 1);
+    }
+
+    #[test]
+    fn two_node_streaming_loop_does_not_leak_iter1_chunk_into_pass1() {
+        let mut it = StrToId::default();
+        let nodes = vec![
+            node("vocoder", &["codes"], &["codes"], vec![edge("mid", "inner_post")]),
+            node("inner_post", &["mid"], &[], vec![]),
+        ];
+        let loops = vec![LoopArg {
+            name: "L".into(),
+            max_iters: 2,
+            parent: None,
+            member_nodes: vec!["vocoder".into(), "inner_post".into()],
+            outputs: vec![],
+            accumulated: vec![],
+            loop_back: vec![],
+            external_inputs: vec![],
+        }];
+        let g = compile_one(&mut it, &nodes, &loops).unwrap();
+        let (vocoder, inner_post) = (0, 1);
+        let mut st = RequestState::new(g.clone());
+
+        assert!(st.is_ready_for_streaming(vocoder));
+        assert!(st.ingest(&g, vocoder, 0, &[t(1)], false, false));
+        st.clear_consumed_inputs(&g, vocoder);
+        let c0 = st.complete(&g, vocoder, &[vec![t(10)]]);
+        assert!(st.ingest_in_pass(&g, c0.pass_walk, c0.walk_pass_id, inner_post, 0, &c0.edges[0].tensors, true, false));
+
+        // While inner_post has not completed iter 0, vocoder has already run iter 0
+        // and must NOT accept chunk 2 into a phantom Pass 1.
+        assert!(!st.is_ready_for_streaming(vocoder));
+        assert!(!st.ingest(&g, vocoder, 0, &[t(2)], false, true));
+        assert_eq!(st.passes.len(), 1);
+
+        // Once inner_post completes iter 0, Pass 0 advances to iter 1 and accepts chunk 2.
+        st.clear_consumed_inputs(&g, inner_post);
+        st.complete(&g, inner_post, &[]);
+        assert_eq!(st.loop_iter(0), 1);
+        assert!(st.is_ready_for_streaming(vocoder));
+        assert!(st.ingest(&g, vocoder, 0, &[t(2)], false, true));
+        assert!(st.is_ready(vocoder));
+        assert_eq!(st.passes.len(), 1);
+    }
+
+    #[test]
+    fn remove_input_from_next_removes_pass1_cur_for_root_node() {
+        let mut it = StrToId::default();
+        let nodes = vec![node("top", &["x"], &[], vec![])];
+        let g = compile_one(&mut it, &nodes, &[]).unwrap();
+        let top = 0;
+        let mut st = RequestState::new(g.clone());
+
+        assert!(st.ingest(&g, top, 0, &[t(1)], true, false));
+        assert!(st.ingest(&g, top, 0, &[t(2)], true, false));
+        assert!(st.has_input(top, 0, false));
+        assert!(st.has_input(top, 0, true));
+
+        let removed = st.remove_input(top, 0, true).unwrap();
+        assert_eq!(removed.iter().map(|x| x.uuid).collect::<Vec<_>>(), vec![2]);
+        assert!(!st.has_input(top, 0, true));
+        assert!(st.has_input(top, 0, false), "Pass 0 must remain intact");
+    }
+
+    #[test]
+    fn pop_empty_pass_by_id_removes_allocated_pass_and_resets_counter() {
+        let mut it = StrToId::default();
+        let nodes = vec![node("top", &["x"], &["x"], vec![])];
+        let g = compile_one(&mut it, &nodes, &[]).unwrap();
+        let top = 0;
+        let walk_a = it.intern("walk_a");
+        let walk_b = it.intern("walk_b");
+        let mut st = RequestState::new(g.clone());
+
+        assert!(st.ingest_for_walk(&g, top, 0, &[t(1)], false, false, walk_a));
+        let idx = st.alloc_pass_idx(walk_a);
+        assert_eq!(st.pass_walk_id(idx), Some((walk_a, 1)));
+        assert!(st.ingest_into_pass(&g, idx, top, 0, &[t(2)], false, false));
+
+        // Undo input and pop allocated pass by (walk, walk_pass_id).
+        assert_eq!(
+            st.remove_input_by_pass_id(walk_a, 1, top, 0, false)
+                .unwrap()
+                .iter()
+                .map(|x| x.uuid)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        st.pop_empty_pass_by_id(walk_a, 1);
+        assert_eq!(st.passes.len(), 1);
+
+        // Complete Pass 0 and retire it; state must be completely clean for walk_b.
+        st.clear_consumed_inputs(&g, top);
+        let done_a = st.complete_strided_for_walk(&g, top, &[], 1, walk_a);
+        assert_eq!((done_a.pass_walk, done_a.walk_pass_id), (walk_a, 0));
+        assert_eq!(st.retire_done_passes(), vec![(walk_a, 0, 0)]);
+        assert!(st.passes.is_empty());
+        assert!(st.is_idle());
+
+        // Switching to walk_b starts at (walk_b, 0), and re-entering walk_a would reuse id 1.
+        assert!(st.ingest_for_walk(&g, top, 0, &[t(3)], false, false, walk_b));
+        assert_eq!(st.pass_walk_id(0), Some((walk_b, 0)));
+    }
+
+    #[test]
+    fn cross_walk_next_pass_is_ignored_for_speculation_and_input_tensors() {
+        let mut it = StrToId::default();
+        let nodes = vec![
+            node("a", &["x"], &[], vec![]),
+            node("b", &["y"], &[], vec![]),
+        ];
+        let g = compile_one(&mut it, &nodes, &[]).unwrap();
+        let (a, b) = (0, 1);
+        let walk_a = it.intern("walk_a");
+        let walk_b = it.intern("walk_b");
+        let mut st = RequestState::new(g.clone());
+
+        assert!(st.ingest_for_walk(&g, a, 0, &[t(1)], false, false, walk_a));
+        let p1 = st.alloc_pass_idx(walk_b);
+        assert!(st.ingest_into_pass(&g, p1, b, 0, &[t(2)], false, false));
+        assert!(st.ingest_into_pass(&g, p1, a, 0, &[t(99)], false, false));
+
+        // Even though Pass 1 (walk_b) has a's slot 0 filled, walk_a Pass 0 must NOT
+        // treat Pass 1 (walk_b) as its next_iter.
+        assert!(!st.ready_for_speculation_in_pass(Some(0), a, true, false));
+        assert!(!st.ready_for_speculation_in_pass(Some(0), a, true, true));
+        assert!(st.input_tensors_in_pass(0, a, true).is_empty());
+        assert!(!st.has_input(a, 0, true));
+        assert!(st.remove_input(a, 0, true).is_none());
+        assert!(st.passes[1].nodes[a as usize].cur.has(0));
     }
 }

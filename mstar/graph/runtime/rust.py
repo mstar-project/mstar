@@ -371,6 +371,9 @@ class RustGraphRuntime(GraphRuntime):
     def get_rid_handle(self, rid: str) -> int | None:
         return self._rust.get_rid_handle(rid)
 
+    def get_walk(self, rid: int, partition: str) -> str | None:
+        return self._rust.get_walk(rid, partition)
+
     def set_walk(self, rid: int, partition: str, walk: str):
         self._rust.set_walk(rid, partition, walk)
 

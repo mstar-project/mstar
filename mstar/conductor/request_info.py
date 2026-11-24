@@ -1,3 +1,4 @@
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -138,8 +139,6 @@ class PartitionState:
     is_done: bool = False
     completed_worker_graph_ids: set[int] = field(default_factory=set)
     current_worker_graph_ids: set[int] = field(default_factory=set)
-    # wg_id -> count of distinct TP ranks that have reported completion
-    wg_rank_completions: dict[int, int] = field(default_factory=dict)
     # a report since the last advance set `partition_done` (it can be the
     # next pass's; see `Conductor._process_done_forward`)
     worker_reported_done: bool = False
@@ -150,3 +149,12 @@ class PartitionState:
     # resource label -> PublishedInfo, accumulated across all TP ranks and
     # handed back out on the next forward
     resource_publish_info: dict[str, PublishedInfo] = field(default_factory=dict)
+    # Per-(wg_id, wg_pass) pass-aware accounting
+    wg_consumed_pass: dict[Any, int] = field(default_factory=dict)
+    wg_queued_pass: dict[Any, int] = field(default_factory=dict)
+    wg_pass_ranks: dict[tuple[Any, int], set[str]] = field(default_factory=dict)
+    wg_pass_done: dict[tuple[Any, int], bool] = field(default_factory=dict)
+    wg_pass_walk: dict[tuple[Any, int], str] = field(default_factory=dict)
+    wg_pass_persist: dict[tuple[Any, int], dict[str, list[Any]]] = field(default_factory=dict)
+    ready_passes: deque[tuple[str, bool, list[tuple[Any, int]]]] = field(default_factory=deque)
+    queued_walk: str = ""

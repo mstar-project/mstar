@@ -10,7 +10,7 @@
 
 use crate::graph::shard::ShardMap;
 use crate::graph::spec::Sym;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 pub type PartitionId = Sym;
 pub type WgIndex = u32; // index into GraphRuntime.graphs, not the wire wg id
@@ -32,9 +32,14 @@ pub struct RequestPartitionInfo {
     /// Local worker graphs live in the CURRENT walk. Derived from the walk, so
     /// it is a cache: `set_walk` recomputes it, and nothing else may write it.
     pub walk_worker_graphs: Vec<WgIndex>,
-    /// Set when the consuming pass sees the final streaming chunk, or a stop
-    /// check returns `END_PARTITION`.
-    pub partition_done: bool,
+    /// Passes marked done by the final streaming chunk or an `END_PARTITION`
+    /// stop check, scoped by `(graph_walk, walk_pass_id)` so overlapping passes
+    /// cannot leak `partition_done` across passes or colocated worker graphs.
+    pub done_passes: FxHashSet<(Sym, u32)>,
+    /// Set when `mark_partition_done` arrives before `complete_and_route_batch`
+    /// (e.g. during `NEED_STOPS` or direct unit-test calls), and bound to the
+    /// next completing `(walk, walk_pass_id)`.
+    pub pending_partition_done: bool,
 }
 
 /// Python's `NestedLoopIndices`, as the runtime stores it.
@@ -107,9 +112,10 @@ pub struct RequestInfo {
 /// What a request has accumulated since its last WORKER_GRAPHS_DONE.
 #[derive(Default)]
 pub struct PendingOutputs {
-    /// signal -> uuids. Uuids, not descriptors: the bookkeeper is shared, so
-    /// resolving at send time cannot go stale against it.
-    pub persist: Vec<(Sym, Vec<u64>)>,
+    /// `(pass_tag, signal, uuids)` where `pass_tag` is `Some((walk, walk_pass_id))`
+    /// when produced by a specific pass so pipelined passes in one WG never
+    /// attach Pass `p+1`'s persist signals to Pass `p`'s WGD.
+    pub persist: Vec<(Option<(Sym, u32)>, Sym, Vec<u64>)>,
     /// partition -> signal -> count; each report carries its own partition's.
     pub new_tokens: Vec<(PartitionId, Vec<(String, i64)>)>,
     /// One name per chunk emitted to the client, in emission order. The
@@ -132,14 +138,41 @@ pub type TakenOutputs = (
 );
 
 impl PendingOutputs {
-    /// Everything pending, with only `partition`'s token counts.
-    pub fn take_for_send(&mut self, partition: Option<PartitionId>) -> TakenOutputs {
+    /// Everything pending for the given completed `(walk, walk_pass_id)` passes,
+    /// with only `partition`'s token counts.
+    pub fn take_for_send(
+        &mut self,
+        partition: Option<PartitionId>,
+        completed_passes: &[(Sym, u32)],
+    ) -> TakenOutputs {
         let new_tokens = match self.new_tokens.iter().position(|(p, _)| Some(*p) == partition) {
             Some(i) => self.new_tokens.swap_remove(i).1,
             None => Vec::new(),
         };
+        let mut persist_out: Vec<(Sym, Vec<u64>)> = Vec::new();
+        let mut remaining = Vec::new();
+        for (tag, sig, uuids) in std::mem::take(&mut self.persist) {
+            let matches = match tag {
+                None => true,
+                Some(p) => completed_passes.is_empty() || completed_passes.contains(&p),
+            };
+            if matches {
+                if let Some((_, existing)) = persist_out.iter_mut().find(|(s, _)| *s == sig) {
+                    for u in uuids {
+                        if !existing.contains(&u) {
+                            existing.push(u);
+                        }
+                    }
+                } else {
+                    persist_out.push((sig, uuids));
+                }
+            } else {
+                remaining.push((tag, sig, uuids));
+            }
+        }
+        self.persist = remaining;
         (
-            std::mem::take(&mut self.persist),
+            persist_out,
             new_tokens,
             std::mem::take(&mut self.output_signals),
             std::mem::take(&mut self.stream_items),
@@ -163,15 +196,15 @@ impl PendingOutputs {
 
     /// Every uuid of a signal, in order and deduped, matching Python: a loop
     /// can persist a name once per iteration before the next frame goes out.
-    pub fn add_persist(&mut self, sig: Sym, uuids: Vec<u64>) {
-        let i = match self.persist.iter().position(|(s, _)| *s == sig) {
+    pub fn add_persist(&mut self, pass: Option<(Sym, u32)>, sig: Sym, uuids: Vec<u64>) {
+        let i = match self.persist.iter().position(|(p, s, _)| *p == pass && *s == sig) {
             Some(i) => i,
             None => {
-                self.persist.push((sig, Vec::with_capacity(uuids.len())));
+                self.persist.push((pass, sig, Vec::with_capacity(uuids.len())));
                 self.persist.len() - 1
             }
         };
-        let v = &mut self.persist[i].1;
+        let v = &mut self.persist[i].2;
         for u in uuids {
             if !v.contains(&u) {
                 v.push(u);
@@ -213,7 +246,8 @@ impl RequestInfo {
             RequestPartitionInfo {
                 graph_walk: walk,
                 walk_worker_graphs: live,
-                partition_done: false,
+                done_passes: FxHashSet::default(),
+                pending_partition_done: false,
             },
         );
     }
@@ -239,16 +273,28 @@ impl RequestInfo {
         true
     }
 
-    pub fn mark_partition_done(&mut self, partition: PartitionId) {
+    pub fn mark_partition_done_pending(&mut self, partition: PartitionId) {
         if let Some(info) = self.partitions.get_mut(&partition) {
-            info.partition_done = true;
+            info.pending_partition_done = true;
         }
     }
 
-    pub fn partition_done(&self, partition: PartitionId) -> bool {
+    pub fn take_pending_partition_done(&mut self, partition: PartitionId) -> bool {
+        self.partitions
+            .get_mut(&partition)
+            .is_some_and(|p| std::mem::take(&mut p.pending_partition_done))
+    }
+
+    pub fn mark_partition_done_pass(&mut self, partition: PartitionId, walk: Sym, pass_id: u32) {
+        if let Some(info) = self.partitions.get_mut(&partition) {
+            info.done_passes.insert((walk, pass_id));
+        }
+    }
+
+    pub fn is_partition_done(&self, partition: PartitionId, walk: Sym, pass_id: u32) -> bool {
         self.partitions
             .get(&partition)
-            .is_some_and(|p| p.partition_done)
+            .is_some_and(|p| p.done_passes.contains(&(walk, pass_id)))
     }
 }
 
@@ -272,11 +318,11 @@ mod tests {
         p.add_new_tokens(1, &[("tok".to_string(), 1)]);
         p.add_new_tokens(1, &[("tok".to_string(), 2)]);
         p.add_new_tokens(2, &[("audio".to_string(), 4)]);
-        let (_, n, _, _) = p.take_for_send(Some(2));
+        let (_, n, _, _) = p.take_for_send(Some(2), &[]);
         assert_eq!(n, vec![("audio".to_string(), 4)]);
-        let (_, n, _, _) = p.take_for_send(None);
+        let (_, n, _, _) = p.take_for_send(None, &[]);
         assert!(n.is_empty());
-        let (_, n, _, _) = p.take_for_send(Some(1));
+        let (_, n, _, _) = p.take_for_send(Some(1), &[]);
         assert_eq!(n, vec![("tok".to_string(), 3)]);
         assert!(p.new_tokens.is_empty());
     }
@@ -342,10 +388,13 @@ mod tests {
     #[test]
     fn add_persist_keeps_every_uuid_of_a_signal_once_in_order() {
         let mut p = PendingOutputs::default();
-        p.add_persist(1, vec![10, 10]);
-        p.add_persist(2, vec![20]);
-        p.add_persist(1, vec![11, 10]);
-        assert_eq!(p.persist, vec![(1, vec![10, 11]), (2, vec![20])]);
+        p.add_persist(Some((1, 0)), 1, vec![10, 10]);
+        p.add_persist(Some((1, 1)), 2, vec![20]);
+        p.add_persist(Some((1, 0)), 1, vec![11, 10]);
+        let (persisted, _, _, _) = p.take_for_send(None, &[(1, 0)]);
+        assert_eq!(persisted, vec![(1, vec![10, 11])]);
+        let (persisted_next, _, _, _) = p.take_for_send(None, &[(1, 1)]);
+        assert_eq!(persisted_next, vec![(2, vec![20])]);
     }
 
     #[test]
@@ -355,18 +404,20 @@ mod tests {
         p.add_stream_items(1, 11, 1);
         p.add_stream_items(1, 10, 3);
         p.add_stream_items(2, 10, 1);
-        let (_, _, _, items) = p.take_for_send(None);
+        let (_, _, _, items) = p.take_for_send(None, &[]);
         assert_eq!(items, vec![(1, vec![(10, 5), (11, 1)]), (2, vec![(10, 1)])]);
         assert!(p.stream_items.is_empty());
     }
 
     #[test]
-    fn partition_done_is_per_partition() {
+    fn partition_done_is_per_partition_and_pass() {
         let mut info = RequestInfo::default();
         info.set_partition(1, 10, vec![]);
         info.set_partition(2, 20, vec![]);
-        info.mark_partition_done(1);
-        assert!(info.partition_done(1));
-        assert!(!info.partition_done(2));
+        info.mark_partition_done_pass(1, 10, 1);
+        assert!(!info.is_partition_done(1, 10, 0));
+        assert!(info.is_partition_done(1, 10, 1));
+        assert!(!info.is_partition_done(1, 10, 2));
+        assert!(!info.is_partition_done(2, 20, 1));
     }
 }

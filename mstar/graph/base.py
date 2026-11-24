@@ -737,14 +737,14 @@ class GraphStateRegistry(ABC):
         self.managed_entities: dict[str, GraphNode|Loop] = top_level_entities(graph_section)
 
         self.is_done = False
-        self._num_completed_entities = 0
+        self._completed_entities: set[str] = set()
         self._num_managed_entities = len(self.managed_entities)
 
     def mark_entity_complete(self, entity_name: str, loop_stride: int = 1) -> NodeCompletionOutput:
         """Record that an entity has finished; no-ops if already done (safeguard only)."""
         if not self.is_done and entity_name in self.managed_entities:
-            self._num_completed_entities += 1
-            self.is_done = self._num_completed_entities == self._num_managed_entities
+            self._completed_entities.add(entity_name)
+            self.is_done = len(self._completed_entities) == self._num_managed_entities
         return NodeCompletionOutput(
             output_edges=self.managed_entities[entity_name].outputs
         )
@@ -755,13 +755,13 @@ class GraphStateRegistry(ABC):
 
     def reset_for_iter(self):
         self.is_done = False
-        self._num_completed_entities = 0
+        self._completed_entities.clear()
         for entity in self.managed_entities.values():
             entity.reset_for_outer_iter()
 
     def clear(self):
         self.is_done = False
-        self._num_completed_entities = 0
+        self._completed_entities.clear()
         for entity in self.managed_entities.values():
             entity.clear()
 
@@ -774,6 +774,8 @@ class LoopStateRegistry(GraphStateRegistry):
         self.loop = loop
 
     def mark_entity_complete(self, entity_name: str, loop_stride: int = 1) -> NodeCompletionOutput:
+        if self.loop.is_done:
+            return NodeCompletionOutput(output_edges=[])
         output = super().mark_entity_complete(entity_name)
         self.loop.maybe_cache_output(self.managed_entities[entity_name].outputs)
         if self.is_done:
