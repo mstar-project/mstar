@@ -256,3 +256,73 @@ def _assert_prefill_ready(model, walk, inputs):
     for edge in inputs:
         assert nodes[edge.next_node].ingest_input(edge)
     assert nodes["dit"].ready_signals.is_ready
+
+
+@pytest.mark.parametrize("representation", ["cpu", "numpy", "list"])
+def test_pi05_rollout_kwargs_transport_across_worker_and_wire(representation, tmp_path):
+    from PIL import Image
+
+    convert = {
+        "cpu": torch.tensor,
+        "numpy": np.asarray,
+        "list": lambda v: v,
+    }[representation]
+
+    model = Pi05Model("unused", skip_weight_loading=True)
+    model.tokenizer = _Tokenizer()
+    rollout_cfg = {"sde_type": "flow_sde", "noise_level": 0.5, "sde_step": 1, "return_state": True}
+    kwargs = {
+        "camera_mask": convert([True, False, True]),
+        "tokenized_prompt": convert([2, 11, 22, 0]),
+        "tokenized_prompt_mask": convert([True, True, True, False]),
+        "rollout": rollout_cfg,
+    }
+    original_kwargs = dict(kwargs)
+    img_paths = []
+    for idx in range(3):
+        p = tmp_path / f"cam_{idx}.png"
+        Image.new("RGB", (8, 8)).save(p)
+        img_paths.append(str(p))
+
+    communicator = _Communicator()
+    sender = _manager(tmp_path, "api_server", "cpu", communicator)
+    receiver = _manager(tmp_path, "worker_0", "cpu", communicator)
+    worker = PreprocessWorkerThread(
+        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=queue.Queue(),
+        profile_queue=queue.Queue(), cleanup_request_queue=queue.Queue(), abort_request_queue=queue.Queue(),
+        reads_done_queue=queue.Queue(), discard_tensor_queue=queue.Queue(), stop_event=threading.Event(),
+        communicator=communicator, tensor_manager=sender, model=model,
+    )
+    try:
+        worker._process_input(PreprocessInput("r", None, {"image": img_paths}, [], ["action"], kwargs))
+        request = next(msg.body for entity, msg in communicator.sent if entity == "conductor")
+        for name, value in original_kwargs.items():
+            assert kwargs[name] is value
+            assert worker.request_model_kwargs["r"][name] is value
+        for name in model.PREPROCESS_ONLY_KWARGS:
+            assert name not in request.model_kwargs
+        assert "active_camera_mask" in request.model_kwargs
+        assert request.model_kwargs["active_camera_mask"] == [True, False, True]
+        assert request.model_kwargs["rollout"] == rollout_cfg
+
+        plan = model.walk_plan("default", ["image", "text"], ["action"], request.initial_signals, request.model_kwargs)
+        assert [step.walk for step in plan] == [Pi05Model.ROLLOUT_WALK]
+        assert plan[0].step_metadata["camera_mask"] == [True, False, True]
+        assert plan[0].step_metadata["rollout"] == {
+            "sde_type": "flow_sde",
+            "noise_level": 0.5,
+            "sde_step": 1,
+            "return_state": True,
+            "ignore_last": False,
+        }
+
+        edges = [
+            GraphEdge(next_node="node", name=name, tensor_info=infos)
+            for name, infos in request.initial_signals.items()
+        ]
+        receiver.start_read_tensors("r", edges)
+        text_ids = receiver.get_tensor(request.initial_signals["text_inputs"][0].uuid)
+        assert text_ids.tolist() == [2, 11, 22]
+    finally:
+        receiver.force_cleanup_request("r")
+        sender.force_cleanup_request("r")

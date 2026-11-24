@@ -20,6 +20,8 @@ import json
 import logging
 from pathlib import Path
 
+import msgpack
+import numpy as np
 import torch
 from torch import nn
 
@@ -44,7 +46,7 @@ from mstar.model.base import (
 from mstar.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
 from mstar.model.media_limits import read_image
 from mstar.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
-from mstar.model.pi05.components.flow_matching import discretize_state
+from mstar.model.pi05.components.flow_matching import discretize_state, normalize_rollout_config
 from mstar.model.pi05.components.normalization import Pi05NormStats, load_norm_stats
 from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mstar.model.pi05.components.siglip import Pi05SiglipEncoder
@@ -54,6 +56,7 @@ from mstar.model.pi05.config import (
     LLM_ATTN,
     LLM_KV,
     LLM_NODES,
+    ROLLOUT_WALK,
     Pi05Config,
     load_pi05_config,
 )
@@ -154,16 +157,93 @@ def _flat(value):
         yield value
 
 
+_ROLLOUT_MAGIC = b"MSTARR01"
+_ROLLOUT_HEADER_BYTES = 48
+
+
+def _pack_msgpack_numpy(obj):
+    if isinstance(obj, np.ndarray):
+        return {
+            b"__ndarray__": True,
+            b"data": obj.tobytes(),
+            b"dtype": obj.dtype.str,
+            b"shape": obj.shape,
+        }
+    if isinstance(obj, np.generic):
+        return {
+            b"__npgeneric__": True,
+            b"data": obj.item(),
+            b"dtype": obj.dtype.str,
+        }
+    raise TypeError(f"cannot encode {type(obj).__name__}")
+
+
+def _encode_rollout_msgpack(raw: bytes) -> bytes:
+    if len(raw) < _ROLLOUT_HEADER_BYTES or raw[:8] != _ROLLOUT_MAGIC:
+        raise ValueError("invalid Pi0.5 rollout tensor payload")
+    num_steps, horizon, action_dim, denoise_ind = np.frombuffer(
+        raw, dtype="<i8", count=4, offset=8
+    ).tolist()
+    seed = int(np.frombuffer(raw, dtype="<u8", count=1, offset=40)[0])
+    if num_steps < 1 or horizon < 1 or action_dim < 1:
+        raise ValueError(
+            f"invalid Pi0.5 rollout dimensions: ({num_steps}, {horizon}, {action_dim})"
+        )
+    chain_count = (num_steps + 1) * horizon * action_dim
+    logprob_count = horizon * action_dim
+    expected_bytes = _ROLLOUT_HEADER_BYTES + chain_count * 4 + logprob_count * 4 + logprob_count
+    if len(raw) != expected_bytes:
+        raise ValueError(
+            f"invalid Pi0.5 rollout payload size {len(raw)} (expected {expected_bytes})"
+        )
+    offset = _ROLLOUT_HEADER_BYTES
+    chain = np.asarray(
+        np.frombuffer(raw, dtype="<f4", count=chain_count, offset=offset).reshape(
+            num_steps + 1, horizon, action_dim
+        ),
+        dtype=np.float32,
+    )
+    offset += chain_count * 4
+    logprobs = np.asarray(
+        np.frombuffer(raw, dtype="<f4", count=logprob_count, offset=offset).reshape(
+            horizon, action_dim
+        ),
+        dtype=np.float32,
+    )
+    offset += logprob_count * 4
+    logprobs_mask = np.asarray(
+        np.frombuffer(raw, dtype=np.bool_, count=logprob_count, offset=offset).reshape(
+            horizon, action_dim
+        ),
+        dtype=np.bool_,
+    )
+    payload = {
+        "chain": chain,
+        "denoise_ind": int(denoise_ind),
+        "logprobs": logprobs,
+        "logprobs_mask": logprobs_mask,
+        "seed": seed,
+    }
+    return msgpack.packb(payload, default=_pack_msgpack_numpy, use_bin_type=True)
+
+
 class Pi05Model(Model):
     """Pi0.5 vision-language-action model implementation."""
 
-    PREPROCESS_ONLY_KWARGS = ("robot_state",)
+    PREPROCESS_ONLY_KWARGS = (
+        "robot_state",
+        "camera_mask",
+        "tokenized_prompt",
+        "tokenized_prompt_mask",
+    )
+    INTERNAL_KWARGS = ("active_camera_mask",)
     # load_image and process_prompt share only the fast tokenizer, called without padding or truncation
     PREPROCESS_PARALLEL = True
     # load_image is a PNG decode per camera, and only that
     PREPROCESS_PARALLEL_IMAGES = True
 
     CHUNK_WALK = CHUNK_WALK
+    ROLLOUT_WALK = ROLLOUT_WALK
 
     def __init__(
         self,
@@ -208,19 +288,103 @@ class Pi05Model(Model):
             cfg = Pi05Config()
         else:
             # The checkpoint's config.json sets the action horizon (chunk_size), so a
-            # deployment that cannot read it must not fall back to the default 50 steps.
-            from huggingface_hub import hf_hub_download
-
-            try:
-                config_path = hf_hub_download(
-                    repo_id=self.model_path_hf,
-                    filename="config.json",
-                    cache_dir=self.cache_dir,
+            # deployment that cannot read it must not fall back to the default 50 steps
+            # unless the serving config explicitly pins action_horizon.
+            pinned_horizon = self._yaml_config_overrides.get("action_horizon")
+            has_pinned_horizon = (
+                isinstance(pinned_horizon, int)
+                and not isinstance(pinned_horizon, bool)
+                and pinned_horizon > 0
+            )
+            model_dir = Path(self.model_path_hf)
+            if model_dir.is_dir():
+                config_file = model_dir / "config.json"
+                if config_file.is_file():
+                    try:
+                        with open(config_file) as f:
+                            cfg = load_pi05_config(json.load(f))
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"could not read the config.json of {self.model_path_hf}: {exc}"
+                        ) from exc
+                elif has_pinned_horizon:
+                    logger.warning(
+                        "Pi05Model._load_config: %s has no config.json; falling back to "
+                        "Pi05Config() defaults with pinned action_horizon=%d",
+                        self.model_path_hf,
+                        pinned_horizon,
+                    )
+                    cfg = Pi05Config()
+                else:
+                    raise RuntimeError(
+                        f"could not read the config.json of {self.model_path_hf}: missing {config_file}"
+                    )
+            else:
+                from huggingface_hub import hf_hub_download, snapshot_download
+                from huggingface_hub.errors import (
+                    EntryNotFoundError,
+                    HfHubHTTPError,
+                    LocalEntryNotFoundError,
                 )
-                with open(config_path) as f:
-                    cfg = load_pi05_config(json.load(f))
-            except Exception as exc:
-                raise RuntimeError(f"could not read the config.json of {self.model_path_hf}: {exc}") from exc
+
+                try:
+                    config_path = hf_hub_download(
+                        repo_id=self.model_path_hf,
+                        filename="config.json",
+                        cache_dir=self.cache_dir,
+                    )
+                    with open(config_path) as f:
+                        cfg = load_pi05_config(json.load(f))
+                except LocalEntryNotFoundError as exc:
+                    if not has_pinned_horizon:
+                        raise RuntimeError(
+                            f"could not read the config.json of {self.model_path_hf}: {exc}"
+                        ) from exc
+                    try:
+                        snap = snapshot_download(
+                            repo_id=self.model_path_hf,
+                            cache_dir=self.cache_dir,
+                            local_files_only=True,
+                        )
+                    except Exception:
+                        raise RuntimeError(
+                            f"could not read the config.json of {self.model_path_hf}: {exc}"
+                        ) from exc
+                    config_file = Path(snap) / "config.json"
+                    if config_file.is_file():
+                        try:
+                            with open(config_file) as f:
+                                cfg = load_pi05_config(json.load(f))
+                        except Exception as cfg_exc:
+                            raise RuntimeError(
+                                f"could not read the config.json of {self.model_path_hf}: {cfg_exc}"
+                            ) from cfg_exc
+                    else:
+                        logger.warning(
+                            "Pi05Model._load_config: cached snapshot for %s has no config.json; "
+                            "falling back to Pi05Config() defaults with pinned action_horizon=%d",
+                            self.model_path_hf,
+                            pinned_horizon,
+                        )
+                        cfg = Pi05Config()
+                except Exception as exc:
+                    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                    is_missing = isinstance(exc, (EntryNotFoundError, FileNotFoundError)) or (
+                        isinstance(exc, HfHubHTTPError) and status_code == 404
+                    )
+                    if is_missing and has_pinned_horizon:
+                        logger.warning(
+                            "Pi05Model._load_config: %s has no config.json (%s); falling back to "
+                            "Pi05Config() defaults with pinned action_horizon=%d",
+                            self.model_path_hf,
+                            exc,
+                            pinned_horizon,
+                        )
+                        cfg = Pi05Config()
+                    else:
+                        raise RuntimeError(
+                            f"could not read the config.json of {self.model_path_hf}: {exc}"
+                        ) from exc
 
         # Overlay yaml-driven overrides (e.g. action_horizon for DROID).
         # Applied last so they win over both HF config.json and Pi05Config
@@ -302,6 +466,10 @@ class Pi05Model(Model):
 
     def _ensure_repo(self) -> Path:
         if self._repo_dir is not None:
+            return self._repo_dir
+        local_dir = Path(self.model_path_hf)
+        if local_dir.is_dir():
+            self._repo_dir = local_dir
             return self._repo_dir
         from huggingface_hub import snapshot_download
 
@@ -449,17 +617,8 @@ class Pi05Model(Model):
                 "so the action step follows the prefix on the worker that holds its KV cache"
             )
 
-    def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        # Pi0.5 encodes the robot state as a decimal-string suffix on the
-        # language prompt (e.g. "Task: pick up the block, State: 12 87 ...;
-        # \nAction: ") and tokenizes the whole thing with the PaliGemma
-        # tokenizer. So the model only ever sees a single "text_inputs"
-        # stream — there are no separate state-bin tokens. This matches
-        # lerobot's processor_pi05.Pi05PrepareStateTokenizerProcessorStep.
-        # One walk, so the action step follows the prefix KV write on the worker
-        # with no round trip through the conductor. ``prefix_done`` only orders
-        # the two: the action step reads the prefix through the shared KV.
-        chunk = Sequential(
+    def _build_walk(self, action_outputs: list[GraphEdge]) -> GraphSection:
+        return Sequential(
             [
                 GraphNode(
                     name="vit_encoder",
@@ -474,19 +633,48 @@ class Pi05Model(Model):
                 GraphNode(
                     name="action_expert",
                     input_names=["prefix_done"],
-                    outputs=[
-                        GraphEdge(
-                            next_node=EMIT_TO_CLIENT,
-                            name="actions",
-                            output_modality="action",
-                        ),
-                    ],
+                    outputs=action_outputs,
+                ),
+            ]
+        )
+
+    def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
+        # Pi0.5 encodes the robot state as a decimal-string suffix on the
+        # language prompt (e.g. "Task: pick up the block, State: 12 87 ...;
+        # \nAction: ") and tokenizes the whole thing with the PaliGemma
+        # tokenizer. So the model only ever sees a single "text_inputs"
+        # stream — there are no separate state-bin tokens. This matches
+        # lerobot's processor_pi05.Pi05PrepareStateTokenizerProcessorStep.
+        # One walk, so the action step follows the prefix KV write on the worker
+        # with no round trip through the conductor. ``prefix_done`` only orders
+        # the two: the action step reads the prefix through the shared KV.
+        chunk = self._build_walk(
+            [
+                GraphEdge(
+                    next_node=EMIT_TO_CLIENT,
+                    name="actions",
+                    output_modality="action",
+                ),
+            ]
+        )
+        rollout = self._build_walk(
+            [
+                GraphEdge(
+                    next_node=EMIT_TO_CLIENT,
+                    name="actions",
+                    output_modality="action",
+                ),
+                GraphEdge(
+                    next_node=EMIT_TO_CLIENT,
+                    name="rollout",
+                    output_modality="tensor",
                 ),
             ]
         )
 
         return {
             self.CHUNK_WALK: chunk,
+            self.ROLLOUT_WALK: rollout,
         }
 
     # ------------------------------------------------------------------
@@ -500,7 +688,7 @@ class Pi05Model(Model):
         output_modalities: list[str],
         **kwargs,
     ) -> NameToTensorList | ProcessPromptOutput:
-        """Tokenize the Pi0.5 prompt + robot state into a single token stream.
+        """Tokenize the Pi0.5 prompt + robot state (or validate pre-tokenized IDs).
 
         openpi's PaligemmaTokenizer (and lerobot's
         ``Pi05PrepareStateTokenizerProcessorStep``) put the state into the
@@ -514,7 +702,17 @@ class Pi05Model(Model):
         as openpi's policy does; without, it is binned as given.
         """
         robot_state = self._robot_state(kwargs.get("robot_state"))
-        if self.tokenizer is None:
+        rollout = normalize_rollout_config(kwargs.get("rollout"), self.config.num_flow_steps)
+        text_ids = self._tokenized_prompt(
+            kwargs.get("tokenized_prompt"), kwargs.get("tokenized_prompt_mask")
+        )
+        raw_camera_mask = kwargs.get("camera_mask")
+        if text_ids is None and self.tokenizer is None:
+            if raw_camera_mask is not None:
+                images = len(kwargs.get("tensors", {}).get("image_inputs", ()))
+                if not images:
+                    raise ValueError("a pi0.5 request needs at least one camera image")
+                self._camera_mask(raw_camera_mask, images)
             # Tokenizer-less fallback for dummy mode (skip_weight_loading), used by structural unit tests.
             if prompt is not None:
                 return {
@@ -524,27 +722,44 @@ class Pi05Model(Model):
                 }
             return {}
 
-        state_bins = None
-        if robot_state is not None:
-            state = robot_state
-            if self.norm_stats is not None:
-                state = self.norm_stats.normalize_state(state)
-            state_bins = discretize_state(state, num_bins=self.config.state_token_bins).tolist()
-        text_ids = self.tokenizer.encode_prompt(pi05_prompt(prompt, state_bins))
+        if text_ids is None:
+            state_bins = None
+            if robot_state is not None:
+                state = robot_state
+                if self.norm_stats is not None:
+                    state = self.norm_stats.normalize_state(state)
+                state_bins = discretize_state(state, num_bins=self.config.state_token_bins).tolist()
+            text_ids = self.tokenizer.encode_prompt(pi05_prompt(prompt, state_bins))
+
         cfg = self.config
-        # the ViT drops the tokens of the camera slots a request leaves empty
+        # the ViT drops the tokens of empty or masked camera slots
         images = len(kwargs.get("tensors", {}).get("image_inputs", ()))
         if not images:
             raise ValueError("a pi0.5 request needs at least one camera image")
-        image_rows = images * (cfg.vit_image_size // cfg.vit_patch_size) ** 2
+        camera_mask = self._camera_mask(raw_camera_mask, images)
+        active_images = sum(camera_mask) if camera_mask is not None else images
+        image_rows = active_images * (cfg.vit_image_size // cfg.vit_patch_size) ** 2
+        if image_rows + text_ids.numel() > cfg.max_position_embeddings:
+            raise ValueError(
+                f"Pi0.5 prefix length {image_rows + text_ids.numel()} exceeds "
+                f"max_position_embeddings ({cfg.max_position_embeddings})"
+            )
+        walk = (
+            self.ROLLOUT_WALK
+            if (rollout is not None and rollout["return_state"])
+            else self.CHUNK_WALK
+        )
         layout = Layout(
             spans=(
-                Span("rows", self.CHUNK_WALK, image_rows, image_rows, "img_emb"),
-                Span("ids", self.CHUNK_WALK, text_ids.numel(), text_ids.numel(), "text_inputs"),
+                Span("rows", walk, image_rows, image_rows, "img_emb"),
+                Span("ids", walk, text_ids.numel(), text_ids.numel(), "text_inputs"),
             ),
             scratch=cfg.action_horizon,
         )
-        return ProcessPromptOutput({"text_inputs": [text_ids]}, {"state_layout": {LLM_KV: {"main": layout}}})
+        metadata: dict = {"state_layout": {LLM_KV: {"main": layout}}}
+        if camera_mask is not None:
+            metadata["active_camera_mask"] = camera_mask
+        return ProcessPromptOutput({"text_inputs": [text_ids]}, metadata)
 
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         """The decoded RGB camera image, left uint8 ``(C, H, W)``: the ViT step
@@ -586,9 +801,154 @@ class Pi05Model(Model):
             raise ValueError("robot_state must be finite; it holds NaN or inf")
         return state
 
+    def _camera_mask(self, raw, num_images: int) -> list[bool] | None:
+        if raw is None:
+            return None
+        if isinstance(raw, torch.Tensor):
+            if raw.dim() != 1:
+                raise ValueError(f"camera_mask must be 1D, got shape {tuple(raw.shape)}")
+            if raw.dtype == torch.bool:
+                mask = [bool(v) for v in raw.detach().cpu().tolist()]
+            elif not raw.is_floating_point() and not raw.is_complex():
+                vals = raw.detach().cpu().tolist()
+                if not all(v in (0, 1) for v in vals):
+                    raise ValueError(f"camera_mask integer values must be 0 or 1, got {vals!r}")
+                mask = [bool(v) for v in vals]
+            else:
+                raise ValueError(f"camera_mask must be bool or 0/1 integer, got dtype {raw.dtype}")
+        elif isinstance(raw, np.ndarray):
+            if raw.ndim != 1:
+                raise ValueError(f"camera_mask must be 1D, got shape {raw.shape}")
+            if raw.dtype.kind == "b":
+                mask = [bool(v) for v in raw.tolist()]
+            elif raw.dtype.kind in ("i", "u"):
+                vals = raw.tolist()
+                if not all(v in (0, 1) for v in vals):
+                    raise ValueError(f"camera_mask integer values must be 0 or 1, got {vals!r}")
+                mask = [bool(v) for v in vals]
+            else:
+                raise ValueError(f"camera_mask must be bool or 0/1 integer, got dtype {raw.dtype}")
+        elif isinstance(raw, (list, tuple)):
+            mask = []
+            for v in raw:
+                if not isinstance(v, (bool, int, np.bool_, np.integer)) or v not in (0, 1):
+                    raise ValueError(f"camera_mask elements must be bool or 0/1, got {v!r}")
+                mask.append(bool(v))
+        else:
+            raise ValueError(f"camera_mask must be a 1D bool/01 sequence, got {type(raw).__name__}")
+
+        if len(mask) != num_images:
+            raise ValueError(f"camera_mask length {len(mask)} != num_images {num_images}")
+        if not any(mask):
+            raise ValueError("camera_mask must enable at least one camera")
+        return mask
+
+    def _tokenized_prompt(self, raw_ids, raw_mask) -> torch.Tensor | None:
+        if raw_ids is None:
+            if raw_mask is not None:
+                raise ValueError("tokenized_prompt_mask requires tokenized_prompt")
+            return None
+
+        if isinstance(raw_ids, torch.Tensor):
+            if raw_ids.dim() != 1 or raw_ids.numel() == 0:
+                raise ValueError(
+                    f"tokenized_prompt must be a non-empty 1D integer sequence, got shape {tuple(raw_ids.shape)}"
+                )
+            if raw_ids.dtype == torch.bool or raw_ids.is_floating_point() or raw_ids.is_complex():
+                raise ValueError(f"tokenized_prompt must have integer dtype, got {raw_ids.dtype}")
+            ids = raw_ids.detach().to(device="cpu", dtype=torch.long).clone()
+        elif isinstance(raw_ids, np.ndarray):
+            if raw_ids.ndim != 1 or raw_ids.size == 0:
+                raise ValueError(
+                    f"tokenized_prompt must be a non-empty 1D integer sequence, got shape {raw_ids.shape}"
+                )
+            if raw_ids.dtype.kind not in ("i", "u"):
+                raise ValueError(f"tokenized_prompt must have integer dtype, got {raw_ids.dtype}")
+            ids = torch.tensor(raw_ids.tolist(), dtype=torch.long)
+        elif isinstance(raw_ids, (list, tuple)):
+            if len(raw_ids) == 0:
+                raise ValueError("tokenized_prompt must be non-empty")
+            for v in raw_ids:
+                if not isinstance(v, (int, np.integer)) or isinstance(v, (bool, np.bool_)):
+                    raise ValueError(f"tokenized_prompt must contain integers (not bool), got {v!r}")
+            ids = torch.tensor([int(v) for v in raw_ids], dtype=torch.long)
+        else:
+            raise ValueError(f"tokenized_prompt must be a 1D integer sequence, got {type(raw_ids).__name__}")
+
+        if raw_mask is not None:
+            if isinstance(raw_mask, torch.Tensor):
+                if raw_mask.dim() != 1:
+                    raise ValueError(f"tokenized_prompt_mask must be 1D, got shape {tuple(raw_mask.shape)}")
+                if raw_mask.dtype == torch.bool:
+                    mask = raw_mask.detach().to(device="cpu", dtype=torch.bool).clone()
+                elif not raw_mask.is_floating_point() and not raw_mask.is_complex():
+                    vals = raw_mask.detach().cpu().tolist()
+                    if not all(v in (0, 1) for v in vals):
+                        raise ValueError(f"tokenized_prompt_mask integer values must be 0 or 1, got {vals!r}")
+                    mask = torch.tensor([bool(v) for v in vals], dtype=torch.bool)
+                else:
+                    raise ValueError(
+                        f"tokenized_prompt_mask must be bool or 0/1 integer, got dtype {raw_mask.dtype}"
+                    )
+            elif isinstance(raw_mask, np.ndarray):
+                if raw_mask.ndim != 1:
+                    raise ValueError(f"tokenized_prompt_mask must be 1D, got shape {raw_mask.shape}")
+                if raw_mask.dtype.kind == "b":
+                    mask = torch.tensor(raw_mask.tolist(), dtype=torch.bool)
+                elif raw_mask.dtype.kind in ("i", "u"):
+                    vals = raw_mask.tolist()
+                    if not all(v in (0, 1) for v in vals):
+                        raise ValueError(f"tokenized_prompt_mask integer values must be 0 or 1, got {vals!r}")
+                    mask = torch.tensor([bool(v) for v in vals], dtype=torch.bool)
+                else:
+                    raise ValueError(
+                        f"tokenized_prompt_mask must be bool or 0/1 integer, got dtype {raw_mask.dtype}"
+                    )
+            elif isinstance(raw_mask, (list, tuple)):
+                mask_list = []
+                for v in raw_mask:
+                    if not isinstance(v, (bool, int, np.bool_, np.integer)) or v not in (0, 1):
+                        raise ValueError(f"tokenized_prompt_mask elements must be bool or 0/1, got {v!r}")
+                    mask_list.append(bool(v))
+                mask = torch.tensor(mask_list, dtype=torch.bool)
+            else:
+                raise ValueError(
+                    f"tokenized_prompt_mask must be a 1D bool/01 sequence, got {type(raw_mask).__name__}"
+                )
+
+            if mask.numel() != ids.numel():
+                raise ValueError(
+                    f"tokenized_prompt_mask length {mask.numel()} != tokenized_prompt length {ids.numel()}"
+                )
+            active = int(mask.sum().item())
+            if active == 0:
+                raise ValueError("tokenized_prompt_mask must keep at least one token")
+            if not bool(mask[:active].all().item()):
+                raise ValueError("tokenized_prompt_mask must be a contiguous right-padded prefix")
+            ids = ids[:active]
+
+        if ids.numel() > self.config.max_lang_tokens:
+            raise ValueError(
+                f"tokenized_prompt active length {ids.numel()} exceeds max_lang_tokens ({self.config.max_lang_tokens})"
+            )
+        min_id = int(ids.min().item())
+        max_id = int(ids.max().item())
+        if min_id < 0 or max_id >= self.config.vocab_size:
+            raise ValueError(
+                f"tokenized_prompt token IDs must be in [0, {self.config.vocab_size - 1}], "
+                f"got range [{min_id}, {max_id}]"
+            )
+        return ids
+
     def request_kwargs(self) -> frozenset[str]:
         # flow steps and the rest come from the deployment YAML, not the request
-        return frozenset({"robot_state"})
+        return frozenset({
+            "robot_state",
+            "camera_mask",
+            "tokenized_prompt",
+            "tokenized_prompt_mask",
+            "rollout",
+        })
 
     def max_input_files(self) -> dict[str, int]:
         # one image per camera slot the SigLIP capture holds
@@ -600,6 +960,9 @@ class Pi05Model(Model):
             if self.norm_stats is not None:
                 actions = self.norm_stats.unnormalize_actions(actions)
             return actions.to(torch.float32).numpy().tobytes()
+        if modality == "tensor":
+            raw = bytes(output.detach().cpu().contiguous().to(torch.uint8).numpy().tobytes())
+            return _encode_rollout_msgpack(raw)
         raise ValueError(f"Unsupported modality for Pi0.5: {modality!r}")
 
     # ------------------------------------------------------------------
@@ -620,7 +983,19 @@ class Pi05Model(Model):
         # them could never finish. process_prompt always emits the prompt's tokens.
         if not input_signals.get("image_inputs"):
             raise ValueError("Pi0.5 requires camera images (image_inputs)")
-        return [WalkStep(self.CHUNK_WALK)]
+        rollout = normalize_rollout_config(model_kwargs.get("rollout"), self.config.num_flow_steps)
+        camera_mask = model_kwargs.get("active_camera_mask")
+        step_metadata: dict = {}
+        if camera_mask is not None:
+            step_metadata["camera_mask"] = list(camera_mask)
+        if rollout is not None:
+            step_metadata["rollout"] = rollout
+        walk = (
+            self.ROLLOUT_WALK
+            if (rollout is not None and rollout["return_state"])
+            else self.CHUNK_WALK
+        )
+        return [WalkStep(walk, step_metadata=step_metadata)]
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading
