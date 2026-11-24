@@ -25,6 +25,7 @@ import io
 import ipaddress
 import logging
 import math
+import mmap
 import os
 import re
 import socket
@@ -706,6 +707,391 @@ class AudioTooLongError(AudioRefusedError):
         super().__init__(f"audio is longer than the {max_seconds:g} s limit")
 
 
+def _build_flac_crc_tables() -> tuple[tuple[int, ...], tuple[int, ...], tuple[tuple[int, ...], ...]]:
+    crc8 = []
+    crc16 = []
+    next_one = []
+    for byte in range(256):
+        c8 = byte
+        c16 = byte << 8
+        for _ in range(8):
+            c8 = ((c8 << 1) ^ 0x07) & 0xFF if c8 & 0x80 else (c8 << 1) & 0xFF
+            c16 = ((c16 << 1) ^ 0x8005) & 0xFFFF if c16 & 0x8000 else (c16 << 1) & 0xFFFF
+        crc8.append(c8)
+        crc16.append(c16)
+        next_one.append(tuple(next((k - s + 1 for k in range(s, 8) if (byte >> (7 - k)) & 1), 9) for s in range(8)))
+    return tuple(crc8), tuple(crc16), tuple(next_one)
+
+
+_FLAC_CRC8_TABLE, _FLAC_CRC16_TABLE, _FLAC_NEXT_ONE = _build_flac_crc_tables()
+_FLAC_BS_FIXED = (0, 192, 576, 1152, 2304, 4608, -1, -2, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
+_FLAC_SR_FIXED = (0, 88200, 176400, 192000, 8000, 16000, 22050, 24000, 32000, 44100, 48000, 96000, -1, -2, -3, -99)
+_FLAC_BPS_FIXED = (0, 8, 12, -1, 16, 20, 24, 32)
+_FLAC_RICE_DFA: dict[int, tuple[tuple[int, ...], ...]] = {}
+
+
+def _flac_rice_dfa(rp: int) -> tuple[tuple[int, ...], ...]:
+    """Byte-aligned Rice residual skip table for Rice parameter ``rp``:
+    maps ``(state, byte) -> (next_state << 4) | completed_symbols``."""
+    dfa = _FLAC_RICE_DFA.get(rp)
+    if dfa is not None:
+        return dfa
+    rows = []
+    for start_state in range(rp + 1):
+        row = []
+        for byte in range(256):
+            st = start_state
+            syms = 0
+            for bit in range(7, -1, -1):
+                if st == 0:
+                    if (byte >> bit) & 1:
+                        if rp == 0:
+                            syms += 1
+                        else:
+                            st = rp
+                else:
+                    st -= 1
+                    if st == 0:
+                        syms += 1
+            row.append((st << 4) | syms)
+        rows.append(tuple(row))
+    dfa = tuple(rows)
+    _FLAC_RICE_DFA[rp] = dfa
+    return dfa
+
+
+def _flac_crc8(data: memoryview) -> int:
+    c = 0
+    table = _FLAC_CRC8_TABLE
+    for byte in data:
+        c = table[c ^ byte]
+    return c
+
+
+def _flac_crc16(data: memoryview) -> int:
+    c = 0
+    table = _FLAC_CRC16_TABLE
+    for byte in data:
+        c = ((c << 8) & 0xFFFF) ^ table[(c >> 8) ^ byte]
+    return c
+
+
+def _verify_complete_flac_stream(path: str, expected_samples: int, expected_rate: int, expected_channels: int) -> bool:
+    """Verify per RFC 9639 that ``path`` is a complete, uncorrupted FLAC stream
+    whose audio frames decode to ``expected_samples`` at ``expected_rate`` and
+    ``expected_channels`` and terminate cleanly at EOF with zero trailing bytes.
+
+    libsndfile raises ``Internal psf_fseek() failed.`` on a headerless FLAC
+    (``STREAMINFO.total_samples == 0``) both at legitimate EOF and on truncated
+    or mid-stream-corrupted frames; walking metadata blocks, frame headers
+    (CRC-8), subframe/Rice residual bit boundaries, and frame footers (CRC-16)
+    to exact EOF separates valid EOF from truncation or corruption.
+    """
+    if not isinstance(path, (str, os.PathLike)):
+        return False
+    try:
+        with open(path, "rb") as fp:
+            file_size = os.fstat(fp.fileno()).st_size
+            if file_size < 42:
+                return False
+            with mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ) as mm, memoryview(mm) as mv:
+                return _verify_flac_memoryview(mv, expected_samples, expected_rate, expected_channels)
+    except OSError:
+        return False
+
+
+def _verify_flac_memoryview(mv: memoryview, expected_samples: int, expected_rate: int, expected_channels: int) -> bool:
+    n = len(mv)
+    pos = 0
+    if n >= 10 and bytes(mv[:3]) == b"ID3":
+        tag_size = ((mv[6] & 0x7F) << 21) | ((mv[7] & 0x7F) << 14) | ((mv[8] & 0x7F) << 7) | (mv[9] & 0x7F)
+        pos = 10 + tag_size + (10 if (mv[5] & 0x10) else 0)
+    if pos + 4 > n or bytes(mv[pos : pos + 4]) != b"fLaC":
+        return False
+    pos += 4
+
+    stream_rate = stream_channels = stream_bps = 0
+    saw_streaminfo = False
+    is_last = 0
+    while not is_last:
+        if pos + 4 > n:
+            return False
+        hdr0 = mv[pos]
+        is_last = hdr0 >> 7
+        btype = hdr0 & 0x7F
+        blen = (mv[pos + 1] << 16) | (mv[pos + 2] << 8) | mv[pos + 3]
+        pos += 4
+        if btype == 127 or pos + blen > n:
+            return False
+        if not saw_streaminfo:
+            if btype != 0 or blen != 34:
+                return False
+            si = int.from_bytes(mv[pos + 10 : pos + 18], "big")
+            stream_rate = (si >> 44) & 0xFFFFF
+            stream_channels = ((si >> 41) & 0x7) + 1
+            stream_bps = ((si >> 36) & 0x1F) + 1
+            if stream_rate != expected_rate or stream_channels != expected_channels:
+                return False
+            saw_streaminfo = True
+        elif btype == 0:
+            return False
+        pos += blen
+
+    if not saw_streaminfo:
+        return False
+
+    end_bit = n * 8
+    total_samples = 0
+    next_one = _FLAC_NEXT_ONE
+
+    while pos < n:
+        frame_start = pos
+        if pos + 6 > n:
+            return False
+        if mv[pos] != 0xFF or (mv[pos + 1] & 0xFE) != 0xF8:
+            return False
+        blocking = mv[pos + 1] & 1
+        b2 = mv[pos + 2]
+        b3 = mv[pos + 3]
+        bs_code = b2 >> 4
+        sr_code = b2 & 0x0F
+        ch_assign = b3 >> 4
+        bps_code = (b3 >> 1) & 0x07
+        if bs_code == 0 or sr_code == 15 or ch_assign > 10 or (b3 & 1):
+            return False
+        channels = (ch_assign + 1) if ch_assign < 8 else 2
+        if channels != stream_channels:
+            return False
+        bps = stream_bps if bps_code == 0 else _FLAC_BPS_FIXED[bps_code]
+        if bps <= 0:
+            return False
+
+        p = pos + 4
+        u0 = mv[p]
+        p += 1
+        if u0 & 0x80:
+            lead = 0
+            mask = 0x80
+            while u0 & mask:
+                lead += 1
+                mask >>= 1
+            if lead < 2 or lead > (7 if blocking else 6) or p + lead - 1 > n:
+                return False
+            for _ in range(lead - 1):
+                if (mv[p] & 0xC0) != 0x80:
+                    return False
+                p += 1
+
+        if bs_code == 6:
+            if p >= n:
+                return False
+            block_size = mv[p] + 1
+            p += 1
+        elif bs_code == 7:
+            if p + 2 > n:
+                return False
+            block_size = ((mv[p] << 8) | mv[p + 1]) + 1
+            p += 2
+        else:
+            block_size = _FLAC_BS_FIXED[bs_code]
+
+        if sr_code == 0:
+            sample_rate = stream_rate
+        elif sr_code == 12:
+            if p >= n:
+                return False
+            sample_rate = mv[p] * 1000
+            p += 1
+        elif sr_code == 13:
+            if p + 2 > n:
+                return False
+            sample_rate = (mv[p] << 8) | mv[p + 1]
+            p += 2
+        elif sr_code == 14:
+            if p + 2 > n:
+                return False
+            sample_rate = ((mv[p] << 8) | mv[p + 1]) * 10
+            p += 2
+        else:
+            sample_rate = _FLAC_SR_FIXED[sr_code]
+        if sample_rate != stream_rate:
+            return False
+
+        if p >= n or _flac_crc8(mv[frame_start:p]) != mv[p]:
+            return False
+        bit_pos = (p + 1) * 8
+
+        for ch in range(channels):
+            if bit_pos + 8 > end_bit:
+                return False
+            bidx = bit_pos >> 3
+            boff = bit_pos & 7
+            shdr = mv[bidx] if boff == 0 else ((mv[bidx] << boff) | (mv[bidx + 1] >> (8 - boff))) & 0xFF
+            bit_pos += 8
+            if shdr & 0x80:
+                return False
+            stype = (shdr >> 1) & 0x3F
+            is_side = (ch_assign == 8 and ch == 1) or (ch_assign == 9 and ch == 0) or (ch_assign == 10 and ch == 1)
+            ch_bps = bps + 1 if is_side else bps
+            if shdr & 1:
+                wasted = 0
+                while True:
+                    if bit_pos >= end_bit:
+                        return False
+                    step = next_one[mv[bit_pos >> 3]][bit_pos & 7]
+                    if step <= 8:
+                        wasted += step
+                        bit_pos += step
+                        break
+                    wasted += 8 - (bit_pos & 7)
+                    bit_pos = (bit_pos & ~7) + 8
+                eff_bps = ch_bps - wasted
+                if eff_bps < 1:
+                    return False
+            else:
+                eff_bps = ch_bps
+
+            if stype == 0:
+                bit_pos += eff_bps
+                if bit_pos > end_bit:
+                    return False
+                continue
+            if stype == 1:
+                bit_pos += block_size * eff_bps
+                if bit_pos > end_bit:
+                    return False
+                continue
+            if 8 <= stype <= 12:
+                order = stype - 8
+                if order > block_size:
+                    return False
+                bit_pos += order * eff_bps
+                if bit_pos > end_bit:
+                    return False
+            elif 32 <= stype <= 63:
+                order = stype - 31
+                if order > block_size:
+                    return False
+                warm_bits = order * eff_bps
+                if bit_pos + warm_bits + 9 > end_bit:
+                    return False
+                bit_pos += warm_bits
+                bidx = bit_pos >> 3
+                boff = bit_pos & 7
+                word = (mv[bidx] << 8) | (mv[bidx + 1] if bidx + 1 < n else 0)
+                qlp_prec_m1 = (word >> (12 - boff)) & 0xF
+                if qlp_prec_m1 == 15:
+                    return False
+                bit_pos += 9 + order * (qlp_prec_m1 + 1)
+                if bit_pos > end_bit:
+                    return False
+            else:
+                return False
+
+            if bit_pos + 6 > end_bit:
+                return False
+            bidx = bit_pos >> 3
+            boff = bit_pos & 7
+            word = (mv[bidx] << 8) | (mv[bidx + 1] if bidx + 1 < n else 0)
+            r_hdr = (word >> (10 - boff)) & 0x3F
+            bit_pos += 6
+            method = r_hdr >> 4
+            if method > 1:
+                return False
+            porder = r_hdr & 0xF
+            num_parts = 1 << porder
+            if block_size % num_parts:
+                return False
+            part_base = block_size >> porder
+            if part_base < order:
+                return False
+            param_bits = 4 + method
+            escape = (1 << param_bits) - 1
+
+            for part_idx in range(num_parts):
+                n_res = part_base - order if part_idx == 0 else part_base
+                if bit_pos + param_bits > end_bit:
+                    return False
+                bidx = bit_pos >> 3
+                boff = bit_pos & 7
+                word = (mv[bidx] << 8) | (mv[bidx + 1] if bidx + 1 < n else 0)
+                rp = (word >> (16 - param_bits - boff)) & escape
+                bit_pos += param_bits
+                if rp == escape:
+                    if bit_pos + 5 > end_bit:
+                        return False
+                    bidx = bit_pos >> 3
+                    boff = bit_pos & 7
+                    word = (mv[bidx] << 8) | (mv[bidx + 1] if bidx + 1 < n else 0)
+                    raw_bits = (word >> (11 - boff)) & 0x1F
+                    bit_pos += 5 + n_res * raw_bits
+                    if bit_pos > end_bit:
+                        return False
+                else:
+                    rem = n_res
+                    if rem and (bit_pos & 7):
+                        while rem and (bit_pos & 7):
+                            while True:
+                                if bit_pos >= end_bit:
+                                    return False
+                                step = next_one[mv[bit_pos >> 3]][bit_pos & 7]
+                                if step <= 8:
+                                    bit_pos += step
+                                    break
+                                bit_pos = (bit_pos & ~7) + 8
+                            bit_pos += rp
+                            if bit_pos > end_bit:
+                                return False
+                            rem -= 1
+                    if rem:
+                        dfa = _flac_rice_dfa(rp)
+                        st = 0
+                        bpos = bit_pos >> 3
+                        while rem > 8 and bpos < n:
+                            entry = dfa[st][mv[bpos]]
+                            st = entry >> 4
+                            rem -= entry & 0xF
+                            bpos += 1
+                        bit_pos = bpos * 8
+                        if st:
+                            bit_pos += st
+                            if bit_pos > end_bit:
+                                return False
+                            rem -= 1
+                        while rem > 0:
+                            while True:
+                                if bit_pos >= end_bit:
+                                    return False
+                                step = next_one[mv[bit_pos >> 3]][bit_pos & 7]
+                                if step <= 8:
+                                    bit_pos += step
+                                    break
+                                bit_pos = (bit_pos & ~7) + 8
+                            bit_pos += rp
+                            if bit_pos > end_bit:
+                                return False
+                            rem -= 1
+
+        rem_bits = bit_pos & 7
+        if rem_bits:
+            bidx = bit_pos >> 3
+            if mv[bidx] & ((1 << (8 - rem_bits)) - 1):
+                return False
+            byte_pos = bidx + 1
+        else:
+            byte_pos = bit_pos >> 3
+
+        if byte_pos + 2 > n:
+            return False
+        expected_crc16 = (mv[byte_pos] << 8) | mv[byte_pos + 1]
+        if _flac_crc16(mv[frame_start:byte_pos]) != expected_crc16:
+            return False
+        pos = byte_pos + 2
+        total_samples += block_size
+
+    return pos == n and total_samples == expected_samples
+
+
 def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> tuple[np.ndarray, int]:
     """libsndfile decode of ``path``: float32 mono at the file's own rate.
 
@@ -713,7 +1099,9 @@ def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> 
     or understates the length cannot make the read unbounded; past
     ``max_seconds`` it raises :class:`AudioTooLongError`. A rate outside
     ``1..MAX_SAMPLE_RATE`` is refused (:class:`AudioRefusedError`) before
-    any read. A container libsndfile cannot read raises soundfile's own error.
+    any read. A headerless FLAC ends when libsndfile raises its terminal seek
+    error only if the stream validates as complete to exact EOF; truncated or
+    corrupt streams re-raise the error. Other read errors propagate.
     """
     import soundfile as sf
 
@@ -725,11 +1113,40 @@ def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> 
             check_resample_rate(rate, rate)
         except ValueError as exc:
             raise AudioRefusedError(str(exc)) from None
+        unknown_flac = False
+        if getattr(f, "format", None) == "FLAC":
+            from mstar.model.media_limits import _COUNT_BLOCK_FRAMES, sound_file_seconds
+
+            unknown_flac = sound_file_seconds(getattr(f, "frames", 0), rate) is None
         limit = int(max_seconds * rate)
         block = max(1, _SOUNDFILE_BLOCK_SECONDS * rate // _SOUNDFILE_BLOCK_ALIGN) * _SOUNDFILE_BLOCK_ALIGN
+        if unknown_flac:
+            block = min(block, _COUNT_BLOCK_FRAMES)
         parts, frames = [], 0
         while True:
-            data = f.read(min(block, limit + 1 - frames), dtype="float32", always_2d=True)
+            size = min(block, limit + 1 - frames)
+            output = np.full((size, f.channels), np.nan, dtype=np.float32) if unknown_flac else None
+            terminal = False
+            try:
+                if unknown_flac:
+                    data = f.read(size, dtype="float32", always_2d=True, out=output)
+                else:
+                    data = f.read(size, dtype="float32", always_2d=True)
+            except RuntimeError as exc:
+                if not (unknown_flac and "psf_fseek() failed" in str(exc)):
+                    raise
+                # libsndfile filled part of `output` before reporting the final
+                # seek failure. FLAC PCM samples are finite; NaNs mark unwritten rows.
+                valid = np.isfinite(output).all(axis=1)
+                written = int(valid.sum())
+                if not valid[:written].all() or valid[written:].any():
+                    raise
+                if frames + written > limit:
+                    raise AudioTooLongError(max_seconds) from None
+                if not _verify_complete_flac_stream(path, frames + written, rate, f.channels):
+                    raise
+                data = output[:written]
+                terminal = True
             if not len(data):
                 break
             frames += len(data)
@@ -738,6 +1155,8 @@ def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> 
             # a mono block is its own mean, and numpy's reduction over the
             # length-1 axis costs ~10x the copy
             parts.append(data[:, 0] if data.shape[1] == 1 else data.mean(axis=1))
+            if terminal:
+                break
     return (np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)), rate
 
 

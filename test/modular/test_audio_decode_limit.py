@@ -489,17 +489,509 @@ def _flac_without_length(path: Path, seconds: float, rate: int = 16000) -> None:
     path.write_bytes(bytes(data))
 
 
-def test_flac_without_a_length_is_measured_by_decoding_it(client, tmp_path):
+def test_headerless_flac_decodes_without_torchcodec(tmp_path, monkeypatch):
+    sf = pytest.importorskip("soundfile")
+    path = tmp_path / "speech.flac"
+    _flac_without_length(path, 5)
+    assert sf.info(path).frames == 2**63 - 1
+    monkeypatch.setitem(sys.modules, "torchcodec", None)
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)
+
+    from mstar.model.components.audio_features import load_speech_file
+
+    audio = load_speech_file(str(path), 16000, max_seconds=5)
+    assert len(audio) == 5 * 16000
+    reference = tmp_path / "reference.flac"
+    tone = (0.1 * np.sin(np.arange(5 * 16000) * 2 * np.pi * 440 / 16000)).astype(np.float32)
+    sf.write(reference, tone, 16000)
+    expected, _ = sf.read(reference, dtype="float32")
+    np.testing.assert_array_equal(audio.numpy(), expected)
+
+
+def test_headerless_flac_still_obeys_the_decoded_limit(tmp_path):
+    path = tmp_path / "speech.flac"
+    _flac_without_length(path, 5)
+    with pytest.raises(AudioTooLongError):
+        media_io.read_soundfile_capped(str(path), max_seconds=1)
+
+
+def test_headerless_flac_still_obeys_the_30_minute_cap(monkeypatch):
+    class LongFile:
+        format = "FLAC"
+        samplerate = 1
+        channels = 1
+        frames = 2**63 - 1
+
+        def __init__(self, path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, frames, **kwargs):
+            return np.zeros((frames, 1), dtype=np.float32)
+
+    monkeypatch.setitem(sys.modules, "soundfile", types.SimpleNamespace(SoundFile=LongFile))
+    with pytest.raises(AudioTooLongError):
+        media_io.read_soundfile_capped("long.flac", max_seconds=MAX_AUDIO_SECONDS)
+
+
+@pytest.mark.parametrize("format_, frames", [
+    ("FLAC", 16000), ("WAV", 2**63 - 1), ("FLAC", 2**63 - 1),
+])
+def test_soundfile_read_errors_outside_headerless_flac_still_raise(monkeypatch, format_, frames):
+    class FailingFile:
+        format = format_
+        samplerate = 16000
+        channels = 1
+
+        def __init__(self, path):
+            self.frames = frames
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, *args, **kwargs):
+            raise RuntimeError("decode failed")
+
+    monkeypatch.setitem(sys.modules, "soundfile", types.SimpleNamespace(SoundFile=FailingFile))
+    with pytest.raises(RuntimeError, match="decode failed"):
+        media_io.read_soundfile_capped("corrupt.flac", max_seconds=10)
+
+
+def test_stereo_24bit_headerless_flac_decodes_without_torchcodec(tmp_path, monkeypatch):
+    sf = pytest.importorskip("soundfile")
+    path = tmp_path / "stereo24.flac"
+    rate = 16000
+    t = np.arange(5 * rate) / rate
+    stereo = np.stack([
+        0.15 * np.sin(2 * np.pi * 440 * t),
+        0.15 * np.cos(2 * np.pi * 660 * t),
+    ], axis=1).astype(np.float32)
+    sf.write(path, stereo, rate, subtype="PCM_24")
+    reference = tmp_path / "reference24.flac"
+    reference.write_bytes(path.read_bytes())
+
+    data = bytearray(path.read_bytes())
+    assert data[:4] == b"fLaC"
+    streaminfo = int.from_bytes(data[8:42], "big")
+    shift = 34 * 8 - 108 - 36
+    streaminfo &= ~(((1 << 36) - 1) << shift)
+    data[8:42] = streaminfo.to_bytes(34, "big")
+    path.write_bytes(bytes(data))
+
+    assert sf.info(path).frames == 2**63 - 1
+    monkeypatch.setitem(sys.modules, "torchcodec", None)
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)
+
+    from mstar.model.components.audio_features import load_speech_file
+
+    expected, _ = sf.read(reference, dtype="float32", always_2d=True)
+    expected_mono = expected.mean(axis=1)
+    decoded, got_rate = media_io.read_soundfile_capped(str(path), max_seconds=5)
+    assert got_rate == rate
+    np.testing.assert_array_equal(decoded, expected_mono)
+    tensor = load_speech_file(str(path), rate, max_seconds=5)
+    np.testing.assert_array_equal(tensor.numpy(), expected_mono)
+
+
+def test_corrupt_headerless_flac_still_raises(tmp_path, monkeypatch):
+    sf = pytest.importorskip("soundfile")
+    path = tmp_path / "corrupt.flac"
+    _flac_without_length(path, 2)
+    data = bytearray(path.read_bytes())
+    for idx in range(1000, min(1200, len(data))):
+        data[idx] = 0
+    path.write_bytes(bytes(data))
+    assert sf.info(path).frames == 2**63 - 1
+    monkeypatch.setitem(sys.modules, "torchcodec", None)
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)
+
+    with pytest.raises(sf.LibsndfileError, match="lost sync"):
+        media_io.read_soundfile_capped(str(path), max_seconds=5)
+
+
+def test_truncated_trailing_garbage_and_midstream_corrupt_headerless_flac_raises(tmp_path, monkeypatch):
+    """Truncated, trailing-garbage, and mid-stream-corrupted headerless FLACs
+    where libsndfile raises ``Internal psf_fseek() failed.`` must raise
+    LibsndfileError (and UndecodableMediaError inside decoding_upload) rather
+    than silently returning partial audio."""
+    import os
+
+    sf = pytest.importorskip("soundfile")
+    from mstar.model.media_limits import UndecodableMediaError, decoding_upload
+    from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
+
+    monkeypatch.setitem(sys.modules, "torchcodec", None)
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)
+
+    src = tmp_path / "source.flac"
+    _flac_without_length(src, 3, rate=16000)
+    raw = src.read_bytes()
+    assert sf.info(src).frames == 2**63 - 1
+
+    # Valid empty 42-byte FLAC (is_last=1 in STREAMINFO) vs truncated metadata (is_last=0)
+    empty42 = bytearray(raw[:42])
+    empty42[4] |= 0x80
+
+    flip_2086 = bytearray(raw)
+    for idx in range(2086, 2106):
+        flip_2086[idx] ^= 0xFF
+    flip_10939 = bytearray(raw)
+    for idx in range(10939, 10959):
+        flip_10939[idx] ^= 0xFF
+    flip_mid_single = bytearray(raw)
+    flip_mid_single[2086] ^= 0x01
+    flip_last_byte = bytearray(raw)
+    flip_last_byte[-1] ^= 0x01
+
+    bad_payloads = {
+        "trunc_1B": raw[:-1],
+        "trunc_10000B": raw[:-10000],
+        "trunc_metadata": raw[:42],
+        "frame0_plus_garbage": raw[:2200] + os.urandom(20000),
+        "empty42_plus_1B": bytes(empty42) + b"\x00",
+        "valid_plus_1B": raw + b"\x00",
+        "flip20_2086": bytes(flip_2086),
+        "flip20_10939": bytes(flip_10939),
+        "flip1_2086": bytes(flip_mid_single),
+        "flip_last_byte_crc16": bytes(flip_last_byte),
+    }
+
+    duplex = object.__new__(NemotronDuplexModel)
+    duplex.max_session_s = 10.0
+
+    for name, payload in bad_payloads.items():
+        bad_path = tmp_path / f"{name}.flac"
+        bad_path.write_bytes(payload)
+        with pytest.raises(sf.LibsndfileError):
+            media_io.read_soundfile_capped(str(bad_path), max_seconds=10.0)
+        with pytest.raises(UndecodableMediaError), decoding_upload(str(bad_path), "the audio"):
+            media_io.read_soundfile_capped(str(bad_path), max_seconds=10.0)
+        with pytest.raises(UndecodableMediaError):
+            duplex.load_audio(str(bad_path), "cpu")
+
+
+def test_valid_headerless_flac_block_aligned_non_aligned_and_empty_decode(tmp_path, monkeypatch):
+    """Valid headerless FLACs across block-aligned, non-block-aligned, empty,
+    constant/verbatim subframes, multi-channel, and exact max_seconds bounds
+    decode sample-identically without torchcodec."""
+    sf = pytest.importorskip("soundfile")
+    monkeypatch.setitem(sys.modules, "torchcodec", None)
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)
+
+    rng = np.random.default_rng(7)
+    cases = [
+        (16000, 1, 1, "PCM_16", "sine"),
+        (16000, 100, 1, "PCM_16", "sine"),
+        (16000, 4095, 1, "PCM_16", "sine"),
+        (16000, 4096, 1, "PCM_16", "sine"),
+        (16000, 4097, 1, "PCM_16", "sine"),
+        (16000, 8192, 1, "PCM_16", "sine"),
+        (16000, 8193, 1, "PCM_16", "sine"),
+        (16000, 8192, 1, "PCM_16", "silence"),
+        (16000, 5000, 1, "PCM_16", "noise"),
+        (44100, 12345, 2, "PCM_24", "noise"),
+        (48000, 8192, 6, "PCM_16", "noise"),
+    ]
+
+    for idx, (rate, n_frames, channels, subtype, kind) in enumerate(cases):
+        ref = tmp_path / f"ref_{idx}.flac"
+        if kind == "silence":
+            arr = np.zeros((n_frames, channels) if channels > 1 else n_frames, dtype=np.float32)
+        elif kind == "noise":
+            arr = (0.2 * rng.standard_normal((n_frames, channels) if channels > 1 else n_frames)).astype(np.float32)
+        else:
+            t = np.arange(n_frames) / rate
+            arr = (0.15 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+            if channels > 1:
+                arr = np.stack([arr] * channels, axis=1)
+        sf.write(ref, arr, rate, subtype=subtype)
+
+        raw = bytearray(ref.read_bytes())
+        shift = 34 * 8 - 108 - 36
+        si = int.from_bytes(raw[8:42], "big") & ~(((1 << 36) - 1) << shift)
+        raw[8:42] = si.to_bytes(34, "big")
+        hl = tmp_path / f"hl_{idx}.flac"
+        hl.write_bytes(bytes(raw))
+        assert sf.info(hl).frames == 2**63 - 1
+
+        expected, _ = sf.read(ref, dtype="float32", always_2d=True)
+        expected_mono = expected[:, 0] if channels == 1 else expected.mean(axis=1)
+        max_s = (n_frames + 1e-6) / rate
+        assert int(max_s * rate) == n_frames
+        decoded, got_rate = media_io.read_soundfile_capped(str(hl), max_seconds=max_s)
+        assert got_rate == rate
+        np.testing.assert_array_equal(decoded, expected_mono)
+        if n_frames > 1:
+            too_short_s = (n_frames - 1 + 1e-6) / rate
+            assert int(too_short_s * rate) == n_frames - 1
+            with pytest.raises(AudioTooLongError):
+                media_io.read_soundfile_capped(str(hl), max_seconds=too_short_s)
+
+    # Empty valid 42-byte headerless FLAC
+    empty42 = bytearray((tmp_path / "hl_3.flac").read_bytes()[:42])
+    empty42[4] |= 0x80
+    empty_path = tmp_path / "empty.flac"
+    empty_path.write_bytes(bytes(empty42))
+    decoded, got_rate = media_io.read_soundfile_capped(str(empty_path), max_seconds=5.0)
+    assert decoded.shape == (0,) and got_rate == 16000
+
+
+def test_flac_without_a_length_is_measured_by_decoding_it(client, tmp_path, monkeypatch):
     # main read libsndfile's "unknown" frame count as a duration of about
     # 5.8e14 s and refused a 2 minute clip with a 413
     pytest.importorskip("soundfile")
-    try:
-        import torchcodec.decoders  # noqa: F401
-    except Exception as exc:  # noqa: BLE001 — needs FFmpeg's shared libraries too
-        pytest.skip(f"torchcodec cannot load here: {exc}")
+    monkeypatch.setitem(sys.modules, "torchcodec", None)
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)
     http, api = client
     path = tmp_path / "speech.flac"
     _flac_without_length(path, 120)
     r = _transcribe(http, content=path.read_bytes(), filename="speech.flac")
     assert r.status_code == 200, r.text
     assert api.submits
+
+
+def test_live_http_serving_decodes_headerless_flac_without_torchcodec(tmp_path, monkeypatch):
+    """CPU live HTTP serving check over uvicorn + APIServer + PreprocessWorkerThread
+    + Model.load_audio with torchcodec disabled: both /v1/audio/transcriptions
+    (windowed >30s headerless FLAC) and /generate (headerless FLAC upload) decode
+    without FFmpeg or torchcodec."""
+    import base64
+    import queue
+    import socket
+    import threading
+    import time
+
+    sf = pytest.importorskip("soundfile")
+    httpx = pytest.importorskip("httpx")
+    uvicorn = pytest.importorskip("uvicorn")
+    from api_server_helpers import StandInSocket, make_test_api_server
+
+    from mstar.api_server import entrypoint
+    from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
+    from mstar.api_server.request_types import ResultChunk
+    from mstar.communication.event import EventWakeup
+    from mstar.model.base import Model
+    from mstar.testing_utils.model import StubModel
+    from mstar.utils.ipc_format import ConductorMessageType
+
+    monkeypatch.setitem(sys.modules, "torchcodec", None)
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)
+
+    class _AudioModel(StubModel):
+        AUDIO_INPUT_RATE = 16000
+        MAX_AUDIO_SECONDS = MAX_AUDIO_SECONDS
+
+        def __init__(self):
+            self.recorded_audio = []
+
+        def process_prompt(
+            self, text, input_modalities, output_modalities,
+            tensors=None, input_metadata=None, **kwargs,
+        ):
+            for wav in (tensors or {}).get("audio_inputs", ()):
+                self.recorded_audio.append(wav.clone())
+            return {}
+
+    class _TensorManager:
+        def store_and_return_tensor_info(self, request_id, tensors):
+            return {}
+
+        def register_for_send(self, request_id, tensor_infos):
+            pass
+
+        def set_persist(self, uuid, persist=True):
+            pass
+
+        def take_failed_reads(self):
+            return []
+
+        def get_ready_tensors(self):
+            return {}
+
+        def has_inflight_reads(self, request_id):
+            return False
+
+        def force_cleanup_request(self, request_id):
+            pass
+
+        def ack_unread_tensors(self, graph_edges):
+            pass
+
+    class _WorkerSocket:
+        codec = types.SimpleNamespace(encode=lambda msg: msg)
+
+        def __init__(self, on_new_request):
+            self.on_new_request = on_new_request
+
+        def get_all_new_messages(self):
+            return []
+
+        def send(self, entity, msg):
+            if entity == "conductor" and msg.message_type == ConductorMessageType.NEW_REQUEST:
+                self.on_new_request(msg.body.request_id)
+
+        def try_send_bytes(self, entity, msg):
+            self.send(entity, msg)
+            return True
+
+    model = _AudioModel()
+    # Explicitly verify Model.load_audio is inherited unchanged.
+    assert type(model).load_audio is Model.load_audio
+
+    stop_event = threading.Event()
+    out_queue = ResultQueue(EventWakeup())
+    profile_queue = ResultQueue(EventWakeup())
+    server_holder = {}
+
+    def complete_request(rid):
+        srv = server_holder["api"]
+        with srv.request_lock:
+            srv.pending_requests[rid].output_chunk_counts = {"text_inputs": 1}
+            srv.recently_completed[rid] = time.time()
+        out_queue.put(ResultChunk(request_id=rid, modality="text", data=b"ok", stopped=True))
+        out_queue.flush()
+
+    worker = PreprocessWorkerThread(
+        in_queue=queue.Queue(),
+        result_tensor_queue=queue.Queue(),
+        out_queue=out_queue,
+        profile_queue=profile_queue,
+        cleanup_request_queue=queue.Queue(),
+        abort_request_queue=queue.Queue(),
+        reads_done_queue=queue.Queue(),
+        discard_tensor_queue=queue.Queue(),
+        stop_event=stop_event,
+        communicator=_WorkerSocket(complete_request),
+        tensor_manager=_TensorManager(),
+        model=model,
+    )
+    facade = PreprocessWorker.__new__(PreprocessWorker)
+    facade.request_input_queue = worker.in_queue
+    facade.result_tensor_input_queue = worker.result_tensor_queue
+    facade.abort_request_queue = worker.abort_request_queue
+    facade.reads_done_queue = worker.reads_done_queue
+    facade.cleanup_request_queue = worker.cleanup_request_queue
+    facade.discard_tensor_queue = worker.discard_tensor_queue
+    facade.output_queue = out_queue
+    facade.results_wakeup = out_queue.wakeup
+    facade.received_chunk_counts = {}
+    facade.per_request_reading_tensors = {}
+    facade.get_result_chunks = lambda: [out_queue.get_nowait()] if not out_queue.empty() else []
+    facade.get_profile_updates = lambda: [profile_queue.get_nowait()] if not profile_queue.empty() else []
+    facade.has_pending_tensors = lambda rid: False
+    facade.received_final_chunks = lambda rid, counts: True
+    facade.finished_reading = lambda rid, drained=True: None
+
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    api = make_test_api_server(
+        preprocess_worker=facade,
+        communicator=StandInSocket(),
+        model=model,
+        model_name="whisper_large",
+        upload_dir=upload_dir,
+    )
+    server_holder["api"] = api
+    monkeypatch.setattr(entrypoint, "api_server", api)
+
+    worker_thread = threading.Thread(target=worker.run, daemon=True)
+    msg_thread = threading.Thread(target=api._process_messages, daemon=True)
+    worker_thread.start()
+    msg_thread.start()
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    http_server = uvicorn.Server(uvicorn.Config(entrypoint.app, host="127.0.0.1", port=port, log_level="warning"))
+    http_thread = threading.Thread(target=http_server.run, daemon=True)
+    http_thread.start()
+
+    deadline = time.monotonic() + 15.0
+    while not http_server.started:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+    try:
+        with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=15.0) as http:
+            # 1. >30s headerless FLAC on /v1/audio/transcriptions -> WindowPlanner splits into 2 windows.
+            long_flac = tmp_path / "long_headerless.flac"
+            _flac_without_length(long_flac, 45)
+            assert sf.info(long_flac).frames == 2**63 - 1
+            r1 = http.post(
+                "/v1/audio/transcriptions",
+                data={"model": "whisper_large"},
+                files={"file": ("long_headerless.flac", long_flac.read_bytes(), "audio/flac")},
+            )
+            assert r1.status_code == 200, r1.text
+            assert r1.json()["text"] == "ok ok"
+            assert len(model.recorded_audio) == 2
+
+            # 2. 5s headerless FLAC upload on /generate -> Model.load_audio -> read_soundfile_capped.
+            short_flac = tmp_path / "short_headerless.flac"
+            _flac_without_length(short_flac, 5)
+            assert sf.info(short_flac).frames == 2**63 - 1
+            ref_flac = tmp_path / "short_ref.flac"
+            tone = (0.1 * np.sin(np.arange(5 * 16000) * 2 * np.pi * 440 / 16000)).astype(np.float32)
+            sf.write(ref_flac, tone, 16000)
+            expected, _ = sf.read(ref_flac, dtype="float32")
+
+            r2 = http.post(
+                "/generate",
+                data={"text": "transcribe", "output_modalities": "text", "streaming": "false"},
+                files={"files": ("short_headerless.flac", short_flac.read_bytes(), "audio/flac")},
+            )
+            assert r2.status_code == 200, r2.text
+            assert [base64.b64decode(o["data"]) for o in r2.json()["outputs"]["text"]] == [b"ok"]
+            assert len(model.recorded_audio) == 3
+            np.testing.assert_array_equal(model.recorded_audio[-1].numpy(), expected)
+
+            # 3. Truncated and mid-stream-corrupt headerless FLAC uploads must be
+            #    rejected with HTTP 400 (never silently returning partial audio).
+            #    Mock torchcodec as a failing FFmpeg decoder so Model.load_audio
+            #    -> load_speech_file rejects corrupt uploads with HTTP 400.
+            class _FailingAudioDecoder:
+                def __init__(self, *args, **kwargs):
+                    raise RuntimeError("Invalid data found when processing input")
+
+            decoders = types.ModuleType("torchcodec.decoders")
+            decoders.AudioDecoder = _FailingAudioDecoder
+            fake_tc = types.ModuleType("torchcodec")
+            fake_tc.decoders = decoders
+            fake_tc.ffmpeg_major_version = 7
+            monkeypatch.setitem(sys.modules, "torchcodec", fake_tc)
+            monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
+
+            short_raw = short_flac.read_bytes()
+            trunc_bytes = short_raw[:-1]
+            r3 = http.post(
+                "/generate",
+                data={"text": "transcribe", "output_modalities": "text", "streaming": "false"},
+                files={"files": ("trunc.flac", trunc_bytes, "audio/flac")},
+            )
+            assert r3.status_code == 400, r3.text
+
+            corrupt_bytes = bytearray(short_raw)
+            corrupt_bytes[2086] ^= 0x01
+            r4 = http.post(
+                "/generate",
+                data={"text": "transcribe", "output_modalities": "text", "streaming": "false"},
+                files={"files": ("corrupt.flac", bytes(corrupt_bytes), "audio/flac")},
+            )
+            assert r4.status_code == 400, r4.text
+            assert len(model.recorded_audio) == 3
+    finally:
+        http_server.should_exit = True
+        http_thread.join(timeout=10)
+        api.running = False
+        out_queue.wakeup.signal()
+        msg_thread.join(timeout=5)
+        stop_event.set()
+        worker_thread.join(timeout=5)
