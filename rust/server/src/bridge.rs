@@ -85,7 +85,7 @@ pub enum StreamItem {
     /// terminal — the route is removed. `status` is the HTTP status the
     /// frontend should return (from the error chunk's `metadata.status`);
     /// `refused`: `submit_request` refused it, so it never had a request id.
-    Error { status: u16, message: String, refused: bool },
+    Error { status: u16, message: String, refused: bool, weight_version: Option<String> },
     Done,
 }
 
@@ -398,6 +398,7 @@ impl Bridge {
                 status: 500,
                 message: "backend unreachable (bridge send failed)".to_string(),
                 refused: false,
+                weight_version: None,
             });
             self.routes.lock().expect("routes lock").remove(sub);
         }
@@ -474,6 +475,25 @@ impl Bridge {
                     error.get("message").and_then(Value::as_str).unwrap_or_default().to_string(),
                 )),
                 _ => Err((500, "the API server's LoRA admin gave no answer".to_string())),
+            },
+            Some(StreamItem::Error { status, message, .. }) => Err((status, message)),
+            _ => Err((503, "backend bridge unreachable".to_string())),
+        }
+    }
+
+    /// Generation control uses the Python API server's shared path guard and
+    /// the conductor messages from #845; the reply carries the HTTP status.
+    pub async fn generation_admin(&self, op: &str, body: &serde_json::Map<String, Value>, timeout: Duration) -> Result<Value, (u16, String)> {
+        let mut args = body.clone();
+        args.insert("op".into(), Value::from(op));
+        match self.round_trip("generation_admin", Extras { op: Some(&args), ..Extras::default() }, timeout).await {
+            Some(StreamItem::Chunk(chunk)) => match (chunk.metadata.get("result"), chunk.metadata.get("error")) {
+                (Some(result), _) => Ok(result.clone()),
+                (_, Some(error)) => Err((
+                    error.get("status").and_then(Value::as_u64).unwrap_or(500) as u16,
+                    error.get("message").and_then(Value::as_str).unwrap_or_default().to_string(),
+                )),
+                _ => Err((500, "the API server's generation admin gave no answer".to_string())),
             },
             Some(StreamItem::Error { status, message, .. }) => Err((status, message)),
             _ => Err((503, "backend bridge unreachable".to_string())),
@@ -606,8 +626,13 @@ fn deliver(routes: &Routes, msg: Inbound) {
                 .and_then(Value::as_u64)
                 .unwrap_or(500) as u16;
             let refused = msg.metadata.get("refused").and_then(Value::as_bool).unwrap_or(false);
+            let weight_version = msg
+                .metadata
+                .get("weight_version")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let message = String::from_utf8_lossy(&msg.data.into_vec()).into_owned();
-            (Some(StreamItem::Error { status, message, refused }), true)
+            (Some(StreamItem::Error { status, message, refused, weight_version }), true)
         }
         "chunk" => (
             Some(StreamItem::Chunk(ResultChunk {
@@ -620,17 +645,25 @@ fn deliver(routes: &Routes, msg: Inbound) {
         // Legacy out-of-band error (the bridge relay caught an exception
         // and sent `t="err"`); no status carried, default to 500.
         "err" => (
-            Some(StreamItem::Error { status: 500, message: msg.msg, refused: false }),
+            Some(StreamItem::Error { status: 500, message: msg.msg, refused: false, weight_version: None }),
             true,
         ),
         "done" => (Some(StreamItem::Done), true),
         // Liveness reply: completes the ping's route like a request.
         "pong" => (Some(StreamItem::Done), true),
         "checked" => match msg.error {
-            Some(message) => (Some(StreamItem::Error { status: msg.status.unwrap_or(400), message, refused: false }), true),
+            Some(message) => (
+                Some(StreamItem::Error {
+                    status: msg.status.unwrap_or(400),
+                    message,
+                    refused: false,
+                    weight_version: None,
+                }),
+                true,
+            ),
             None => (Some(StreamItem::Done), true),
         },
-        "metrics" | "voices" | "windows" | "live" | "end_of_turn" | "lora" => (
+        "metrics" | "voices" | "windows" | "live" | "end_of_turn" | "lora" | "generation_admin" => (
             Some(StreamItem::Chunk(ResultChunk {
                 modality: msg.t,
                 data: msg.data.into_vec(),
@@ -923,5 +956,31 @@ mod tests {
         assert!(Waiter::start(&routes, "X").is_none(), "a second caller waited too");
         drop(first);
         assert!(Waiter::start(&routes, "X").is_some(), "the slot stayed taken after the wait");
+    }
+
+    #[test]
+    fn an_error_chunk_carries_its_weight_version_only_when_set() {
+        let deliver_error = |sub: u64, metadata: Value| {
+            let routes: Routes = Mutex::new(Table::default());
+            let (tx, mut rx) = unbounded_channel();
+            routes.lock().unwrap().claim("X", sub, tx).unwrap();
+            let msg = json!({
+                "t": "chunk", "rid": "X", "sub": sub, "modality": "error",
+                "data": b"boom".to_vec(), "metadata": metadata,
+            });
+            let inbound: Inbound = rmp_serde::from_slice(&rmp_serde::to_vec_named(&msg).unwrap()).unwrap();
+            deliver(&routes, inbound);
+            assert!(!routes.lock().unwrap().routes.contains_key(&sub));
+            match rx.try_recv().unwrap() {
+                StreamItem::Error { status, message, refused, weight_version } => {
+                    assert_eq!((status, message.as_str(), refused), (500, "boom", false));
+                    weight_version
+                }
+                other => panic!("expected error, got {other:?}"),
+            }
+        };
+        assert_eq!(deliver_error(1, json!({"status": 500, "weight_version": "v4"})).as_deref(), Some("v4"));
+        assert_eq!(deliver_error(2, json!({"status": 500})), None);
+        assert_eq!(deliver_error(3, json!({"status": 500, "weight_version": null})), None);
     }
 }

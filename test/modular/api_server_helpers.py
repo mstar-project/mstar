@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 from mstar.api_server.entrypoint import APIServer
+from mstar.api_server.generation_admin import GenerationAdmin
 from mstar.api_server.lora_admin import LoraAdmin
 from mstar.api_server.served_models import ServedModels
 from mstar.communication.event import EventWakeup
@@ -41,6 +42,9 @@ def make_test_api_server(**overrides) -> APIServer:
     server.model_config = None   # max_call_input_bytes reads it on first use
     server.openpi_policy = None   # no openpi: block
     server.lora_admin = LoraAdmin(None, server.served_models, lambda message: None)
+    server.generation_admin = GenerationAdmin(
+        lambda message: None, key_enabled=False, roots=(), timeout_s=server.timeout_seconds,
+    )
     server.client_streams = frozenset()
     server.takes_stream_input = False
     server.client_audio = []

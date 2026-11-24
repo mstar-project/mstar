@@ -30,6 +30,7 @@ mod auth;
 mod bridge;
 mod client_errors;
 mod generation_kwargs;
+mod generation_admin;
 mod media;
 mod protocol;
 mod realtime;
@@ -221,7 +222,7 @@ async fn main() {
     // outside admission, so an unauthenticated request never takes a permit.
     // The refusal counter sits between the two, so it sees the 401 and not
     // the preflights.
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/models", get(list_models))
@@ -234,7 +235,13 @@ async fn main() {
         .route("/healthz", get(ws::openpi::healthz))
         .route("/generate/ws", any(ws::generate::generate_ws))
         .route("/v1/realtime", any(realtime::realtime))
-        .merge(api)
+        .merge(api);
+    // A reload path is client-controlled, so no admin route exists without
+    // both authentication and a deployment-owned checkpoint allowlist.
+    if generation_admin::enabled(key_enabled, std::env::var("MSTAR_WEIGHT_RELOAD_ROOTS").ok().as_deref()) {
+        app = app.merge(generation_admin::router());
+    }
+    let app = app
         .layer(DefaultBodyLimit::max(body_limit_mb << 20))
         .layer(axum::middleware::from_fn_with_state(
             api_key,
@@ -1464,12 +1471,12 @@ fn video_ndjson(base: OutStream) -> impl futures::Stream<Item = Result<Bytes, In
                     st.0 += 1;
                     ndjson_line(&c)
                 }
-                Out::Error { status, message, .. } => {
+                Out::Error { status, message, weight_version, .. } => {
                     st.1 = true;
                     ndjson_line(&ResultChunk {
                         modality: "error".to_string(),
                         data: message.into_bytes(),
-                        metadata: json!({"status": status}),
+                        metadata: error_metadata(status, weight_version.as_deref()),
                     })
                 }
             };
@@ -1986,10 +1993,10 @@ async fn generate_finish(
                 Out::Chunk(c) => c,
                 // After the 200 the status travels in-band, as the error chunk
                 // Python's `errors_in_band` ends the stream with.
-                Out::Error { status, message, .. } => ResultChunk {
+                Out::Error { status, message, weight_version, .. } => ResultChunk {
                     modality: "error".to_string(),
                     data: message.into_bytes(),
-                    metadata: json!({"status": status}),
+                    metadata: error_metadata(status, weight_version.as_deref()),
                 },
             };
             let pieces = if binary {
@@ -2020,7 +2027,28 @@ async fn generate_finish(
             .or_default()
             .push(json!({"data": media::b64(&c.data), "metadata": c.metadata}));
     }
-    Json(json!({"request_id": request_id, "outputs": outputs})).into_response()
+    let mut body = json!({"request_id": request_id, "outputs": outputs});
+    if let Some(v) = top_level_weight_version(&chunks) {
+        body["weight_version"] = v.clone();
+    }
+    Json(body).into_response()
+}
+
+fn error_metadata(status: u16, weight_version: Option<&str>) -> Value {
+    match weight_version {
+        Some(v) => json!({"status": status, "weight_version": v}),
+        None => json!({"status": status}),
+    }
+}
+
+/// The top-level `weight_version` of a non-streaming `/generate`: the first
+/// chunk that carries one, as the Python frontend reads it. Only once a reload
+/// named a version, which every chunk carries the same; a request that
+/// completed with no output chunks has none on either frontend.
+fn top_level_weight_version(chunks: &[ResultChunk]) -> Option<&Value> {
+    chunks
+        .iter()
+        .find_map(|c| c.metadata.get("weight_version").filter(|v| !v.is_null()))
 }
 
 /// The Python `/generate`'s refusals for `video_frame`, worded the same: raw
@@ -2129,6 +2157,44 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_top_level_version_is_the_first_chunk_that_carries_one() {
+        let chunk = |metadata: Value| ResultChunk { modality: "text".into(), data: vec![], metadata };
+        assert_eq!(top_level_weight_version(&[]), None);
+        assert_eq!(top_level_weight_version(&[chunk(json!({}))]), None);
+        assert_eq!(top_level_weight_version(&[chunk(json!({"weight_version": null}))]), None);
+        let null_then_v3 = [chunk(json!({"weight_version": null})), chunk(json!({"weight_version": "v3"}))];
+        assert_eq!(top_level_weight_version(&null_then_v3), Some(&json!("v3")));
+        let chunks = [chunk(json!({})), chunk(json!({"weight_version": "v3"})), chunk(json!({"weight_version": "v3"}))];
+        assert_eq!(top_level_weight_version(&chunks), Some(&json!("v3")));
+    }
+
+    #[test]
+    fn streaming_generate_error_chunk_carries_weight_version_only_when_set() {
+        assert_eq!(error_metadata(500, None), json!({"status": 500}));
+        assert_eq!(error_metadata(503, Some("v1")), json!({"status": 503, "weight_version": "v1"}));
+
+        for (version, expected_meta) in [
+            (None, json!({"status": 500})),
+            (Some("v1"), json!({"status": 500, "weight_version": "v1"})),
+        ] {
+            let chunk = ResultChunk {
+                modality: "error".into(),
+                data: b"boom".to_vec(),
+                metadata: error_metadata(500, version),
+            };
+            let line: Value = serde_json::from_slice(&ndjson_line(&chunk)).unwrap();
+            assert_eq!(line["modality"], "error");
+            assert_eq!(line["metadata"], expected_meta);
+
+            let (header, payload) = binary_frame(chunk);
+            let header_json: Value = serde_json::from_slice(&header[..header.len() - 1]).unwrap();
+            assert_eq!(header_json["modality"], "error");
+            assert_eq!(header_json["metadata"], expected_meta);
+            assert_eq!(payload.as_ref(), b"boom");
+        }
+    }
     use mstar_rust::communicator::RawZmqCommunicator;
     use std::sync::atomic::{AtomicBool, Ordering};
 
