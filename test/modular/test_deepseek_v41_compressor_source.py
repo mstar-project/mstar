@@ -22,9 +22,12 @@ from mstar.model.components.deepseek_v41.compressor_source import (
 )
 
 
-def _weights(model: DeepSeekV41Compressor, layer: int) -> list[tuple[str, torch.Tensor]]:
-    return [(f"layers.{layer}.attn.compressor.{name}", torch.randn_like(value))
-            for name, value in model.named_parameters()]
+def _weights(model: DeepSeekV41Compressor, layer: int, seed: int = 300) -> list[tuple[str, torch.Tensor]]:
+    gen = torch.Generator().manual_seed(seed)
+    return [
+        (f"layers.{layer}.attn.compressor.{name}", torch.randn(value.shape, generator=gen, dtype=value.dtype))
+        for name, value in model.named_parameters()
+    ]
 
 
 def test_loader_accepts_ratio_one_bf16_and_ratio_two_fp32_without_scales():
@@ -44,9 +47,12 @@ def test_loader_accepts_ratio_one_bf16_and_ratio_two_fp32_without_scales():
 
 def test_ratio_one_source_needs_no_partial_value():
     model = DeepSeekV41Compressor(16, 8, 1).eval()
+    gen = torch.Generator().manual_seed(301)
+    with torch.no_grad():
+        model.wkv.weight.copy_(torch.randn(model.wkv.weight.shape, generator=gen, dtype=model.wkv.weight.dtype))
     source = DeepSeekV41CompressorSource(20, model, "unused")
     source.bind_state({})
-    tokens = torch.randn(1, 2, 16, dtype=torch.bfloat16)
+    tokens = torch.randn(1, 2, 16, generator=gen, dtype=torch.bfloat16)
     expected, state = model(tokens, 0)
     assert state is None
     torch.testing.assert_close(source(tokens, 0), expected, rtol=0, atol=0)

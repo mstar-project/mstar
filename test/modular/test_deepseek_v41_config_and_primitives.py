@@ -108,7 +108,8 @@ def test_rope_plain_yarn_and_inverse_roundtrip() -> None:
     assert torch.isclose(yarn_freqs[-1], plain_freqs[-1] / cfg.rope_factor)
 
     # Exact inverse RoPE roundtrip on last qk_rope_head_dim dims, leaving prefix untouched.
-    x = torch.randn(3, 4, cfg.head_dim, dtype=torch.float32)
+    gen = torch.Generator().manual_seed(401)
+    x = torch.randn(3, 4, cfg.head_dim, generator=gen, dtype=torch.float32)
     rot = rotate_tail(x, comp)
     assert torch.equal(rot[..., : -cfg.qk_rope_head_dim], x[..., : -cfg.qk_rope_head_dim])
     assert not torch.allclose(rot[..., -cfg.qk_rope_head_dim :], x[..., -cfg.qk_rope_head_dim :])
@@ -120,14 +121,14 @@ def test_rope_plain_yarn_and_inverse_roundtrip() -> None:
     torch.testing.assert_close(direct.cos, plain.cos)
     torch.testing.assert_close(direct.sin, plain.sin)
     # 2D input apply_rotary_emb
-    v2 = torch.randn(3, cfg.qk_rope_head_dim, dtype=torch.float32)
+    v2 = torch.randn(3, cfg.qk_rope_head_dim, generator=gen, dtype=torch.float32)
     rt = apply_rotary_emb(apply_rotary_emb(v2, plain), plain, inverse=True)
     torch.testing.assert_close(rt, v2, atol=1e-5, rtol=1e-5)
 
 
 def test_mx_rounding_and_reference_rmsnorm_bf16_fidelity() -> None:
-    torch.manual_seed(42)
-    x = torch.randn(4, 64, dtype=torch.bfloat16) * 3.5
+    gen = torch.Generator().manual_seed(42)
+    x = torch.randn((4, 64), generator=gen, dtype=torch.bfloat16) * 3.5
     x8 = round_fp8(x, block=32)
     assert x8.dtype == torch.bfloat16
     assert torch.isfinite(x8).all()
@@ -142,7 +143,7 @@ def test_mx_rounding_and_reference_rmsnorm_bf16_fidelity() -> None:
     torch.testing.assert_close(unpack_e2m1(pack_e2m1(grid_vals)), grid_vals, rtol=0, atol=0)
 
     # dequant_block_fp8 exactness
-    w = torch.randint(-8, 8, (32, 32), dtype=torch.int8).to(torch.float8_e4m3fn)
+    w = torch.randint(-8, 8, (32, 32), generator=gen, dtype=torch.int8).to(torch.float8_e4m3fn)
     s = torch.full((1, 1), 0.25, dtype=torch.float8_e8m0fnu)
     dq = dequant_block_fp8(w, s, torch.bfloat16)
     torch.testing.assert_close(dq, (w.float() * 0.25).to(torch.bfloat16), rtol=0, atol=0)

@@ -82,8 +82,11 @@ def test_two_layer_carry_matches_pinned_reference_block() -> None:
 
 
 def test_glm_hyper_connection_forward_keeps_its_original_collapse() -> None:
+    gen = torch.Generator().manual_seed(19)
     site = Glm5NextHyperConnection(8)
-    streams = torch.randn(1, 3, 4, 8, generator=torch.Generator().manual_seed(19))
+    with torch.no_grad():
+        site.fn.copy_(torch.randn(site.fn.shape, generator=gen) * 0.02)
+    streams = torch.randn(1, 3, 4, 8, generator=gen)
     pre, post, comb = site.mixes(streams)
     post_forward, comb_forward, collapsed = site(streams)
     torch.testing.assert_close(post_forward, post, rtol=0, atol=0)

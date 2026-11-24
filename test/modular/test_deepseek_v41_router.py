@@ -14,10 +14,10 @@ def test_sqrtsoftplus_image_routing_matches_published_gate() -> None:
         5, 6, 2, routed_scaling_factor=1.5, score_func="sqrtsoftplus",
         gate_temp=0.7, image_bias=True,
     )
-    torch.manual_seed(44)
-    tokens = torch.randn(4, 5)
+    gen = torch.Generator().manual_seed(44)
+    tokens = torch.randn(4, 5, generator=gen)
     with torch.no_grad():
-        router.weight.copy_(torch.randn(6, 5))
+        router.weight.copy_(torch.randn(6, 5, generator=gen))
         router.e_score_correction_bias.copy_(torch.tensor([0.1, 0, 0.2, 0, 0, 0]))
         router.bias_vl.copy_(torch.tensor([-1, 2, 0, 0, 0, 0]))
     router.finalize_weights()

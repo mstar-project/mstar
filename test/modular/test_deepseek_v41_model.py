@@ -243,7 +243,7 @@ def test_chunked_prefill_matches_one_shot_prefill_on_cpu() -> None:
     load_deepseek_v41_weights(m, tensors, device="cpu")
     m.eval()
 
-    ids = torch.randint(0, cfg.vocab_size, (2, 13))
+    ids = torch.randint(0, cfg.vocab_size, (2, 13), generator=torch.Generator().manual_seed(23))
     with torch.no_grad():
         one_shot = m(ids, 0)
         cache = m.new_cache(2, 32, "cpu", torch.float32)
@@ -594,8 +594,13 @@ def test_backbone_layer_loop_compiles_without_per_layer_recompiles(dynamo_counts
         m = DeepSeekV41TextBackbone(cfg)
         for layer in m.layers:
             layer.ffn = _StubFFN(cfg.hidden_size)
+        gen = torch.Generator().manual_seed(500 + n)
+        with torch.no_grad():
+            for p in m.parameters():
+                if p.is_floating_point():
+                    p.copy_(torch.randn(p.shape, generator=gen, dtype=torch.float32).to(p.dtype) * 0.02)
         cache = m.new_cache(1, 16, "cpu", torch.float32)
-        x = torch.randint(0, cfg.vocab_size, (1, 4))
+        x = torch.randint(0, cfg.vocab_size, (1, 4), generator=gen)
         return dynamo_counts(lambda inp: m.forward_hidden(inp, 0, cache=cache), x).compiles
 
     assert compiles(4) == compiles(2)
@@ -610,7 +615,7 @@ def test_multi_engram_chunked_prefill_and_masks() -> None:
     load_deepseek_v41_weights(m, tensors, device="cpu")
     m.eval()
 
-    ids = torch.randint(0, cfg.vocab_size, (2, 11))
+    ids = torch.randint(0, cfg.vocab_size, (2, 11), generator=torch.Generator().manual_seed(45))
     tok_mask = torch.ones_like(ids, dtype=torch.bool)
     tok_mask[:, 4:6] = False
     img_mask = ~tok_mask

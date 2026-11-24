@@ -102,7 +102,8 @@ def test_attention_prefill_decode_matches_naive_reference_across_all_layer_roles
         _init_attn(layer, seed=100 + i)
 
     seq_len = 21
-    x = torch.randn(1, seq_len, cfg.hidden_size, dtype=torch.float32) * 0.5
+    gen = torch.Generator().manual_seed(1000)
+    x = torch.randn(1, seq_len, cfg.hidden_size, generator=gen, dtype=torch.float32) * 0.5
 
     # Run independent naive reference across all 7 layers
     # (covering ratio=0, ratio=2, ratio=1, candidate_source, uses_candidates).
@@ -163,8 +164,9 @@ def test_forward_packed_isolates_multiple_requests() -> None:
     attn = DeepSeekV41Attention(cfg, layer_id=1).eval()  # ratio=2 compressor + indexer
     _init_attn(attn, seed=7)
 
-    x_a = torch.randn(1, 7, cfg.hidden_size, dtype=torch.float32)
-    x_b = torch.randn(1, 5, cfg.hidden_size, dtype=torch.float32)
+    gen = torch.Generator().manual_seed(701)
+    x_a = torch.randn(1, 7, cfg.hidden_size, generator=gen, dtype=torch.float32)
+    x_b = torch.randn(1, 5, cfg.hidden_size, generator=gen, dtype=torch.float32)
 
     cache_a = DeepSeekV41TextCache(cfg, 1, 32, torch.device("cpu"), torch.float32)
     cache_b = DeepSeekV41TextCache(cfg, 1, 32, torch.device("cpu"), torch.float32)
@@ -224,8 +226,10 @@ def test_text_cache_clears_bound_layer_after_write_layer() -> None:
     cfg = DeepSeekV41Config.reduced()
     rope = DeepSeekV41Rope(cfg)
     layers = [DeepSeekV41Attention(cfg, i).eval() for i in range(3)]
+    for i, layer in enumerate(layers):
+        _init_attn(layer, seed=200 + i)
     cache = DeepSeekV41TextCache(cfg, 1, 32, torch.device("cpu"), torch.float32)
-    x = torch.randn(1, 3, cfg.hidden_size, dtype=torch.float32)
+    x = torch.randn(1, 3, cfg.hidden_size, generator=torch.Generator().manual_seed(203), dtype=torch.float32)
 
     with torch.no_grad():
         cache.bind_layer(0)
