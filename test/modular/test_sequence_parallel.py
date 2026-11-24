@@ -12,6 +12,7 @@ and into which ranges; and the Wan2.2 DiT over its own resources on two ranks ag
 from __future__ import annotations
 
 import dataclasses
+import math
 import types
 
 import numpy as np
@@ -178,7 +179,8 @@ def _split_exchanges(rank, world, total, rows):
     r = SeqRange(group, tuple(sp_seq_split(total, world)), rows)
     b = rows or 1
     gen = torch.Generator().manual_seed(0)
-    q, k, v = (torch.randn(b * total, heads, 4, generator=gen) for heads in (HEADS, world, world))
+    q_heads = math.lcm(HEADS, world)
+    q, k, v = (torch.randn(b * total, heads, 4, generator=gen) for heads in (q_heads, world, world))
 
     def local(x):
         return r.local(x.unflatten(0, (b, total)), 1).flatten(0, 1)
@@ -198,12 +200,34 @@ def _split_exchanges(rank, world, total, rows):
     communication._all_gather_into_tensor = record
     run = _rows_attention(b, causal=True)
     want = run(q, k, v)
-    torch.testing.assert_close(ulysses(run, local(q), local(k), local(v), r=r), local(want))
+    exchanges = []
+    original_all_to_all = group.all_to_all
+    original_single = communication._all_to_all_single
+    single_calls = []
+
+    def counted_all_to_all(value, *args, **kwargs):
+        exchanges.append(len(value) if isinstance(value, list) else 1)
+        return original_all_to_all(value, *args, **kwargs)
+
+    def counted_single(*args, **kwargs):
+        single_calls.append(1)
+        return original_single(*args, **kwargs)
+
+    group.all_to_all = counted_all_to_all
+    communication._all_to_all_single = counted_single
+    try:
+        got = ulysses(run, local(q), local(k), local(v), r=r)
+    finally:
+        group.all_to_all = original_all_to_all
+        communication._all_to_all_single = original_single
+    assert exchanges == [3, 1], "q/k/v must share one exchange and the output one more"
+    assert len(single_calls) == 2, "q/k/v and output must use two all_to_all_single calls"
+    assert torch.equal(got, local(want))
     if rows is None:
         torch.testing.assert_close(all_gather(run, local(q), local(k), local(v), r), local(want))
     torch.testing.assert_close(head_slice(run, q, k, v, group), want)
     # copied queries over this rank's keys
-    q_short = torch.randn(b * 5, HEADS, 4, generator=gen)
+    q_short = torch.randn(b * 5, q_heads, 4, generator=gen)
     merged = sharded_key_merge(_rows_attention(b, causal=False, lse=True), q_short, local(k), local(v), r)
     torch.testing.assert_close(merged, _rows_attention(b, causal=False)(q_short, k, v))
 
@@ -226,7 +250,8 @@ def _split_exchanges(rank, world, total, rows):
 
 @pytest.mark.parametrize("rows", [None, 2], ids=["packed", "rows"])
 @pytest.mark.parametrize(
-    "world,total", [(2, 7), (3, 11), (2, 6)], ids=["2-uneven", "3-uneven", "2-even"],
+    "world,total", [(2, 7), (3, 11), (2, 6), (4, 13), (4, 12)],
+    ids=["2-uneven", "3-uneven", "2-even", "4-uneven", "4-even"],
 )
 def test_sequence_shard_exchanges_match_one_rank(tmp_path, world, total, rows):
     _run(_split_exchanges, world, tmp_path / "store", total, rows)
