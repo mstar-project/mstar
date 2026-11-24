@@ -54,6 +54,17 @@ fn body(bytes: &Bytes) -> Result<Map<String, Value>, Response> {
         })
 }
 
+fn validate_pause(fields: &Map<String, Value>) -> Result<(), Response> {
+    match fields.get("mode").and_then(Value::as_str) {
+        Some("abort" | "wait") => Ok(()),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"detail": "mode must be 'abort' or 'wait'"})),
+        )
+            .into_response()),
+    }
+}
+
 async fn call(st: AppState, op: &str, fields: Map<String, Value>) -> Response {
     let Some(bridge) = &st.bridge else {
         return (
@@ -62,6 +73,11 @@ async fn call(st: AppState, op: &str, fields: Map<String, Value>) -> Response {
         )
             .into_response();
     };
+    if op == "pause_generation" {
+        if let Err(error) = validate_pause(&fields) {
+            return error;
+        }
+    }
     let timeout = st.request_timeout + std::time::Duration::from_secs(30);
     match bridge.generation_admin(op, &fields, timeout).await {
         Ok(result) => {
@@ -125,5 +141,32 @@ mod tests {
         assert!(!enabled(true, None));
         assert!(!enabled(true, Some(":")));
         assert!(enabled(true, Some("/weights")));
+    }
+
+    #[tokio::test]
+    async fn pause_requires_explicit_valid_mode() {
+        use http_body_util::BodyExt;
+
+        for raw in [
+            "{}",
+            r#"{"mode":null}"#,
+            r#"{"mode":123}"#,
+            r#"{"mode":"invalid"}"#,
+            r#"{"mode":""}"#,
+        ] {
+            let fields: Map<String, Value> = serde_json::from_str(raw).unwrap();
+            let err = validate_pause(&fields).expect_err(raw);
+            assert_eq!(err.status(), StatusCode::BAD_REQUEST, "{raw}");
+            let bytes = err.into_body().collect().await.unwrap().to_bytes();
+            let json: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({"detail": "mode must be 'abort' or 'wait'"})
+            );
+        }
+        for raw in [r#"{"mode":"abort"}"#, r#"{"mode":"wait"}"#] {
+            let fields: Map<String, Value> = serde_json::from_str(raw).unwrap();
+            assert!(validate_pause(&fields).is_ok(), "{raw}");
+        }
     }
 }

@@ -117,3 +117,53 @@ def test_late_conductor_answer_after_http_timeout(tmp_path):
     admin.on_result(GenerationControlResult(
         op_id=sent[0].body.op_id, status=200, state="paused", paused=True,
     ))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [None, {}, {"mode": ""}, {"mode": None}, {"mode": 123}, {"mode": True}, {"mode": ["abort"]}, {"mode": "other"}],
+)
+def test_pause_requires_explicit_valid_mode(tmp_path, payload):
+    sent = []
+    admin = GenerationAdmin(sent.append, key_enabled=True, roots=(tmp_path,))
+    with pytest.raises(ValueError, match="mode must be 'abort' or 'wait'"):
+        asyncio.run(admin.call("pause_generation", payload))
+    assert sent == []
+
+
+def test_python_pause_route_requires_explicit_mode(tmp_path, monkeypatch):
+    sent = []
+
+    def send(message):
+        sent.append(message)
+        admin.on_result(GenerationControlResult(
+            op_id=message.body.op_id, status=200, state="paused", paused=True,
+        ))
+
+    admin = GenerationAdmin(send, key_enabled=True, roots=(tmp_path,))
+    monkeypatch.setattr("mstar.api_server.generation_routes._admin", lambda: admin)
+    app = FastAPI()
+    app.add_middleware(APIKeyMiddleware, guard=APIKeyGuard("secret"))
+    app.include_router(router)
+    auth = {"Authorization": "Bearer secret"}
+
+    with TestClient(app) as client:
+        for kwargs in (
+            {"content": b""},
+            {"json": {}},
+            {"json": {"mode": ""}},
+            {"json": {"mode": None}},
+            {"json": {"mode": 123}},
+            {"json": {"mode": ["abort"]}},
+            {"json": {"mode": "other"}},
+        ):
+            response = client.post("/pause_generation", headers=auth, **kwargs)
+            assert response.status_code == 400
+            assert response.json() == {"detail": "mode must be 'abort' or 'wait'"}
+        assert sent == []
+
+        for mode in ("abort", "wait"):
+            response = client.post("/pause_generation", json={"mode": mode}, headers=auth)
+            assert response.status_code == 200
+            assert response.json()["paused"] is True
+    assert [m.body.mode for m in sent] == ["abort", "wait"]
