@@ -61,7 +61,7 @@ pub enum Out {
     /// `status` is the HTTP status to return (carried in-band from the error
     /// chunk's `metadata.status`; defaults to 500). `refused`: `submit_request`
     /// refused it, so it never had a request id.
-    Error { status: u16, message: String, refused: bool },
+    Error { status: u16, message: String, refused: bool, weight_version: Option<String> },
 }
 
 pub type OutStream = Pin<Box<dyn Stream<Item = Out> + Send>>;
@@ -95,7 +95,9 @@ pub fn result_stream(
     streaming: bool,
 ) -> OutStream {
     try_result_stream(state, args, request_id, streaming).unwrap_or_else(|(status, message)| {
-        Box::pin(futures::stream::once(async move { Out::Error { status, message, refused: false } }))
+        Box::pin(futures::stream::once(async move {
+            Out::Error { status, message, refused: false, weight_version: None }
+        }))
     })
 }
 
@@ -119,20 +121,33 @@ pub fn try_result_stream(
     })
 }
 
+struct DetokState {
+    dec: IncrementalDecoder,
+    failed: bool,
+    weight_version: Option<serde_json::Value>,
+}
+
 /// Token-id chunks -> text chunks through one [`IncrementalDecoder`]; at the
 /// end of the stream, whatever it still holds goes out as a last text chunk.
 fn detokenize(base: OutStream, tok: Arc<Tok>) -> OutStream {
     use futures::StreamExt;
-    // (decoder, failed): the tail flushes what the decoder still holds,
-    // unless the stream already ended on an error.
-    let detok = Arc::new(Mutex::new((IncrementalDecoder::new(tok), false)));
+    // The tail flushes what the decoder still holds, unless the stream already
+    // ended on an error, carrying any weight_version seen on token chunks.
+    let detok = Arc::new(Mutex::new(DetokState {
+        dec: IncrementalDecoder::new(tok),
+        failed: false,
+        weight_version: None,
+    }));
     let tail_detok = detok.clone();
     let body = base.filter_map(move |item| {
         let mut st = detok.lock().unwrap();
         let mapped = match item {
             Out::Chunk(c) if c.modality == "token" && c.data.len() == 4 => {
+                if st.weight_version.is_none() {
+                    st.weight_version = c.metadata.get("weight_version").filter(|v| !v.is_null()).cloned();
+                }
                 let id = u32::from_le_bytes([c.data[0], c.data[1], c.data[2], c.data[3]]);
-                st.0.step(id).map(|piece| {
+                st.dec.step(id).map(|piece| {
                     Out::Chunk(ResultChunk {
                         modality: "text".to_string(),
                         data: piece.into_bytes(),
@@ -150,7 +165,7 @@ fn detokenize(base: OutStream, tok: Arc<Tok>) -> OutStream {
                 None
             }
             err @ Out::Error { .. } => {
-                st.1 = true;
+                st.failed = true;
                 Some(err)
             }
             other => Some(other),
@@ -159,14 +174,18 @@ fn detokenize(base: OutStream, tok: Arc<Tok>) -> OutStream {
     });
     let tail = futures::stream::once(async move {
         let mut st = tail_detok.lock().unwrap();
-        if st.1 {
+        if st.failed {
             return None;
         }
-        st.0.finish().map(|rest| {
+        st.dec.finish().map(|rest| {
+            let metadata = match st.weight_version.take() {
+                Some(v) => serde_json::json!({ "weight_version": v }),
+                None => serde_json::Value::Null,
+            };
             Out::Chunk(ResultChunk {
                 modality: "text".to_string(),
                 data: rest.into_bytes(),
-                metadata: serde_json::Value::Null,
+                metadata,
             })
         })
     })
@@ -225,10 +244,10 @@ fn submitted_stream(
                         Ok(Some(StreamItem::Chunk(c))) => {
                             Some((Out::Chunk(c), (rx, guard, deadline, false)))
                         }
-                        Ok(Some(StreamItem::Error { status, message, refused })) => {
+                        Ok(Some(StreamItem::Error { status, message, refused, weight_version })) => {
                             guard.done = true; // conductor already cleaned up
                             Some((
-                                Out::Error { status, message, refused },
+                                Out::Error { status, message, refused, weight_version },
                                 (rx, guard, deadline, true),
                             ))
                         }
@@ -247,6 +266,7 @@ fn submitted_stream(
                                     status: 500,
                                     message: "Request timed out".to_string(),
                                     refused: false,
+                                    weight_version: None,
                                 },
                                 (rx, guard, deadline, true),
                             ))
@@ -367,7 +387,66 @@ mod tests {
         let ids = tok.encode("中");
         let items = vec![
             token(ids[0]),
-            Out::Error { status: 500, message: "boom".to_string(), refused: false },
+            Out::Error { status: 500, message: "boom".to_string(), refused: false, weight_version: None },
+        ];
+        let base: OutStream = Box::pin(futures::stream::iter(items));
+        let out = futures::executor::block_on(detokenize(base, tok).collect::<Vec<_>>());
+        assert_eq!(texts(out), vec!["error: boom"]);
+    }
+
+    fn token_with_meta(id: u32, metadata: serde_json::Value) -> Out {
+        Out::Chunk(ResultChunk {
+            modality: "token".to_string(),
+            data: id.to_le_bytes().to_vec(),
+            metadata,
+        })
+    }
+
+    #[test]
+    fn detokenize_tail_flush_carries_weight_version_only_when_set() {
+        let tok = crate::tokenizer::byte_tok();
+        let mut ids = tok.encode("中文 😀");
+        ids.pop(); // stream ends inside the emoji, flushed by finish()
+        let base: OutStream = Box::pin(futures::stream::iter(
+            ids.iter().map(|&id| token_with_meta(id, serde_json::json!({"weight_version": "v9"}))).collect::<Vec<_>>(),
+        ));
+        let out = futures::executor::block_on(detokenize(base, tok.clone()).collect::<Vec<_>>());
+        let chunks: Vec<_> = out.into_iter().map(|o| match o { Out::Chunk(c) => c, _ => panic!() }).collect();
+        assert_eq!(chunks.len(), 4);
+        assert!(chunks.iter().all(|c| c.metadata == serde_json::json!({"weight_version": "v9"})));
+
+        // All tokens buffered until tail flush: single tail chunk still gets weight_version.
+        let buffered_ids = &tok.encode("😀")[..3];
+        let base: OutStream = Box::pin(futures::stream::iter(
+            buffered_ids.iter().map(|&id| token_with_meta(id, serde_json::json!({"weight_version": "v9"}))).collect::<Vec<_>>(),
+        ));
+        let out = futures::executor::block_on(detokenize(base, tok.clone()).collect::<Vec<_>>());
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            Out::Chunk(c) => {
+                assert_eq!(c.data, "\u{FFFD}".as_bytes());
+                assert_eq!(c.metadata, serde_json::json!({"weight_version": "v9"}));
+            }
+            _ => panic!("expected tail chunk"),
+        }
+
+        // Absent or null weight_version leaves tail metadata as Value::Null.
+        for meta in [serde_json::Value::Null, serde_json::json!({}), serde_json::json!({"weight_version": null})] {
+            let base: OutStream = Box::pin(futures::stream::iter(
+                buffered_ids.iter().map(|&id| token_with_meta(id, meta.clone())).collect::<Vec<_>>(),
+            ));
+            let out = futures::executor::block_on(detokenize(base, tok.clone()).collect::<Vec<_>>());
+            assert_eq!(out.len(), 1);
+            match &out[0] {
+                Out::Chunk(c) => assert_eq!(c.metadata, serde_json::Value::Null),
+                _ => panic!("expected tail chunk"),
+            }
+        }
+
+        // After an Out::Error preceded by versioned tokens, tail emits nothing.
+        let items = vec![
+            token_with_meta(ids[0], serde_json::json!({"weight_version": "v9"})),
+            Out::Error { status: 500, message: "boom".to_string(), refused: false, weight_version: Some("v9".into()) },
         ];
         let base: OutStream = Box::pin(futures::stream::iter(items));
         let out = futures::executor::block_on(detokenize(base, tok).collect::<Vec<_>>());

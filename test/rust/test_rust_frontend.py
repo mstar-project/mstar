@@ -1525,6 +1525,104 @@ def test_a_generate_stream_reads_as_pythons_down_to_a_late_error(binary):
     assert items(rust_body) == items(python_body)
 
 
+class _VersionedFailsMidStreamStub(_StubAPIServer):
+    def __init__(self, version):
+        super().__init__()
+        self.version = version
+
+    async def iter_result_chunks(self, request_id):
+        wv = {"weight_version": self.version} if self.version is not None else {}
+        yield _Chunk("text", b"Hel", {"token_ids": [1], **wv})
+        yield _Chunk("error", b"Error in worker: boom", {"status": 500, **wv})
+
+
+@pytest.mark.parametrize("binary", [False, True], ids=["ndjson", "frames"])
+@pytest.mark.parametrize("version", ["v1", None], ids=["versioned", "unversioned"])
+def test_streaming_generate_error_chunk_carries_weight_version_like_python(version, binary):
+    from mstar.api_server.entrypoint import (
+        BINARY_STREAM_MEDIA_TYPE,
+        _chunk_to_binary_frame,
+        _chunk_to_ndjson_payload,
+    )
+
+    wv = {"weight_version": version} if version is not None else {}
+    sent = [
+        _Chunk("text", b"Hel", {"token_ids": [1], **wv}),
+        _Chunk("error", b"Error in worker: boom", {"status": 500, **wv}),
+    ]
+    if binary:
+        python_body = b"".join(b"".join(_chunk_to_binary_frame(c)) for c in sent)
+    else:
+        python_body = "".join(_chunk_to_ndjson_payload(c) for c in sent).encode()
+
+    def items(body: bytes):
+        if binary:
+            return _frames(body)
+        return [(m["modality"], m["data"], m["metadata"]) for m in map(json.loads, body.splitlines())]
+
+    data = urllib.parse.urlencode({"text": "hi", "output_modalities": "text"}).encode()
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    if binary:
+        headers["Accept"] = BINARY_STREAM_MEDIA_TYPE
+    with _model_stack("qwen3_omni", _VersionedFailsMidStreamStub(version)) as (port, _up):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/generate", data=data, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            rust_body = r.read()
+    got = items(rust_body)
+    assert got == items(python_body)
+    expected_meta = {"status": 500, "weight_version": "v1"} if version == "v1" else {"status": 500}
+    assert got[-1][0] == "error" and got[-1][2] == expected_meta
+
+
+class _FixedChunksStub(_StubAPIServer):
+    def __init__(self, chunks):
+        super().__init__()
+        self._chunks = chunks
+
+    async def iter_result_chunks(self, request_id):
+        for chunk in self._chunks:
+            yield chunk
+
+
+class _FixedChunksPython(_GeneratePython):
+    def __init__(self, upload_dir, chunks):
+        super().__init__(upload_dir)
+        self._chunks = chunks
+
+    async def collect_results(self, request_id, raw_request=None):
+        return list(self._chunks)
+
+
+@pytest.mark.parametrize("chunks,expected_wv", [
+    ([], None),
+    ([_Chunk("text", b"a", {"weight_version": None})], None),
+    ([_Chunk("text", b"a", {}), _Chunk("text", b"b", {"weight_version": "v1"})], "v1"),
+    ([_Chunk("text", b"a", {"weight_version": "v1"})], "v1"),
+], ids=["empty", "null-metadata", "unversioned-then-v1", "v1"])
+def test_nonstreaming_generate_weight_version_parity(chunks, expected_wv, tmp_path, monkeypatch):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from mstar.api_server import entrypoint
+
+    monkeypatch.setattr(entrypoint, "api_server", _FixedChunksPython(tmp_path, chunks))
+    form = {"text": "hi", "output_modalities": "text", "streaming": "false"}
+    py = TestClient(entrypoint.app).post("/generate", data=form)
+    py_json = py.json()
+
+    with _model_stack("qwen3_omni", _FixedChunksStub(chunks)) as (port, _up):
+        status, rust_raw = _generate(port, urlencoded=True, fields=form)
+    rust_body = json.loads(rust_raw)
+
+    assert (status, rust_body["outputs"], "weight_version" in rust_body, rust_body.get("weight_version")) == (
+        py.status_code, py_json["outputs"], "weight_version" in py_json, py_json.get("weight_version")
+    )
+    if expected_wv is None:
+        assert "weight_version" not in rust_body
+    else:
+        assert rust_body["weight_version"] == expected_wv
+
+
 @pytest.mark.parametrize("root", ["/proj/job", "/proj/job/"], ids=["bare", "trailing-slash"])
 def test_both_frontends_route_under_a_root_path_alike(root, tmp_path, monkeypatch):
     """MSTAR_ROOT_PATH as Starlette's ``root_path`` routes it: a path under the

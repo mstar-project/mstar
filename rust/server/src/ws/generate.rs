@@ -198,11 +198,23 @@ fn encode(fields: Vec<(&str, Field)>, binary: bool) -> Message {
     Message::Text(Value::Object(obj).to_string())
 }
 
-/// `{request_id, error[, status]}`.
-fn error_reply(request_id: Option<&str>, error: &str, status: Option<u16>, binary: bool) -> Message {
-    let mut fields = vec![("request_id", Field::OptStr(request_id.map(str::to_string))), ("error", Field::Str(error.to_string()))];
+/// `{request_id, error[, status, weight_version]}`.
+fn error_reply(
+    request_id: Option<&str>,
+    error: &str,
+    status: Option<u16>,
+    weight_version: Option<&str>,
+    binary: bool,
+) -> Message {
+    let mut fields = vec![
+        ("request_id", Field::OptStr(request_id.map(str::to_string))),
+        ("error", Field::Str(error.to_string())),
+    ];
     if let Some(status) = status {
         fields.push(("status", Field::Int(status.into())));
+    }
+    if let Some(version) = weight_version {
+        fields.push(("weight_version", Field::Str(version.to_string())));
     }
     encode(fields, binary)
 }
@@ -505,7 +517,7 @@ async fn serve_one(
                 let _ = call.send(Some(None));
             }
             release_turn(turn.take().unwrap(), after);
-            sock.send(error_reply(request_id.as_deref(), &error, Some(status), binary));
+            sock.send(error_reply(request_id.as_deref(), &error, Some(status), None, binary));
             finish_call(&sock, request_id.as_deref(), call.is_some());
             return;
         }
@@ -538,7 +550,7 @@ async fn serve_one(
             }
             let _ = turn.take().unwrap().send(());
             // refused before it had an id: an unnamed message's error names none, as on Python's route
-            sock.send(error_reply(request_id.as_deref(), &error, Some(status), binary));
+            sock.send(error_reply(request_id.as_deref(), &error, Some(status), None, binary));
             finish_call(&sock, request_id.as_deref(), call.is_some());
             return;
         }
@@ -547,10 +559,10 @@ async fn serve_one(
     let mut failed = false;
     while let Some(item) = stream.next().await {
         match item {
-            Out::Error { status, message, refused } => {
+            Out::Error { status, message, refused, weight_version } => {
                 failed = true;
                 let id = if refused { request_id.as_deref() } else { Some(rid.as_str()) };
-                sock.send(error_reply(id, &message, Some(status), binary));
+                sock.send(error_reply(id, &message, Some(status), weight_version.as_deref(), binary));
             }
             Out::Chunk(c) => sock.send(encode(
                 vec![
@@ -788,11 +800,11 @@ async fn serve(socket: WebSocket, st: AppState) {
                 Val::Map(pairs)
             }
             Ok(_) => {
-                sock.send(error_reply(None, "message must be an object", None, binary));
+                sock.send(error_reply(None, "message must be an object", None, None, binary));
                 continue;
             }
             Err(e) => {
-                sock.send(error_reply(None, &format!("undecodable frame: {}", crate::scrub_paths(&e)), None, binary));
+                sock.send(error_reply(None, &format!("undecodable frame: {}", crate::scrub_paths(&e)), None, None, binary));
                 continue;
             }
         };
@@ -800,13 +812,13 @@ async fn serve(socket: WebSocket, st: AppState) {
             None => None,
             Some(Val::Str(s)) => Some(s.clone()),
             Some(_) => {
-                sock.send(error_reply(None, "request_id must be a string", None, binary));
+                sock.send(error_reply(None, "request_id must be a string", None, None, binary));
                 continue;
             }
         };
         if let Some(rid) = &request_id {
             if let Err(e) = crate::check_request_id(rid) {
-                sock.send(error_reply(Some(rid), &e, Some(400), binary));
+                sock.send(error_reply(Some(rid), &e, Some(400), None, binary));
                 continue;
             }
         }
@@ -837,7 +849,7 @@ async fn serve(socket: WebSocket, st: AppState) {
         if let Some(rid) = &request_id {
             if sock.live.lock().unwrap().contains_key(rid) {
                 // refused as any id in flight is, and the call goes on
-                sock.send(error_reply(Some(rid), &crate::bridge::request_id_in_use(rid), Some(409), binary));
+                sock.send(error_reply(Some(rid), &crate::bridge::request_id_in_use(rid), Some(409), None, binary));
                 continue;
             }
         }
@@ -845,7 +857,7 @@ async fn serve(socket: WebSocket, st: AppState) {
         if takes_stream_input() && !matches!(message.get("end_input"), None | Some(Val::Bool(true))) {
             // a live call: appends find it by id, from the moment it is read
             let Some(rid) = &request_id else {
-                sock.send(error_reply(None, "a live call needs a request_id", None, binary));
+                sock.send(error_reply(None, "a live call needs a request_id", None, None, binary));
                 continue;
             };
             let (tx, rx) = watch::channel(None);
@@ -937,5 +949,25 @@ mod tests {
         assert_eq!(input_layout(Some("hi"), None, parts.clone()).0, vec!["image", "text"]);
         assert_eq!(input_layout(Some("hi"), Some(vec!["image".into()]), parts.clone()).0, vec!["image", "text"]);
         assert_eq!(input_layout(None, Some(vec!["image".into(), "text".into()]), parts).0, vec!["image"]);
+    }
+
+    #[test]
+    fn error_reply_carries_weight_version_only_when_set() {
+        let decode = |msg: Message| -> Value {
+            match msg {
+                Message::Text(s) => serde_json::from_str(&s).unwrap(),
+                Message::Binary(b) => rmp_serde::from_slice(&b).unwrap(),
+                other => panic!("unexpected ws message: {other:?}"),
+            }
+        };
+        for binary in [false, true] {
+            let without = decode(error_reply(Some("r1"), "boom", Some(500), None, binary));
+            assert_eq!(without, serde_json::json!({"request_id": "r1", "error": "boom", "status": 500}));
+            let with_ver = decode(error_reply(Some("r1"), "boom", Some(500), Some("v1"), binary));
+            assert_eq!(
+                with_ver,
+                serde_json::json!({"request_id": "r1", "error": "boom", "status": 500, "weight_version": "v1"})
+            );
+        }
     }
 }
