@@ -334,6 +334,12 @@ that no sampler declares fails the request.
 - ``repetition_window``, ``top_p_first`` and ``top_p_min_keep`` stay at their defaults
   until a port needs them: they ask the node's sampler for a capability a ``Sampler``
   declaration doesn't name yet.
+- ``RASSamplingReqConfig`` (a model-supplied subclass of ``SamplingReqConfig`` for a
+  sampler declaring ``enable_ras=True``): opts the request into repetition-aware
+  sampling (``ras_mode=True``, ``ras_tau`` in ``[0, 1]``, ``repetition_window`` up to
+  ``max_repetition_window``, ``top_k`` in ``[1, 128]``, ``top_p`` in ``[0, 1]``) with
+  direct request-seed noise; it cannot combine with ``repetition_penalty``, ``min_p``,
+  ``min_tokens``, ``top_p_first``, ``top_p_min_keep > 1``, or ``return_logprobs``.
 
 A step whose every row samples greedily (temperature 0, no repetition penalty, no
 ``min_tokens`` and no log-probs) takes each row's argmax instead of the full sampler's draw,
@@ -1150,6 +1156,17 @@ The spec types are:
        ``enable_min_p``, ``max_repetition_window``, ``min_tokens_stop_ids`` and
        ``enable_top_p_first`` are capabilities of the same kind. See
        ``SampleSettings`` above.
+       With ``enable_blocked_tokens=True``, a node can pass a per-step bool
+       ``blocked_tokens`` tensor of the same shape as its logits to
+       ``sampler.sample``. The resource masks those logits before sampling on
+       eager and captured paths. Leave at least one token available in every
+       row; the default sampler path has no mask cost.
+       With ``enable_ras=True`` (and ``enable_repetition_penalty=False``), the
+       sampler runs opt-in repetition-aware sampling (``RASSamplingReqConfig``)
+       with counter-based hash noise and the shared ``max_repetition_window``
+       history ring, without affecting the default Philox/FlashInfer path; it
+       cannot combine with ``enable_repetition_penalty``, ``enable_min_p``,
+       ``enable_logprobs``, ``enable_top_p_first``, or ``min_tokens_stop_ids``.
    * - ``RecurrentStateSpec(config=RecurrentStateConfig(...))``
      - Fixed-size per-request state that carries between steps (an LSTM's ``h`` and
        ``c``, a cursor, a conv tail, a Mamba or gated-DeltaNet layer's conv window and SSM

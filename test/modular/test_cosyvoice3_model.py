@@ -28,6 +28,8 @@ import yaml
 
 from mstar.api_server.openai import adapters
 from mstar.api_server.openai.protocol import SpeechRequest
+from mstar.engine.resources.sampler.config import RASSamplingReqConfig
+from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.base import TensorAndMetadata
 from mstar.model.chatterbox.chatterbox_model import voice_key_for
 from mstar.model.cosyvoice3.components.dit import _SinusEmbedding, chunk_attention_mask
@@ -42,6 +44,7 @@ from mstar.model.cosyvoice3.config import (
     LM_KV,
     LM_LABEL,
     LM_POS,
+    LM_SAMPLER,
     SYSTEM_PROMPT,
     CausalHiFTConfig,
     CosyVoice3Config,
@@ -53,7 +56,6 @@ from mstar.model.cosyvoice3.cosyvoice3_model import LM_PARTITION, PROMPT_MODE, T
 from mstar.model.cosyvoice3.submodules import (
     AUDIO_CHUNK,
     DECODE_LOOP,
-    HISTORY,
     MAX_SPEECH_TOKENS,
     MEL,
     MEL_FINAL,
@@ -842,11 +844,28 @@ def _rows(out, rids) -> dict:
     return {rid: {k: [v[i]] for k, v in out.row_outputs.items()} for i, rid in enumerate(rids)}
 
 
+def _lm_sampler(sub, infos):
+    sampler = SamplerResource(
+        vocab_size=None, enable_repetition_penalty=False, device=torch.device("cpu"),
+        max_repetition_window=sub.config.sampling.ras_window, enable_blocked_tokens=True, enable_ras=True,
+    )
+    for rid, info in infos.items():
+        meta = info.step_metadata
+        cfg = RASSamplingReqConfig(
+            temperature=meta["temperature"], top_p=meta["top_p"], top_k=meta["top_k"],
+            repetition_window=meta["ras_window"], ras_mode=True, ras_tau=meta["ras_tau"],
+            ignore_eos=meta["ignore_eos"],
+        )
+        cfg.apply_conductor_config(seed=info.random_seed & (2**63 - 1), resource_key=LM_SAMPLER)
+        sampler.ingest_request(rid, cfg)
+    return sampler
+
+
 def _lm_run(sub, res, requests: dict, steps: int, **knobs) -> dict[int, list[int]]:
     """Prefill every request together, then batched decode steps until one stops."""
     rids = list(requests)
     infos = {rid: _info(rid, requests[rid][1], limits=requests[rid][0]["limits"], **knobs) for rid in rids}
-    engine = SimpleNamespace(request_ids=rids, resources={LM_ATTN: res.kv_attn})
+    engine = SimpleNamespace(request_ids=rids, resources={LM_ATTN: res.kv_attn, LM_SAMPLER: _lm_sampler(sub, infos)})
     tokens: dict[int, list[int]] = {rid: [] for rid in rids}
     live = list(rids)
     walk, inputs = "prefill", {rid: requests[rid][0] for rid in rids}
@@ -992,7 +1011,7 @@ def test_lm_stops_on_any_control_id_or_the_length_cap():
 def _lm_prefill_then_decode(sub, res, limits, **knobs):
     """One request: prefill, postprocess, then one decode step on the prefill token."""
     info = _info(0, 0, limits=limits, ras_window=0, **knobs)
-    engine = SimpleNamespace(request_ids=[0], resources={LM_ATTN: res.kv_attn})
+    engine = SimpleNamespace(request_ids=[0], resources={LM_ATTN: res.kv_attn, LM_SAMPLER: _lm_sampler(sub, {0: info})})
     tokens, inputs = [], _lm_request()
     for walk in ("prefill", "decode"):
         prepared = sub.prepare_inputs(walk, info, inputs)
@@ -1031,7 +1050,7 @@ def test_the_prefill_and_the_loop_cap_spend_the_token_budget(model, budget):
     sub, res = _lm(cfg)
     _fixed_logits(sub, favourite=5, second=6)
     info = _info(0, 0, limits=(0, budget), ras_window=0)
-    engine = SimpleNamespace(request_ids=[0], resources={LM_ATTN: res.kv_attn})
+    engine = SimpleNamespace(request_ids=[0], resources={LM_ATTN: res.kv_attn, LM_SAMPLER: _lm_sampler(sub, {0: info})})
     caps = model.get_loop_caps(**{MAX_SPEECH_TOKENS: budget})
     assert model.get_loop_caps(max_new_tokens=budget) == caps
     decode_steps = 0 if budget == 1 else caps[DECODE_LOOP]
@@ -1197,32 +1216,25 @@ def test_lm_ras_history_is_committed_once_per_step():
     cfg = _tiny_config()
     sub, _ = _lm(cfg)
     info = _info(3, 0)
+    sampler = _lm_sampler(sub, {3: info})
     sub.prepare_inputs("prefill", info, _lm_request())
     state = sub.request_state(3)
     again = sub.prepare_inputs("decode", info, {PREV_TOKEN: [torch.tensor([9])]})
     sub.prepare_inputs("decode", info, {PREV_TOKEN: [torch.tensor([9])]})  # re-driven step
-    assert state["history"].tolist() == [-1] * 10  # not committed until postprocess
+    slot = sampler._history._rid_to_slot[3]
+    assert sampler._history.count[slot] == 0
     sub.postprocess(3, info, {SPEECH_TOKENS: [torch.tensor([4])]}, inputs=again)
-    assert state["history"].tolist() == [-1] * 9 + [9] and state["generated"] == 1
+    assert sampler._history.count[slot] == 0 and state["generated"] == 1
+    # The sampler, rather than the model's postprocess, commits the draw.
+    sampler.sample([3], torch.tensor([[0.0, 1.0, 2.0]]))
+    assert sampler._history.count[slot] == 1
 
 
-def _row_tensors_per_value(sub, info, seed, step, min_len, history, force_eos):
-    """The decode inputs as the node built them before it staged columns: one
-    device tensor per value per row, the knobs re-read from the metadata."""
-    meta = info.step_metadata
-    window = int(sub._knob(meta, "ras_window"))
-    threshold = float(window) * float(sub._knob(meta, "ras_tau")) if window > 0 else 0.0
-    ignore_eos = bool(meta.get("ignore_eos", False))
+def _row_tensors_per_value(info, step, min_len, force_eos):
+    """The LM owns only stop controls; sampling inputs live on the resource."""
+    ignore_eos = bool(info.step_metadata.get("ignore_eos", False))
     return {
-        HISTORY: history,
         "force_eos": torch.tensor([force_eos]),
-        "seed": torch.tensor([seed], dtype=torch.long),
-        "step": torch.tensor([step], dtype=torch.long),
-        "temperature": torch.tensor([float(sub._knob(meta, "temperature"))]),
-        "top_p": torch.tensor([float(sub._knob(meta, "top_p"))]),
-        "top_k": torch.tensor([int(sub._knob(meta, "top_k"))], dtype=torch.long),
-        "window": torch.tensor([window], dtype=torch.long),
-        "threshold": torch.tensor([threshold]),
         "block_sos": torch.tensor([step < min_len or ignore_eos]),
         "block_stop": torch.tensor([ignore_eos]),
     }
@@ -1263,8 +1275,7 @@ def test_lm_staged_columns_equal_the_per_value_tensors():
     def check(walk, step_inputs):
         prepared = [sub.prepare_inputs(walk, infos[rid], step_inputs[rid]) for rid in rows]
         old_rows = []
-        for rid, inp in zip(rows, prepared, strict=True):
-            seed, (min_len, max_len), knobs, _ = rows[rid]
+        for rid, (_, (min_len, max_len), knobs, _) in rows.items():
             state = sub.request_state(rid)
             force = False
             if walk == "decode":
@@ -1274,15 +1285,7 @@ def test_lm_staged_columns_equal_the_per_value_tensors():
                     ended[rid] = stopped or int(state["generated"]) >= max_len
                 force = ended[rid]
             old_rows.append(
-                _row_tensors_per_value(
-                    sub,
-                    infos[rid],
-                    seed & (2**63 - 1),
-                    int(state["generated"]),
-                    min_len,
-                    inp.tensor_inputs[HISTORY],
-                    force,
-                )
+                _row_tensors_per_value(infos[rid], int(state["generated"]), min_len, force)
             )
         old = _stack_per_value([inp.input_embeds for inp in prepared], old_rows)
         _assert_same_packed(sub.preprocess(walk, None, prepared), old)
@@ -1305,14 +1308,6 @@ def test_lm_staged_columns_equal_the_per_value_tensors():
         graph = sub.get_accelerator_graph_configs(torch.device("cpu"))[0]
         template = graph.single_request_inputs
         per_value = {
-            HISTORY: torch.full((sub.window,), -1, dtype=torch.long),
-            "seed": torch.zeros(1, dtype=torch.long),
-            "step": torch.zeros(1, dtype=torch.long),
-            "temperature": torch.ones(1),
-            "top_p": torch.full((1,), 0.8),
-            "top_k": torch.full((1,), 25, dtype=torch.long),
-            "window": torch.ones(1, dtype=torch.long),
-            "threshold": torch.ones(1),
             "block_sos": torch.zeros(1, dtype=torch.bool),
             "block_stop": torch.zeros(1, dtype=torch.bool),
             "force_eos": torch.zeros(1, dtype=torch.bool),
@@ -1381,7 +1376,7 @@ def test_lm_declares_one_kv_segment_per_request_and_a_decode_capture():
     cfg = _tiny_config()
     sub, _ = _lm(cfg)
     step = sub.declare_step("decode", [0, 1], [SimpleNamespace(input_seq_len=1)] * 2)
-    assert set(step.steps) == {LM_KV, LM_ATTN, LM_POS}
+    assert set(step.steps) == {LM_KV, LM_ATTN, LM_POS, LM_SAMPLER}
     assert [(s.request_id, s.span) for s in step.segments] == [(0, 1), (1, 1)]
     graph = sub.get_accelerator_graph_configs(torch.device("cpu"))[0]
     assert graph.capture_graph_walk == "decode" and graph.capture_batch_sizes == [1, 2, 4, 8, 16, 32]

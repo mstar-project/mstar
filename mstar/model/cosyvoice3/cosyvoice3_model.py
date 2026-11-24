@@ -54,12 +54,14 @@ from mstar.engine.resources import (
     PositionConfig,
     PositionSpec,
     ResourceReqConfig,
+    SamplerSpec,
 )
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
     RecurrentStateConfig,
     RecurrentStateSpec,
 )
+from mstar.engine.resources.sampler.config import RASSamplingReqConfig
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import (
@@ -99,6 +101,7 @@ from mstar.model.cosyvoice3.config import (
     LM_LABEL,
     LM_NODE,
     LM_POS,
+    LM_SAMPLER,
     SAMPLE_RATE,
     SPEAKER_ENCODER_NODE,
     SYSTEM_PROMPT,
@@ -389,6 +392,11 @@ class CosyVoice3Model(Model):
                 nodes={LM_NODE},
                 config=PositionConfig(kv_cache=LM_KV, rope_theta=lm.rope_theta),
             ),
+            SamplerSpec(
+                resource_key=LM_SAMPLER, nodes={LM_NODE}, vocab_size=None,
+                enable_repetition_penalty=False, max_repetition_window=self.config.sampling.ras_window,
+                enable_blocked_tokens=True, enable_ras=True,
+            ),
         ]
         return specs + hift_state_specs(self.config) + self._flow_resources()
 
@@ -440,8 +448,14 @@ class CosyVoice3Model(Model):
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        del input_modalities, output_modalities, model_kwargs
+        del input_modalities, output_modalities
+        knobs = self.resolve_generation_kwargs(model_kwargs)
         configs: dict[str, ResourceReqConfig] = {LM_KV: KVReqConfig(needed_labels=[LM_LABEL])}
+        configs[LM_SAMPLER] = RASSamplingReqConfig(
+            temperature=knobs["temperature"], top_p=knobs["top_p"], top_k=knobs["top_k"],
+            repetition_window=knobs["ras_window"], ras_mode=True, ras_tau=knobs["ras_tau"],
+            ignore_eos=knobs["ignore_eos"],
+        )
         if self.config.flow_cache_frames:
             configs[FLOW_KV] = KVReqConfig(needed_labels=[FLOW_COND_LABEL, FLOW_UNCOND_LABEL])
         return configs

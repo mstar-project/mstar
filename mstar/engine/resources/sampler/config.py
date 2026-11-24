@@ -8,7 +8,7 @@ step without pulling them in behind it.
 import hashlib
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
@@ -104,12 +104,34 @@ class SamplerSpec(NodeResourceSpec):
     # Allows ``logprobs_mode: "processed"``; the captured sampler then also
     # renorms every step's distribution again (CUDA only).
     enable_processed_logprobs: bool = False
+    # A node may pass a per-row boolean token mask to ``sample``. The mask is
+    # applied to logits before any penalty, temperature or filter.
+    enable_blocked_tokens: bool = False
+    # Use the RAS nucleus draw and repetition-window redraw, with per-request
+    # hash noise and the shared generation-history ring. Default draws stay on
+    # the existing Philox path.
+    enable_ras: bool = False
     # Whether a step whose rows all sample greedily may take each row's argmax
     # (`SamplerResource.lean_for`), in a twin of each batched capture: None
     # decides by the vocabulary (past the one-kernel draw), False never, True
     # always. The twins cost capture memory and time, so a deployment that never
     # samples greedily turns them off in its ``resources:`` block.
     greedy_capture: bool | None = None
+
+    def __post_init__(self) -> None:
+        check_int_knob("max_repetition_window", self.max_repetition_window, ">= 0", lambda v: v >= 0)
+        if self.enable_ras and (
+            self.enable_repetition_penalty
+            or self.enable_min_p
+            or self.enable_logprobs
+            or self.enable_processed_logprobs
+            or self.enable_top_p_first
+            or self.min_tokens_stop_ids
+        ):
+            raise ValueError(
+                "enable_ras cannot combine with enable_repetition_penalty, enable_min_p, "
+                "enable_logprobs, enable_top_p_first, or min_tokens_stop_ids"
+            )
 
     def apply_yaml_overrides(
         self, enable_logprobs: bool | None = None, enable_processed_logprobs: bool | None = None,
@@ -126,6 +148,8 @@ class SamplerSpec(NodeResourceSpec):
             self.enable_processed_logprobs = enable_processed_logprobs
         if self.enable_processed_logprobs and not self.enable_logprobs:
             raise ValueError("enable_processed_logprobs needs enable_logprobs")
+        if self.enable_ras and self.enable_logprobs:
+            raise ValueError("enable_ras cannot combine with enable_logprobs")
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -149,6 +173,10 @@ class SamplingReqConfig(ResourceReqConfig):
     # the last ``repetition_window`` generated tokens; 0: presence over prompt
     # and output.
     repetition_window: int = 0
+    # Internal sampler modes are supplied by a model-specific request config,
+    # not exposed as generation knobs to every model and frontend.
+    ras_mode: ClassVar[bool] = False
+    ras_tau: ClassVar[float] = 0.0
     # The spec's stop ids get no probability until this many tokens exist
     # (applied after top-k/top-p).
     min_tokens: int = 0
@@ -173,7 +201,9 @@ class SamplingReqConfig(ResourceReqConfig):
         **kwargs
     ):
         # each sampler of a request draws its own stream from the request's seed
-        self._seed = seed if resource_key is None else derive_seed(seed, resource_key)
+        # RAS's existing CosyVoice stream is keyed directly by the request
+        # seed. Its token parity would change if this were stream-derived.
+        self._seed = seed if resource_key is None or self.ras_mode else derive_seed(seed, resource_key)
 
     @property
     def seed(self):
@@ -184,6 +214,9 @@ class SamplingReqConfig(ResourceReqConfig):
         node cannot honour. None means the sampler's default."""
         for name, (rule, ok) in REAL_KNOB_RULES.items():
             if (value := getattr(self, name)) is not None:
+                if name == "top_p" and self.ras_mode:
+                    check_real_knob(name, value, "in [0, 1]", lambda v: 0 <= v <= 1)
+                    continue
                 check_real_knob(name, value, rule, ok)
         for name, (rule, ok) in INT_KNOB_RULES.items():
             if (value := getattr(self, name)) is not None:
@@ -191,10 +224,34 @@ class SamplingReqConfig(ResourceReqConfig):
         for name in BOOL_KNOBS:
             if (value := getattr(self, name)) is not None:
                 check_bool_knob(name, value)
+        check_int_knob("repetition_window", self.repetition_window, ">= 0 (0 is off)", lambda v: v >= 0)
         if self.logprobs_mode not in (None, "raw", "processed"):
             raise ValueError(f"logprobs_mode must be 'raw' or 'processed'; got {self.logprobs_mode!r}")
+        if self.ras_mode:
+            if self.top_k is None or isinstance(self.top_k, bool) or not 1 <= self.top_k <= 128:
+                raise ValueError("RAS top_k must be in [1, 128]")
+            if (
+                (self.repetition_penalty is not None
+                 and (isinstance(self.repetition_penalty, bool) or self.repetition_penalty != 1))
+                or self.min_p
+                or self.return_logprobs
+            ):
+                raise ValueError("RAS cannot combine with repetition_penalty, min_p or logprobs")
+            if (
+                (self.min_tokens is not None
+                 and (isinstance(self.min_tokens, bool) or self.min_tokens != 0))
+                or self.top_p_first
+                or (self.top_p_min_keep is not None
+                    and (isinstance(self.top_p_min_keep, bool) or self.top_p_min_keep != 1))
+            ):
+                raise ValueError("RAS cannot combine with min_tokens, top_p_first or top_p_min_keep")
         if spec is None:
             return
+        if self.ras_mode:
+            if not spec.enable_ras:
+                raise ValueError("this model does not declare RAS sampling")
+            if self.repetition_window > spec.max_repetition_window:
+                raise ValueError("RAS window exceeds the sampler's declared history")
         # refused here, not ignored: the node's sampler has no such filter
         if self.min_p and not spec.enable_min_p:
             raise ValueError("this model does not support min_p; send 0 or leave it unset")
@@ -208,6 +265,21 @@ class SamplingReqConfig(ResourceReqConfig):
             raise ValueError(
                 "this model does not support repetition_penalty; send 1 or leave it unset"
             )
+
+
+@dataclass
+class RASSamplingReqConfig(SamplingReqConfig):
+    """Opt-in RAS settings supplied by a model, outside the public knob set."""
+
+    ras_mode: bool = True
+    ras_tau: float = 0.1
+
+    def validate(self, spec: "SamplerSpec | None" = None) -> None:
+        check_bool_knob("ras_mode", self.ras_mode)
+        if not self.ras_mode:
+            raise ValueError("RASSamplingReqConfig requires ras_mode=True")
+        check_real_knob("ras_tau", self.ras_tau, "in [0, 1]", lambda v: 0 <= v <= 1)
+        super().validate(spec)
 
 
 def derive_seed(seed: int, stream: str) -> int:

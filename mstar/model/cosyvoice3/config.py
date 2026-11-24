@@ -32,6 +32,7 @@ from mstar.model.chatterbox.config import (
 LM_KV = "lm_kv"
 LM_ATTN = "lm_attn"
 LM_POS = "lm_pos"
+LM_SAMPLER = "lm_sampler"
 LM_LABEL = "main"
 
 # Resource keys (vocoder node)
