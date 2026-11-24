@@ -4363,7 +4363,7 @@ class KVManager(AttentionResource):
                         stream.step_in_flight = False
                         stream.lent.clear()
                         self._lay_out(rid, label, stream)
-                        if stream.stored_len > 0:
+                        if stream.stored_len > 0 or stream.released > 0:
                             stream.forget_chain()
                             stream.span_cursor = None
                         else:
@@ -4430,7 +4430,7 @@ class KVManager(AttentionResource):
                 if _DEBUG_ASSERTS:
                     self.assert_pages_conserved()
                 return
-            if _DEBUG_ASSERTS and rid in self._streams:
+            if _DEBUG_ASSERTS and rid in self._streams and rid in self._overrides:
                 self._report_underuse(rid)
             room = self._spare()
             allotment = self._allotments.pop(rid, None)
@@ -4467,7 +4467,9 @@ class KVManager(AttentionResource):
                 self.assert_pages_conserved()
 
     def _report_underuse(self, rid: str) -> None:
-        overrides = self._overrides[rid]
+        overrides = self._overrides.get(rid)
+        if overrides is None:
+            return
         for label, layout in (overrides.kv_layout or {}).items():
             stream = self._streams[rid].get(label)
             footprint = layout.pages(overrides.loop_caps, self.config.tokens_per_page)

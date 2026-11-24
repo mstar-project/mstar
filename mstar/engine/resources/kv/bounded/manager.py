@@ -399,7 +399,7 @@ class BoundedKVManager(Resource):
 
     def post_warmup_validate(self):
         if self._requests:
-            raise RuntimeError(f"bounded KV slots still held after capture: {sorted(self._requests)}")
+            raise RuntimeError(f"bounded KV slots still held after capture: {sorted(self._requests, key=str)}")
 
     def cleanup(self):
         self._cg_tables.clear()

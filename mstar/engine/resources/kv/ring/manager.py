@@ -313,8 +313,8 @@ class RingKVManager(AttentionResource):
                 reason=AllocationFailed(
                     message=(
                         f"ring KV {self.name!r} holds all {self.num_sessions} of "
-                        f"its sessions ({sorted(self._sessions)}); request(s) "
-                        f"{sorted(wanted)} wait for one to be released"
+                        f"its sessions ({sorted(self._sessions, key=str)}); request(s) "
+                        f"{sorted(wanted, key=str)} wait for one to be released"
                     ),
                     pages_short=len(wanted) - len(self._free_sessions),
                     label="session",
@@ -445,7 +445,7 @@ class RingKVManager(AttentionResource):
 
         if self._sessions:
             raise RuntimeError(
-                f"ring KV {self.name!r} is still claimed by {sorted(self._sessions)} "
+                f"ring KV {self.name!r} is still claimed by {sorted(self._sessions, key=str)} "
                 "after accelerator graph capture; a capture dummy rid was never reset, "
                 "and the session it holds is gone from the pool for good."
             )
@@ -459,7 +459,8 @@ class RingKVManager(AttentionResource):
         if self._committed_frames:
             raise RuntimeError(
                 f"ring KV {self.name!r} counted committed frames "
-                f"({sorted(self._committed_frames.items())}) during accelerator graph capture; "
+                f"({sorted(self._committed_frames.items(), key=lambda item: str(item[0]))}) "
+                "during accelerator graph capture; "
                 "the first real request would write its first frame that many slots on."
             )
         for i, layer in enumerate(self.layers):

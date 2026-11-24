@@ -305,6 +305,8 @@ class RollingKVManager(Resource):
 
     def reserve(self, rid, node_name: str, graph_walk: str, published: None) -> int | None:
         with self._lock:
+            if rid in self._requests or rid in self._reserved:
+                return None
             wants = self._wants.get(rid)
             need, room = 0 if wants is None else wants.tokens, self._room()
             if need > room:

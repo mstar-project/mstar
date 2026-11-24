@@ -10,6 +10,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+import mstar.engine.resources.kv.manager as kv_manager_module
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources.base import EngineResourceInfo
@@ -51,7 +52,7 @@ from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.sized.config import SizedField, SizedValueConfig, SizedValueReqConfig, SizedValueSpec
 from mstar.engine.resources.sized.store import SizedValueStore
-from mstar.engine.resources.step import ASKS, Segment, StepContext, SubmoduleStep
+from mstar.engine.resources.step import ASKS, AllocationFailed, Segment, StepContext, SubmoduleStep
 from mstar.engine.state import (
     Array,
     ArrayStep,
@@ -93,6 +94,7 @@ from mstar.model.base import RebuildPolicy
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.testing_utils.engine import make_engine, make_mgmt
 from mstar.testing_utils.model import make_model
+from mstar.worker.rid_table import RidTable
 
 CPU = torch.device("cpu")
 PAGE_SIZE = 8
@@ -1432,3 +1434,179 @@ def test_engine_load_model_registers_all_episode_storages_and_aux_positions():
     assert pos_key not in batch.episode_held[1]
     engine.remove_request(1)
     assert engine.end_episode("ep-full", 0) is True
+
+
+def test_paged_kv_end_episode_with_debug_asserts_and_released_stream(monkeypatch):
+    monkeypatch.setattr(kv_manager_module, "_DEBUG_ASSERTS", True)
+    kv = _paged_kv_manager(max_num_pages=6, page_size=PAGE_SIZE, prefix_cache=True, episode_lifetime=True)
+
+    # Full lifecycle under _DEBUG_ASSERTS=True: commit -> remove_request -> end_episode
+    kv.ingest_request(1, _kv_req(list(range(10)), keyed=True))
+    kv.bind_episode(1, 0, "ep-dbg", cold=True, reset=False)
+    assert kv.ask(1, "llm", "prefill") is ASKS
+    assert kv.reserve(1, "llm", "prefill", None) is None
+    _kv_step(kv, 1, 10)
+    kv.remove_request(1)
+    kv.end_episode(0)
+    kv.assert_pages_conserved()
+    assert kv._arena.num_free == 4
+    assert len(kv._index.evictable()) == 1
+
+    # Un-admitted episode (no overrides on owner) -> remove_request -> end_episode
+    kv.ingest_request(2, _kv_req(list(range(4)), keyed=True))
+    kv.bind_episode(2, 1, "ep-dbg-uncommitted", cold=True, reset=False)
+    kv.remove_request(2)
+    kv.end_episode(1)
+    kv.assert_pages_conserved()
+    kv._report_underuse(("episode", 99))
+
+    # Warm resume when stream has stored_len == 0 but released > 0 skips offset-0 key seeding
+    kv.ingest_request(3, _kv_req(list(range(4)), keyed=True))
+    kv.bind_episode(3, 2, "ep-dbg-released", cold=True, reset=False)
+    kv.remove_request(3)
+    kv._streams[("episode", 2)]["main"].released = PAGE_SIZE
+    kv.ingest_request(4, _kv_req(list(range(4)), keyed=True))
+    kv.bind_episode(4, 2, "ep-dbg-released", cold=False, reset=False)
+    stream4 = kv._streams[4]["main"]
+    assert stream4.span_cursor is None and stream4.chain is None
+    kv.remove_request(4)
+    kv.end_episode(2)
+    kv.assert_pages_conserved()
+
+
+def test_ring_kv_admit_full_pool_contention_with_mixed_int_and_tuple_keys():
+    frame = 128
+    cfg = RingKVConfig(
+        num_layers=1,
+        num_qo_heads=2,
+        num_kv_heads=2,
+        head_dim=8,
+        tokens_per_frame=frame,
+        num_sessions=2,
+        layers=(RingKVLayerConfig(ring_frames=4, ring_buckets=4, pinned_dilation=1),),
+    )
+    ring = RingKVManager(cfg, "ring", CPU, torch.float32, episode_lifetime=True)
+    rids = RidTable()
+
+    r0 = rids.intern("req-0")
+    ring.ingest_request(r0)
+    ring.bind_episode(r0, 0, "ep-0", cold=True, reset=False)
+    st0 = RingKVStep(segments=(Segment(r0, "main", frame),))
+    ctx0 = StepContext([r0], "step", 0, False)
+    assert ring.admit(st0, ctx0).ok
+    ring.commit(st0, ctx0)
+    ring.remove_request(r0)  # leaves ("episode", 0) tuple in _sessions and _committed_frames
+
+    r1 = rids.intern("req-1")
+    ring.ingest_request(r1)
+    ring.bind_episode(r1, 1, "ep-1", cold=True, reset=False)
+    st1 = RingKVStep(segments=(Segment(r1, "main", frame),))
+    ctx1 = StepContext([r1], "step", 0, False)
+    assert ring.admit(st1, ctx1).ok
+    ring.commit(st1, ctx1)  # leaves int r1 active in _sessions and _committed_frames
+
+    r2 = rids.intern("req-2")
+    ring.ingest_request(r2)
+    ring.bind_episode(r2, 2, "ep-2", cold=True, reset=False)
+    st2 = RingKVStep(segments=(Segment(r2, "main", frame),))
+    ctx2 = StepContext([r2], "step", 0, False)
+    outcome = ring.admit(st2, ctx2)
+    assert not outcome.ok and not outcome.ready
+    assert isinstance(outcome.reason, AllocationFailed)
+
+    with pytest.raises(RuntimeError, match="still claimed"):
+        ring.post_warmup_validate()
+
+    # Check _committed_frames mixed-key formatting in post_warmup_validate too
+    saved_sessions = dict(ring._sessions)
+    ring._sessions.clear()
+    ring._free_sessions.update({0, 1})
+    try:
+        with pytest.raises(RuntimeError, match="counted committed frames"):
+            ring.post_warmup_validate()
+    finally:
+        ring._sessions.update(saved_sessions)
+        ring._free_sessions.difference_update(saved_sessions.values())
+
+    ring.remove_request(r2)
+    ring.remove_request(r1)
+    ring.end_episode(0)
+    ring.end_episode(1)
+    ring.end_episode(2)
+    ring.post_warmup_validate()
+
+
+def test_bounded_kv_post_warmup_validate_formats_mixed_int_and_tuple_keys():
+    cfg = BoundedKVConfig(
+        num_layers=1,
+        num_heads=2,
+        head_dim=16,
+        rows_per_request=1,
+        max_source_len=0,
+        max_slots=3,
+        retention=SinkWindow(0, 4),
+        dtype=torch.float32,
+    )
+    bnd = BoundedKVManager(cfg, CPU, name="bnd", episode_lifetime=True)
+
+    bnd.ingest_request(1)
+    bnd.bind_episode(1, 0, "ep-0", cold=True, reset=False)
+    st1 = BoundedKVStep(segments=(Segment(1, "main", 2),), positions={1: StreamPosition(0, 0)})
+    ctx1 = StepContext([1], "step", 0, False)
+    assert bnd.admit(st1, ctx1).ok
+    bnd.commit(st1, ctx1)
+    bnd.remove_request(1)  # ("episode", 0) in _requests
+
+    bnd.ingest_request(2)
+    bnd.bind_episode(2, 1, "ep-1", cold=True, reset=False)
+    st2 = BoundedKVStep(segments=(Segment(2, "main", 2),), positions={2: StreamPosition(0, 0)})
+    ctx2 = StepContext([2], "step", 0, False)
+    assert bnd.admit(st2, ctx2).ok
+    bnd.commit(st2, ctx2)  # int 2 in _requests
+
+    with pytest.raises(RuntimeError, match="bounded KV slots still held after capture"):
+        bnd.post_warmup_validate()
+
+    bnd.remove_request(2)
+    bnd.end_episode(0)
+    bnd.end_episode(1)
+    bnd.post_warmup_validate()
+
+
+def test_rolling_kv_reserve_idempotent_on_warm_and_reserved_requests():
+    cfg = RollingKVConfig(num_layers=1, num_heads=1, head_dim=4, pool_tokens=16, dtype=torch.float32)
+    store = RollingKVManager(cfg, CPU, name="roll", episode_lifetime=True)
+
+    # Cold request: reserve is idempotent while already reserved
+    store.ingest_request(1, RollingKVReqConfig(tokens=8, sink=0))
+    store.bind_episode(1, 0, "ep-roll", cold=True, reset=False)
+    assert store.reserve(1, "llm", "step", None) is None
+    assert store._kept == 8 and store._reserved == {1: 8}
+    assert store.reserve(1, "llm", "step", None) is None
+    assert store._kept == 8 and store._reserved == {1: 8}
+
+    st1 = RollingKVStep(segments=(Segment(1, "main", 4),), positions={1: RollingPosition(0, 0, 8)})
+    ctx1 = StepContext([1], "step", 0, False)
+    assert store.admit(st1, ctx1).ok
+    store.commit(st1, ctx1)
+    store.remove_request(1)
+
+    # Warm episode (half-full pool: room == 8): direct reserve() does not leak _kept/_reserved
+    store.ingest_request(2, RollingKVReqConfig(tokens=8, sink=0))
+    store.bind_episode(2, 0, "ep-roll", cold=False, reset=False)
+    assert store.reserve(2, "llm", "step", None) is None
+    assert store._kept == 0 and store._reserved == {}
+
+    # Competing request can still reserve the remaining 8 tokens; then at full pool (room == 0)
+    # direct reserve() on warm episode 2 still returns None cleanly
+    store.ingest_request(3, RollingKVReqConfig(tokens=8, sink=0))
+    store.bind_episode(3, 1, None, cold=True, reset=False)
+    assert store.reserve(3, "llm", "step", None) is None
+    assert store._room() == 0
+    assert store.reserve(2, "llm", "step", None) is None
+    assert store._kept == 8 and store._reserved == {3: 8}
+
+    store.remove_request(3)
+    store.remove_request(2)
+    store.end_episode(0)
+    assert store.num_free_tokens() == 16
