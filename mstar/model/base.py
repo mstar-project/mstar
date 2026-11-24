@@ -140,6 +140,7 @@ def _applying_chunking(build):
     return get_graph_walk_graphs
 
 if TYPE_CHECKING:
+    from mstar.distributed.communication import CommGroup, JointGroups
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
 if TYPE_CHECKING:
@@ -1280,6 +1281,17 @@ class Model(ABC):
             b"" if v in stop and not (kw or {}).get("ignore_eos") else token_bytes(v)
             for v, kw in zip(values, request_kwargs, strict=True)
         ]
+
+    def submodule_comm_group(self, node_name: str, joint_groups: "JointGroups") -> "CommGroup":
+        """The group passed to ``get_submodule`` as ``tp_group`` at load time.
+
+        Most models build TP weights and use the TP group. A node declared in
+        ``sp_collective_nodes`` keeps full weights and receives the existing
+        SP group for its own non-sequence collective.
+        """
+        if node_name in self.get_default_sharding_config().sp_collective_nodes:
+            return joint_groups.sp_group
+        return joint_groups.tp_group
 
     @abstractmethod
     def get_submodule(

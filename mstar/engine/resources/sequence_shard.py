@@ -869,14 +869,27 @@ def state_passing(
 def sequence_parallel_refusals(
     specs: Iterable[NodeResourceSpec], node: str, tp: int, sp: int,
     moe_parallel: MoeParallelConfig | None = None,
+    sp_collective: bool = False,
 ) -> list[str]:
     """What ``node``, on ``tp`` TP and ``sp`` SP ranks, declares that its SP ranks can't run; each
     a sentence. Each resource answers for itself (``NodeResourceSpec.split_step_refusals``); the
     checks on built objects (``supports_split_steps``, ``check_captures``) are the engine's."""
+    if sp_collective and tp > 1:
+        return [
+            f"node {node!r} uses a non-sequence SP collective but also runs on {tp} TP ranks; "
+            "its work and weights must be replicated over TP 1"
+        ]
     if sp == 1:
         return []
     by_key = {spec.resource_key: spec for spec in specs}
     specs = [spec for spec in by_key.values() if node in spec.nodes]
+    if sp_collective:
+        if specs or moe_parallel is not None:
+            return [
+                f"node {node!r} uses a non-sequence SP collective but also declares "
+                "engine resources or expert parallelism; those need their own SP plan"
+            ]
+        return []
     shard = next((spec for spec in specs if isinstance(spec, SeqShardSpec)), None)
     try:
         placed = any(position_pools(specs, node).values())

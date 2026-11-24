@@ -453,10 +453,11 @@ class LTXVideoDecoderSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):
 
     def __init__(self, vae: nn.Module, config: LTX25Config, max_batch_size: int = 2,
                  tile_min_pixels: int = 1280 * 720, compile_decode: bool = False,
-                 warmup_shapes: Sequence[LTXShape] = ()):
+                 warmup_shapes: Sequence[LTXShape] = (), comm_group=None):
         super().__init__()
         self.vae = vae
         self.config = config
+        self.comm_group = comm_group
         self._max_batch_size = max_batch_size
         # Frames larger than this decode in spatial tiles (the card's recipe tiles its
         # 1088x1920 stage-2 decode); smaller ones decode whole, as the single-stage
@@ -505,6 +506,21 @@ class LTXVideoDecoderSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):
         return {LATENTS: torch.stack([inp.tensor_inputs[LATENTS] for inp in inputs]),
                 "shape": inputs[0].resource_step_info}
 
+    def forward(self, graph_walk, engine_inputs, **kwargs):
+        out = self.run_batch(**kwargs)
+        return {VIDEO_OUTPUT: [out[VIDEO_OUTPUT][0]]} if out else {}
+
+    def forward_batched(self, graph_walk, engine_inputs, **kwargs):
+        out = self.run_batch(**kwargs)
+        if not out:
+            # This follower joined the decode's SP collective, but only rank
+            # zero owns the assembled frames and emits them to the client.
+            return {rid: {} for rid in engine_inputs.request_ids}
+        return {
+            rid: {VIDEO_OUTPUT: [self._row(out[VIDEO_OUTPUT], i)]}
+            for i, rid in enumerate(engine_inputs.request_ids)
+        }
+
     def run_batch(self, latents: torch.Tensor, shape: LTXShape, **kwargs):
         dtype = self.vae.dtype
         x = unpack_video(latents.to(device=self.get_device(), dtype=dtype), shape)
@@ -512,7 +528,32 @@ class LTXVideoDecoderSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):
         std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(x.device, dtype)
         x = x * std / self.vae.config.scaling_factor + mean
         self.vae.use_tiling = self._tiled(shape)
-        video = self.vae.decode(x, None, return_dict=False)[0]
+        group = self.comm_group
+        distributed = (
+            group is not None and group.world_size > 1 and self.vae.use_tiling
+            and not self.vae.use_framewise_decoding
+            and not (self.vae.use_slicing and x.shape[0] > 1)
+        )
+        if distributed:
+            from mstar.model.ltx2_5.tiled_decode import distributed_tiled_decode, spatial_tile_count
+
+            # Stock decode only enters the spatial tile path when the latent
+            # exceeds its minimum tile size on at least one axis.
+            ratio = self.vae.spatial_compression_ratio
+            spatial = (
+                x.shape[-2] > self.vae.tile_sample_min_height // ratio
+                or x.shape[-1] > self.vae.tile_sample_min_width // ratio
+            )
+            if spatial and spatial_tile_count(self.vae, x) >= group.world_size:
+                video = distributed_tiled_decode(self.vae, x, group)
+            else:
+                # This call is still one SP instance. A full fallback decode
+                # belongs to its leader alone, including on the small stage.
+                video = self.vae.decode(x, None, return_dict=False)[0] if group.rank == 0 else None
+        else:
+            video = self.vae.decode(x, None, return_dict=False)[0] if group is None or group.rank == 0 else None
+        if video is None:
+            return {}
         frames = ((video / 2 + 0.5).clamp(0, 1).float() * 255).round().to(torch.uint8)
         return {VIDEO_OUTPUT: frames.permute(0, 2, 3, 4, 1).contiguous()}
 

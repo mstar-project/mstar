@@ -93,6 +93,10 @@ class ShardingConfig:
     # cfg_size must divide). Like SP: no shard_dim entries, the whole
     # instance one ShardingGroup. Gates validation only.
     cfg_enabled_nodes: dict[str, int] = field(default_factory=dict)
+    # Nodes that split independent non-sequence work over their SP ranks with
+    # their own collective. They must keep inputs and weights replicated and
+    # cannot own engine resources or expert parallelism.
+    sp_collective_nodes: set[str] = field(default_factory=set)
 
     def clone_empty(self):
         return ShardingConfig(
@@ -101,6 +105,7 @@ class ShardingConfig:
             shard_dim=self.shard_dim,
             ep_enabled_nodes=self.ep_enabled_nodes,
             cfg_enabled_nodes=self.cfg_enabled_nodes,
+            sp_collective_nodes=self.sp_collective_nodes,
         )
 
     def get_sharding_group(
@@ -114,6 +119,7 @@ class ShardingConfig:
         self.tp_enabled_nodes = set(self.tp_enabled_nodes)
         self.ep_enabled_nodes = set(self.ep_enabled_nodes)
         self.cfg_enabled_nodes = dict(self.cfg_enabled_nodes)
+        self.sp_collective_nodes = set(self.sp_collective_nodes)
         self._setup_done = False
 
     def assert_stream_consumer_compatibility(self, streaming_consumers: set[str]):
