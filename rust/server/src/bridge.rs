@@ -117,6 +117,8 @@ struct SubmitMsg<'a> {
     /// `submit_request`'s `report_usage`; left out when false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     report_usage: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    traceparent: Option<&'a str>,
     /// `submit_request`'s `raw_inputs`, `end_input` and `file_streams`, each
     /// left out when unset.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -385,6 +387,7 @@ impl Bridge {
             prompt_parts: &args.parts,
             streaming,
             report_usage: args.report_usage,
+            traceparent: args.traceparent.as_deref(),
             raw_inputs: &args.raw_inputs,
             end_input: args.end_input.as_ref(),
             file_streams: args.file_streams.as_ref(),
@@ -680,6 +683,10 @@ mod tests {
     }
 
     fn encoded_with(parts: &[Part], report_usage: bool) -> Value {
+        encoded_with_traceparent(parts, report_usage, None)
+    }
+
+    fn encoded_with_traceparent(parts: &[Part], report_usage: bool, traceparent: Option<&str>) -> Value {
         let file_paths = BTreeMap::new();
         let model_kwargs = serde_json::Map::new();
         let raw_inputs = BTreeMap::new();
@@ -698,11 +705,19 @@ mod tests {
             prompt_parts: parts,
             streaming: true,
             report_usage,
+            traceparent,
             raw_inputs: &raw_inputs,
             end_input: None,
             file_streams: None,
         };
         rmp_serde::from_slice(&rmp_serde::to_vec_named(&msg).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn only_a_submitted_http_parent_is_sent_to_the_api_server() {
+        let header = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
+        assert_eq!(encoded_with_traceparent(&[], false, Some(header))["traceparent"], header);
+        assert!(encoded(&[]).get("traceparent").is_none());
     }
 
     #[test]
