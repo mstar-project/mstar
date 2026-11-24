@@ -698,3 +698,216 @@ def test_data_worker_attaches_action_shape_and_rollout_state_metadata():
     assert c1.modality == "tensor" and c1.metadata == {"weight_version": "v2", "rollout_state": True}
     assert c2.modality == "tensor" and c2.metadata == {}
 
+
+def test_live_asgi_mid_batch_iter_failure_cancels_and_releases_siblings(monkeypatch, tmp_path):
+    import time
+
+    import httpx
+
+    fake = _FakeActionsServer(_Cosmos3StubModel(), tmp_path, model_name="cosmos3")
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    state = {"row1_completed": False, "row1_cancelled": False, "row1_finally": False}
+
+    async def chunks_fn(rid, idx, sub):
+        if idx == 0:
+            await asyncio.sleep(0.01)
+            yield ResultChunk(rid, "error", b"row0 failed", {"status": 503})
+            return
+        try:
+            await asyncio.sleep(0.30)
+            state["row1_completed"] = True
+            yield ResultChunk(rid, "action", np.zeros((16, 64), dtype=np.float32).tobytes())
+        except asyncio.CancelledError:
+            state["row1_cancelled"] = True
+            raise
+        finally:
+            state["row1_finally"] = True
+
+    fake.chunks_fn = chunks_fn
+    body = _pack_bytes_keys({"input": {"prompt": ["a", "b"]}})
+
+    async def _run():
+        t0 = time.monotonic()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=entrypoint.app), base_url="http://testserver",
+        ) as client:
+            resp = await client.post(
+                "/v1/actions/generations", content=body, headers={"Content-Type": "application/msgpack"},
+            )
+        elapsed = time.monotonic() - t0
+        await asyncio.sleep(0.35)
+        return resp, elapsed
+
+    resp, elapsed = asyncio.run(_run())
+    assert resp.status_code == 503
+    assert elapsed < 0.20
+    assert state["row1_cancelled"] is True
+    assert state["row1_finally"] is True
+    assert state["row1_completed"] is False
+    assert len(fake.released) == 2
+
+
+def test_live_asgi_mid_batch_failure_with_completed_sibling_on_real_apiserver(monkeypatch, tmp_path):
+    import threading
+
+    import httpx
+
+    from mstar.api_server.entrypoint import APIServer, PendingRequest
+
+    api = object.__new__(APIServer)
+    api.model = _Cosmos3StubModel()
+    api.model_name = "cosmos3"
+    api.openpi_policy = None
+    api.upload_dir = tmp_path
+    api.fatal_error = None
+    api.paused = False
+    api.metrics = None
+    api.enable_nvtx = False
+    api.timeout_seconds = 5.0
+    api.request_lock = threading.Lock()
+    api.pending_requests = {}
+    api.recently_completed = {}
+    api._live = {}
+    aborted: list[str] = []
+    api.preprocess_worker = SimpleNamespace(abort_request=aborted.append)
+    api._retire = lambda key: None
+    api._record_end = lambda req, outcome: None
+    api._finalize_profile = lambda req: None
+
+    submitted_keys: list[str] = []
+
+    def submit_request(**kwargs):
+        rid = kwargs["request_id"]
+        key = f"{rid}#0"
+        submitted_keys.append(key)
+        req = PendingRequest(
+            streaming=False,
+            input_modalities=kwargs["input_modalities"],
+            output_modalities=kwargs["output_modalities"],
+            profile=None,
+            request_id=rid,
+        )
+        with api.request_lock:
+            api._live[rid] = key
+            api.pending_requests[key] = req
+        return rid
+
+    api.submit_request = submit_request
+    monkeypatch.setattr(entrypoint, "api_server", api)
+    body = _pack_bytes_keys({"input": {"prompt": ["a", "b"]}})
+
+    async def _run():
+        async def _drive():
+            while len(api.pending_requests) < 2:
+                await asyncio.sleep(0.002)
+            with api.request_lock:
+                keys = list(api.pending_requests.keys())
+                req0 = api.pending_requests[keys[0]]
+                req1 = api.pending_requests[keys[1]]
+            # Row 1 finishes cleanly BEFORE row 0 errors
+            req1.chunks.append(ResultChunk(req1.request_id, "action", np.zeros((16, 64), dtype=np.float32).tobytes()))
+            req1.event.set()
+            req1.notify()
+            await asyncio.sleep(0.01)
+            req0.chunks.append(ResultChunk(req0.request_id, "error", b"boom", {"status": 503}))
+            req0.event.set()
+            req0.notify()
+
+        driver = asyncio.create_task(_drive())
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=entrypoint.app), base_url="http://testserver",
+            ) as client:
+                return await client.post(
+                    "/v1/actions/generations", content=body, headers={"Content-Type": "application/msgpack"},
+                )
+        finally:
+            await driver
+
+    resp = asyncio.run(_run())
+    assert resp.status_code == 503
+    assert resp.json()["error"]["message"] == "boom"
+    assert api.pending_requests == {}
+    # Completed sibling (row 1) is not aborted; only the erroring row (row 0) aborts on early stream close
+    assert aborted == [submitted_keys[0]]
+
+
+def test_weight_version_chunk_precedence_seed_u64_and_cosmos3_0d_ndarray(monkeypatch, tmp_path):
+    fake = _FakeActionsServer(_pi05_model(), tmp_path, model_name="pi05_libero")
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+
+    # Chunk metadata weight_version on later tensor chunk must override PendingRequest.weight_version
+    async def split_wv_chunks(rid, idx, sub):
+        await asyncio.sleep(0)
+        key = fake.submission_key(rid)
+        fake.pending_requests[key] = SimpleNamespace(weight_version="v1", chunk_weight_version=None)
+        yield ResultChunk(rid, "action", np.zeros((10, 32), dtype=np.float32).tobytes(), {})
+        tensor = _pack_bytes_keys({
+            "chain": np.zeros((4, 10, 32), dtype=np.float32),
+            "denoise_ind": 0,
+            "logprobs": np.zeros((10, 32), dtype=np.float32),
+            "logprobs_mask": np.ones((10, 32), dtype=np.bool_),
+            "seed": 42,
+        })
+        yield ResultChunk(rid, "tensor", tensor, {"rollout_state": True, "weight_version": "v2"})
+
+    fake.chunks_fn = split_wv_chunks
+    rollout_req = _pack_bytes_keys({
+        "input": {"prompt": "pick", "images": np.zeros((1, 2, 3, 4, 4), dtype=np.uint8)},
+        "parameters": {"rollout": {"sde_type": "flow_sde", "noise_level": 0.5}},
+    })
+    resp = _post(TestClient(entrypoint.app), rollout_req)
+    assert resp.status_code == 200
+    assert _unpack_strict_bytes(resp.content)["data"][0]["rollout"]["weight_version"] == "v2"
+
+    # First chunk weight_version wins over later chunk weight_version (matching Rust find_map)
+    async def multi_wv_chunks(rid, idx, sub):
+        await asyncio.sleep(0)
+        key = fake.submission_key(rid)
+        fake.pending_requests[key] = SimpleNamespace(weight_version="v0", chunk_weight_version=None)
+        yield ResultChunk(rid, "action", np.zeros((10, 32), dtype=np.float32).tobytes(), {"weight_version": "v2"})
+        tensor = _pack_bytes_keys({
+            "chain": np.zeros((4, 10, 32), dtype=np.float32),
+            "denoise_ind": 0,
+            "logprobs": np.zeros((10, 32), dtype=np.float32),
+            "logprobs_mask": np.ones((10, 32), dtype=np.bool_),
+            "seed": 2**63 - 1,
+        })
+        yield ResultChunk(rid, "tensor", tensor, {"rollout_state": True, "weight_version": "v3"})
+
+    fake.chunks_fn = multi_wv_chunks
+    resp2 = _post(TestClient(entrypoint.app), rollout_req)
+    assert resp2.status_code == 200
+    ro2 = _unpack_strict_bytes(resp2.content)["data"][0]["rollout"]
+    assert ro2["weight_version"] == "v2"
+    assert ro2["seed"] == 2**63 - 1
+
+    # rollout.seed >= 2**63 rejected with 500 (matching Rust check_int64)
+    async def u64_over_seed_chunks(rid, idx, sub):
+        await asyncio.sleep(0)
+        yield ResultChunk(rid, "action", np.zeros((10, 32), dtype=np.float32).tobytes(), {})
+        tensor = _pack_bytes_keys({
+            "chain": np.zeros((4, 10, 32), dtype=np.float32),
+            "denoise_ind": 0,
+            "logprobs": np.zeros((10, 32), dtype=np.float32),
+            "logprobs_mask": np.ones((10, 32), dtype=np.bool_),
+            "seed": 2**63,
+        })
+        yield ResultChunk(rid, "tensor", tensor, {"rollout_state": True})
+
+    fake.chunks_fn = u64_over_seed_chunks
+    resp_bad_seed = _post(TestClient(entrypoint.app), rollout_req)
+    assert resp_bad_seed.status_code == 500
+
+    # Cosmos3 0-D ndarray in parameters.{raw_action_dim, num_frames, action_chunk_size} -> 400
+    fake_c3 = _FakeActionsServer(_Cosmos3StubModel(), tmp_path / "c3_0d", model_name="cosmos3")
+    monkeypatch.setattr(entrypoint, "api_server", fake_c3)
+    client = TestClient(entrypoint.app)
+    for param_key in ("raw_action_dim", "num_frames", "action_chunk_size"):
+        bad_0d = _pack_bytes_keys({
+            "input": {"prompt": "pick"},
+            "parameters": {param_key: np.array(10, dtype=np.int64)},
+        })
+        r = _post(client, bad_0d)
+        assert r.status_code == 400, param_key
+

@@ -325,26 +325,13 @@ def _build_cosmos3_rows(
         shared_mk["action_mode"] = "policy"
     elif not isinstance(shared_mk["action_mode"], str):
         raise ValueError("parameters.action_mode must be a string")
-    if "raw_action_dim" in shared_mk:
-        rad = _check_int64(shared_mk["raw_action_dim"], "parameters.raw_action_dim")
-        if rad <= 0:
-            raise ValueError("parameters.raw_action_dim must be >= 1")
-        shared_mk["raw_action_dim"] = rad
-    if "num_frames" in shared_mk:
-        nf = _check_int64(shared_mk["num_frames"], "parameters.num_frames")
-        if nf <= 0:
-            raise ValueError("parameters.num_frames must be >= 1")
-        shared_mk["num_frames"] = nf
-    if "action_chunk_size" in shared_mk:
-        acs = _check_int64(shared_mk["action_chunk_size"], "parameters.action_chunk_size")
-        if acs <= 0:
-            raise ValueError("parameters.action_chunk_size must be >= 1")
-        shared_mk["action_chunk_size"] = acs
-    if "num_inference_steps" in shared_mk:
-        nis = _check_int64(shared_mk["num_inference_steps"], "parameters.num_inference_steps")
-        if nis <= 0:
-            raise ValueError("parameters.num_inference_steps must be >= 1")
-        shared_mk["num_inference_steps"] = nis
+    for int_key in ("raw_action_dim", "num_frames", "action_chunk_size", "num_inference_steps"):
+        raw_val = parameters.get(int_key)
+        if raw_val is not None:
+            iv = _check_int64(raw_val, f"parameters.{int_key}")
+            if iv <= 0:
+                raise ValueError(f"parameters.{int_key} must be >= 1")
+            shared_mk[int_key] = iv
     if rollout_cfg is not None:
         shared_mk["rollout"] = rollout_cfg
 
@@ -789,14 +776,11 @@ def _extract_rollout(data: bytes, weight_version: str | None) -> dict:
         logprobs_mask, np.ndarray
     ):
         raise HTTPException(status_code=500, detail="Rollout tensor chunk arrays must be ndarrays")
-    denoise_ind = unpacked["denoise_ind"]
-    seed = unpacked["seed"]
-    if isinstance(denoise_ind, np.integer):
-        denoise_ind = int(denoise_ind)
-    if isinstance(seed, np.integer):
-        seed = int(seed)
-    if type(denoise_ind) is not int or type(seed) is not int:
-        raise HTTPException(status_code=500, detail="Rollout denoise_ind and seed must be integers")
+    try:
+        denoise_ind = _check_int64(unpacked["denoise_ind"], "denoise_ind")
+        seed = _check_int64(unpacked["seed"], "seed")
+    except ValueError:
+        raise HTTPException(status_code=500, detail="Rollout denoise_ind and seed must be integers") from None
     return {
         "chain": np.ascontiguousarray(chain, dtype="<f4"),
         "denoise_ind": denoise_ind,
@@ -834,26 +818,35 @@ async def _collect_row(
     action_meta: dict = {}
     tensor_data: bytes | None = None
     tensor_is_rollout = False
-    weight_version: str | None = None
+    fallback_wv = _pending_weight_version(api, key)
+    chunk_wv: str | None = None
 
-    async for chunk in api.iter_result_chunks(request_id):
-        meta = chunk.metadata if isinstance(chunk.metadata, dict) else {}
-        if weight_version is None and meta.get("weight_version") is not None:
-            weight_version = meta["weight_version"]
-        if weight_version is None:
-            weight_version = _pending_weight_version(api, key)
+    chunks = api.iter_result_chunks(request_id)
+    try:
+        async for chunk in chunks:
+            meta = chunk.metadata if isinstance(chunk.metadata, dict) else {}
+            if fallback_wv is None:
+                fallback_wv = _pending_weight_version(api, key)
+            if chunk_wv is None and isinstance(meta.get("weight_version"), str):
+                chunk_wv = meta["weight_version"]
 
-        if chunk.modality == "error":
-            status = int(meta.get("status", 500))
-            msg = bytes(chunk.data).decode("utf-8", "replace")
-            raise HTTPException(status_code=status, detail=msg)
-        if chunk.modality == "action":
-            action_data = bytes(chunk.data)
-            action_meta = meta
-        elif chunk.modality == "tensor":
-            if meta.get("rollout_state") is True or not tensor_is_rollout:
-                tensor_data = bytes(chunk.data)
-                tensor_is_rollout = bool(meta.get("rollout_state") is True)
+            if chunk.modality == "error":
+                status = int(meta.get("status", 500))
+                msg = bytes(chunk.data).decode("utf-8", "replace")
+                raise HTTPException(status_code=status, detail=msg)
+            if chunk.modality == "action":
+                action_data = bytes(chunk.data)
+                action_meta = meta
+            elif chunk.modality == "tensor":
+                if meta.get("rollout_state") is True or not tensor_is_rollout:
+                    tensor_data = bytes(chunk.data)
+                    tensor_is_rollout = bool(meta.get("rollout_state") is True)
+    finally:
+        aclose = getattr(chunks, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+    weight_version = chunk_wv if chunk_wv is not None else fallback_wv
 
     if action_data is None:
         raise HTTPException(status_code=500, detail="Request finished without action output")
@@ -954,11 +947,23 @@ async def create_actions(api, request: Request) -> Response:
             return _error(status, msg)
         raise
 
+    tasks: list[asyncio.Task[dict]] = []
+    failed = True
     try:
-        results = await asyncio.gather(*(
-            _collect_row(api, idx, req_id, key, facts, expect_rollout)
+        tasks = [
+            asyncio.create_task(_collect_row(api, idx, req_id, key, facts, expect_rollout))
             for idx, (req_id, key) in enumerate(submitted)
-        ))
+        ]
+        pending: set[asyncio.Task[dict]] = set(tasks)
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_EXCEPTION)
+            for task in tasks:
+                if task in done:
+                    exc = task.exception()
+                    if exc is not None:
+                        raise exc
+        results = [task.result() for task in tasks]
+        failed = False
         results.sort(key=lambda item: item["input_index"])
         return Response(
             content=openpi.pack({"data": results}),
@@ -971,5 +976,16 @@ async def create_actions(api, request: Request) -> Response:
         status, msg = exception_status_text(exc, "/v1/actions/generations", log=logger)
         return _error(status, msg)
     finally:
-        if saved_paths:
-            media_io.schedule_upload_cleanup({"image": saved_paths}, upload_dir)
+        try:
+            if failed:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                try:
+                    if tasks:
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                finally:
+                    _release_submitted(api, submitted)
+        finally:
+            if saved_paths:
+                media_io.schedule_upload_cleanup({"image": saved_paths}, upload_dir)
