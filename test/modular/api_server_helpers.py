@@ -35,6 +35,7 @@ def make_test_api_server(**overrides) -> APIServer:
     server.log_stats = False
     server.log_stats_file = None
     server.metrics = None
+    server.tracing = None
     server.model = None
     server.model_name = "dummy"
     server.served_models = ServedModels.of("dummy", None)

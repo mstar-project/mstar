@@ -1324,12 +1324,14 @@ def _config(monkeypatch, tmp_path, text="model: fake\n") -> str:
     return str(cfg)
 
 
-def _main_until_api_server(monkeypatch, tmp_path, *argv):
+def _main_until_api_server(monkeypatch, tmp_path, *argv, capture=None):
     """Run ``mstar-serve`` up to building the API server; True if it got there."""
     reached = []
 
     def fake_api_server(**kwargs):
         reached.append(kwargs)
+        if capture is not None:
+            capture.append(kwargs)
         raise _StopError
 
     cfg = _config(monkeypatch, tmp_path)
@@ -1337,6 +1339,19 @@ def _main_until_api_server(monkeypatch, tmp_path, *argv):
     with pytest.raises((_StopError, SystemExit)):
         entrypoint.main(["--config", cfg, *argv])
     return bool(reached)
+
+
+def test_tracing_enables_worker_profiling_without_log_stats(monkeypatch, tmp_path):
+    monkeypatch.setattr(entrypoint, "require_tracing", lambda: None)
+    plain, traced = [], []
+    assert _main_until_api_server(monkeypatch, tmp_path, capture=plain)
+    assert _main_until_api_server(
+        monkeypatch, tmp_path, "--otlp-traces-endpoint", "http://localhost:4318/v1/traces",
+        capture=traced,
+    )
+    assert plain[0]["profile_workers"] is False
+    assert traced[0]["profile_workers"] is True
+    assert plain[0]["log_stats"] is traced[0]["log_stats"] is False
 
 
 def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch, tmp_path):
@@ -1616,7 +1631,7 @@ def test_the_api_server_reads_the_placement_and_refuses_declarations_the_conduct
     assert calls == ["get_worker_graphs", "declare_state", "kernel_settings"], "it declared before the placement"
 
 
-def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
+def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv, capture_args=None) -> dict:
     """The keyword arguments ``mstar-serve`` spawns the conductor process with."""
     spawned = []
 
@@ -1643,7 +1658,24 @@ def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
     with pytest.raises(_StopError):
         entrypoint.main(["--config", cfg, *argv])
     (kw,) = spawned
+    if capture_args is not None:
+        capture_args.append(kw["args"])
     return kw.get("kwargs", {})
+
+
+def test_tracing_profiles_workers_without_printing_stats(monkeypatch, tmp_path):
+    import inspect
+
+    monkeypatch.setattr(entrypoint, "require_tracing", lambda: None)
+    plain, traced = [], []
+    _conductor_spawn_kwargs(monkeypatch, tmp_path, capture_args=plain)
+    _conductor_spawn_kwargs(
+        monkeypatch, tmp_path, "--otlp-traces-endpoint", "http://localhost:4318/v1/traces",
+        capture_args=traced,
+    )
+    target = inspect.signature(entrypoint._conductor_process_target)
+    assert target.bind(*plain[0]).arguments["enable_prof"] is False
+    assert target.bind(*traced[0]).arguments["enable_prof"] is True
 
 
 def test_the_conductor_gets_a_status_interval_only_with_metrics_on(monkeypatch, tmp_path):

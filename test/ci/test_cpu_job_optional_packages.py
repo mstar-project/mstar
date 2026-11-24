@@ -40,6 +40,11 @@ class CpuJobOptionalPackageTests(unittest.TestCase):
         self.assertEqual(self.commands[index], 'uv pip install "audioseal>=0.2,<0.3"')
         self.assertLess(index, self.pip_check)
 
+    def test_tracing_extra_is_installed_before_cpu_tests(self):
+        index = self.only_install_of("tracing")
+        self.assertEqual(self.commands[index], 'uv pip install -e ".[dev,waypoint,metrics,tracing]"')
+        self.assertLess(index, self.pip_check)
+
 
 if __name__ == "__main__":
     unittest.main()
