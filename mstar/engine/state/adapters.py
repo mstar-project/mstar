@@ -1648,7 +1648,7 @@ class OwnQueries(Queries):
 
     def __init__(self, array: Array, causal: bool):
         super().__init__(array)
-        # the read's mask, which the step plans once for every read on the resource
+        # whether the read's mask is causal, which the step plans once for every read on the resource
         self.causal = causal
 
     def plan_label(self, keys: Array) -> str:
@@ -2136,9 +2136,9 @@ class WithinStepStorage(Storage):
         return WithinStepSteps()
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
-        """A ragged spec per read, a `RaggedCrossAttentionSpec` for a read with ``queries``. Reads of one kind, on one
-        node set and with one config share the spec of the first of them, under its key, so each read is a plan on that
-        resource rather than a resource of its own."""
+        """A ragged spec per read, a `RaggedCrossAttentionSpec` for a read with ``queries``. Reads of one kind and mask,
+        on one node set and with one config share the spec of the first of them, under its key, so each read is a plan
+        on that resource rather than a resource of its own."""
         by_name = {array.name: array for array in declared}
         resolved = Resolved({}, {}, {}, {})
         shared: dict[tuple, NodeResourceSpec] = {}

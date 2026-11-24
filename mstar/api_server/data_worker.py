@@ -1535,8 +1535,9 @@ class PreprocessWorkerThread:
 
     def _check_whole_steps(self, layouts: dict) -> None:
         """Refuse a keyed span that a prefix hit could end inside a step of: an ids span, or a digest span sharing its
-        step, on a walk that reads the array through a Block or Bidirectional read, which sees each step's adds as a
-        whole. The layout is the model's, so this raises ``RuntimeError``, which fails the request with a 500."""
+        step, on a walk that reads the array through a read that sees each step's adds as a whole
+        (`Mask.sees_step_whole`). The layout is the model's, so this raises ``RuntimeError``, which fails the request
+        with a 500."""
         for array, by_label in self._keyed_labels.items():
             whole = self._whole_reads.get(array, {})
             for label in by_label.keys() & layouts.get(array, {}).keys():
