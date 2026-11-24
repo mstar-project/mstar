@@ -142,6 +142,19 @@ def test_chat_text(client_and_stub):
     assert stub.last_submit["model_kwargs"]["max_output_tokens"] == 16
 
 
+def test_chat_forwards_traceparent_per_request(client_and_stub):
+    client, stub = client_and_stub
+    header = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+    stub.next_chunks = [_Chunk("text", b"ok")]
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"traceparent": header},
+        json={"model": "bagel", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert stub.last_submit["traceparent"] == header
+
+
 @pytest.mark.parametrize("top_k", ["5", 5.0])
 def test_chat_extra_numeric_knob_is_coerced(client_and_stub, top_k):
     from mstar.utils.generation_kwargs import normalize_generation_kwargs

@@ -12,12 +12,14 @@ class _RecordingServer:
 
     def __init__(self):
         self.streaming = None
+        self.submitted = []
 
     async def wait_for_request_id(self, request_id):
         pass
 
     def submit_request(self, **kwargs):
         self.streaming = kwargs["streaming"]
+        self.submitted.append(kwargs)
         return "r"
 
     async def open_result_stream(self, request_id, raw_request=None):
@@ -58,6 +60,22 @@ def test_generate_streams_when_streaming_field_is_omitted(monkeypatch, multipart
     assert response.status_code == 200
     assert server.streaming is True
     assert response.headers["content-type"].startswith(NDJSON_STREAM_MEDIA_TYPE)
+
+
+@pytest.mark.parametrize("multipart", [False, True], ids=["urlencoded", "multipart"])
+@pytest.mark.parametrize("parent", [None, "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"])
+def test_generate_forwards_incoming_traceparent(monkeypatch, multipart, parent):
+    server = _RecordingServer()
+    monkeypatch.setattr(entrypoint, "api_server", server)
+    headers = {"traceparent": parent} if parent else {}
+    client = TestClient(entrypoint.app)
+    if multipart:
+        response = client.post("/generate", files={"text": (None, "hi")}, headers=headers)
+    else:
+        response = client.post("/generate", data={"text": "hi"}, headers=headers)
+
+    assert response.status_code == 200
+    assert server.submitted[0]["traceparent"] == parent
 
 
 @pytest.mark.parametrize("multipart", [False, True], ids=["urlencoded", "multipart"])

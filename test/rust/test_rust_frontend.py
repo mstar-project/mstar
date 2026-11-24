@@ -67,7 +67,7 @@ class _StubAPIServer:
     def submit_request(self, *, text=None, file_paths=None,
                        input_modalities, output_modalities,
                        model_kwargs=None, prompt_parts=None, streaming=True,
-                       request_id=None, report_usage=False):
+                       request_id=None, report_usage=False, traceparent=None):
         if text and "boom" in text:
             raise ValueError("scripted ingest failure")
         self.texts[request_id] = text
@@ -76,6 +76,7 @@ class _StubAPIServer:
             "in": input_modalities, "out": output_modalities,
             "mk": model_kwargs, "files": file_paths, "parts": prompt_parts,
             "streaming": streaming, "report_usage": report_usage,
+            "traceparent": traceparent,
         })
         return request_id
 
@@ -352,6 +353,40 @@ def test_generate_submits_the_layout_python_does(fields, files, tmp_path, monkey
     parts = lambda ps: None if ps is None else [dataclasses.asdict(p) for p in ps]  # noqa: E731
     assert parts(sub["parts"]) == parts(want["prompt_parts"])
     assert got_files == want_files
+
+
+@pytest.mark.parametrize("multipart", [False, True], ids=["urlencoded", "multipart"])
+@pytest.mark.parametrize("parent", [None, "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"])
+def test_generate_forwards_traceparent_on_both_frontends(multipart, parent, tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from mstar.api_server import entrypoint
+
+    fields = {"text": "hi", "streaming": "false"}
+    headers = {"traceparent": parent} if parent else {}
+    python = _GeneratePython(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", python)
+    if multipart:
+        reply = TestClient(entrypoint.app).post(
+            "/generate", files={"text": (None, "hi"), "streaming": (None, "false")},
+            headers=headers)
+    else:
+        reply = TestClient(entrypoint.app).post("/generate", data=fields, headers=headers)
+    assert reply.status_code == 200
+    assert python.submitted[0]["traceparent"] == parent
+
+    stub = _StubAPIServer()
+    with _model_stack("qwen3_omni", stub) as (port, _upload):
+        if multipart:
+            body, ctype = _multipart(fields, [])
+        else:
+            body, ctype = urllib.parse.urlencode(fields).encode(), "application/x-www-form-urlencoded"
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/generate", data=body,
+            headers={"Content-Type": ctype, **headers})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            assert response.status == 200
+    assert stub.submitted[0]["traceparent"] == parent
 
 
 def _post_raw(port, path, raw_bytes, content_type="application/json", timeout=15):
@@ -1560,6 +1595,26 @@ def _listening(port) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _process_gone(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] == "Z"  # exited, not yet reaped
+    except (FileNotFoundError, ProcessLookupError):
+        # /proc can disappear after open succeeds but before read completes.
+        return True
+
+
+def test_process_gone_if_proc_stat_disappears_during_read(monkeypatch):
+    from unittest.mock import mock_open
+
+    opened = mock_open()
+    opened.return_value.__enter__.return_value.read.side_effect = ProcessLookupError
+    monkeypatch.setattr("builtins.open", opened)
+
+    assert _process_gone(123)
+    opened.assert_called_once_with("/proc/123/stat")
+
+
 def test_a_taken_port_exits_3_and_says_so():
     """``mstar serve`` exits when mstar-server does, and ``test/e2e/server.py``
     tells a lost port race by this message."""
@@ -1601,19 +1656,17 @@ def test_mstar_server_exits_when_its_launcher_is_killed():
         launcher.kill()
         launcher.wait()
 
-    def gone() -> bool:
-        try:
-            with open(f"/proc/{pid}/stat") as f:
-                return f.read().rsplit(")", 1)[1].split()[0] == "Z"  # exited, not yet reaped
-        except FileNotFoundError:
-            return True
-
     deadline = time.time() + 15
-    while not gone() and time.time() < deadline:
+    while not _process_gone(pid) and time.time() < deadline:
         time.sleep(0.1)
-    if not gone():
-        os.kill(pid, 9)
-        pytest.fail("mstar-server outlived its launcher")
+    if not _process_gone(pid):
+        try:
+            os.kill(pid, 9)
+        except ProcessLookupError:
+            # It exited between the final /proc check and our cleanup signal.
+            pass
+        else:
+            pytest.fail("mstar-server outlived its launcher")
     # the port is free again, to a server binding it as mstar-server does (mio
     # sets SO_REUSEADDR): a zombie's other threads may still hold its sockets
     # for a moment after its leader exits, so retry briefly
@@ -1628,3 +1681,47 @@ def test_mstar_server_exits_when_its_launcher_is_killed():
                 if time.time() > deadline:
                     raise
         time.sleep(0.1)
+
+
+def test_launcher_exit_cleanup_tolerates_exit_after_last_probe(monkeypatch):
+    """The server may exit after ``gone`` returns false but before cleanup kills it."""
+    import builtins
+    import io
+    import os
+    import subprocess
+    import sys
+    from types import SimpleNamespace
+
+    pid = 99999999
+    port = _free_port()
+    real_open = builtins.open
+    calls = []
+
+    class Launcher:
+        stdout = io.StringIO(f"{pid}\n")
+
+        def kill(self):
+            pass
+
+        def wait(self):
+            pass
+
+    def fake_open(path, *args, **kwargs):
+        if path == f"/proc/{pid}/stat":
+            return io.StringIO(f"{pid} (mstar-server) S 1 0 0")
+        return real_open(path, *args, **kwargs)
+
+    def exited_before_kill(target, signal):
+        calls.append((target, signal))
+        raise ProcessLookupError
+
+    clock = iter((0, 0, 0, 20, 20))
+    monkeypatch.setattr(sys.modules[__name__], "_free_port", lambda: port)
+    monkeypatch.setattr(sys.modules[__name__], "_listening", lambda _: True)
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: Launcher())
+    monkeypatch.setattr(builtins, "open", fake_open)
+    monkeypatch.setattr(os, "kill", exited_before_kill)
+    monkeypatch.setattr(sys.modules[__name__], "time", SimpleNamespace(time=lambda: next(clock), sleep=lambda _: None))
+
+    test_mstar_server_exits_when_its_launcher_is_killed()
+    assert calls == [(pid, 9)]

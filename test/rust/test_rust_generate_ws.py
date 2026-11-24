@@ -73,7 +73,7 @@ class _Server:
 
     def submit_request(self, *, text=None, file_paths=None, input_modalities, output_modalities, model_kwargs=None,
                        prompt_parts=None, streaming=True, request_id=None, model=None, end_input=True,
-                       file_streams=None, raw_inputs=None, report_usage=False):
+                       file_streams=None, raw_inputs=None, report_usage=False, traceparent=None):
         if text == "refuse me":
             raise ValueError("the model refuses this text")
         rid = request_id or f"gen-{len(self.submitted)}"
@@ -83,6 +83,7 @@ class _Server:
             "parts": [(p.modality, p.text, p.index, p.role) for p in prompt_parts or []],
             "files": self._files(file_paths), "streaming": streaming, "end_input": end_input,
             "file_streams": file_streams,
+            "traceparent": traceparent,
         })
         opened = set()
         if self.client_streams and end_input is not True:
@@ -218,6 +219,34 @@ def _rust_session(port, frames, settle, ending):
         while len([r for r in replies if _ended(r) or r.get("append")]) < ending:
             replies.append(_decode(ws.recv(timeout=15)))
     return replies
+
+
+@pytest.mark.parametrize("parent", [None, "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"])
+def test_websocket_handshake_traceparent_reaches_each_submission_on_both_frontends(monkeypatch, tmp_path, parent):
+    frames = [json.dumps({"request_id": rid, "text": "hi"}) for rid in ("first", "second")]
+    headers = {"traceparent": parent} if parent else {}
+    python = _Server(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", python)
+    with TestClient(entrypoint.app).websocket_connect(
+        "/generate/ws", headers=headers) as ws:
+        for frame in frames:
+            ws.send_text(frame)
+        for _ in range(2):
+            while not _ended(_decode(ws.receive_text())):
+                pass
+    assert [sub["traceparent"] for sub in python.submitted] == [parent, parent]
+
+    rust = _Server(tmp_path)
+    with _rust(rust) as (port, _bridge):
+        with websockets.sync.client.connect(
+            f"ws://127.0.0.1:{port}/generate/ws", compression=None,
+            additional_headers=headers) as ws:
+            for frame in frames:
+                ws.send(frame)
+            for _ in range(2):
+                while not _ended(_decode(ws.recv(timeout=15))):
+                    pass
+    assert [sub["traceparent"] for sub in rust.submitted] == [parent, parent]
 
 
 def _by_request(replies):
