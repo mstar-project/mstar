@@ -33,6 +33,9 @@ VIDEO_GEN_AR_WALK = "video_gen_ar"
 VIDEO_DECODE_AR_WALK = "video_decode_ar"
 WINDOW_DECODER_PARTITION = "window_decoder"
 ACTION_GEN_WALK = "action_gen"
+# RL rollout action generation: same joint video+action denoise with opt-in
+# Flow-SDE and terminal rollout_state tensor emission.
+ACTION_ROLLOUT_GEN_WALK = "action_rollout_gen"
 # Forward-dynamics runs the same joint video+action denoise but emits the
 # predicted video (VAE-decoded) instead of the action, so it has its own walk.
 ACTION_VIDEO_GEN_WALK = "action_video_gen"

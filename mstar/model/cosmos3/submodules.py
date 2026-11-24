@@ -86,6 +86,7 @@ from mstar.model.cosmos3.components.packing import (
 )
 from mstar.model.cosmos3.constants import (
     ACTION_GEN_WALK,
+    ACTION_ROLLOUT_GEN_WALK,
     ACTION_VIDEO_GEN_WALK,
     IMAGE_GEN_WALK,
     PREFILL_COND_VIDEO_WALK,
@@ -134,19 +135,21 @@ VIDEO_GEN_LOOP = "video_gen_loop"
 VIDEO_GEN_AR_LOOP = "video_gen_ar_loop"
 VIDEO_SOUND_GEN_LOOP = "video_sound_gen_loop"
 ACTION_GEN_LOOP = "action_gen_loop"
+ACTION_ROLLOUT_GEN_LOOP = "action_rollout_gen_loop"
 ACTION_VIDEO_GEN_LOOP = "action_video_gen_loop"
 # Each denoise walk's loop; any other walk runs the image loop.
 DENOISE_LOOP_FOR_WALK = {
     ACTION_GEN_WALK: ACTION_GEN_LOOP,
+    ACTION_ROLLOUT_GEN_WALK: ACTION_ROLLOUT_GEN_LOOP,
     ACTION_VIDEO_GEN_WALK: ACTION_VIDEO_GEN_LOOP,
     VIDEO_GEN_WALK: VIDEO_GEN_LOOP,
     VIDEO_GEN_AR_WALK: VIDEO_GEN_AR_LOOP,
     VIDEO_SOUND_GEN_WALK: VIDEO_SOUND_GEN_LOOP,
 }
 
-# Both action walks run the joint video+action denoise loop body; they differ
-# only in what they emit (the predicted action vs the predicted video).
-ACTION_WALKS = (ACTION_GEN_WALK, ACTION_VIDEO_GEN_WALK)
+# Action walks run the joint video+action denoise loop body; they differ in
+# what they emit (predicted action, rollout state, or predicted video).
+ACTION_WALKS = (ACTION_GEN_WALK, ACTION_ROLLOUT_GEN_WALK, ACTION_VIDEO_GEN_WALK)
 
 # Opt-in sound generation: the same video denoise loop with an AVAE-latent sound
 # band appended to the generation block, jointly denoised and threaded through
@@ -316,11 +319,12 @@ class _UniPCSampler:
     def initial_state(self, sample: torch.Tensor) -> dict[str, torch.Tensor]:
         return initial_state(sample)
 
-    def step(self, model_output, sample, step_index: int, solver, generator=None):
+    def step(self, model_output, sample, step_index: int, solver, generator=None, reset_step: int = 0):
         step = unipc_step(
             model_output, sample,
             UniPCState(model_outputs=solver[MODEL_OUTPUTS], last_sample=solver[LAST_SAMPLE]),
             self.host_sigmas, self.sigmas, step_index, len(self.host_timesteps),
+            reset_step=reset_step,
         )
         return step.sample, {MODEL_OUTPUTS: step.model_outputs, LAST_SAMPLE: step.last_sample}
 
@@ -1362,6 +1366,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             vmask=vmask,
             action_clean_mask=action_clean,
             clean_action=clean_action,
+            num_inference_steps=steps,
+            state_rows=state_rows,
+            rollout=md.get("rollout"),
         )
         return node_inputs
 
@@ -1520,6 +1527,28 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             v_noise = randn_tensor(st["latent_shape"], generator=gen, device=device, dtype=dtype)
             latents = st["vmask"] * st["cond_video_latents"] + (1.0 - st["vmask"]) * v_noise
             solver = scheduler.initial_state(self._packed(latents, action_latents))
+            rollout = st.get("rollout")
+            if rollout is not None:
+                num_steps = int(st.get("num_inference_steps") or len(_host_timesteps(scheduler)))
+                st.add("num_inference_steps", num_steps)
+                st.add("sde_generator", gen)
+                st.add("random_seed", int(fwd_info.random_seed))
+                sde_step = rollout.get("sde_step", "random")
+                if rollout["sde_type"] == "flow_ode":
+                    denoise_ind = -1
+                elif sde_step == "random":
+                    cpu_gen = torch.Generator(device="cpu").manual_seed(int(fwd_info.random_seed))
+                    high = (num_steps - 1) if (rollout.get("ignore_last", False) and num_steps > 1) else num_steps
+                    denoise_ind = int(torch.randint(0, high, (1,), generator=cpu_gen).item())
+                else:
+                    denoise_ind = int(sde_step)
+                st.add("rollout_denoise_ind", denoise_ind)
+                st.add("unipc_reset_step", 0)
+                chain = torch.empty((num_steps + 1, chunk, adim), dtype=torch.float32, device=device)
+                chain[0].copy_(action_latents[0].detach().to(torch.float32))
+                st.add("rollout_chain", chain)
+                st.add("rollout_logprobs", torch.zeros((chunk, adim), dtype=torch.float32, device=device))
+                st.add("rollout_logprobs_mask", torch.zeros((chunk, adim), dtype=torch.bool, device=device))
         else:
             latents = inputs["latents"][0]
             action_latents = inputs["action_latents"][0]
@@ -1528,7 +1557,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         return ARNodeInputs(
             input_seq_len=st["cond"]["num_vision_tokens"] + st["cond"]["num_action_tokens"],
             tensor_inputs={"latents": latents, "action_latents": action_latents, **solver},
-            resource_step_info=self._step_info(ACTION_GEN_WALK, st, step_index),
+            resource_step_info=self._step_info(graph_walk, st, step_index),
         )
 
     # ------------------------------------------------------------------
@@ -1795,7 +1824,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         if graph_walk in SOUND_WALKS:
             return self._forward_video_sound_gen(attn, states[rid], k, **kwargs)
         if graph_walk in ACTION_WALKS:
-            return self._forward_action_gen(attn, states[rid], k, **kwargs)
+            return self._forward_action_gen(attn, states[rid], k, graph_walk=graph_walk, **kwargs)
         raise ValueError(f"Unknown Cosmos3 DiT graph walk: {graph_walk!r}")
 
     def _forward_prefill(
@@ -2026,9 +2055,161 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         new_action[..., raw:] = 0
         return new_latents, new_action, solver
 
-    def _forward_action_gen(self, attn, st, k, latents, action_latents, **solver) -> dict:
+    @staticmethod
+    def _pack_rollout_state(st, device: torch.device) -> torch.Tensor:
+        import numpy as np
+
+        from mstar.api_server.openpi import pack
+
+        state_rows = int(st.get("state_rows", 0))
+        chain = st["rollout_chain"][:, state_rows:].detach().cpu().contiguous().numpy()
+        logprobs = st["rollout_logprobs"][state_rows:].detach().cpu().contiguous().numpy()
+        logprobs_mask = st["rollout_logprobs_mask"][state_rows:].detach().cpu().contiguous().numpy()
+        seed_u64 = int(st["random_seed"]) & ((1 << 64) - 1)
+        seed_i64 = seed_u64 - (1 << 64) if seed_u64 >= (1 << 63) else seed_u64
+        packed = pack({
+            "chain": np.ascontiguousarray(chain, dtype=np.float32),
+            "denoise_ind": int(st["rollout_denoise_ind"]),
+            "logprobs": np.ascontiguousarray(logprobs, dtype=np.float32),
+            "logprobs_mask": np.ascontiguousarray(logprobs_mask, dtype=np.bool_),
+            "seed": seed_i64,
+        })
+        return torch.frombuffer(bytearray(packed), dtype=torch.uint8).clone().to(device)
+
+    def _action_rollout_step(
+        self,
+        st,
+        latents: torch.Tensor,
+        action_latents: torch.Tensor,
+        video_v: torch.Tensor,
+        action_v: torch.Tensor,
+        step_index: int,
+        solver: dict,
+        emit_rollout_state: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict, torch.Tensor | None]:
+        """Opt-in Flow-SDE / Flow-ODE rollout step in fp32 on ACTION_GEN_LOOP /
+        ACTION_ROLLOUT_GEN_LOOP.
+
+        Video latents always step deterministically (Euler or hybrid UniPC with
+        solver-state + order-ramp reset after the stochastic action step). Flow-SDE
+        perturbation and masked fp32 Gaussian log-probabilities apply solely to noisy
+        action coordinates (``1 - action_clean_mask`` and ``col < raw_action_dim``).
+        """
+        num_steps = int(st["num_inference_steps"])
+        if step_index >= num_steps:
+            return latents, action_latents, solver, None
+
+        rollout = st["rollout"]
+        sde_type = rollout["sde_type"]
+        noise_level = float(rollout.get("noise_level", 0.5))
+        video_solver = rollout.get("video_solver", "hybrid_unipc")
+        denoise_ind = int(st["rollout_denoise_ind"])
+        raw, chunk, adim = st["raw_action_dim"], st["action_chunk"], st["action_dim"]
+
+        lat_f32 = latents.to(torch.float32)
+        act_f32 = action_latents.to(torch.float32)
+        vmask_f32 = st["vmask"].to(torch.float32)
+        cond_video_f32 = st["cond_video_latents"].to(torch.float32)
+        clean_mask_f32 = st["action_clean_mask"].to(torch.float32)
+        clean_act_f32 = st["clean_action"].to(torch.float32)
+
+        video_v_f32 = video_v.to(torch.float32) * (1.0 - vmask_f32)
+        action_v_f32 = action_v.to(torch.float32) * (1.0 - clean_mask_f32)
+        action_v_f32[..., raw:] = 0.0
+
+        host_sigmas = st["scheduler"].host_sigmas
+        s_curr = host_sigmas[:-1]
+        s_next = host_sigmas[1:]
+        s_denom = torch.where(s_curr >= 1.0 - 1e-3, s_next, s_curr)
+        t = float(s_curr[step_index])
+        t_next = float(s_next[step_index])
+        delta = t - t_next
+        t_denom = float(s_denom[step_index])
+
+        nv = video_v_f32.numel()
+        if video_solver == "hybrid_unipc":
+            packed_next, next_solver = st["scheduler"].step(
+                self._packed(video_v_f32, action_v_f32),
+                self._packed(lat_f32, act_f32),
+                step_index,
+                solver,
+                reset_step=int(st.get("unipc_reset_step", 0)),
+            )
+            new_latents = packed_next[:, :nv].reshape(lat_f32.shape)
+            new_latents = (1.0 - vmask_f32) * new_latents + vmask_f32 * cond_video_f32
+        else:
+            xv0_hat = lat_f32 - video_v_f32 * t
+            xv1_hat = lat_f32 + video_v_f32 * (1.0 - t)
+            new_latents = xv0_hat * (1.0 - t_next) + xv1_hat * t_next
+            new_latents = (1.0 - vmask_f32) * new_latents + vmask_f32 * cond_video_f32
+            next_solver = solver
+
+        is_sde_step = sde_type == "flow_sde" and step_index == denoise_ind
+        if is_sde_step:
+            sigma_sde = noise_level * math.sqrt(t / (1.0 - t_denom)) if noise_level > 0.0 else 0.0
+            x0_hat = act_f32 - action_v_f32 * t
+            x1_hat = act_f32 + action_v_f32 * (1.0 - t)
+            w0 = 1.0 - t_next
+            if sigma_sde > 0.0:
+                w1 = t_next - (sigma_sde ** 2) * delta / (2.0 * t)
+                std_t = math.sqrt(delta) * sigma_sde
+                mu_a = x0_hat * w0 + x1_hat * w1
+                eps = torch.randn(
+                    act_f32.shape,
+                    generator=st["sde_generator"],
+                    device=act_f32.device,
+                    dtype=torch.float32,
+                )
+                new_action = mu_a + std_t * eps
+            else:
+                w1 = t_next
+                std_t = 0.0
+                mu_a = x0_hat * w0 + x1_hat * w1
+                new_action = mu_a
+            new_action = (1.0 - clean_mask_f32) * new_action + clean_mask_f32 * clean_act_f32
+            new_action[..., raw:] = 0.0
+
+            col_mask = torch.arange(adim, device=act_f32.device) < raw
+            active_mask = ((1.0 - clean_mask_f32[0, :, 0]) > 0.5).unsqueeze(-1) & col_mask.unsqueeze(0)
+            if std_t > 0.0:
+                diff = new_action[0] - mu_a[0]
+                raw_lp = -0.5 * (diff / std_t) ** 2 - math.log(std_t) - 0.5 * math.log(2.0 * math.pi)
+                lp = torch.where(active_mask, raw_lp, torch.zeros_like(raw_lp))
+                lp_mask = active_mask
+            else:
+                lp = torch.zeros((chunk, adim), dtype=torch.float32, device=act_f32.device)
+                lp_mask = torch.zeros((chunk, adim), dtype=torch.bool, device=act_f32.device)
+            st["rollout_logprobs"].copy_(lp)
+            st["rollout_logprobs_mask"].copy_(lp_mask)
+
+            if video_solver == "hybrid_unipc":
+                next_solver = {
+                    name: torch.zeros_like(tensor) for name, tensor in next_solver.items()
+                }
+                st.add("unipc_reset_step", step_index + 1)
+        else:
+            if video_solver == "hybrid_unipc":
+                new_action = packed_next[:, nv:].reshape(1, chunk, adim)
+            else:
+                x0_hat = act_f32 - action_v_f32 * t
+                x1_hat = act_f32 + action_v_f32 * (1.0 - t)
+                new_action = x0_hat * (1.0 - t_next) + x1_hat * t_next
+            new_action = (1.0 - clean_mask_f32) * new_action + clean_mask_f32 * clean_act_f32
+            new_action[..., raw:] = 0.0
+
+        st["rollout_chain"][step_index + 1].copy_(new_action[0].detach().to(torch.float32))
+        rollout_state = None
+        if emit_rollout_state and step_index + 1 == num_steps:
+            rollout_state = self._pack_rollout_state(st, latents.device)
+        return new_latents, new_action, next_solver, rollout_state
+
+    def _forward_action_gen(
+        self, attn, st, k, latents, action_latents, graph_walk: str = ACTION_GEN_WALK, **solver
+    ) -> dict:
         scheduler = st["scheduler"]
         step_index = k
+        if st.get("rollout") is not None and step_index >= st["num_inference_steps"]:
+            return {"latents": [latents], "action_latents": [action_latents], **self._solver_edges(solver)}
         t = _host_timesteps(scheduler)[step_index]
         device = latents.device
         vts = torch.full((st["cond"]["num_noisy_vision_tokens"],), t, device=device)
@@ -2068,6 +2249,22 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             )
             video_v = _guided(video_v, v_u, st["gs"], latents.dtype)
             action_v = _guided(action_v, a_u, st["gs"], action_latents.dtype)
+
+        if st.get("rollout") is not None:
+            new_latents, new_action, solver, rollout_state = self._action_rollout_step(
+                st,
+                latents,
+                action_latents,
+                video_v,
+                action_v,
+                step_index,
+                solver,
+                emit_rollout_state=(graph_walk == ACTION_ROLLOUT_GEN_WALK),
+            )
+            out = {"latents": [new_latents], "action_latents": [new_action], **self._solver_edges(solver)}
+            if rollout_state is not None:
+                out["rollout_state"] = [rollout_state]
+            return out
 
         new_latents, new_action, solver = self._action_scheduler_step(
             st, latents, action_latents, video_v, action_v, step_index, solver,
@@ -2281,7 +2478,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         attn = self._gen_attn(engine_inputs)
         rids = engine_inputs.request_ids
         with_cfg = states[rids[0]]["uncond"] is not None and any(
-            self._cfg_active(states[rid], _loop_step(engine_inputs.per_request_info[rid], graph_walk))
+            self._cfg_active(
+                states[rid],
+                min(
+                    _loop_step(engine_inputs.per_request_info[rid], graph_walk),
+                    len(_host_timesteps(states[rid]["scheduler"])) - 1,
+                ),
+            )
             for rid in rids
         )
         reqs, meta = [], []
@@ -2322,15 +2525,36 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         out = {}
         for (rid, st, lat, act, k), branches in zip(meta, results, strict=True):
+            solver = {name: solvers[name][rid] for name in self._solver_state}
+            if st.get("rollout") is not None and k >= st["num_inference_steps"]:
+                out[rid] = {"latents": [lat], "action_latents": [act], **self._solver_edges(solver)}
+                continue
             video_v, action_v = branches[0]
             # `can_batch` keeps the rows to one value; the per-row check is belt and braces.
             if with_cfg and self._cfg_active(st, k):
                 uncond_video, uncond_action = branches[1]
                 video_v = _guided(video_v, uncond_video, st["gs"], lat.dtype)
                 action_v = _guided(action_v, uncond_action, st["gs"], act.dtype)
-            solver = {name: solvers[name][rid] for name in self._solver_state}
-            new_latents, new_action, solver = self._action_scheduler_step(st, lat, act, video_v, action_v, k, solver)
-            out[rid] = {"latents": [new_latents], "action_latents": [new_action], **self._solver_edges(solver)}
+            if st.get("rollout") is not None:
+                new_latents, new_action, solver, rollout_state = self._action_rollout_step(
+                    st,
+                    lat,
+                    act,
+                    video_v,
+                    action_v,
+                    k,
+                    solver,
+                    emit_rollout_state=(graph_walk == ACTION_ROLLOUT_GEN_WALK),
+                )
+                row_out = {"latents": [new_latents], "action_latents": [new_action], **self._solver_edges(solver)}
+                if rollout_state is not None:
+                    row_out["rollout_state"] = [rollout_state]
+                out[rid] = row_out
+            else:
+                new_latents, new_action, solver = self._action_scheduler_step(
+                    st, lat, act, video_v, action_v, k, solver
+                )
+                out[rid] = {"latents": [new_latents], "action_latents": [new_action], **self._solver_edges(solver)}
         return out
 
     # ------------------------------------------------------------------

@@ -1,0 +1,28 @@
+model: "cosmos3"
+# Sequence-length hint for the scheduler. The conductor only asserts its
+# presence; the real per-request capacity is the KV pool below.
+max_seq_len: 8192
+# KV pool sizing, matching the Nano config: 1024 pages easily cover 8
+# concurrent 320x192 LIBERO policy rollouts alongside action generation.
+resources:
+  kv:
+    max_num_pages: 1024
+model_kwargs:
+  accelerator_graph: true
+  graph_max_latent_area: 2000
+  enable_sound: false
+  num_inference_steps_action: 30
+  guidance_scale_action: 1.0
+  flow_shift_action: 5.0
+  policy_action_chunk_size: 16
+  policy_conditioning_fps: 20.0
+  policy_domain_name: "libero"
+  inverted_action_dims: []
+  image_size_default: [320, 192]
+  video_size_default: [320, 192]
+  compile_vae_encode_size: [320, 192]
+node_groups:
+  - node_names: ["dit"]
+    ranks: [0]
+  - node_names: ["vae_encoder", "vae_decoder"]
+    ranks: [0]
