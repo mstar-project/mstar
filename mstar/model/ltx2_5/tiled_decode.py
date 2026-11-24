@@ -36,7 +36,11 @@ def distributed_tiled_decode(vae, z: torch.Tensor, group: CommGroup) -> torch.Te
         for h in range(0, z.shape[-2], stride_h)
         for w in range(0, z.shape[-1], stride_w)
     ]
-    if len(positions) < group.world_size:
+    if (
+        z.numel() == 0
+        or len(positions) < group.world_size
+        or (z.shape[-2] <= tile_h and z.shape[-1] <= tile_w)
+    ):
         return vae.decode(z, None, return_dict=False)[0] if group.rank == 0 else None
 
     local_tiles = [

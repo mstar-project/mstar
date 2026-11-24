@@ -20,9 +20,10 @@ from mstar.graph.base import GraphEdge, GraphNode, NodeAndGraphWalk
 from mstar.graph.runtime.base import RouteInput
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import WorkerGraph
+from mstar.model.components.moe_parallel import MoeParallelConfig
 from mstar.model.ltx2_5.config import LTX25Config
 from mstar.model.ltx2_5.ltx2_5_model import GENERATE_VIDEO_WALK, LTX25Model
-from mstar.model.ltx2_5.submodules import VIDEO_OUTPUT, LTXVideoDecoderSubmodule
+from mstar.model.ltx2_5.submodules import VIDEO_OUTPUT, LTXShape, LTXVideoDecoderSubmodule, pack_video
 from mstar.model.ltx2_5.tiled_decode import distributed_tiled_decode, spatial_tile_count
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.containers import ParallelList
@@ -130,6 +131,9 @@ def test_non_sequence_sp_requires_explicit_capability_and_no_engine_shard():
     assert sequence_parallel_refusals([], "vae_decoder", 1, 1, sp_collective=True) == []
     assert "2 TP ranks" in sequence_parallel_refusals([], "vae_decoder", 2, 1, sp_collective=True)[0]
     assert "2 TP ranks" in sequence_parallel_refusals([], "vae_decoder", 2, 2, sp_collective=True)[0]
+    assert "expert parallelism" in sequence_parallel_refusals(
+        [], "vae_decoder", 1, 2, moe_parallel=MoeParallelConfig(parallel="ep"), sp_collective=True,
+    )[0]
 
 
 @pytest.mark.parametrize("rank", [0, 1])
@@ -331,3 +335,258 @@ def test_follower_completes_worker_route_without_a_video_tensor(rank: int, tmp_p
     ))
     assert stored.num_tensors == ([1] if rank == 0 else [0])
     assert route.register_uuids == (stored.flat_uuids if rank == 0 else [])
+
+
+def _rank_check_bf16_nonsquare_batched(rank: int, world_size: int, init_file: str, results) -> None:
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
+    try:
+        torch.set_num_threads(1)
+        torch.manual_seed(123)
+        group = CommGroup(rank, rank, list(range(world_size)))
+        group.device_group = dist.group.WORLD
+        vae = _small_real_vae().to(dtype=torch.bfloat16)
+        # B=2, H=8 != W=14 -> 3x5 = 15 uneven spatial tiles in bfloat16.
+        shape = (2, 4, 2, 8, 14)
+        z = (torch.arange(math.prod(shape), dtype=torch.float32).reshape(shape) / 97).to(torch.bfloat16)
+        with torch.inference_mode():
+            reference = vae.tiled_decode(z, None, return_dict=False)[0]
+            got = distributed_tiled_decode(vae, z, group)
+        results.put((
+            rank,
+            torch.equal(got, reference) if got is not None else False,
+            got.dtype if got is not None else None,
+            tuple(got.shape) if got is not None else None,
+        ))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_distributed_tiled_decode_bfloat16_nonsquare_batched(tmp_path: Path):
+    pytest.importorskip("diffusers")
+    ctx = mp.get_context("spawn")
+    results = ctx.Queue()
+    init_file = str(tmp_path / "gloo-init-bf16")
+    world_size = 2
+    procs = [
+        ctx.Process(target=_rank_check_bf16_nonsquare_batched, args=(rank, world_size, init_file, results))
+        for rank in range(world_size)
+    ]
+    for proc in procs:
+        proc.start()
+    try:
+        observed = [results.get(timeout=60) for _ in procs]
+        assert sorted(observed) == [
+            (0, True, torch.bfloat16, (2, 3, 2, 16, 28)),
+            (1, False, None, None),
+        ]
+    finally:
+        for proc in procs:
+            proc.join(timeout=20)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join()
+        assert all(proc.exitcode == 0 for proc in procs)
+
+
+def _rank_check_submodule_end_to_end(rank: int, world_size: int, init_file: str, results) -> None:
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
+    try:
+        torch.set_num_threads(1)
+        group = CommGroup(rank, rank, list(range(world_size)))
+        group.device_group = dist.group.WORLD
+        torch.manual_seed(123)
+        vae = _small_real_vae()
+        decoder = LTXVideoDecoderSubmodule(vae, LTX25Config(), tile_min_pixels=0, comm_group=group)
+
+        torch.manual_seed(123)
+        serial_vae = _small_real_vae()
+        serial_decoder = LTXVideoDecoderSubmodule(serial_vae, LTX25Config(), tile_min_pixels=0, comm_group=None)
+
+        shape = LTXShape(frames=2, height=9, width=9, audio_frames=1, fps=24.0, text_len=1)
+        raw = torch.arange(math.prod((2, 4, 2, 9, 9)), dtype=torch.float32).reshape(2, 4, 2, 9, 9) / 97
+        packed = pack_video(raw)
+        engine_inputs = SimpleNamespace(request_ids=["r0", "r1"])
+        with torch.inference_mode():
+            run_out = decoder.run_batch(packed, shape)
+            fwd_out = decoder.forward_batched(GENERATE_VIDEO_WALK, engine_inputs, latents=packed, shape=shape)
+            serial_run = serial_decoder.run_batch(packed, shape)
+            serial_fwd = serial_decoder.forward_batched(
+                GENERATE_VIDEO_WALK, engine_inputs, latents=packed, shape=shape,
+            )
+
+        if rank == 0:
+            run_match = (
+                set(run_out) == {VIDEO_OUTPUT}
+                and torch.equal(run_out[VIDEO_OUTPUT], serial_run[VIDEO_OUTPUT])
+            )
+            fwd_match = (
+                set(fwd_out) == {"r0", "r1"}
+                and all(
+                    set(fwd_out[rid]) == {VIDEO_OUTPUT}
+                    and len(fwd_out[rid][VIDEO_OUTPUT]) == 1
+                    and fwd_out[rid][VIDEO_OUTPUT][0].dtype == torch.uint8
+                    and fwd_out[rid][VIDEO_OUTPUT][0].shape == (2, 18, 18, 3)
+                    and torch.equal(fwd_out[rid][VIDEO_OUTPUT][0], serial_fwd[rid][VIDEO_OUTPUT][0])
+                    for rid in ("r0", "r1")
+                )
+            )
+            results.put((rank, run_match, fwd_match))
+        else:
+            results.put((rank, run_out == {}, fwd_out == {"r0": {}, "r1": {}}))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_submodule_run_batch_and_forward_batched_distributed_gloo(tmp_path: Path):
+    pytest.importorskip("diffusers")
+    ctx = mp.get_context("spawn")
+    results = ctx.Queue()
+    init_file = str(tmp_path / "gloo-init-submodule")
+    world_size = 2
+    procs = [
+        ctx.Process(target=_rank_check_submodule_end_to_end, args=(rank, world_size, init_file, results))
+        for rank in range(world_size)
+    ]
+    for proc in procs:
+        proc.start()
+    try:
+        observed = [results.get(timeout=60) for _ in procs]
+        assert sorted(observed) == [(0, True, True), (1, True, True)]
+    finally:
+        for proc in procs:
+            proc.join(timeout=20)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join()
+        assert all(proc.exitcode == 0 for proc in procs)
+
+
+@pytest.mark.parametrize("use_trivial", [False, True])
+@pytest.mark.parametrize("use_tiling", [False, True])
+def test_submodule_run_batch_sp1_uses_serial_decode(use_trivial: bool, use_tiling: bool, monkeypatch):
+    pytest.importorskip("diffusers")
+    from mstar.model.ltx2_5 import tiled_decode
+
+    torch.manual_seed(123)
+    vae = _small_real_vae()
+    comm_group = CommGroup.trivial() if use_trivial else None
+    decoder = LTXVideoDecoderSubmodule(
+        vae, LTX25Config(), tile_min_pixels=0 if use_tiling else 10**9, comm_group=comm_group,
+    )
+    monkeypatch.setattr(
+        tiled_decode, "distributed_tiled_decode",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sp_size=1 must not use distributed decode")),
+    )
+    shape = LTXShape(frames=2, height=9, width=9, audio_frames=1, fps=24.0, text_len=1)
+    raw = torch.arange(math.prod((1, 4, 2, 9, 9)), dtype=torch.float32).reshape(1, 4, 2, 9, 9) / 97
+    packed = pack_video(raw)
+    with torch.inference_mode():
+        out = decoder.run_batch(packed, shape)
+        vae.use_tiling = use_tiling
+        expected_video = vae.decode(raw, None, return_dict=False)[0]
+    expected_frames = ((expected_video / 2 + 0.5).clamp(0, 1).float() * 255).round().to(torch.uint8)
+    expected_frames = expected_frames.permute(0, 2, 3, 4, 1).contiguous()
+    assert set(out) == {VIDEO_OUTPUT}
+    assert torch.equal(out[VIDEO_OUTPUT], expected_frames)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_use_slicing_batch_one_takes_distributed_path(rank: int, monkeypatch):
+    from mstar.model.ltx2_5 import submodules, tiled_decode
+
+    decoder = LTXVideoDecoderSubmodule.__new__(LTXVideoDecoderSubmodule)
+    torch.nn.Module.__init__(decoder)
+    distributed_calls = []
+    decode_calls = []
+    x = torch.ones(1, 1, 1, 6, 6)
+
+    def fake_distributed(vae, z, group):
+        distributed_calls.append(tuple(z.shape))
+        return z if group.rank == 0 else None
+
+    decoder.vae = SimpleNamespace(
+        dtype=torch.float32, latents_mean=torch.zeros(1), latents_std=torch.ones(1),
+        config=SimpleNamespace(scaling_factor=1.0),
+        decode=lambda z, *args, **kwargs: decode_calls.append(tuple(z.shape)) or (z,),
+        use_framewise_decoding=False, use_slicing=True,
+        spatial_compression_ratio=2, tile_sample_min_height=8, tile_sample_min_width=8,
+        tile_sample_stride_height=6, tile_sample_stride_width=6,
+    )
+    decoder.comm_group = SimpleNamespace(rank=rank, world_size=2)
+    decoder.get_device = lambda: torch.device("cpu")
+    decoder._tiled = lambda shape: True
+    monkeypatch.setattr(submodules, "unpack_video", lambda latents, shape: latents)
+    monkeypatch.setattr(tiled_decode, "distributed_tiled_decode", fake_distributed)
+
+    out = decoder.run_batch(x, shape=None)
+    assert distributed_calls == [tuple(x.shape)]
+    assert decode_calls == []
+    assert bool(out) is (rank == 0)
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+def test_four_ranks_two_tiles_falls_back_to_leader(rank: int, monkeypatch):
+    from mstar.model.ltx2_5 import submodules, tiled_decode
+
+    decoder = LTXVideoDecoderSubmodule.__new__(LTXVideoDecoderSubmodule)
+    torch.nn.Module.__init__(decoder)
+    decode_calls = []
+    # tile=4x4, stride=4x4, latent=3x6 -> spatial=True (6 > 4) with 1x2 = 2 tiles < world_size = 4.
+    x = torch.ones(1, 1, 1, 3, 6)
+    vae = SimpleNamespace(
+        dtype=torch.float32, latents_mean=torch.zeros(1), latents_std=torch.ones(1),
+        config=SimpleNamespace(scaling_factor=1.0),
+        decode=lambda z, *args, **kwargs: decode_calls.append(tuple(z.shape)) or (z,),
+        use_framewise_decoding=False, use_slicing=False,
+        spatial_compression_ratio=2, tile_sample_min_height=8, tile_sample_min_width=8,
+        tile_sample_stride_height=8, tile_sample_stride_width=8,
+    )
+    assert spatial_tile_count(vae, x) == 2
+
+    decoder.vae = vae
+    decoder.comm_group = SimpleNamespace(rank=rank, world_size=4)
+    decoder.get_device = lambda: torch.device("cpu")
+    decoder._tiled = lambda shape: True
+    monkeypatch.setattr(submodules, "unpack_video", lambda latents, shape: latents)
+    monkeypatch.setattr(
+        tiled_decode, "distributed_tiled_decode",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("2 tiles on 4 ranks must fall back")),
+    )
+
+    out = decoder.run_batch(x, shape=None)
+    assert bool(out) is (rank == 0)
+    assert decode_calls == ([tuple(x.shape)] if rank == 0 else [])
+
+    direct_calls = []
+    direct_vae = SimpleNamespace(
+        spatial_compression_ratio=2, tile_sample_min_height=8, tile_sample_min_width=8,
+        tile_sample_stride_height=8, tile_sample_stride_width=8,
+        decode=lambda z, *args, **kwargs: direct_calls.append(tuple(z.shape)) or (z,),
+    )
+    direct = distributed_tiled_decode(direct_vae, x, SimpleNamespace(rank=rank, world_size=4))
+    assert (torch.equal(direct, x) if rank == 0 else direct is None)
+    assert direct_calls == ([tuple(x.shape)] if rank == 0 else [])
+
+
+def test_direct_single_tile_and_empty_fallback_are_leader_only():
+    calls = []
+
+    def decode(z, *args, **kwargs):
+        calls.append(tuple(z.shape))
+        return (z,)
+
+    vae = SimpleNamespace(
+        spatial_compression_ratio=2,
+        tile_sample_min_height=8, tile_sample_min_width=8,
+        tile_sample_stride_height=4, tile_sample_stride_width=4,
+        decoder=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must fall back to decode")),
+        decode=decode,
+    )
+    # 4x4 fits within a single 4x4 tile even though stride=2 gives 4 positions >= world_size=2.
+    single_tile = torch.ones(1, 1, 1, 4, 4)
+    assert distributed_tiled_decode(vae, single_tile, SimpleNamespace(rank=1, world_size=2)) is None
+    assert torch.equal(distributed_tiled_decode(vae, single_tile, SimpleNamespace(rank=0, world_size=2)), single_tile)
+    empty = torch.empty(0, 1, 1, 6, 6)
+    assert distributed_tiled_decode(vae, empty, SimpleNamespace(rank=1, world_size=2)) is None
+    assert torch.equal(distributed_tiled_decode(vae, empty, SimpleNamespace(rank=0, world_size=2)), empty)
+    assert calls == [tuple(single_tile.shape), tuple(empty.shape)]
