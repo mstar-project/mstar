@@ -21,7 +21,7 @@ the v1 engine supplies neither the autocast nor the no-grad wrapper.
 import logging
 import os
 from contextlib import contextmanager
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import torch
 from torch import nn
@@ -29,11 +29,13 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup, my_rows
+from mstar.model.components.diffusion.compile_utils import recompile_limit_kwargs, step_schedule_recompile_limit
 from mstar.model.components.diffusion.decode_utils import latent_affine, wan_vae_decode_dtype
 from mstar.model.components.diffusion.denoise_loop import UniPCDenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.image_io import truncate_to_uint8
 from mstar.model.components.diffusion.unipc import make_unipc_tables
+from mstar.model.components.quant_linear import BF16, StepDtypes
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.model.wan22.config import DIT_SHARD, DIT_TOKENS, Wan22Config
 
@@ -316,9 +318,18 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
     # the [cond, uncond] stack a guided step forwards (the CFG axis splits it)
     CFG_BRANCHES = 2
 
-    def __init__(self, transformer: nn.Module, config: Wan22Config, cfg_group=None):
-        super().__init__(loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size)
+    def __init__(
+        self,
+        transformer: nn.Module,
+        config: Wan22Config,
+        cfg_group=None,
+        *,
+        step_dtypes: StepDtypes | None = None,
+        bf16_transformer: nn.Module | None = None,
+    ):
+        super().__init__(loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size, step_dtypes=step_dtypes)
         self.transformer = transformer
+        self.bf16_transformer = bf16_transformer
         self.config = config
         # CFG parallelism (cfg_size: 2; not passed on one GPU, so trivial here):
         # the ranks split the CFG stack (my_rows, then an all-gather), each
@@ -341,23 +352,34 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         # request at a new resolution pauses; logged in ``_noise_prediction``);
         # fullgraph=False allows the SDPA graph break, matching cosmos3. Only the
         # latent grids of ``config.compile_dit_sizes`` reach the compiled forward;
-        # every other grid runs ``_eager_forward``, the transformer's own forward.
+        # every other grid runs ``_eager_forwards``, the transformer's own forward.
         self._compile_dit = bool(config.compile_dit)
         self._compile_grids = config.compile_dit_grids()
-        self._compiled_shapes: set[tuple[int, ...]] = set()
-        self._eager_forward = None
-        if self._compile_dit and transformer is not None:
-            # with the transformer it belongs to: one swapped in later runs its own forward
-            self._eager_forward = (transformer, transformer.forward)
-            transformer.forward = torch.compile(
-                transformer.forward, fullgraph=False, dynamic=False,
-            )
-            logger.info(
-                "Wan2.2 DiT: torch.compile enabled on the transformer region "
-                "(fullgraph=False, dynamic=False) for latent (frames, height, width) %s; other "
-                "shapes and the UniPC solver run eager.",
-                sorted(self._compile_grids),
-            )
+        self._compiled_shapes: set[tuple[Any, ...]] = set()
+        self._eager_forwards: dict[int, tuple[nn.Module, Any]] = {}
+        if self._compile_dit:
+            compile_kwargs: dict[str, object] = {
+                "fullgraph": False,
+                "dynamic": False,
+                **recompile_limit_kwargs(step_schedule_recompile_limit(step_dtypes)),
+            }
+            for module in (transformer, bf16_transformer):
+                if module is not None:
+                    # with the transformer it belongs to: one swapped in later runs its own forward
+                    self._eager_forwards[id(module)] = (module, module.forward)
+                    module.forward = torch.compile(module.forward, **compile_kwargs)
+            if self._eager_forwards:
+                logger.info(
+                    "Wan2.2 DiT: torch.compile enabled on the transformer region "
+                    "(fullgraph=False, dynamic=False) for latent (frames, height, width) %s; other "
+                    "shapes and the UniPC solver run eager.",
+                    sorted(self._compile_grids),
+                )
+
+    def _active_transformer(self) -> nn.Module:
+        if self.step_dtype == BF16 and self.bf16_transformer is not None:
+            return self.bf16_transformer
+        return self.transformer
 
     def bind_state(self, handles) -> None:
         """The node's sequence shard. See ``NodeSubmodule.bind_node_state``."""
@@ -452,7 +474,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         # timestep (patch_size (1, 2, 2) keeps the frame axis); I2V frame 0 gets 0.
         temp_ts = (mask[0, 0, :, 0, 0] * timestep[:, None]).squeeze(0)
         output = self._noise_prediction(
-            model_input.to(self.transformer.dtype), temp_ts, text_embeds_pos.flatten(0, 1),
+            model_input.to(self._active_transformer().dtype), temp_ts, text_embeds_pos.flatten(0, 1),
             text_embeds_neg.flatten(0, 1), bucket_key.guidance,
         )
         return output[:, None]
@@ -475,13 +497,18 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         branches = branch_rows.stop - branch_rows.start
         hidden_states = model_input.repeat(branches, 1, 1, 1, 1)
         timestep = temp_ts.repeat(branches, 1)
+        active = self._active_transformer()
         # dynamic=False keys the compiled trace on the full input shape (batch
         # included, so each row count and CFG on or off are distinct graphs). Announce
         # the one-time compile pause the first time a shape is seen, so an operator
         # watching the log knows why the first request at a new resolution is slow.
         compiled = self._compile_dit and tuple(hidden_states.shape[2:]) in self._compile_grids
         if compiled:
-            shape_key = tuple(hidden_states.shape)
+            shape_key = (
+                (self.step_dtype, *hidden_states.shape)
+                if self.step_dtypes is not None
+                else tuple(hidden_states.shape)
+            )
             if shape_key not in self._compiled_shapes:
                 self._compiled_shapes.add(shape_key)
                 logger.info(
@@ -495,13 +522,15 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
             encoder_hidden_states = stack[branch_rows.start * rows : branch_rows.stop * rows]
         else:
             encoder_hidden_states = text_embeds_pos
-        transformer = self.transformer
-        if not compiled and self._eager_forward is not None and self._eager_forward[0] is transformer:
-            transformer = self._eager_forward[1]
-        out = transformer(
+        fn = active
+        if not compiled:
+            entry = self._eager_forwards.get(id(active))
+            if entry is not None and entry[0] is active:
+                fn = entry[1]
+        out = fn(
             hidden_states=hidden_states,
             timestep=timestep,
-            encoder_hidden_states=encoder_hidden_states.to(self.transformer.dtype),
+            encoder_hidden_states=encoder_hidden_states.to(active.dtype),
             shard=self.shard,
         )
         if not do_cfg:

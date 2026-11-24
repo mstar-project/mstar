@@ -6,8 +6,8 @@ Three pieces, each declared once:
   ``mstar::<format>_linear`` op with a fake implementation, so a compiled forward sees one opaque node per linear;
   ``block_scaled.py`` declares ``mxfp8`` and ``nvfp4``;
 - a linear kind says whether it takes a format (``quant_capability``), as ``lora_capability`` does for LoRA:
-  ``nn.Linear`` and ``FusedColumnLinear`` do, and a kind that can't says why, so a declared linear is never skipped
-  silently;
+  ``nn.Linear``, ``FusedColumnLinear`` and the standard TP linears do, and a kind that can't says why, so a
+  declared linear is never skipped silently;
 - a model declares which of its linears may go low precision and which stay bf16 (``QuantizableLinears``), and a
   deployment can keep more of them bf16 (``linear_keep_bf16``).
 
@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 BF16 = "bf16"
 # a format's name -> the module that declares it, imported on first use (it registers its ops)
 _FORMAT_MODULES = {
+    "dense_fp8": "mstar.model.components.dense_fp8_format",
     "mxfp8": "mstar.model.components.block_scaled",
     "nvfp4": "mstar.model.components.block_scaled",
 }
@@ -318,12 +319,19 @@ def select_linears(
 
 
 def quantize_linears(module: nn.Module, selection: LinearSelection) -> list[str]:
-    """Replace ``selection``'s linears with ``QuantLinear``s, one at a time, so the bf16 weight of each goes before
-    the next is quantized. Returns the names replaced."""
+    """Replace selected linears one at a time, so each bf16 weight goes before the next is quantized.
+
+    Sharded kinds keep their collectives and LoRA binding around a rank-local ``QuantLinear``.
+    """
     for name, amax in zip(selection.names, selection.input_amax, strict=True):
         parent_name, _, leaf = name.rpartition(".")
         parent = module.get_submodule(parent_name)
-        setattr(parent, leaf, QuantLinear.from_linear(getattr(parent, leaf), selection.fmt, amax))
+        linear = getattr(parent, leaf)
+        quantize = getattr(linear, "quantize_linear", None)
+        replacement = quantize(selection.fmt, amax) if quantize is not None else QuantLinear.from_linear(
+            linear, selection.fmt, amax,
+        )
+        setattr(parent, leaf, replacement)
     if selection.names:
         logger.info("linear_dtype %s: %d linears", selection.fmt.name, len(selection.names))
     return list(selection.names)

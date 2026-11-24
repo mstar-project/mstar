@@ -24,6 +24,7 @@ The denoise loop is dynamic: ``Loop.max_iters`` is the config ceiling, and the
 request's ``num_inference_steps`` is the loop's cap (``get_loop_caps``).
 """
 
+import copy
 import html
 import logging
 import math
@@ -47,8 +48,16 @@ from mstar.graph.base import (
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, WalkStep
 from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
+from mstar.model.components.quant_linear import (
+    check_linear_dtype,
+    check_linear_dtype_steps,
+    check_linear_keep,
+    quantize_linears,
+    select_linears,
+)
 from mstar.model.components.video_encode import encode_mp4
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.wan22.components.dit import QUANTIZABLE_LINEARS
 from mstar.model.wan22.config import DIT_SHARD, DIT_TOKENS, SELF_ATTN, WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
     DENOISE_LOOP_NAME,
@@ -94,6 +103,9 @@ class Wan22Model(Model):
         dit_max_batch_size: int = Wan22Config.dit_max_batch_size,
         max_video_pixels: int = Wan22Config.max_video_pixels,
         skip_weight_loading: bool = False,
+        linear_dtype: str = "bf16",
+        linear_keep_bf16: list[str] | None = None,
+        linear_dtype_steps: int | list[str] | None = None,
         vae_decode_fast: bool = True,
         vae_decode_fast_sizes: tuple[str, ...] | None = None,
         **kwargs,
@@ -106,6 +118,9 @@ class Wan22Model(Model):
             )
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
+        self.linear_dtype = check_linear_dtype(linear_dtype)
+        self.linear_keep_bf16 = check_linear_keep(linear_keep_bf16)
+        self.step_dtypes = check_linear_dtype_steps(linear_dtype_steps, self.linear_dtype)
         self.config = Wan22Config(
             variant=variant, compile_dit_sizes=compile_dit_sizes,
             dit_max_batch_size=self._require_positive_int("dit_max_batch_size", dit_max_batch_size),
@@ -670,7 +685,16 @@ class Wan22Model(Model):
             transformer = build_wan22_dit(
                 self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir,
             )
-            return Wan22DitSubmodule(transformer, self.config, cfg_group=cfg_group)
+            selection = select_linears(
+                transformer, self.linear_dtype, QUANTIZABLE_LINEARS, self.linear_keep_bf16, "Wan2.2 DiT",
+            )
+            step_dtypes = self.step_dtypes if selection.names else None
+            bf16_transformer = copy.deepcopy(transformer) if step_dtypes is not None else None
+            quantize_linears(transformer, selection)
+            return Wan22DitSubmodule(
+                transformer, self.config, cfg_group=cfg_group,
+                step_dtypes=step_dtypes, bf16_transformer=bf16_transformer,
+            )
         logger.warning("Wan2.2 has no submodule for node %r; running it dummy.", node_name)
         return None
 

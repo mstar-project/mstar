@@ -109,20 +109,25 @@ def compile_transformer_forward(
         kept = exclude_from_compile(transformer, types)
         logger.info("compiled transformer keeps %d modules (%s) on the eager result", kept,
                     "all classes" if exact_ops is True else ", ".join(exact_ops))
-    kwargs: dict[str, object] = {}
-    if recompile_limit is not None:
-        if _compile_takes_recompile_limit():
-            kwargs["recompile_limit"] = recompile_limit
-        else:
-            import torch._dynamo.config as dynamo_config
-
-            dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, recompile_limit)
-            logger.info("torch.compile on torch %s takes no recompile_limit; the process-wide limit is %d",
-                        torch.__version__, dynamo_config.recompile_limit)
+    kwargs = recompile_limit_kwargs(recompile_limit)
     transformer.forward = with_inductor_rounding(
         torch.compile(transformer.forward, fullgraph=False, dynamic=False, **kwargs),
         eager_rounding=bool(eager_rounding),
     )
+
+
+def recompile_limit_kwargs(recompile_limit: int | None) -> dict[str, int]:
+    """Build ``recompile_limit`` kwargs for ``torch.compile`` when supported, or bump the global limit."""
+    if recompile_limit is None:
+        return {}
+    if _compile_takes_recompile_limit():
+        return {"recompile_limit": recompile_limit}
+    import torch._dynamo.config as dynamo_config
+
+    dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, recompile_limit)
+    logger.info("torch.compile on torch %s takes no recompile_limit; the process-wide limit is %d",
+                torch.__version__, dynamo_config.recompile_limit)
+    return {}
 
 
 def _compile_takes_recompile_limit() -> bool:
