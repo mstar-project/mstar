@@ -6,16 +6,27 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+import yaml
+from torch import nn
 
+import mstar.conductor.conductor as conductor_mod
+import mstar.conductor.episodes as episodes_mod
 from mstar.api_server.openpi import pack
 from mstar.api_server.positronic_input import decode_praxis_frame
+from mstar.communication.tensors import LocalTransferEngine, TensorPointerInfo
+from mstar.conductor.conductor import Conductor
+from mstar.conductor.request_info import EPISODE_CALLS
+from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources.base import EngineResourceInfo
+from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.recurrent.dense_window import DenseWindowPool
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import ArrayStep
-from mstar.engine.state.adapters import build_specs, node_handles, state_steps
+from mstar.engine.state.adapters import build_specs, node_handles, state_setup, state_steps
 from mstar.engine.state.episodes import EpisodeRowBindings
 from mstar.model.base import EpisodeView
+from mstar.model.praxis1.components.action_expert import _RESOURCE_MASK
+from mstar.model.praxis1.components.encoder import TapFeatures
 from mstar.model.praxis1.episode_history import (
     BOUNDARY_STATE_NAME,
     FIRST_ROWS,
@@ -25,7 +36,21 @@ from mstar.model.praxis1.episode_history import (
     window_size,
 )
 from mstar.model.praxis1.praxis1_model import TEXT_STATE_NAME, Praxis1Model
-from mstar.model.praxis1.submodules import Praxis1VaeEncoderSubmodule
+from mstar.model.praxis1.submodules import (
+    Praxis1ActionExpertSubmodule,
+    Praxis1ActionHeadSubmodule,
+    Praxis1BackboneSubmodule,
+    Praxis1TextEncoderSubmodule,
+    Praxis1VaeEncoderSubmodule,
+)
+from mstar.model.submodule_base import InputMetadata
+from mstar.utils.ipc_format import (
+    EndEpisode,
+    NewRequestConductor,
+    ReadsDone,
+    WorkerGraphsDone,
+    WorkerMessageType,
+)
 
 
 class _Tokenizer:
@@ -585,3 +610,354 @@ def test_engine_keeps_paired_history_across_request_ids_then_clears_on_reset():
     assert call(4, "episode-a", list(range(45, 69)), boundary_value=69) == list(range(69))
     assert call(5, "episode-a", list(range(69, 93)), boundary_value=93) == list(range(24, 93))
     assert call(6, "episode-a", [], boundary_value=100, reset=True) == []
+
+
+def test_praxis1_episode_idle_expiry_e2e_with_real_conductor_and_engine(tmp_path, monkeypatch):
+    """Real Conductor + real Engine + all 5 Praxis-1 submodules across cold -> warm -> idle expiry -> re-encode."""
+    now = 100.0
+    monkeypatch.setattr(conductor_mod.time, "perf_counter", lambda: now)
+    monkeypatch.setattr(episodes_mod.time, "perf_counter", lambda: now)
+
+    model = Praxis1Model(
+        "runwayml/praxis-1-droid", skip_weight_loading=True,
+        max_context_chunks=1, max_text_tokens=16, num_steps=1,
+    )
+    model.config = replace(
+        model.config,
+        tile_height=32,
+        tile_width=16,
+        canvas_height=32,
+        canvas_width=32,
+        latent_channels=4,
+        encoder_depth=1,
+        decoder_depth=1,
+        tap_blocks=(0,),
+        expert_layers=2,
+        num_heads=2,
+        num_kv_heads=2,
+        head_dim=4,
+        expert_heads=2,
+        expert_head_dim=4,
+        text_hidden_dim=4,
+        normalization={
+            "proprio_mean": [0.0] * 10,
+            "proprio_std": [1.0] * 10,
+            "action_q01": [-1.0] * 10,
+            "action_q99": [1.0] * 10,
+        },
+    )
+
+    class _SeqTokenizer:
+        def __call__(self, *, text, **kwargs):
+            length = 2 if text[0].strip() else 1
+            ids = torch.arange(1, length + 1, dtype=torch.long)[None]
+            return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+
+    model._tokenizer_cache = _SeqTokenizer()
+
+    cfg_dict = {
+        "max_seq_len": 16384,
+        "node_groups": [
+            {"node_names": ["text_encoder"], "ranks": [0]},
+            {"node_names": ["vae_encoder"], "ranks": [0]},
+            {"node_names": ["backbone", "action_expert", "action_head"], "ranks": [0]},
+        ],
+        "episodes": {"max_episodes": 1, "max_calls": 64, "idle_timeout_s": 10},
+        "resources": {
+            "executed_observations": {"max_slots": 2},
+            "boundary_poses": {"max_slots": 2},
+            "text_embeds": {"max_slots": 3},
+        },
+    }
+    cfg_path = tmp_path / "praxis1_e2e.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg_dict))
+
+    class _Comm:
+        def __init__(self):
+            self.sent = []
+
+        def send(self, entity_id, msg):
+            self.sent.append((entity_id, msg))
+
+    comm = _Comm()
+    monkeypatch.setattr(Conductor, "_launch_workers", lambda self: None)
+    monkeypatch.setattr(conductor_mod, "make_communicator", lambda **kw: comm)
+    conductor = Conductor(model, str(cfg_path), socket_path_prefix=str(tmp_path / "sock"))
+
+    setup, problems = state_setup(cfg_dict, model.declare_state())
+    assert problems == []
+    specs = build_specs(model.declare_state(), setup=setup)
+    joint = SimpleNamespace(
+        rank=0, world_size=1,
+        tp_group=SimpleNamespace(barrier=lambda: None, world_size=1),
+        sp_group=SimpleNamespace(world_size=1),
+    )
+    groups = SimpleNamespace(
+        get_joint_group_for_node=lambda name: joint,
+        get_instance_world_size_for_node=lambda name: 1,
+        get_instance_rank_for_node=lambda name: 0,
+        resource_needs_remote_transfer=lambda spec_nodes, relevant: False,
+    )
+
+    class _TextEnc(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(()))
+            self.config = SimpleNamespace(hidden_size=4, num_hidden_layers=3)
+
+        def forward(self, input_ids, attention_mask, **kwargs):
+            del attention_mask, kwargs
+            h = torch.full((1, input_ids.shape[1], 4), 0.25, dtype=torch.bfloat16)
+            return SimpleNamespace(hidden_states=[h, h, h])
+
+    class _BackboneEnc(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(()))
+
+        def forward_chunk_causal(self, text, anchor, clean, noised, times, *, attend_for_layer):
+            k = times.shape[1]
+            f = noised.shape[2] // k
+            clean_len = 0 if clean is None else clean.shape[2]
+            reg = model.config.num_registers
+            anc = anchor.shape[-2] * anchor.shape[-1]
+            g = reg + anc + text.shape[1]
+            seq = g + noised.shape[2] + clean_len
+            dummy = torch.zeros(1, model.config.num_heads, seq, model.config.head_dim)
+            attend_for_layer(0)(dummy, dummy, dummy, None)
+            emb = torch.zeros((1, seq, model.config.trunk_dim))
+            features = TapFeatures(
+                taps=[emb.clone()], embeddings=emb,
+                frames_per_chunk=f, tokens_per_frame=1, rope_ids=torch.arange(seq)[None],
+                global_spans={"register": (0, reg), "anchor": (reg, anc),
+                              "text": (reg + anc, text.shape[1])},
+                noised_span=(g, k * f), clean_span=(g + k * f, clean_len) if clean_len else None,
+                n_chunks=k,
+            )
+            return torch.zeros((1, k * f, 1, 1, 4)), features
+
+    class _BackboneDec(nn.Module):
+        def forward_chunk_causal(self, noised, cond, times, *, attend_for_layer):
+            del cond, times
+            attend_for_layer(0)(noised, noised, noised, None)
+            return torch.zeros_like(noised)
+
+    class _Expert(nn.Module):
+        global_order = ("register", "anchor", "text")
+        num_future_per_chunk = 8
+
+        def forward_trunk_rope(self, *, noised_action_latents, action_timesteps, proprio_latents,
+                               trunk_features, global_tokens, kv_rope_ids, chunk_size,
+                               num_clean_frames, num_noised_frames, tokens_per_frame, window_size,
+                               cross_mask, self_mask, attend_for_layer):
+            del action_timesteps, proprio_latents, num_clean_frames, num_noised_frames, tokens_per_frame, window_size
+            del cross_mask, self_mask
+            q_len = noised_action_latents.shape[1] // chunk_size * (1 + self.num_future_per_chunk + chunk_size)
+            kv_len = global_tokens.shape[1] + sum(t.shape[1] for t in trunk_features)
+            q = torch.zeros(1, 2, q_len, 4)
+            kv = torch.zeros(1, 2, kv_len, 4)
+            attend_for_layer(0, True)(q, kv, kv, _RESOURCE_MASK)
+            attend_for_layer(1, False)(q, q, q, _RESOURCE_MASK)
+            return torch.zeros_like(noised_action_latents)
+
+    vae_node = Praxis1VaeEncoderSubmodule(model.config, _Vae(), max_context_chunks=1)
+    vae_node._tiles = lambda views: views
+    vae_node.vae_encode = lambda canvas: torch.zeros(
+        (1, 16, (canvas.shape[2] + 3) // 4, 1, 1), dtype=torch.float32,
+    )
+    submodules = {
+        "text_encoder": Praxis1TextEncoderSubmodule(model.config, _TextEnc()),
+        "vae_encoder": vae_node,
+        "backbone": Praxis1BackboneSubmodule(
+            model.config, SimpleNamespace(encoder=_BackboneEnc(), decoder=_BackboneDec()),
+            episode_text=True,
+        ),
+        "action_expert": Praxis1ActionExpertSubmodule(model.config, _Expert()),
+        "action_head": Praxis1ActionHeadSubmodule(model.config),
+    }
+    engine = Engine(None, state_setup=setup, autocast_dtype=None)
+    engine.load_model(
+        submodules=submodules,
+        specs=specs,
+        parallel_groups=groups,
+        device=torch.device("cpu"),
+        transfer_engine_info=TransferEngineInfo("worker_0", "worker_0", LocalTransferEngine("localhost")),
+        kv_cache_type=torch.float32,
+        model=model,
+    )
+
+    def _ptr(uuid: int) -> TensorPointerInfo:
+        return TensorPointerInfo(
+            dims=[1], dtype=torch.float32, nbytes=4, address=0, stride=[1],
+            uuid=uuid, source_session_id="s", source_entity="worker_0",
+        )
+
+    def _run_node(node_name: str, rid_int: int, info, inp_tensors: dict, merged_held: dict):
+        batch = ExecutingBatch(
+            node_name,
+            {rid_int: info},
+            StepContext([rid_int], info.graph_walk, 0, False),
+            per_request_input_tensors={rid_int: inp_tensors},
+            per_request_input_metadata={
+                rid_int: InputMetadata(dynamic_loop_iter_counts=dict(info.dynamic_loop_iter_counts)),
+            },
+        )
+        engine.prepare_inputs(batch)
+        assert not batch.failed_requests, batch.failed_requests
+        out = engine.exec_and_postprocess(batch)
+        assert batch.admit_error is None, batch.admit_error
+        engine.finalize_batch(batch)
+        merged_held.update(batch.episode_held.get(rid_int, {}))
+        return out.per_rid_outputs[rid_int]
+
+    def run_call(rid_str: str, rid_int: int, prompt: str, executed_rows: int, *,
+                 prior_frames=None, prior_poses=None):
+        sent_start = len(comm.sent)
+        tensors = {
+            "image_inputs": [torch.zeros((3, 32, 16), dtype=torch.uint8)] * 2,
+        }
+        if prior_frames is not None:
+            tensors["executed_frame_inputs"] = prior_frames
+        if prior_poses is not None:
+            tensors["executed_pose_inputs"] = prior_poses
+        prep = model.process_prompt(
+            prompt, ["image", "text"], ["action"],
+            robot_state=_pose(), action_format="positronic", tensors=tensors,
+        )
+        model_kwargs = {
+            "executed_rows": executed_rows,
+            "action_format": "positronic",
+            "text_tokens": prep.metadata["text_tokens"],
+            "blank_tokens": prep.metadata["blank_tokens"],
+            "num_steps": 1,
+        }
+        initial_signals = {
+            name: [_ptr(idx + 1)] for idx, name in enumerate(prep.new_input_tensors)
+        }
+        conductor._ingest_request(NewRequestConductor(
+            rid_str, initial_signals, ["image", "text"], ["action"],
+            prep.metadata, model_kwargs, episode="sess-1", episode_keys=prep.episode_keys,
+        ))
+        new_msg = next(
+            msg.body for _, msg in comm.sent[sent_start:]
+            if msg.message_type == WorkerMessageType.NEW_REQUEST and msg.body.request_id == rid_str
+        )
+        engine.add_request(
+            rid_int,
+            overrides=new_msg.request_info.resource_configs,
+            request_info=new_msg.request_info,
+            episode_id=new_msg.episode_id,
+            episode_slot=new_msg.episode_slot,
+            reset_episode=new_msg.reset_episode,
+            episode_clear=new_msg.episode_clear,
+        )
+
+        walks = [new_msg.request_info.graph_walk]
+        step_metas = [dict(new_msg.request_info.step_metadata)]
+        merged_held: dict[str, int] = {}
+        chunk_info = new_msg.request_info
+        text_out: dict = {}
+
+        if new_msg.request_info.graph_walk == model.ENCODE_TEXT_WALK:
+            text_out = _run_node("text_encoder", rid_int, new_msg.request_info, prep.new_input_tensors, merged_held)
+            sig_idx = len(comm.sent)
+            wg_ids = sorted(conductor.requests[rid_str].partition_states["default"].current_worker_graph_ids)
+            done_parts = conductor._process_worker_graphs_done(WorkerGraphsDone(
+                rid_str, wg_ids, True, partition_name="default",
+                persist_signals={"text_embeds": [_ptr(1)], "text_embeds_blank": [_ptr(2)]},
+            ))
+            for pname in done_parts:
+                conductor._process_done_forward(rid_str, pname)
+            sig_msg = next(
+                msg.body for _, msg in comm.sent[sig_idx:]
+                if msg.message_type == WorkerMessageType.INPUT_SIGNALS and msg.body.request_id == rid_str
+            )
+            chunk_info = sig_msg.request_info
+            walks.append(chunk_info.graph_walk)
+            step_metas.append(dict(chunk_info.step_metadata))
+
+        vae_out = _run_node("vae_encoder", rid_int, chunk_info, prep.new_input_tensors, merged_held)
+        step_info = replace(chunk_info, dynamic_loop_iter_counts={"praxis_denoise": 0})
+        backbone_in = {**vae_out, **text_out}
+        backbone_out = _run_node("backbone", rid_int, step_info, backbone_in, merged_held)
+        expert_in = {**backbone_out, "proprio": [vae_out["proprio_all"][0][:, -1:]],
+                     "proprio_all": vae_out["proprio_all"]}
+        expert_out = _run_node("action_expert", rid_int, step_info, expert_in, merged_held)
+        head_out = _run_node("action_head", rid_int, chunk_info, expert_out, merged_held)
+
+        wg_ids = sorted(conductor.requests[rid_str].partition_states["default"].current_worker_graph_ids)
+        done_parts = conductor._process_worker_graphs_done(WorkerGraphsDone(
+            rid_str, wg_ids, True, partition_name="default", partition_done=True,
+            episode_held=merged_held,
+        ))
+        conductor._record_episode_held(
+            WorkerGraphsDone(rid_str, wg_ids, True, partition_name="default", episode_held=merged_held),
+            conductor.requests[rid_str],
+        )
+        for pname in done_parts:
+            conductor._process_done_forward(rid_str, pname)
+        conductor._process_request_done(rid_str)
+        conductor._handle_reads_done(ReadsDone(rid_str, conductor.PREPROCESS_WORKER))
+        engine.remove_request(rid_int)
+        return prep, walks, step_metas, merged_held, head_out["actions"][0]
+
+    def _metric_map(counter) -> dict[str, float]:
+        snap = counter.snapshot()
+        return {labels[0]: val for labels, val in zip(snap.label_values, snap.values, strict=True)}
+
+    # Call 1: cold "new" -> encode_text + chunk, 21 action rows, text & boundary retained.
+    prep1, walks1, metas1, held1, act1 = run_call("c1", 1, "pick cup", executed_rows=0)
+    assert walks1 == ["encode_text", "chunk"]
+    assert [m[EPISODE_CALLS] for m in metas1] == [0, 0]
+    assert metas1[-1]["history_append"] == 0
+    assert act1.shape == (21, 10)
+    assert held1 == {"executed_observations": 0, "boundary_poses": 1, "text_embeds": 3}
+    assert _metric_map(conductor._episode_cold_starts) == {"new": 1.0}
+
+    # Call 2: warm -> chunk_warm only (text encoding skipped), 21 frames appended, 24 action rows.
+    prior_frames_2 = [torch.zeros((21, 3, 32, 16), dtype=torch.uint8)] * 2
+    prior_poses_2 = [torch.tensor(_pose(), dtype=torch.float32).repeat(21, 1)]
+    _, walks2, metas2, held2, act2 = run_call(
+        "c2", 2, "pick cup", executed_rows=21,
+        prior_frames=prior_frames_2, prior_poses=prior_poses_2,
+    )
+    assert walks2 == ["chunk_warm"]
+    assert [m[EPISODE_CALLS] for m in metas2] == [1]
+    assert metas2[0]["history_append"] == 21
+    assert act2.shape == (24, 10)
+    assert held2 == {"executed_observations": 21, "boundary_poses": 2, "text_embeds": 3}
+    assert _metric_map(conductor._episode_cold_starts) == {"new": 1.0}
+
+    # Idle expiry -> END_EPISODE, eviction metric "idle", Engine.end_episode releases all 3 pools.
+    now = 112.0
+    sent_before_expire = len(comm.sent)
+    assert conductor._expire_episode_slots(now) is True
+    end_msgs = [
+        msg.body for _, msg in comm.sent[sent_before_expire:]
+        if msg.message_type == WorkerMessageType.END_EPISODE
+    ]
+    assert end_msgs == [EndEpisode("sess-1", 0)]
+    assert _metric_map(conductor._episode_evictions) == {"idle": 1.0}
+    assert conductor._episode_slots.used_by_worker() == {}
+    view_after_expire = conductor._episode_records.view(
+        "sess-1", prep1.episode_keys, identity=(conductor._episode_weight_epoch, None),
+    )
+    assert view_after_expire.cold == "idle"
+    assert dict(view_after_expire.held) == {
+        "executed_observations": 0, "boundary_poses": 0, "text_embeds": 0,
+    }
+    assert engine.end_episode("sess-1", 0) is True
+
+    # Call 3: cold after idle expiry -> encode_text re-runs, history_append resets to 0, 21 action rows.
+    prior_frames_3 = [torch.zeros((24, 3, 32, 16), dtype=torch.uint8)] * 2
+    prior_poses_3 = [torch.tensor(_pose(), dtype=torch.float32).repeat(24, 1)]
+    _, walks3, metas3, held3, act3 = run_call(
+        "c3", 3, "pick cup", executed_rows=24,
+        prior_frames=prior_frames_3, prior_poses=prior_poses_3,
+    )
+    assert walks3 == ["encode_text", "chunk"]
+    assert [m[EPISODE_CALLS] for m in metas3] == [2, 2]
+    assert metas3[-1]["history_append"] == 0
+    assert act3.shape == (21, 10)
+    assert held3 == {"executed_observations": 0, "boundary_poses": 1, "text_embeds": 3}
+    assert _metric_map(conductor._episode_cold_starts) == {"new": 1.0, "idle": 1.0}

@@ -75,7 +75,7 @@ from mstar.model.media_limits import read_image
 from mstar.model.praxis1.components.commands import compose_commands
 from mstar.model.praxis1.components.pose_frames import pose_to_model
 from mstar.model.praxis1.components.proprio import normalized_proprio
-from mstar.model.praxis1.config import Praxis1Config, Praxis1ConfigError
+from mstar.model.praxis1.config import RIG_DEFAULTS, Praxis1Config, Praxis1ConfigError
 from mstar.model.praxis1.episode_history import (
     BOUNDARY_STATE_NAME,
     FIRST_ROWS,
@@ -173,25 +173,34 @@ class Praxis1Model(Model):
         # which it ships: the Wan2.2 VAE and the Qwen3.5-2B text encoder.
         self.vae_weights_hf: str = kwargs.pop("vae_weights_hf", "Wan-AI/Wan2.2-TI2V-5B-Diffusers")
         self.text_encoder_hf: str = kwargs.pop("text_encoder_hf", "Qwen/Qwen3.5-2B")
-        # Sampler defaults of the deployment; a request may ask for fewer
-        # steps than num_steps, never for more (get_loop_caps).
-        self.sampler_defaults: dict = {
-            "num_steps": kwargs.pop("num_steps", 2),
-            "t_shift": kwargs.pop("t_shift", 12.5),
-            "cfg_scale": kwargs.pop("cfg_scale", 1.0),
-            "cfg_video_scale": kwargs.pop("cfg_video_scale", 4.0),
-            # A cold-only call has no earlier executed-frame context.
-            "max_context_chunks": kwargs.pop("max_context_chunks", 0),
+        # Sampler defaults of the deployment; a request defaults to num_steps
+        # and may override it up to max_denoise_steps (get_loop_caps).
+        sampler_overrides = {
+            key: kwargs.pop(key)
+            for key in ("num_steps", "t_shift", "cfg_scale", "cfg_video_scale", "max_context_chunks")
+            if key in kwargs
         }
         self.max_text_tokens = kwargs.pop("max_text_tokens", None)
         self._yaml_config_overrides: dict = dict(kwargs)
 
-        if not skip_weight_loading and self._rig() not in _SERVABLE_RIGS:
+        rig = self._rig()
+        if not skip_weight_loading and rig not in _SERVABLE_RIGS:
             raise NotImplementedError(
                 f"Praxis-1 ({model_path_hf}) is not servable yet: this build has its "
                 "tower code, but this rig's checkpoint and session validation are pending. "
                 "Nothing was downloaded."
             )
+        rig_sampler = RIG_DEFAULTS.get(rig, {}).get("sampler", {})
+        self.sampler_defaults: dict = {
+            "num_steps": sampler_overrides.get("num_steps", rig_sampler.get("num_steps", 2)),
+            "t_shift": sampler_overrides.get("t_shift", rig_sampler.get("t_shift", 12.5)),
+            "cfg_scale": sampler_overrides.get("cfg_scale", rig_sampler.get("cfg_scale", 1.0)),
+            "cfg_video_scale": sampler_overrides.get(
+                "cfg_video_scale", rig_sampler.get("cfg_video_scale", 4.0)
+            ),
+            # A cold-only call has no earlier executed-frame context.
+            "max_context_chunks": sampler_overrides.get("max_context_chunks", 0),
+        }
 
         self._repo_dir: Path | None = None
         self._submodule_cache: dict = {}
@@ -489,20 +498,17 @@ class Praxis1Model(Model):
     def request_kwargs(self) -> frozenset[str]:
         # The sampler knobs come from the deployment YAML. What a request
         # carries is the arm's pose, how much of the last chunk it ran, and
-        # optionally fewer Euler steps than the deployment's recipe.
+        # optionally Euler steps up to max_denoise_steps.
         return frozenset({
             STATE_KWARG, "executed_rows", "num_steps", "action_format", "pose_descriptor", "control_mode",
         })
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        """The denoise loop runs the deployment's ``num_steps``, or the request's if fewer.
+        """The denoise loop runs the deployment's ``num_steps``, or the request's up to ``max_denoise_steps``.
 
         The cap is what ends the loop on a request's last Euler step: without
         it the loop runs its ``max_iters`` ceiling, and the expert's async
-        scheduling would speculate a step past the last one. A request may ask
-        for fewer steps than the recipe, never more: the recipe is what the
-        checkpoint was tuned for, and the constructor already holds it under
-        the loop's ceiling.
+        scheduling would speculate a step past the last one.
         """
         recipe = self.sampler_defaults["num_steps"]
         steps = model_kwargs.get("num_steps")
@@ -510,10 +516,9 @@ class Praxis1Model(Model):
             return {DENOISE_LOOP_NAME: recipe}
         if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
             raise ValueError(f"num_steps must be an integer >= 1; got {steps!r}")
-        if steps > recipe:
+        if steps > self.max_denoise_steps:
             raise ValueError(
-                f"num_steps {steps} is more than this deployment's {recipe}; "
-                "a request may ask for fewer steps, never more"
+                f"num_steps {steps} is more than max_denoise_steps {self.max_denoise_steps}"
             )
         return {DENOISE_LOOP_NAME: steps}
 

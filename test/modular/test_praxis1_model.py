@@ -715,19 +715,53 @@ def test_the_loop_runs_the_recipe_not_its_ceiling(tmp_path, monkeypatch):
     conductor = _loop_conductor(model)
     assert conductor._loop_max_iters == {DENOISE_LOOP_NAME: 8}
     assert conductor._loop_caps({}) == {DENOISE_LOOP_NAME: 2}
-    # A request may ask for fewer steps.
+    # A request may ask for fewer steps or raise up to max_denoise_steps.
     assert conductor._loop_caps({"num_steps": 1}) == {DENOISE_LOOP_NAME: 1}
+    assert conductor._loop_caps({"num_steps": 4}) == {DENOISE_LOOP_NAME: 4}
+    assert conductor._loop_caps({"num_steps": 8}) == {DENOISE_LOOP_NAME: 8}
+    assert model.walk_plan(
+        "", ["image"], ["action"], {"image_inputs": [object()]}, {"num_steps": 4},
+    )[-1].step_metadata["num_steps"] == 4
     assert "num_steps" in model.request_kwargs()
 
 
 @pytest.mark.parametrize(
     "num_steps, message",
-    [(3, "never more"), (0, "integer >= 1"), (True, "integer"), ("2", "integer")],
+    [(9, "max_denoise_steps"), (0, "integer >= 1"), (True, "integer"), ("2", "integer")],
 )
 def test_a_request_cannot_raise_the_step_count(tmp_path, monkeypatch, num_steps, message):
     model = _model(tmp_path, DROID_CONFIG, monkeypatch, num_steps=2)
     with pytest.raises(ValueError, match=message):
         model.get_loop_caps(num_steps=num_steps)
+
+
+def test_a_request_respects_custom_max_denoise_steps(tmp_path, monkeypatch):
+    config = json.loads(json.dumps(DROID_CONFIG))
+    config["max_denoise_steps"] = 4
+    model = _model(tmp_path, config, monkeypatch, num_steps=2)
+    assert model.get_loop_caps(num_steps=4) == {DENOISE_LOOP_NAME: 4}
+    with pytest.raises(ValueError, match="max_denoise_steps 4"):
+        model.get_loop_caps(num_steps=5)
+
+
+def test_sampler_defaults_follow_the_rig_when_yaml_omits_them(tmp_path, monkeypatch):
+    yam = _model(tmp_path, _yam_config(), monkeypatch)
+    yam_dummy = Praxis1Model("runwayml/praxis-1-yam", skip_weight_loading=True)
+    expected_yam = {
+        "num_steps": 2, "t_shift": 1.0, "cfg_scale": 1.0,
+        "cfg_video_scale": 1.0, "max_context_chunks": 0,
+    }
+    assert yam.sampler_defaults == expected_yam
+    assert yam_dummy.sampler_defaults == expected_yam
+    assert yam.POSITRONIC_SESSION_READY is False
+    yam_meta = yam.walk_plan("", ["image"], ["action"], {"image_inputs": [object()]}, {})[-1].step_metadata
+    assert (yam_meta["t_shift"], yam_meta["cfg_video_scale"]) == (1.0, 1.0)
+
+    droid = _model(tmp_path, DROID_CONFIG, monkeypatch)
+    assert (droid.sampler_defaults["t_shift"], droid.sampler_defaults["cfg_video_scale"]) == (12.5, 4.0)
+
+    overridden = _model(tmp_path, _yam_config(), monkeypatch, t_shift=3.0, cfg_video_scale=2.0)
+    assert (overridden.sampler_defaults["t_shift"], overridden.sampler_defaults["cfg_video_scale"]) == (3.0, 2.0)
 
 
 def test_a_recipe_past_the_loop_ceiling_is_refused_at_construction(tmp_path, monkeypatch):

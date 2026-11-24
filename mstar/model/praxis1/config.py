@@ -58,8 +58,18 @@ SUPPORTED_ROUTED_WEIGHT_LAYOUT = "expert_first"
 # the graph tests construct a model with no checkpoint to read. Serving reads
 # the real config.json, so these are never what a request runs against.
 RIG_DEFAULTS: dict[str, dict] = {
-    "single_arm": {"canvas": (224, 832), "tile": (224, 416), "action_dim": 10},
-    "bimanual": {"canvas": (256, 1248), "tile": (256, 416), "action_dim": 20},
+    "single_arm": {
+        "canvas": (224, 832),
+        "tile": (224, 416),
+        "action_dim": 10,
+        "sampler": {"num_steps": 2, "t_shift": 12.5, "cfg_scale": 1.0, "cfg_video_scale": 4.0},
+    },
+    "bimanual": {
+        "canvas": (256, 1248),
+        "tile": (256, 416),
+        "action_dim": 20,
+        "sampler": {"num_steps": 2, "t_shift": 1.0, "cfg_scale": 1.0, "cfg_video_scale": 1.0},
+    },
 }
 # Shared by both checkpoints.
 _SHARED_DEFAULTS = {

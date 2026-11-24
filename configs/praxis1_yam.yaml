@@ -31,7 +31,7 @@ model_kwargs:
   text_encoder_hf: "Qwen/Qwen3.5-2B"
   # The recommended recipe of this checkpoint (Runway's serve_yam.yaml): two Euler
   # steps, no flow shift and no text guidance on either the actions or the video.
-  # It is not the DROID recipe. A request may ask for fewer steps, never more.
+  # It is not the DROID recipe. A request may override num_steps up to max_denoise_steps.
   num_steps: 2
   t_shift: 1.0
   cfg_scale: 1.0
