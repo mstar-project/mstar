@@ -322,7 +322,8 @@ class _OnePass:
         return False
 
 
-def _served(token_counts, cap, report_usage=True, error=False, stopped=False, chunks=None):
+def _served(token_counts, cap, report_usage=True, error=False, stopped=False, chunks=None,
+            weight_version=None):
     """A request run through ``submit_request`` and one pass of the message
     thread: text chunks carrying ``token_counts`` tokens, the last one ended by
     a stop token when ``stopped``, or the data worker's own ``chunks``; then
@@ -335,7 +336,10 @@ def _served(token_counts, cap, report_usage=True, error=False, stopped=False, ch
     )
     key = worker.inputs[0].request_id
     if chunks is None:
-        chunks = [ResultChunk(request_id=key, modality="text", data=b"x", num_tokens=n) for n in token_counts]
+        chunks = [ResultChunk(
+            request_id=key, modality="text", data=b"x", num_tokens=n,
+            metadata={"weight_version": weight_version} if weight_version is not None else {},
+        ) for n in token_counts]
         chunks[-1].stopped = stopped
     worker.chunks = [dataclasses.replace(c, request_id=key) for c in chunks]
     if error:
@@ -344,6 +348,7 @@ def _served(token_counts, cap, report_usage=True, error=False, stopped=False, ch
         request_id=key, output_chunk_counts={"new_token": len(chunks)},
         conductor_ingest_time=0.0, conductor_finish_time=0.0,
         prompt_tokens=len(_tokenize(PROMPT)), max_output_tokens=cap,
+        weight_version=weight_version,
     ))])
     server.communicator.server = server
     server.running = True
@@ -376,6 +381,16 @@ def test_a_reported_request_ends_with_its_usage(read, token_counts, cap, stopped
     assert chunks[-1].request_id == "r"
     assert chunks[-1].metadata == {
         "prompt_tokens": len(_tokenize(PROMPT)), "completion_tokens": completion, "finish_reason": finish,
+    }
+
+
+def test_streamed_usage_tail_carries_the_admitted_weight_version():
+    chunks = _streamed(_served([1], 4, weight_version="v2"))
+    assert [chunk.modality for chunk in chunks] == ["text", USAGE]
+    assert chunks[0].metadata["weight_version"] == "v2"
+    assert chunks[-1].metadata == {
+        "prompt_tokens": len(_tokenize(PROMPT)), "completion_tokens": 1,
+        "finish_reason": "stop", "weight_version": "v2",
     }
 
 

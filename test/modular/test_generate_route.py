@@ -34,7 +34,7 @@ class _RecordingServer:
     def release_submission(self, key):
         pass
 
-    async def collect_results(self, request_id, request):
+    async def collect_results(self, request_id, request, meta=None):
         return []
 
 
