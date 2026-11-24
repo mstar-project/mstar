@@ -324,7 +324,7 @@ def _ingest_stored(rt, store, registered: bool):
     from mstar.graph.runtime.base import ColumnarEdgeSpecs
 
     rid = rt.add_request(
-        request_id="r0", partition="default", graph_walk="decode",
+        request_id=100, partition="default", graph_walk="decode",
         partition_worker_graph_ids=[0],
         worker_graph_to_workers=ParallelList([0], [["w0"]]), loop_caps={},
     )

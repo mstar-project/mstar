@@ -41,7 +41,7 @@ from mstar.worker.node_manager_utils import (
 
 def _fwd_info(graph_walk: str, partition: str = "default", fwd_index: int = 0):
     return CurrentForwardPassInfo(
-        request_id="rid",
+        request_id=101,
         graph_walk=graph_walk,
         fwd_index=fwd_index,
         random_seed=0,
@@ -491,7 +491,7 @@ def test_route_batch_decodes_the_flat_rid_major_layout():
         nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
     )
     rid_b = runtime.add_request(
-        request_id="rid_b", partition="default", graph_walk="decode",
+        request_id=102, partition="default", graph_walk="decode",
         partition_worker_graph_ids=[0],
         worker_graph_to_workers=ParallelList([0], [["worker0"]]),
         loop_caps={},
@@ -718,7 +718,7 @@ def test_worker_graphs_done_names_each_rows_own_walk(tmp_path):
     store, minter = runtime.tensor_store, TensorUuidMinter("worker_0")
     rids = [
         runtime.add_request(
-            request_id=f"r_{walk}", partition="default", graph_walk=walk,
+            request_id=101 if walk == "prefill" else 102, partition="default", graph_walk=walk,
             partition_worker_graph_ids=[0, 1],
             worker_graph_to_workers=ParallelList([0, 1], [["worker0"], ["worker0"]]),
             loop_caps={},
@@ -747,7 +747,7 @@ def test_worker_graphs_done_names_each_rows_own_walk(tmp_path):
         for e, m in comm.sent
         if e == "conductor" and m.message_type == ConductorMessageType.WORKER_GRAPHS_DONE
     }
-    assert done == {"r_prefill": ([0], "prefill"), "r_decode": ([1], "decode")}
+    assert done == {101: ([0], "prefill"), 102: ([1], "decode")}
 
 
 def test_an_unread_loop_back_is_not_routed():
@@ -1052,7 +1052,7 @@ def _build_on_real_manager(section, nodes, tmp_path, loops=frozenset(), inboxes=
         sharding_config=_sharding_config(),
     )
     rid = runtime.add_request(
-        request_id="r", partition="default", graph_walk="w",
+        request_id=103, partition="default", graph_walk="w",
         partition_worker_graph_ids=[0],
         worker_graph_to_workers=ParallelList(list(walks), [["worker_0"]] * len(walks)),
         loop_caps={},

@@ -1,0 +1,99 @@
+---
+orphan: true
+---
+
+# Integer request IDs below the API server (#582)
+
+This is the implementation contract for [#582](https://github.com/mstar-project/mstar/issues/582).
+The switch lands as one Python and Rust wire change: letting one process send integers while another expects
+strings would break teardown, stream routing, and TP followers.
+
+## Boundary
+
+```text
+client request_id (string)
+          |
+          v
+API server: client ID <-> submission ID; seed from client ID
+          |
+          | submission ID (positive int, never reused in this launch)
+          v
+data worker <-> conductor <-> workers <-> Rust graph runtime
+          |
+          v
+API server maps results back to the client ID
+```
+
+- The HTTP and WebSocket contract keeps the client's string ID. The Rust HTTP
+  frontend keeps it too: it submits through the Python bridge, which reaches
+  the same API-server boundary.
+- The API server's `_live` map remains client ID to submission ID; its
+  `_client_ids`, pending, and recently-completed maps use the integer. A new
+  submission gets a fresh integer even when a client reuses its ID while an
+  older submission is draining. `test_request_id_reuse.py` guards this.
+- Mint a positive signed-63-bit integer in the API server: a nonzero random
+  31-bit per-launch high part and a monotonic 32-bit low part. It makes
+  cross-launch collision very unlikely even if a launcher reuses
+  `MSTAR_DEPLOYMENT_TOKEN`; it does not make collision impossible. Refuse
+  counter exhaustion rather than wrapping. All wire writers and the Rust
+  tensor store must accept its range.
+- Keep the seed tied to the client ID, not the new integer. The API server can
+  derive the fallback 32-bit seed and pass that integer with the preprocessing
+  input. The conductor's `_request_seed` then chooses an explicit `seed` in
+  the postprocessed model kwargs or this fallback, retaining its current
+  validation. No client ID needs to cross to the conductor.
+- Worker logs can print the submission integer; the API server logs the
+  client-to-integer mapping once. That mapping lets an operator follow a
+  client ID without putting it in every downstream message.
+
+## Atomic wire migration
+
+1. Change request identity fields in `mstar/api_server/request_types.py`,
+   `mstar/conductor/request_info.py`, and `mstar/utils/ipc_format.py` together.
+   This includes scalar IDs, `EdgeItems.request_ids`, `ScheduleTPNode.request_ids`,
+   `OffloadDelta.rids` and victims, `FailRequests.errors`, and maps keyed by an
+   ID. Leave graph names, node names, and the client ID as strings.
+2. Mint and retain the integer in `mstar/api_server/entrypoint.py`; carry it
+   through `data_worker.py` and the conductor. Keep result delivery, abort,
+   append, duplicate-ID grace, and the two-phase drain keyed by the submission
+   integer. An append still enters with the client ID and resolves through
+   `_live` at the API boundary.
+3. Change conductor and worker wire IDs as one unit. Keep each worker's small
+   recycled handle for tensor and resource arrays; `RidTable` may map the
+   global integer to that local handle. A TP follower must resolve the global
+   integer to *its own* handle. This preserves the existing cleanup rule for
+   recycled handles.
+4. Change the Rust graph runtime's `InternedRids` key from `String` to the
+   global integer, and make its frame writers in `rust/src/graph/frames.rs`
+   encode integer request fields with the same msgpack type as Python's typed
+   wire codec. The Rust tensor store already accepts `RidKey::Int`; verify
+   that the API data worker no longer sends its string variant and keep tensor
+   descriptors unchanged. `StrToId` still interns graph names; it does not
+   become the request-ID table.
+5. Update fixture constructors and tests that currently use wire strings.
+   Change both implementations of every frame in the same commit, following
+   AGENTS.md's Python/Rust parity rule. Do not add a lasting string-or-int
+   compatibility branch: it would keep both lookup costs on the hot path.
+
+## Checks before review
+
+- Red/green CPU tests for ID reuse during drain, early abort before ingest,
+  late result after a new submission with the same client ID, and TP follower
+  handle orders that differ from the leader. Existing starting points are
+  `test_request_id_reuse.py`, `test_teardown_barrier.py`, and
+  `test_rid_handles.py`.
+- Python/Rust typed-wire parity for every message shape carrying an ID,
+  including nested dict keys, `EdgeItems`, TP scheduling, and Rust-generated
+  `WorkerGraphsDone` and `InputSignals` frames. Extend
+  `test_wire_codec.py`, `test_rust_wire_frames.py`, and
+  `test_rust_graph_runtime.py`.
+- Run both frontends and both Python/Rust graph paths with client-pinned IDs.
+  Check that replies retain the client ID and an unchanged default seed.
+- Benchmark matched main and migrated head at high concurrency with
+  `benchmark/worker_phases`; report API formatting, wire encode/decode,
+  conductor dispatch, worker lookup, and served throughput. Keep the raw
+  samples and commit pins with any chart. A microbenchmark of integer dict
+  lookups alone is not evidence of a served gain.
+
+The integer layout and seed handoff above are the selected contract. This
+document and the Python/Rust wire change land together.

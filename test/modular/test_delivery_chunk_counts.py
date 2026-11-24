@@ -35,6 +35,7 @@ from mstar.utils.ipc_format import ConductorMessageType, WorkerGraphsDone
 WORKER = "worker_0"
 PREFILL, DECODE, LOOP = "prefill_text", "thinker_decode", "thinker_decode_loop"
 NODE = "Thinker"
+RID = (1 << 62) | 17
 
 # (prefill runs, decode steps): Qwen3-Omni's "text, image, text" prompt runs
 # prefill_text twice (the image walk emits on its own worker graph, which
@@ -88,7 +89,7 @@ def drive(runtime, put, prefills: int, decode_steps: int, inline: bool = False) 
     (the RESULT_TOKENS path).
     """
     rid = runtime.add_request(
-        request_id="r1", partition="default", graph_walk=PREFILL,
+        request_id=RID, partition="default", graph_walk=PREFILL,
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
         loop_caps={},
@@ -143,7 +144,7 @@ def expected_counts(reports: list[WorkerGraphsDone]) -> dict[str, int]:
         max_output_tokens=64, random_seed=0, resource_configs={},
         partition_states={"default": PartitionState(partition_name="default", graph_walk=PREFILL)},
     )
-    conductor.requests = {"r1": request}
+    conductor.requests = {RID: request}
     for body in reports:
         conductor._process_worker_graphs_done(body)
     return request.output_chunk_counts
@@ -151,8 +152,8 @@ def expected_counts(reports: list[WorkerGraphsDone]) -> dict[str, int]:
 
 def api_server() -> PreprocessWorker:
     worker = PreprocessWorker.__new__(PreprocessWorker)
-    worker.received_chunk_counts = {"r1": {}}
-    worker.per_request_reading_tensors = {"r1": 0}
+    worker.received_chunk_counts = {RID: {}}
+    worker.per_request_reading_tensors = {RID: 0}
     worker.result_tensor_input_queue = SimpleNamespace(put=lambda item: None)
     worker._signal = lambda: None
     return worker
@@ -172,11 +173,11 @@ def assert_holds_until_last_chunk(chunks: list, reports: list[WorkerGraphsDone])
     assert counts == {"new_token": len(chunks)}
     worker = api_server()
     for i, chunk in enumerate(chunks):
-        assert not worker.received_final_chunks("r1", counts), (
+        assert not worker.received_final_chunks(RID, counts), (
             f"request reported delivered with {i} of {len(chunks)} chunks received"
         )
         deliver(worker, chunk)
-    assert worker.received_final_chunks("r1", counts)
+    assert worker.received_final_chunks(RID, counts)
 
 
 def new_runtime(decode_steps: int, path, **overrides):
@@ -249,13 +250,13 @@ def test_completion_that_overtakes_the_last_chunks_waits_for_them(inline, tmp_pa
     drive(runtime, put, *SHAPES["text_image_text"], inline=inline)
     chunks, reports = sent()
     complete = APIServerMessage(message_type="request_complete", body=RequestComplete(
-        request_id="r1", output_chunk_counts=expected_counts(reports),
+        request_id=RID, output_chunk_counts=expected_counts(reports),
         conductor_ingest_time=0.0, conductor_finish_time=0.0,
     ))
 
     worker = PreprocessWorker.__new__(PreprocessWorker)
-    worker.received_chunk_counts = {"r1": {}}
-    worker.per_request_reading_tensors = {"r1": 0}
+    worker.received_chunk_counts = {RID: {}}
+    worker.per_request_reading_tensors = {RID: 0}
     worker.output_queue = queue.Queue()
     worker.profile_queue = queue.Queue()
     worker.reads_done_queue = queue.Queue()
@@ -283,7 +284,7 @@ def test_completion_that_overtakes_the_last_chunks_waits_for_them(inline, tmp_pa
     server.preprocess_worker = worker
     req = PendingRequest(streaming=False, input_modalities=["text", "image", "text"],
                          output_modalities=["text"], profile=RequestProfile(rid="r1"))
-    server.pending_requests = {"r1": req}
+    server.pending_requests = {RID: req}
 
     def msg(body):
         kind = "result_tokens" if isinstance(body, ResultTokens) else "result_tensors"
@@ -316,10 +317,10 @@ def test_every_rank_reports_the_chunks_it_sent():
         max_output_tokens=64, random_seed=0, resource_configs={},
         partition_states={"default": PartitionState(partition_name="default", graph_walk=DECODE)},
     )
-    conductor.requests = {"r1": request}
+    conductor.requests = {RID: request}
     for first, names in [(True, ["sharded", "replicated"]), (False, ["sharded"])]:
         conductor._process_worker_graphs_done(WorkerGraphsDone(
-            request_id="r1", worker_graph_ids=[0], is_first_tp_rank=first,
+            request_id=RID, worker_graph_ids=[0], is_first_tp_rank=first,
             output_signal_names=names,
         ))
     assert request.output_chunk_counts == {"sharded": 2, "replicated": 1}

@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 @dataclass
 class ResultChunk:
     """One chunk of generated output for a request."""
-    request_id: str
+    request_id: int
     modality: str  # "text" | "image" | "audio" | "video" | "video_frame"
     data: bytes  # raw payload (text encoded as utf-8)
     metadata: dict = field(default_factory=dict)
@@ -41,7 +41,7 @@ USAGE = "usage"
 
 @dataclass
 class ResultTensors:
-    request_id: str
+    request_id: int
     modality: str
     graph_edge: GraphEdge
     loop_indices: NestedLoopIndices
@@ -53,7 +53,7 @@ class ResultTokens:
     """One step's client-facing scalars (sampled tokens), every request in one
     frame. Replaces one ResultTensors per request for an output whose value
     the worker already holds on the host: no transport tensor, no ack."""
-    request_ids: list[str]
+    request_ids: list[int]
     values: list[int]
     # per request, the loop context of the step that produced the value
     loop_indices: list[NestedLoopIndices | None]
@@ -68,7 +68,7 @@ class ResultTokens:
 @dataclass
 class RequestComplete:
     """Signals that a request has finished processing."""
-    request_id: str
+    request_id: int
     # Output signal name -> chunks the workers emitted to the client. The API
     # server waits until it has received that many of each before completing
     # the request: completion can overtake the last chunks on the wire.
@@ -95,7 +95,7 @@ class RequestFailed:
     One message per request, so it routes through the API server's result
     loop exactly like ``RequestComplete`` does.
     """
-    request_id: str
+    request_id: int
     error_message: str
     status: int = 500
 
@@ -150,7 +150,7 @@ class DataWorkerProfile:
     conductor and the per-modality sizes of the raw inputs. (The data worker's
     tx/rx are read directly from its tensor manager at request completion,
     not via this.)"""
-    request_id: str
+    request_id: int
     preprocess_finish_time: float | None = None  # time.perf_counter
     inputs: list[InputInfo] = field(default_factory=list)
     # Set only with metrics on: the data worker's own numbers for the request.
@@ -164,7 +164,7 @@ class DataWorkerProfile:
 
 @dataclass
 class PreprocessInput:
-    request_id: str
+    request_id: int
     text: str | None
 
     # file_paths is modality: list of filenames
@@ -177,7 +177,7 @@ class PreprocessInput:
     prompt_parts: list[PromptPart] | None = None
     # The id the client knows the request by; ``request_id`` is the API
     # server's key for this one submission.
-    client_request_id: str | None = None
+    fallback_seed: int = 0
     # what the prompt's prefix-cache key chains hang from: the root of the LoRA adapter
     # the API server selected (``ServedModels.select``), empty for the base model. Set
     # in process, never from the client's kwargs.
@@ -197,7 +197,7 @@ class ClientAppend:
     request's own ``PreprocessInput`` so its chunks stay in order. The
     streams in ``ends`` end after this chunk. Stays inside the API server
     process."""
-    request_id: str
+    request_id: int
     file_paths: dict[str, list[str]] | None = None
     ends: frozenset[str] = frozenset()
     text: str | None = None

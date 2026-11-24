@@ -549,7 +549,7 @@ class EngineManager:
         return self.engine
 
     def add_request(
-        self, request_id: str,
+        self, request_id: int,
         resource_configs: dict[str, ResourceReqConfig] | None = None,
         request_info: CurrentForwardPassInfo | None = None,
     ) -> None:
@@ -558,7 +558,7 @@ class EngineManager:
         and hand the submodules its ``request_info``."""
         self.engine.add_request(request_id, resource_configs, request_info)
 
-    def remove_request(self, request_id: str) -> set[str]:
+    def remove_request(self, request_id: int) -> set[str]:
         """Tear the request down; returns the resources it handed pages back to."""
         return self.engine.remove_request(request_id)
 

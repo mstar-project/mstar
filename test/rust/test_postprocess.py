@@ -93,7 +93,7 @@ def _start(rt, n, limits=True):
     rids = []
     for i in range(n):
         rid = rt.add_request(
-            request_id=f"r{i}", partition=PART, graph_walk=WALK,
+            request_id=100 + i, partition=PART, graph_walk=WALK,
             partition_worker_graph_ids=[0],
             worker_graph_to_workers=ParallelList([0], [[ME]]), loop_caps={})
         if limits:
@@ -246,7 +246,7 @@ def test_missing_limits_leave_the_check_to_the_model(tmp_path):
     """A row with no registered limits: the runtime decides nothing (STOPS)."""
     rt = _runtime(rust_runtime.RustGraphRuntime, str(tmp_path))
     rid = rt.add_request(
-        request_id="r", partition=PART, graph_walk=WALK, partition_worker_graph_ids=[0],
+        request_id=100, partition=PART, graph_walk=WALK, partition_worker_graph_ids=[0],
         worker_graph_to_workers=ParallelList([0], [[ME]]), loop_caps={})
     column = torch.tensor([EOS], dtype=torch.int64)
     step = rt.begin_postprocess(PostprocessRequest(
@@ -308,7 +308,7 @@ def test_a_repeated_step_stops_a_row_at_its_iteration_and_emits_up_to_it(tmp_pat
     for frame in _collect(box):
         for rid, value in zip(frame.body.request_ids, frame.body.values, strict=True):
             sent.setdefault(rid, []).append(value)
-    assert sent == {"r0": [1, 2, 3], "r1": [4, EOS]}
+    assert sent == {100: [1, 2, 3], 101: [4, EOS]}
 
 
 @pytest.mark.parametrize("known", [True, False], ids=["withheld_on_begin", "withheld_on_stops"])
@@ -340,5 +340,5 @@ def test_a_withheld_rows_inline_emit_goes_nowhere(tmp_path, known):
         iters[k] = [it[LOOP] for it in rt.get_dynamic_loop_iters(rids, PART).values]
     assert frames["native"] == frames["reference"]
     [tokens] = frames["native"]
-    assert tokens.body.request_ids == ["r0", "r2"] and tokens.body.values == [100, 102]
+    assert tokens.body.request_ids == [100, 102] and tokens.body.values == [100, 102]
     assert iters["native"] == iters["reference"] == [1, 1, 1]

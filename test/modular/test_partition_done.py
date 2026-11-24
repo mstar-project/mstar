@@ -28,7 +28,7 @@ class _Recorder:
     partition_inputs: list = field(default_factory=list)
 
 
-def _conductor(rid="r"):
+def _conductor(rid=101):
     c = object.__new__(Conductor)
     c._client_streams = {}
     rec = _Recorder()
@@ -61,7 +61,7 @@ def _conductor(rid="r"):
 def _done_forward(c, req, partition, partition_done=False):
     """``_process_done_forward`` after a pass whose report carried ``partition_done``."""
     req.partition_states[partition].worker_reported_done = partition_done
-    return c._process_done_forward("r", partition)
+    return c._process_done_forward(101, partition)
 
 
 def test_worker_final_chunk_signal_ends_the_partition_and_propagates_producer_done():
@@ -70,7 +70,7 @@ def test_worker_final_chunk_signal_ends_the_partition_and_propagates_producer_do
     all_done = _done_forward(c, req, "B", partition_done=True)
     assert req.partition_states["B"].is_done is True
     assert req.streaming_connections["B->C"].producer_done is True
-    assert rec.producer_done == [("r", "B", "C")]
+    assert rec.producer_done == [(101, "B", "C")]
     assert all_done is False          # A and C are still running
 
 
@@ -95,16 +95,16 @@ def test_the_flag_on_any_report_ends_a_partition_without_a_stream_in(flag_on):
     pstate.current_worker_graph_ids = {0, 1}
     req.worker_graph_to_workers = {0: ["enc"], 1: ["llm"]}
     reports = [
-        WorkerGraphsDone(request_id="r", partition_name="A", worker_graph_ids=[wg], is_first_tp_rank=True,
+        WorkerGraphsDone(request_id=101, partition_name="A", worker_graph_ids=[wg], is_first_tp_rank=True,
                          partition_done=wg == 1)
         for wg in ((1, 0) if flag_on == "first" else (0, 1))
     ]
     assert c._process_worker_graphs_done(reports[0]) == []
     assert c._process_worker_graphs_done(reports[1]) == ["A"]
-    c._process_done_forward("r", "A")
+    c._process_done_forward(101, "A")
     assert pstate.is_done is True
     assert rec.partition_inputs == [], "no further walk starts"
-    assert rec.producer_done == [("r", "A", "B")]
+    assert rec.producer_done == [(101, "A", "B")]
     assert pstate.worker_reported_done is False, "reset for the next pass"
 
 
@@ -122,26 +122,26 @@ def test_two_passes_reported_in_one_cycle_end_the_partition_once():
         name
         for done in (False, True)
         for name in c._process_worker_graphs_done(WorkerGraphsDone(
-            request_id="r", partition_name="B", worker_graph_ids=[0], is_first_tp_rank=True,
+            request_id=101, partition_name="B", worker_graph_ids=[0], is_first_tp_rank=True,
             partition_done=done,
         ))
     ]
     assert queued == ["B", "B"]
     for name in queued:
-        c._process_done_forward("r", name)
+        c._process_done_forward(101, name)
     assert pstate.is_done is True
     assert pstate.fwd_pass_number == 1, "the done partition is not advanced again"
-    assert rec.producer_done == [("r", "B", "C")]
+    assert rec.producer_done == [(101, "B", "C")]
 
 
 def test_chain_closes_partition_by_partition():
     c, req, rec = _conductor()
     req.partition_states["A"].plan = [WalkStep("a")]
-    assert c._process_done_forward("r", "A") is False           # A ends itself: its plan has run
+    assert c._process_done_forward(101, "A") is False           # A ends itself: its plan has run
     assert req.streaming_connections["A->B"].producer_done is True
     assert _done_forward(c, req, "B", partition_done=True) is False
     assert _done_forward(c, req, "C", partition_done=True) is True   # every partition done
-    assert rec.producer_done == [("r", "A", "B"), ("r", "B", "C")]
+    assert rec.producer_done == [(101, "A", "B"), (101, "B", "C")]
 
 
 def test_a_finished_consumer_is_not_told_its_producer_is_done():

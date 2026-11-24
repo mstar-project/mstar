@@ -1778,12 +1778,12 @@ def test_a_tp_follow_batch_goes_before_the_backlog():
     sched = _scheduler(_Engine(max_bs=8))
     sched.backlog[("B", WALK)] = _batch(["b0"], node="B")
     sched.lockstep.enqueue_follow(
-        ScheduleTPNode(node_name=NODE, graph_walk=WALK, request_ids=["t0"]),
+        ScheduleTPNode(node_name=NODE, graph_walk=WALK, request_ids=[1000]),
     )
 
-    batch = _next_batch(sched, _Manager(["t0"]))
+    batch = _next_batch(sched, _Manager([1000]))
 
-    assert (batch.node_name, list(batch.request_to_worker_graph)) == (NODE, ["t0"])
+    assert (batch.node_name, list(batch.request_to_worker_graph)) == (NODE, [1000])
     assert ("B", WALK) in sched.backlog
 
 
@@ -1798,15 +1798,15 @@ def test_a_follower_does_not_hold_a_head_back_for_rows_rank_0_has_not_sent():
         engine_manager=SimpleNamespace(get_engine=lambda name: _Engine(max_bs=8)),
         parallel_leader_nodes=set(),
     )
-    manager = _Manager(["t0", "t1"])
+    manager = _Manager([1000, 1001])
     manager.queues["wg0"]._ready["b0"] = {"B"}
     manager.per_request_info["b0"] = object()
-    for rid in ("t0", "t1"):
+    for rid in (1000, 1001):
         sched.lockstep.enqueue_follow(ScheduleTPNode(node_name=NODE, graph_walk=WALK, request_ids=[rid]))
 
-    assert list(_next_batch(sched, manager).request_to_worker_graph) == ["t0"]
+    assert list(_next_batch(sched, manager).request_to_worker_graph) == [1000]
     second = _next_batch(sched, manager)
-    assert second is not None and list(second.request_to_worker_graph) == ["t1"]
+    assert second is not None and list(second.request_to_worker_graph) == [1001]
 
 
 def test_an_input_landing_on_a_backlogged_row_does_not_ready_it_again():
@@ -3011,29 +3011,29 @@ def test_a_follower_runs_the_leaders_chunks():
 
     sched = _scheduler(_Engine(max_bs=8))
     sched.lockstep.enqueue_follow(ScheduleTPNode(
-        node_name=NODE, graph_walk=WALK, request_ids=["t0", "t1", "t2"],
+        node_name=NODE, graph_walk=WALK, request_ids=[1000, 1001, 1002],
         chunk_starts=[0, -1, 6], chunk_ends=[8, -1, 10], chunk_totals=[10, -1, 10],
         chunk_strides=[8, -1, 4],
     ))
-    manager = _Manager(["t0", "t1", "t2"])
+    manager = _Manager([1000, 1001, 1002])
     sched.chunk_loop_walks = {NODE: frozenset({WALK})}
     sched.lockstep._chunk_loop_walks = sched.chunk_loop_walks
 
     batch = _next_batch(sched, manager)
 
-    assert batch.chunk_ranges == {"t0": (0, 8, 10, 8), "t2": (6, 10, 10, 4)}
-    assert batch.incomplete_node_rids == {"t0"}
-    assert _cap_of(manager, "t0", WALK) == 10, "t0's first chunk caps its Loop, as on the leader"
-    assert _cap_of(manager, "t2", WALK) is None, "t2 was capped on its first chunk"
+    assert batch.chunk_ranges == {1000: (0, 8, 10, 8), 1002: (6, 10, 10, 4)}
+    assert batch.incomplete_node_rids == {1000}
+    assert _cap_of(manager, 1000, WALK) == 10, "t0's first chunk caps its Loop, as on the leader"
+    assert _cap_of(manager, 1002, WALK) is None, "t2 was capped on its first chunk"
 
 
 def test_a_follower_step_without_chunks_takes_no_ranges():
     from mstar.utils.ipc_format import ScheduleTPNode
 
     sched = _scheduler(_Engine(max_bs=8))
-    sched.lockstep.enqueue_follow(ScheduleTPNode(node_name=NODE, graph_walk=WALK, request_ids=["t0", "t1"]))
+    sched.lockstep.enqueue_follow(ScheduleTPNode(node_name=NODE, graph_walk=WALK, request_ids=[1000, 1001]))
 
-    batch = _next_batch(sched, _Manager(["t0", "t1"]))
+    batch = _next_batch(sched, _Manager([1000, 1001]))
 
     assert (batch.chunk_ranges, batch.incomplete_node_rids) == ({}, set())
 
@@ -3044,14 +3044,14 @@ def test_a_follower_refuses_chunk_lists_that_do_not_match_its_rows():
 
     sched = _scheduler(_Engine(max_bs=8))
     head = ScheduleTPNode(
-        node_name=NODE, graph_walk=WALK, request_ids=["t0", "t1"],
+        node_name=NODE, graph_walk=WALK, request_ids=[1000, 1001],
         chunk_starts=[4], chunk_ends=[8], chunk_totals=[10], chunk_strides=[4],
     )
     sched.lockstep.enqueue_follow(head)
-    manager = _Manager(["t0", "t1"])
+    manager = _Manager([1000, 1001])
 
     with pytest.raises(ValueError):
         _next_batch(sched, manager)
 
     assert sched.lockstep.follow_head() is head
-    assert set(manager.queues["wg0"].get_ready_node_names()) == {"t0", "t1"}
+    assert set(manager.queues["wg0"].get_ready_node_names()) == {1000, 1001}

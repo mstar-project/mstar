@@ -427,7 +427,7 @@ impl GraphRuntime {
                     continue;
                 }
                 let bytes = frames::StopLoops {
-                    request_id: &request_id,
+                    request_id,
                     partition_name: partition,
                     loop_names: &names,
                     loop_stop_times: stop_times.clone(),

@@ -110,7 +110,7 @@ def _staged_runtime():
     )
     rids = [
         runtime.add_request(
-            request_id=f"r{i}", partition="default", graph_walk=walk, partition_worker_graph_ids=[0],
+            request_id=101 + i, partition="default", graph_walk=walk, partition_worker_graph_ids=[0],
             worker_graph_to_workers=ParallelList([0], [["w0"]]), loop_caps={},
         )
         for i in range(2)

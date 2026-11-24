@@ -49,7 +49,7 @@ def _runtime_at_prefill() -> tuple[RustGraphRuntime, int]:
         sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
     )
     rid = runtime.add_request(
-        request_id="r", partition="default", graph_walk=WALK, partition_worker_graph_ids=[0],
+        request_id=101, partition="default", graph_walk=WALK, partition_worker_graph_ids=[0],
         worker_graph_to_workers=ParallelList([0], [["worker0"]]), loop_caps={},
     )
     block = ColumnarEdgeSpecs.empty()

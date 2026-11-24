@@ -41,7 +41,7 @@ def test_finished_loop_ownership(accumulated, nested, readers, persist):
     section = Loop(name="outer", section=section, max_iters=2,
                    outputs=[] if accumulated else edges, accumulated_outputs=edges if accumulated else [])
     runtime, book, store = _build(section)
-    rid = runtime.add_request("ownership", "default", "decode", [0], ParallelList([0], [[WORKER]]), _caps(section))
+    rid = runtime.add_request(101, "default", "decode", [0], ParallelList([0], [[WORKER]]), _caps(section))
     block = ColumnarEdgeSpecs.empty()
     block.add_edge(rid, GraphEdge(name="token", next_node="producer"))
     assert runtime.ingest_inputs_batch(block) == []
@@ -90,7 +90,7 @@ def test_child_accumulation_survives_parent_finish(readers):
                  accumulated_outputs=[GraphEdge(name="frame", next_node=EMIT_TO_CLIENT) for _ in range(readers)])
     outer = Loop(name="outer", section=inner, max_iters=2, outputs=[])
     runtime, book, store = _build(outer)
-    rid = runtime.add_request("child", "default", "decode", [0], ParallelList([0], [[WORKER]]), _caps(outer))
+    rid = runtime.add_request(102, "default", "decode", [0], ParallelList([0], [[WORKER]]), _caps(outer))
     block = ColumnarEdgeSpecs.empty()
     block.add_edge(rid, GraphEdge(name="token", next_node="producer"))
     assert runtime.ingest_inputs_batch(block) == []
@@ -128,7 +128,7 @@ def test_loop_finished_by_node_without_outputs_settles_older_holds(accumulated, 
     loop = Loop(name="outer", section=body, max_iters=2,
                 outputs=[] if accumulated else edges, accumulated_outputs=edges if accumulated else [])
     runtime, book, store = _build(loop)
-    rid = runtime.add_request("tail", "default", "decode", [0], ParallelList([0], [[WORKER]]), _caps(loop))
+    rid = runtime.add_request(103, "default", "decode", [0], ParallelList([0], [[WORKER]]), _caps(loop))
     block = ColumnarEdgeSpecs.empty()
     block.add_edge(rid, GraphEdge(name="token", next_node="producer"))
     assert runtime.ingest_inputs_batch(block) == []
@@ -175,7 +175,7 @@ def test_abandoned_loop_keeps_its_holds_until_hard_cleanup(nested):
     loop = Loop(name="outer", section=section, max_iters=100, outputs=[],
                 accumulated_outputs=[GraphEdge(name="token", next_node=EMIT_TO_CLIENT)])
     runtime, book, store = _build(loop)
-    rid = runtime.add_request("abandoned", "default", "decode", [0], ParallelList([0], [[WORKER]]), _caps(loop))
+    rid = runtime.add_request(104, "default", "decode", [0], ParallelList([0], [[WORKER]]), _caps(loop))
     block = ColumnarEdgeSpecs.empty()
     block.add_edge(rid, GraphEdge(name="token", next_node="producer"))
     assert runtime.ingest_inputs_batch(block) == []

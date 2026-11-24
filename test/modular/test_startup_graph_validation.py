@@ -292,7 +292,7 @@ class _ChunkWalkRuntime:
             node_to_partition={"vocoder": "C", "post": "C"}, sharding_config=_sharding_config(),
         )
         self.rid = self.rt.add_request(
-            request_id="r", partition="C", graph_walk="chunk", partition_worker_graph_ids=ids,
+            request_id=101, partition="C", graph_walk="chunk", partition_worker_graph_ids=ids,
             worker_graph_to_workers=ParallelList(ids, [["worker_0"]] * len(ids)),
             loop_caps={},
         )
@@ -576,7 +576,7 @@ class _LoopWorker:
             node_to_partition={"step": "default", "post": "default"}, sharding_config=_sharding_config(),
         )
         self.rid = self.rt.add_request(
-            request_id="r", partition="default", graph_walk="w", partition_worker_graph_ids=[0],
+            request_id=101, partition="default", graph_walk="w", partition_worker_graph_ids=[0],
             worker_graph_to_workers=ParallelList([0], [["worker_0"]]),
             loop_caps={},
         )

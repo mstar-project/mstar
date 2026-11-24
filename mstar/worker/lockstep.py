@@ -580,7 +580,7 @@ class Lockstep:
         self._discharge(head.request_ids)
         self._follow_fifo[0] = moves_alone(head)
 
-    def _discharge(self, rids: list[str]) -> None:
+    def _discharge(self, rids: list[int]) -> None:
         for rid in rids:
             if rid not in self._follow_count:
                 continue
@@ -594,7 +594,7 @@ class Lockstep:
         forwarded removal against the step stream."""
         return self._last_popped_seq
 
-    def pending_follow_count(self, wire_rid: str) -> int:
+    def pending_follow_count(self, wire_rid: int) -> int:
         """How many queued follow steps name this request."""
         return self._follow_count.get(wire_rid, 0)
 
@@ -837,13 +837,13 @@ class Lockstep:
             )
         node_batch.drop_rids(flagged)
 
-    def clear(self, rid: int, wire_rid: str) -> None:
+    def clear(self, rid: int, wire_rid: int) -> None:
         """Forget a request; called from its teardown."""
         self._unread.pop(rid, None)
         self.read_failed_rids.discard(rid)
         self.clear_wire_rid(wire_rid)
 
-    def clear_wire_rid(self, wire_rid: str) -> None:
+    def clear_wire_rid(self, wire_rid: int) -> None:
         """Forget the wire-string-keyed state for a rid. Separate for the REMOVE
         of a rid this rank never admitted: there is no handle to clear anything
         else with, but a follow step may still be counted against the string."""

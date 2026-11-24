@@ -202,7 +202,7 @@ class InlineTokens:
     order. One item per frame, not per request, so the data worker wakes the
     message thread once per step (``ResultQueue``). A chunk's order is its
     arrival sequence; its loop indices only give a turn-token model's ``step``."""
-    request_ids: list[str]
+    request_ids: list[int]
     values: list[int]
     modality: str
     # per request, or None when no request of the frame asked
@@ -321,7 +321,7 @@ class PreprocessWorker:
 
         self.per_request_reading_tensors = {}
         # request id -> output name -> chunks received, for received_final_chunks
-        self.received_chunk_counts: dict[str, dict[str, int]] = {}
+        self.received_chunk_counts: dict[int, dict[str, int]] = {}
 
         # Build the communicator + tensor manager here (main thread) and hand
         # them to the worker thread, rather than constructing them inside it.
@@ -420,7 +420,7 @@ class PreprocessWorker:
         self.request_input_queue.put(chunk)
         self._signal()
 
-    def abort_request(self, request_id: str):
+    def abort_request(self, request_id: int):
         # Forward the abort to the conductor and begin draining our own reads
         # (the worker thread ACKs READS_DONE once they finish). The hard cleanup
         # of the persisted input signals waits for the conductor's
@@ -430,13 +430,13 @@ class PreprocessWorker:
         self.received_chunk_counts.pop(request_id, None)
         self.per_request_reading_tensors.pop(request_id, None)
 
-    def forward_abort(self, request_id: str):
+    def forward_abort(self, request_id: int):
         """:meth:`abort_request` for a request the API server still holds:
         the main-thread bookkeeping stays until :meth:`finished_reading`."""
         self.abort_request_queue.put(request_id)
         self._signal()
 
-    def finished_reading(self, request_id: str, drained: bool = True):
+    def finished_reading(self, request_id: int, drained: bool = True):
         """The API server is done with this request's outputs. Tell the
         conductor via READS_DONE; it will send REMOVE_REQUEST to trigger the
         hard cleanup. ``drained`` means every chunk was delivered, so no read
@@ -469,7 +469,7 @@ class PreprocessWorker:
         self._signal()
 
     def new_result_tokens(
-        self, request_ids: list[str], values: list[int], signal: str, modality: str,
+        self, request_ids: list[int], values: list[int], signal: str, modality: str,
         logprobs: list[float | None] | None = None,
         loop_indices: list[NestedLoopIndices | None] | None = None,
     ):
@@ -510,11 +510,11 @@ class PreprocessWorker:
         self.discard_tensor_queue.put(input)
         self._signal()
 
-    def has_pending_tensors(self, request_id: str):
+    def has_pending_tensors(self, request_id: int):
         return self.per_request_reading_tensors.get(request_id, 0) > 0
 
     def received_final_chunks(
-        self, request_id: str,
+        self, request_id: int,
         output_chunk_counts: dict[str, int],
     ):
         # Every serving walk reports at least one client-facing output, so an
@@ -559,7 +559,7 @@ class PreprocessWorker:
             updates.append(self.profile_queue.get())
         return updates
 
-    def get_tx_info(self, request_id: str) -> list[TxInfo]:
+    def get_tx_info(self, request_id: int) -> list[TxInfo]:
         """Snapshot the data worker's send (tx) profiling for a request.
 
         Safe to call from the main thread once the request is done: by then the
@@ -568,7 +568,7 @@ class PreprocessWorker:
         """
         return self.tensor_manager.get_tx_info(request_id)
 
-    def get_rx_info(self, request_id: str) -> list[RxInfo]:
+    def get_rx_info(self, request_id: int) -> list[RxInfo]:
         """Snapshot the data worker's receive (rx) profiling for a request.
 
         Same safety contract as :meth:`get_tx_info` — read once the request's
@@ -581,7 +581,7 @@ class PreprocessWorker:
         from now on; the API server exports the thread's published counts."""
         return self.tensor_manager.enable_transfer_metrics()
 
-    def cleanup_request(self, request_id: str):
+    def cleanup_request(self, request_id: int):
         self.cleanup_request_queue.put(request_id)
         self._signal()
         self.received_chunk_counts.pop(request_id, None)
@@ -629,7 +629,7 @@ class RequestOutputState:
 class EncodedOutput(NamedTuple):
     """An output encoded on the pool, waiting for the data worker to queue its chunk."""
     future: Future  # of ``(bytes, seconds in Model.postprocess)``
-    request_id: str
+    request_id: int
     state: RequestOutputState
     sequence: int
     modality: str
@@ -775,7 +775,7 @@ class PreprocessWorkerThread:
         self._client_edges = frozenset(self._client_connections)
         self._model_config = model_config
         # per request of a model with client streams, those streams' state
-        self._client_calls: dict[str, ClientCall] = {}
+        self._client_calls: dict[int, ClientCall] = {}
         self.in_queue = in_queue
         # Whether the API server still waits on a submission (see
         # _process_waiting_input); None (tests) takes everything.
@@ -790,15 +790,15 @@ class PreprocessWorkerThread:
 
         # Teardown drain: rids we've stopped reading for (until REMOVE_REQUEST),
         # and those we've already ACKed READS_DONE for (avoid double-ACK).
-        self._draining_rids: set[str] = set()
-        self._reads_done_sent: set[str] = set()
+        self._draining_rids: set[int] = set()
+        self._reads_done_sent: set[int] = set()
         # Requests under each rid that started here and are not removed yet
         # (by REMOVE_REQUEST, or by failing before they reached the conductor).
         # A release (finished_reading or an abort) for a rid with none must not
         # enter the sets above: its request is gone and no REMOVE_REQUEST
         # follows. A count, since a client can reuse a rid before the last
         # request under it is removed.
-        self._live_requests: dict[str, int] = {}
+        self._live_requests: dict[int, int] = {}
 
         self.stop_event = stop_event
         self.device = device
@@ -819,8 +819,8 @@ class PreprocessWorkerThread:
         self.tensor_uuid_to_metadata_per_request = {}
         # The request's model_kwargs, kept so output postprocessing can
         # honor per-request parameters (e.g. the video container fps).
-        self.request_model_kwargs: dict[str, dict] = {}
-        self.request_output_state: dict[str, RequestOutputState] = {}
+        self.request_model_kwargs: dict[int, dict] = {}
+        self.request_output_state: dict[int, RequestOutputState] = {}
 
         # Owned by PreprocessWorker (main thread); used only from this thread.
         self.communicator = communicator
@@ -876,7 +876,7 @@ class PreprocessWorkerThread:
             return 1
         return self._prepare_workers
 
-    def _cleanup_request_state(self, request_id: str, *, force: bool = False) -> None:
+    def _cleanup_request_state(self, request_id: int, *, force: bool = False) -> None:
         """Release transport and postprocessing state owned by this thread.
 
         ``force`` unlinks the tensor SHM unconditionally, for a request that
@@ -891,7 +891,7 @@ class PreprocessWorkerThread:
         finally:
             self._drop_request_state(request_id)
 
-    def _drop_request_state(self, request_id: str) -> None:
+    def _drop_request_state(self, request_id: int) -> None:
         """Forget every per-request dict this thread keeps. Shared by both
         teardown paths so a new dict cannot be dropped by one and leaked by the
         other; a held reorder chunk can be a full 11 MiB 720p frame."""
@@ -1129,7 +1129,7 @@ class PreprocessWorkerThread:
                 initial_output_modalities=input.output_modalities,
                 input_metadata=input_metadata,
                 model_kwargs=conductor_kwargs,
-                client_request_id=input.client_request_id,
+                fallback_seed=input.fallback_seed,
                 input_open=bool(self._client_edges - input.ends),
                 streaming=input.streaming,
                 prompt_tokens=num_prompt_tokens,
@@ -1318,7 +1318,7 @@ class PreprocessWorkerThread:
         self._send_ends(request_id, call, call.ended)
 
     def _send_stream_items(
-        self, request_id: str, call: ClientCall, signals: dict[str, list[TensorPointerInfo]],
+        self, request_id: int, call: ClientCall, signals: dict[str, list[TensorPointerInfo]],
         on_late: Callable[[str], None] | None,
     ) -> None:
         """Send stored items to their streams' consumer ranks, each rank one
@@ -1348,7 +1348,7 @@ class PreprocessWorkerThread:
             self.tensor_manager.dereference_batch_uniform(uuids)
         _answer_late(on_late, late)
 
-    def _send_ends(self, request_id: str, call: ClientCall, names: Collection[str]) -> None:
+    def _send_ends(self, request_id: int, call: ClientCall, names: Collection[str]) -> None:
         """Each rank of ``names``' consumers gets one ``producer_done`` from
         ``CLIENT`` per partition, naming the streams it ends there, with the
         items each carried, on the FIFO its items took, so it can't overtake
@@ -1437,7 +1437,7 @@ class PreprocessWorkerThread:
         )
 
     def _store(
-        self, request_id: str, tensors: NameToTensorList,
+        self, request_id: int, tensors: NameToTensorList,
     ) -> tuple[dict[str, list[TensorPointerInfo]], list[TensorPointerInfo]]:
         """Store tensors for workers to read; the descriptors by name, and flat."""
         signals = self.tensor_manager.store_and_return_tensor_info(
@@ -1448,7 +1448,7 @@ class PreprocessWorkerThread:
         return signals, infos
 
     def _store_persisted(
-        self, request_id: str, tensors: NameToTensorList,
+        self, request_id: int, tensors: NameToTensorList,
     ) -> dict[str, list[TensorPointerInfo]]:
         """A request's initial signals, held until the conductor releases them
         with their reader count."""
@@ -1460,7 +1460,7 @@ class PreprocessWorkerThread:
         return signals
 
     def _store_held(
-        self, request_id: str, items: NameToTensorList,
+        self, request_id: int, items: NameToTensorList,
     ) -> dict[str, list[TensorPointerInfo]]:
         """Client stream items, with one reference of the store's own until
         they are sent (``_send_stream_items``)."""
@@ -1666,7 +1666,7 @@ class PreprocessWorkerThread:
         return infos
 
     def _fail_request(
-        self, request_id: str, exc: BaseException, stage: str, count: int = 1,
+        self, request_id: int, exc: BaseException, stage: str, count: int = 1,
         sequence: int | None = None, abort: bool = True, traceback: bool = True,
         intake: bool = False,
     ):
@@ -1712,7 +1712,7 @@ class PreprocessWorkerThread:
         if abort:
             self._abort_failed_request(request_id)
 
-    def _torn_down(self, request_id: str) -> bool:
+    def _torn_down(self, request_id: int) -> bool:
         """Being torn down, or already handed back by the API server: this
         thread starts no more work for it."""
         return (
@@ -1721,7 +1721,7 @@ class PreprocessWorkerThread:
             or request_id not in self.in_flight_requests
         )
 
-    def _abort_failed_request(self, request_id: str) -> None:
+    def _abort_failed_request(self, request_id: int) -> None:
         """Stop the walk of a request this thread failed. Left running, it
         would produce every remaining output only for each to be read and
         dropped. Skipped for a request already being torn down, or already
@@ -1731,7 +1731,7 @@ class PreprocessWorkerThread:
         logger.info("Aborting request %s: one of its outputs failed", request_id)
         self._send_abort(request_id)
 
-    def _send_abort(self, request_id: str) -> None:
+    def _send_abort(self, request_id: int) -> None:
         self.communicator.send(
             "conductor",
             ConductorMessage(
@@ -1746,7 +1746,7 @@ class PreprocessWorkerThread:
         if request_id in self._live_requests:
             self._begin_drain(request_id)
 
-    def _sequence_unanswered(self, request_id: str, sequence: int) -> bool:
+    def _sequence_unanswered(self, request_id: int, sequence: int) -> bool:
         """True if no chunk has been queued for ``sequence`` yet."""
         state = self.request_output_state.get(request_id)
         if state is None:
@@ -1840,11 +1840,11 @@ class PreprocessWorkerThread:
                     sequence=sequence,
                 )
 
-    def _wants_token_ids(self, request_id: str, modality: str) -> bool:
+    def _wants_token_ids(self, request_id: int, modality: str) -> bool:
         """A text chunk of a request that set ``return_token_ids``."""
         return modality == "text" and bool((self.request_model_kwargs.get(request_id) or {}).get("return_token_ids"))
 
-    def _with_token_ids(self, request_id: str, modality: str, tensor: torch.Tensor, metadata: dict) -> dict:
+    def _with_token_ids(self, request_id: int, modality: str, tensor: torch.Tensor, metadata: dict) -> dict:
         """``metadata`` plus the chunk's sampled ids, stop tokens included. A
         float text tensor (Whisper's word alignment) carries no ids."""
         if tensor.is_floating_point() or not self._wants_token_ids(request_id, modality):
@@ -1853,7 +1853,7 @@ class PreprocessWorkerThread:
 
     def _queue_completed_output(
         self,
-        request_id: str,
+        request_id: int,
         sequence: int,
         chunk: ResultChunk,
     ) -> None:
@@ -1896,7 +1896,7 @@ class PreprocessWorkerThread:
                 )
 
     def _postprocess_inline(
-        self, request_id: str, sequence: int, modality: str, uuid: int, tensor: torch.Tensor,
+        self, request_id: int, sequence: int, modality: str, uuid: int, tensor: torch.Tensor,
         loop_indices: NestedLoopIndices | None,
         read_time: float | None = None,
     ) -> None:
@@ -1978,7 +1978,7 @@ class PreprocessWorkerThread:
             profiler.range_pop()
 
     def _submit_encode(
-        self, request_id: str, sequence: int, modality: str, uuid: int, tensor: torch.Tensor,
+        self, request_id: int, sequence: int, modality: str, uuid: int, tensor: torch.Tensor,
         read_time: float | None = None,
     ) -> None:
         """Encode on the pool; :meth:`_release_encoded` queues the chunk. The
@@ -2140,7 +2140,7 @@ class PreprocessWorkerThread:
                 message_type=ConductorMessageType.ENABLE_METRICS, body=EnableMetrics(),
             ))
 
-    def _finish_reading(self, request_id: str, drained: bool) -> None:
+    def _finish_reading(self, request_id: int, drained: bool) -> None:
         """The API server is done with this rid's outputs. ``drained`` (every
         chunk delivered) means no read can still be in flight, so ACK straight
         away, unless a failed read's transfers are still running: its error
@@ -2159,13 +2159,13 @@ class PreprocessWorkerThread:
         else:
             self._begin_drain(request_id)
 
-    def _begin_drain(self, request_id: str) -> None:
+    def _begin_drain(self, request_id: int) -> None:
         """Stop reading this rid; ACK READS_DONE once in-flight reads finish.
         Idempotent — abort self-initiates while the conductor may also drive it."""
         self._draining_rids.add(request_id)
         self._complete_drain_if_ready(request_id)
 
-    def _complete_drain_if_ready(self, request_id: str) -> None:
+    def _complete_drain_if_ready(self, request_id: int) -> None:
         if request_id not in self._draining_rids:
             return
         if request_id in self._reads_done_sent:
@@ -2174,7 +2174,7 @@ class PreprocessWorkerThread:
             return  # let _process_read_tensors resolve the futures; retry
         self._send_reads_done(request_id)
 
-    def _send_reads_done(self, request_id: str) -> None:
+    def _send_reads_done(self, request_id: int) -> None:
         if request_id in self._reads_done_sent:
             return
         self._reads_done_sent.add(request_id)
@@ -2189,14 +2189,14 @@ class PreprocessWorkerThread:
             ),
         )
 
-    def _hard_cleanup(self, request_id: str) -> None:
+    def _hard_cleanup(self, request_id: int) -> None:
         """Phase-2 teardown: unconditionally drop all tensor state for the rid
         (unlink the input-signal SHM). Safe now that every reader has drained."""
         self._removed(request_id)
         self.tensor_manager.force_cleanup_request(request_id)
         self._drop_request_state(request_id)
 
-    def _removed(self, request_id: str) -> None:
+    def _removed(self, request_id: int) -> None:
         """A request under the rid is gone: no REMOVE_REQUEST comes for it again."""
         self._draining_rids.discard(request_id)
         self._reads_done_sent.discard(request_id)

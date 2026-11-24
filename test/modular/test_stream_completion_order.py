@@ -50,7 +50,7 @@ from mstar.worker.stream_buffers import StreamBufferManager
 PRODUCER = "worker_0"
 CONSUMER = "worker_1"
 EDGE = "new_token"
-RID = "r1"
+RID = (1 << 62) | 23
 
 
 class _Capture:

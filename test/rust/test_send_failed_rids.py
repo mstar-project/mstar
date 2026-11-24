@@ -32,7 +32,7 @@ def test_a_failed_rid_gets_no_completion_frame(failed):
         bookkeeping=book,
     )
     rid = rt.add_request(
-        request_id="r", partition="default", graph_walk="w",
+        request_id=100, partition="default", graph_walk="w",
         partition_worker_graph_ids=[0],
         worker_graph_to_workers=ParallelList([0], [["worker_0"]]),
         loop_caps={},
@@ -101,7 +101,7 @@ def test_a_failed_rid_sends_no_peer_edge_persist_or_emit_next_to_a_kept_one(tmp_
             worker_graph_to_workers=ParallelList([0, 1], [[me], [peer]]),
             loop_caps={},
         )
-        for name in ("failed", "kept")
+        for name in (101, 102)
     ]
     block = ColumnarEdgeSpecs.empty()
     for rid in rids:
@@ -140,8 +140,8 @@ def test_a_failed_rid_sends_no_peer_edge_persist_or_emit_next_to_a_kept_one(tmp_
 
     got = {entity: collect(box) for entity, box in inboxes.items()}
     assert sent_rids == [rids[1]]
-    assert [m.body.request_id for m in got[peer]] == ["kept"]
-    assert [m.body.request_id for m in got["api_server"]] == ["kept"]
+    assert [m.body.request_id for m in got[peer]] == [102]
+    assert [m.body.request_id for m in got["api_server"]] == [102]
     (done,) = got["conductor"]
-    assert done.body.request_id == "kept"
+    assert done.body.request_id == 102
     assert list(done.body.persist_signals) == ["keep"]

@@ -1,5 +1,4 @@
 import atexit
-import hashlib
 import itertools
 import logging
 import math
@@ -141,39 +140,16 @@ class DeadWorkerError(RuntimeError):
         self.exitcode = exitcode
 
 
-def _req_id_to_seed(req_id: str):
-    """Map a request id to a 32-bit seed.
-
-    Uses ``hashlib.md5`` rather than Python's builtin ``hash`` so the result
-    is **stable across processes**: Python salts ``hash`` per-interpreter via
-    ``PYTHONHASHSEED``, which would otherwise make the conductor's per-request
-    seed unpredictable from a client process. A deterministic mapping lets a
-    client pin ``request_id`` and reproduce the exact noise the server's
-    sampler will use, which is essential for noise-controlled debugging
-    (e.g. comparing Pi0.5 server output against a reference implementation).
-    """
-    digest = hashlib.md5(req_id.encode("utf-8")).digest()
-    return int.from_bytes(digest[:4], "little")
-
-
-def _request_seed(model_kwargs: dict, request_id: str) -> int:
-    """The request's seed: its explicit ``seed`` kwarg, else one from its id.
+def _request_seed(model_kwargs: dict, fallback_seed: int) -> int:
+    """The request's seed: its explicit ``seed`` kwarg, else the API fallback.
 
     Raises ``ValueError`` on a bad explicit seed (see ``check_seed``).
     """
     seed = model_kwargs.get("seed")
     if seed is None:
-        return _req_id_to_seed(request_id)
+        return fallback_seed
     check_seed(seed)
     return seed
-
-
-def _seed_id(body: NewRequestConductor) -> str:
-    """The id a derived seed comes from: the client's, so a pinned request_id
-    reproduces the same noise whatever key the API server ran it under."""
-    if body.client_request_id is None:
-        return body.request_id
-    return body.client_request_id
 
 
 def _pick_free_tcp_port() -> int:
@@ -501,11 +477,11 @@ class Conductor:
         adapters' digests pinned, say), which the workers are spawned with; None reads
         ``model_config_file``, which the model's placement methods read in any case. A
         LoRA adapter without its digest is refused either way."""
-        self.requests: dict[str, RequestData] = {}
+        self.requests: dict[int, RequestData] = {}
         self._arrivals = itertools.count()
         # Requests in teardown: kept in self.requests (so they still count toward
         # concurrency until their GPU state is freed) with barrier state here.
-        self.draining: dict[str, DrainingRequest] = {}
+        self.draining: dict[int, DrainingRequest] = {}
         # Backstop for a participant that never ACKs (crashed, hung, OOMed): the
         # barrier is force-finalized so one faulty worker can't hold a
         # concurrency slot — or the client's failure notification — forever.
@@ -513,17 +489,17 @@ class Conductor:
 
         # READS_DONE that arrived before the barrier was registered (the
         # preprocess worker self-drains on abort before we process ABORT_REQUEST).
-        self._early_reads_done: dict[str, set[str]] = {}
+        self._early_reads_done: dict[int, set[str]] = {}
         # Aborts for requests we haven't ingested yet: the preprocess worker
         # forwards ABORT_REQUEST from its abort queue before it finishes
         # preprocessing, so it can outrun the NEW_REQUEST it aborts.
-        self._early_abort_requests: set[str] = set()
+        self._early_abort_requests: set[int] = set()
         # (deadline, rid) FIFOs — expiry sweeps for the three above, so an entry
         # whose awaited message never arrives can't pile up. Deadlines are all
         # the same TTL from insertion, so each deque stays sorted.
-        self._draining_deadlines: deque[tuple[float, str]] = deque()
-        self._early_reads_done_deadlines: deque[tuple[float, str]] = deque()
-        self._early_abort_deadlines: deque[tuple[float, str]] = deque()
+        self._draining_deadlines: deque[tuple[float, int]] = deque()
+        self._early_reads_done_deadlines: deque[tuple[float, int]] = deque()
+        self._early_abort_deadlines: deque[tuple[float, int]] = deque()
 
         self.model = model
         self.hostname = hostname
@@ -661,7 +637,7 @@ class Conductor:
         self._status_interval_s = status_interval_s
         self._next_status = 0.0
         # request id -> when it was queued at capacity
-        self._queued_since: dict[str, float] = {}
+        self._queued_since: dict[int, float] = {}
         self._wg_nodes = {
             wg_id: tuple(wg.section.get_nodes()) for wg_id, wg in self.worker_graphs.items()
         }
@@ -1227,7 +1203,7 @@ class Conductor:
         return inputs_per_worker
 
     def _update_persist_ref_counts(
-        self, request_id: str, inputs: list[GraphEdge]
+        self, request_id: int, inputs: list[GraphEdge]
     ):
         """Update reference counts for persist signals in inputs."""
         ref_cnts = self.requests[request_id].persist_signal_ref_cnt
@@ -1238,7 +1214,7 @@ class Conductor:
                 ref_cnts[info.uuid] += 1
 
     def _un_persist_tensors(
-        self, request_id: str, tensor_info: list[TensorPointerInfo]
+        self, request_id: int, tensor_info: list[TensorPointerInfo]
     ):
         entity_id_to_msg = {}
         uuids = []
@@ -1301,7 +1277,7 @@ class Conductor:
             )
             return
         try:
-            _request_seed(body.model_kwargs or {}, _seed_id(body))
+            _request_seed(body.model_kwargs or {}, body.fallback_seed)
         except ValueError as exc:
             self._reject_request(body.request_id, str(exc), status=400)
             return
@@ -1366,7 +1342,7 @@ class Conductor:
                     body.request_id, request_data, failure_error=f"Ingest failed: {text}",
                 )
 
-    def _reject_request(self, request_id: str, error: str, status: int):
+    def _reject_request(self, request_id: int, error: str, status: int):
         """Fail a request that was never dispatched to any worker.
 
         Only the preprocess worker holds its input signals, so hard-remove
@@ -1400,7 +1376,7 @@ class Conductor:
         # Honor an explicit per-request seed (e.g. OpenAI ``seed``) when given;
         # otherwise derive a stable seed from the request id. ``_ingest_request``
         # already rejected a bad one.
-        seed = _request_seed(model_kwargs, _seed_id(body))
+        seed = _request_seed(model_kwargs, body.fallback_seed)
 
         partitions = self.model.get_partitions()
         topology = self.model.get_partition_topology()
@@ -1635,7 +1611,7 @@ class Conductor:
         return partition_wg_ids
 
     def _set_partition_worker_graph_ids(
-        self, request_id: str, partition_name: str, graph_walk: str,
+        self, request_id: int, partition_name: str, graph_walk: str,
     ):
         """Update the set of active worker graph IDs for a partition's walk."""
         pstate = self.requests[request_id].partition_states[partition_name]
@@ -1653,10 +1629,10 @@ class Conductor:
             for worker_id in worker_ids
         }
 
-    def _register_request(self, request_id: str, request_data: RequestData) -> None:
+    def _register_request(self, request_id: int, request_data: RequestData) -> None:
         self.requests[request_id] = request_data
 
-    def _drop_request(self, request_id: str) -> None:
+    def _drop_request(self, request_id: int) -> None:
         """The one way a request leaves ``self.requests``, so what the replica pick recorded cannot leak."""
         request_data = self.requests.pop(request_id, None)
         if request_data is not None and request_data.routing is not None:
@@ -1665,7 +1641,7 @@ class Conductor:
             ])
 
     def _register_draining(
-        self, request_id: str, expected_acks: set[str], participants: set[str],
+        self, request_id: int, expected_acks: set[str], participants: set[str],
         failure_error: str | None = None, failure_status: int = 500,
     ):
         """Start the teardown barrier for a request. Applies any READS_DONE that
@@ -1684,7 +1660,7 @@ class Conductor:
         if not expected_acks:
             self._finalize_draining(request_id)
 
-    def _send_drain(self, request_id: str, entities: set[str]):
+    def _send_drain(self, request_id: int, entities: set[str]):
         for entity in entities:
             self._send_for_teardown(
                 request_id, entity,
@@ -1694,7 +1670,7 @@ class Conductor:
                 ),
             )
 
-    def _send_remove_to_preprocess_worker(self, request_id: str):
+    def _send_remove_to_preprocess_worker(self, request_id: int):
         self._send_for_teardown(
             request_id, self.PREPROCESS_WORKER,
             WorkerMessage(
@@ -1703,7 +1679,7 @@ class Conductor:
             ),
         )
 
-    def _send_for_teardown(self, request_id: str, entity: str, message):
+    def _send_for_teardown(self, request_id: int, entity: str, message):
         """Send one teardown message; a send that raises is logged so it can't
         skip the sends, drain record or free that follow it. A dead peer does
         not raise (the send queues in the outbox), so this is only a
@@ -1716,7 +1692,7 @@ class Conductor:
                 _message_name(message), request_id, entity,
             )
 
-    def _finalize_draining(self, request_id: str):
+    def _finalize_draining(self, request_id: int):
         """Every reader has drained: send the hard RemoveRequest to all
         participants, notify the client on the fail path, then free state."""
         dr = self.draining.pop(request_id, None)
@@ -1823,7 +1799,7 @@ class Conductor:
                 # the other requests in the batch keep their own error
                 self._fail_after_error(rid, "failing it", exc)
 
-    def _abort_request(self, request_id: str):
+    def _abort_request(self, request_id: int):
         """Tear down a request the client abandoned, freeing its worker GPU state."""
         for i, body in enumerate(self.waiting_queue):
             if body.request_id == request_id:
@@ -1859,7 +1835,7 @@ class Conductor:
         self._remove_request(request_id, request_data)
 
     def _remove_request(
-        self, request_id: str, request_data: RequestData,
+        self, request_id: int, request_data: RequestData,
         failure_error: str | None = None,
     ):
         """Begin teardown for an abort/fail: drain every participant's reads,
@@ -1883,7 +1859,7 @@ class Conductor:
         )
 
     def _process_request_done(
-        self, request_id: str
+        self, request_id: int
     ):
         """Called when all partitions are done."""
         request_log.debug("Request %s done", request_id)
@@ -2053,7 +2029,7 @@ class Conductor:
 
         return done_partitions
 
-    def _process_done_forward(self, request_id: str, partition_name: str) -> bool:
+    def _process_done_forward(self, request_id: int, partition_name: str) -> bool:
         """Process a completed forward pass for a specific partition.
 
         Moves the partition's plan on (`_next_plan_args`). If the next step has
@@ -2228,7 +2204,7 @@ class Conductor:
         ]
 
     def _send_inputs(
-        self, request_id: str, partition_name: str, inputs: list[GraphEdge],
+        self, request_id: int, partition_name: str, inputs: list[GraphEdge],
         graph_walk: str, step_metadata: dict,
     ) -> dict[str, list[GraphEdge]]:
         """Split ``inputs`` over the ranks that consume them, count each rank as
@@ -2268,7 +2244,7 @@ class Conductor:
         return inputs_per_worker
 
     def _send_producer_done(
-        self, request_id: str, producer_partition: str, consumer_partition_name: str,
+        self, request_id: int, producer_partition: str, consumer_partition_name: str,
     ):
         """Send producer_done signal to the consumer partition's worker(s), for
         every stream between the two partitions."""
@@ -2314,7 +2290,7 @@ class Conductor:
             )
             self.communicator.send(worker_id, message)
 
-    def _send_client_route(self, request_id: str, workers: dict[str, list[str]]) -> None:
+    def _send_client_route(self, request_id: int, workers: dict[str, list[str]]) -> None:
         """Tell the data worker, which sends a request's client stream items to
         their consumers itself, where each of ``workers``' streams goes: its
         consuming node, which the data worker's own copy of the model can't
@@ -2398,7 +2374,7 @@ class Conductor:
             raise ValueError(f"Unknown message type: {message.message_type}")
 
     def _fail_after_error(
-        self, request_id: str | None, step: str, exc: Exception,
+        self, request_id: int | None, step: str, exc: Exception,
     ) -> None:
         """Fail the one request whose handling raised, through the drain barrier,
         so its client gets the error and its concurrency slot is freed.

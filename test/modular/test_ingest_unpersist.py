@@ -503,13 +503,13 @@ def test_a_walk_plan_sends_each_steps_inputs_and_releases_their_last_read(tmp_pa
         node = next(iter(walks[walk].get_nodes()))
         wg = c.node_walk_to_wg[(node, walk)].worker_graph_id
         reports.append([_msg(ConductorMessageType.WORKER_GRAPHS_DONE, WorkerGraphsDone(
-            request_id="r", worker_graph_ids=[wg], is_first_tp_rank=True, partition_name=partition,
+            request_id=101, worker_graph_ids=[wg], is_first_tp_rank=True, partition_name=partition,
             partition_done=done, graph_walk=walk,
             persist_signals={name: [_info(u, entity=worker[node], node=node, walk=walk)]
                              for name, u in persist.items()},
         ))])
     _run(c, [[_msg(ConductorMessageType.NEW_REQUEST, NewRequestConductor(
-        request_id="r", initial_signals=signals, initial_input_modalities=["text"],
+        request_id=101, initial_signals=signals, initial_input_modalities=["text"],
         initial_output_modalities=["text"], input_metadata={}, model_kwargs=kwargs,
     ))], *reports])
 
@@ -567,12 +567,12 @@ def test_a_plan_the_conductor_cant_run_is_refused(tmp_path, monkeypatch, caplog,
     nodes = sorted({n for w in walks.values() for n in w.get_nodes()})
     c = _conductor(_ToyModel(walks, plans, groups, connections=connections),
                    [{"node_names": nodes, "ranks": [0]}], tmp_path, monkeypatch)
-    _run(c, [[_new_request("r", {"x": [_info(PROMPT)]})]])
+    _run(c, [[_new_request(101, {"x": [_info(PROMPT)]})]])
 
     failed = [m.body for _, m in c.comm.sent if getattr(m, "message_type", None) == "request_failed"]
-    assert [(f.request_id, f.status) for f in failed] == [("r", status)]
+    assert [(f.request_id, f.status) for f in failed] == [(101, status)]
     assert message in (failed[0].error_message if status < 500 else caplog.text)
-    assert not _sends(c, ("NEW_REQUEST",)) and "r" not in c.requests
+    assert not _sends(c, ("NEW_REQUEST",)) and 101 not in c.requests
 
 
 def test_a_stream_moved_report_of_a_walk_its_plan_is_past_moves_nothing():
