@@ -461,9 +461,20 @@ class MicroScheduler:
         # only a fairness hint, and finishing a split set beats fairness --
         # except under ARRIVAL, where the rows holding a key's step keep it: a
         # yield-away from the chain running it leaves that backlog to it.
+        # Under an unmixed combined-walk yield-away (``skip_walk``), the
+        # chain's own rows stay parked and other constituent walks can refill
+        # the shared backlog, so defer ``exclude_target``'s backlog behind
+        # other backlogged keys and the policy order to avoid ping-ponging past
+        # competing keys.
+        defer = (
+            exclude_target
+            if skip_walk is not None and exclude_target in self._walks_of_key
+            else None
+        )
         keys = [
             k for k in self.backlog
-            if self._lane(k) == lane and not self._left_to_its_chain(k, exclude_target, skip_walk)
+            if self._lane(k) == lane and k != defer
+            and not self._left_to_its_chain(k, exclude_target, skip_walk)
         ]
         for key in keys:
             scheduled = schedule(key, ready.get(key, []))
@@ -479,12 +490,19 @@ class MicroScheduler:
         # scheduled, so round robin picks it again next pass anyway -- and
         # under a colocated model the node behind it is the one that frees
         # its pages (snac_decoder behind Orpheus's LLM).
+        tried = set(keys)
         for rr_key in self.policy.order(ready, self):
             if rr_key in keys:
                 continue  # already tried above, off its backlog
+            tried.add(rr_key)
             scheduled = schedule(rr_key, ready.get(rr_key, []))
             if scheduled is not None:
                 return scheduled
+        if (
+            defer is not None and defer in self.backlog
+            and self._lane(defer) == lane and defer not in tried
+        ):
+            return schedule(defer, ready.get(defer, []))
         return None
 
     def _lane(self, key: tuple[str, str]) -> int:
