@@ -101,6 +101,8 @@ class WeightOps:
                 self.weight_version = op.weight_version
                 self.weight_epoch = op.epoch
                 self.dirty = False
+                # outputs from here on carry it; nothing is in flight to mix
+                self._runtime.set_weight_version(op.weight_version)
                 logger.info(
                     "Worker %s: weights reloaded from %s as version %r",
                     self.worker_id, op.model_path, op.weight_version,

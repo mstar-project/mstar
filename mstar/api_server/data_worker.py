@@ -209,6 +209,8 @@ class InlineTokens:
     logprobs: list[float | None] | None = None
     # per request, the loop context of the step that produced the value
     loop_indices: list[NestedLoopIndices | None] | None = None
+    # the frame's metadata (its weight_version), shared by every value in it
+    metadata: dict = field(default_factory=dict)
 
 
 def _answer_late(on_late: Callable[[str], None] | None, streams: list[str]) -> None:
@@ -216,6 +218,11 @@ def _answer_late(on_late: Callable[[str], None] | None, streams: list[str]) -> N
     more items."""
     if streams and on_late is not None:
         on_late(f"the call's {', '.join(map(repr, sorted(streams)))} input has ended")
+
+
+# A frame without metadata shares this one; nothing writes to a frame's
+# metadata (each chunk builds its own).
+_NO_METADATA: dict = {}
 
 
 def unlink_files(file_paths: dict[str, list[str]] | None) -> None:
@@ -472,10 +479,12 @@ class PreprocessWorker:
         self, request_ids: list[str], values: list[int], signal: str, modality: str,
         logprobs: list[float | None] | None = None,
         loop_indices: list[NestedLoopIndices | None] | None = None,
+        metadata: dict | None = None,
     ):
         """A frame's values that rode inline: the same accounting per request
         as a result tensor, no transport read and nothing to ack. A request
-        already cleaned up is dropped."""
+        already cleaned up is dropped. ``metadata`` is the frame's (its
+        weight_version), shared by every value in it."""
         counts_by_rid = self.received_chunk_counts
         reading = self.per_request_reading_tensors
         kept_ids: list[str] = []
@@ -497,7 +506,10 @@ class PreprocessWorker:
                 kept_loops.append(loop_indices[i])
         if kept_ids:
             self.result_tensor_input_queue.put(
-                InlineTokens(kept_ids, kept_values, modality, kept_logprobs or None, kept_loops or None)
+                InlineTokens(
+                    kept_ids, kept_values, modality, kept_logprobs or None,
+                    kept_loops or None, metadata or _NO_METADATA,
+                )
             )
             self._signal()
 
@@ -1669,6 +1681,7 @@ class PreprocessWorkerThread:
         self, request_id: str, exc: BaseException, stage: str, count: int = 1,
         sequence: int | None = None, abort: bool = True, traceback: bool = True,
         intake: bool = False,
+        weight_version: str | None = None,
     ):
         """Report a per-request data-worker failure to the API server.
 
@@ -1690,6 +1703,9 @@ class PreprocessWorkerThread:
         ``intake`` marks a failure while taking client input in (a request or
         an append), where a ValueError or TypeError refuses it (a 400). Past
         intake one is a server bug like any other error (a 500).
+
+        ``weight_version`` is the failed output's, from its frame, so the error
+        chunk carries it like the chunk it replaces would have.
         """
         status = 400 if intake and isinstance(exc, (ValueError, TypeError)) else 500
         text, _ = client_error_text(
@@ -1701,7 +1717,8 @@ class PreprocessWorkerThread:
                 request_id=request_id,
                 modality="error",
                 data=f"{stage} failed: {text}".encode("utf-8"),
-                metadata={"status": status},
+                metadata={"status": status} if weight_version is None
+                else {"status": status, "weight_version": weight_version},
             )
             for _ in range(max(count, 1))
         ]
@@ -1780,6 +1797,8 @@ class PreprocessWorkerThread:
         """Postprocess a frame's inline values in one model call and queue each
         request's chunk, in arrival order with its tensor results."""
         rids, values, logprobs, loops = item.request_ids, item.values, item.logprobs, item.loop_indices
+        # one version for the whole frame, read once rather than per value
+        version = item.metadata.get("weight_version")
         if self._draining_rids:
             keep = [i for i, rid in enumerate(rids) if rid not in self._draining_rids]
             rids = [rids[i] for i in keep]
@@ -1819,6 +1838,8 @@ class PreprocessWorkerThread:
                 else:
                     data = datas[i]
                 metadata = {} if not logprobs or logprobs[i] is None else {"logprobs": [logprobs[i]]}
+                if version is not None:
+                    metadata["weight_version"] = version
                 if self._wants_token_ids(request_id, item.modality):
                     metadata["token_ids"] = [values[i]]
                 if self._turn_tokens:
@@ -1837,7 +1858,7 @@ class PreprocessWorkerThread:
             except Exception as exc:  # noqa: BLE001 — must reach the client
                 self._fail_request(
                     request_id, exc, f"{item.modality} output postprocessing",
-                    sequence=sequence,
+                    sequence=sequence, weight_version=version,
                 )
 
     def _wants_token_ids(self, request_id: str, modality: str) -> bool:
@@ -1888,11 +1909,12 @@ class PreprocessWorkerThread:
         metadata = self.tensor_uuid_to_metadata_per_request.get(request_id, {})
         for edge in failed.graph_edges:
             for info in edge.tensor_info:
-                metadata.pop(info.uuid, None)
+                frame = metadata.pop(info.uuid, None) or {}
                 slot = state.order.pop(info.uuid, None) if state is not None else None
                 self._fail_request(
                     request_id, failed.error, "output tensor read",
                     sequence=slot[0] if slot is not None else None, traceback=False,
+                    weight_version=frame.get("weight_version"),
                 )
 
     def _postprocess_inline(
@@ -2025,6 +2047,7 @@ class PreprocessWorkerThread:
             except Exception as exc:  # noqa: BLE001 — must reach the client
                 self._fail_request(
                     out.request_id, exc, f"{out.modality} output postprocessing", sequence=out.sequence,
+                    weight_version=(out.metadata or {}).get("weight_version"),
                 )
                 continue
             self._queue_completed_output(
@@ -2082,9 +2105,11 @@ class PreprocessWorkerThread:
                                 loop_indices, read_time,
                             )
                     except Exception as exc:  # noqa: BLE001 — must reach the client
+                        frame = self.tensor_uuid_to_metadata_per_request.get(
+                            request_id, {}).get(tensor_info.uuid) or {}
                         self._fail_request(
                             request_id, exc, f"{modality} output postprocessing",
-                            sequence=sequence,
+                            sequence=sequence, weight_version=frame.get("weight_version"),
                         )
                     self.tensor_uuid_to_metadata_per_request.get(
                         request_id, {}
@@ -2400,6 +2425,7 @@ class PreprocessWorkerThread:
                                 result.request_id, exc,
                                 f"{result.modality} output transfer",
                                 count=len(result.graph_edge.tensor_info),
+                                weight_version=result.metadata.get("weight_version"),
                             )
                     # one wake per item, and so per step
                     flush_results()

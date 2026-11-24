@@ -207,6 +207,8 @@ pub struct GraphRuntime {
 
     /// A postprocess parked at a break (`begin_postprocess`).
     postprocess: Option<postprocess::Postprocess>,
+    /// Stamped on every result frame; see `set_weight_version`.
+    weight_version: Option<String>,
 }
 
  impl GraphRuntime {
@@ -1698,6 +1700,7 @@ impl GraphRuntime {
             postprocess: None,
             bookkeeping: bookkeeping.share(),
             communicator: communicator.map(|c| c.share()),
+            weight_version: None,
         })
     }
 
@@ -1900,6 +1903,13 @@ impl GraphRuntime {
         // worker drops its outputs on a speculative new iteration and prep
         // excludes it from speculation.
         self.pending_loop_stops.retain(|&(r, _, _)| r != rid);
+    }
+
+    /// The version stamped on every result frame from now on; the worker
+    /// sets it once a reload copies, None until then.
+    #[pyo3(signature = (version))]
+    fn set_weight_version(&mut self, version: Option<String>) {
+        self.weight_version = version;
     }
 
     /// `(requests, parked_routes, staged_specs)`: requests still registered,
@@ -4289,6 +4299,7 @@ impl GraphRuntime {
                         infos,
                         loop_indices,
                         logprob: plan.logprobs.get(&rid).copied(),
+                        weight_version: self.weight_version.as_deref(),
                     }
                     .encode(&self.interner, bk.strings())
                 };
@@ -4335,6 +4346,7 @@ impl GraphRuntime {
                         signal: &signal,
                         modality: &modality,
                         logprobs: &logprobs,
+                        weight_version: self.weight_version.as_deref(),
                     }
                     .encode(&self.interner);
                     frames.push(("api_server".to_string(), bytes));

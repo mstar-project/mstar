@@ -153,6 +153,19 @@ class _Server:
             yield _Chunk("text", b"partial")
             yield _Chunk("error", b"the engine gave up", {"status": 503})
             return
+        if call["text"] == "fail later v1":
+            yield _Chunk("text", b"partial", {"weight_version": "v1"})
+            yield _Chunk("error", b"the engine gave up", {"status": 503, "weight_version": "v1"})
+            return
+        if call["text"] == "fail now v1":
+            yield _Chunk("error", b"the engine gave up", {"status": 500, "weight_version": "v1"})
+            return
+        if call["text"] == "fail now":
+            yield _Chunk("error", b"the engine gave up", {"status": 500})
+            return
+        if call["text"] == "ok v1":
+            yield _Chunk("text", b"ok", {"weight_version": "v1"})
+            return
         yield _Chunk("text", json.dumps({"inputs": call["inputs"]}).encode())
         yield _Chunk("audio", b"\x00\x01\xff", {"sample_rate": 24000})
 
@@ -297,6 +310,34 @@ def test_a_refused_message_reads_as_pythons(stacks, monkeypatch, binary):
     for rid in [f"e{i}" for i in range(1, 12)] + ["x" * 200]:
         assert rust.get(rid) == py.get(rid), rid
     assert rust["None"] == py["None"]
+
+
+@pytest.mark.parametrize("binary", [False, True], ids=["json", "msgpack"])
+def test_an_error_reply_carries_the_error_chunks_weight_version_as_pythons(stacks, monkeypatch, binary):
+    messages = [
+        {"request_id": "after-v1", "text": "fail later v1"},
+        {"request_id": "only-v1", "text": "fail now v1"},
+        {"request_id": "after-none", "text": "fail later"},
+        {"request_id": "only-none", "text": "fail now"},
+        {"request_id": "ok-v1", "text": "ok v1"},
+    ]
+    (py, _), (rust, _) = _both(stacks, monkeypatch, False, messages, binary=binary)
+    assert rust == py
+    assert rust["after-v1"][-1] == {
+        "request_id": "after-v1",
+        "error": "the engine gave up",
+        "status": 503,
+        "weight_version": "v1",
+    }
+    assert rust["only-v1"] == [{
+        "request_id": "only-v1",
+        "error": "the engine gave up",
+        "status": 500,
+        "weight_version": "v1",
+    }]
+    assert "weight_version" not in rust["after-none"][-1]
+    assert "weight_version" not in rust["only-none"][0]
+    assert rust["ok-v1"][-1] == {"request_id": "ok-v1", "finish": True}
 
 
 def test_an_undecodable_frame_is_answered_and_the_socket_goes_on(stacks, monkeypatch):
