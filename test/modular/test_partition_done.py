@@ -482,3 +482,64 @@ def test_producer_triggered_out_of_order_reports_overlapping_and_disjoint_wgs():
         ("walk_a", False, [(0, 0)]),
         ("walk_b", True, [(1, 0)]),
     ]
+
+
+def test_producer_triggered_disjoint_three_walk_prefers_plan_order_over_wg_id():
+    """When disjoint producer-triggered walks arrive out of order with
+    wg_id(walk_b) > wg_id(walk_c) and walk_c has partition_done=True, Conductor
+    must close walk_b before walk_c following pstate.plan order."""
+    from types import SimpleNamespace
+
+    c, req, _ = _conductor()
+    c.enable_prof = False
+    c.producer_triggered_partitions = {"B"}
+    c._walk_inputs = {**c._walk_inputs, "walk_a": (), "walk_b": (), "walk_c": ()}
+    c._walk_persists = {
+        **c._walk_persists,
+        "walk_a": frozenset(), "walk_b": frozenset(), "walk_c": frozenset(),
+    }
+    c.worker_graphs = {
+        0: SimpleNamespace(graph_walks={"walk_a"}),
+        1: SimpleNamespace(graph_walks={"walk_c"}),
+        2: SimpleNamespace(graph_walks={"walk_b"}),
+    }
+    req.all_worker_graph_ids = {0, 1, 2}
+    req.worker_graph_to_workers = {0: ["w0_0", "w0_1"], 1: ["w1_0"], 2: ["w2_0"]}
+    pstate = req.partition_states["B"]
+    pstate.plan = [WalkStep("walk_a"), WalkStep("walk_b"), WalkStep("walk_c")]
+    pstate.graph_walk = "walk_a"
+    pstate.current_worker_graph_ids = {0}
+    wg_map = {"walk_a": {0}, "walk_b": {2}, "walk_c": {1}}
+    c._set_partition_worker_graph_ids = lambda rid, pname, walk: setattr(
+        pstate, "current_worker_graph_ids", wg_map[walk],
+    )
+
+    assert c._process_worker_graphs_done(WorkerGraphsDone(
+        request_id="r", partition_name="B", worker_graph_ids=[0], is_first_tp_rank=True,
+        graph_walk="walk_a", worker_id="w0_0", pass_ids=[0],
+    )) == []
+    assert c._process_worker_graphs_done(WorkerGraphsDone(
+        request_id="r", partition_name="B", worker_graph_ids=[1], is_first_tp_rank=True,
+        graph_walk="walk_c", worker_id="w1_0", pass_ids=[0], partition_done=True,
+    )) == []
+    assert c._process_worker_graphs_done(WorkerGraphsDone(
+        request_id="r", partition_name="B", worker_graph_ids=[2], is_first_tp_rank=True,
+        graph_walk="walk_b", worker_id="w2_0", pass_ids=[0], partition_done=False,
+    )) == []
+    queued = c._process_worker_graphs_done(WorkerGraphsDone(
+        request_id="r", partition_name="B", worker_graph_ids=[0], is_first_tp_rank=False,
+        graph_walk="walk_a", worker_id="w0_1", pass_ids=[0],
+    ))
+    assert queued == ["B", "B", "B"]
+    assert [(w, d, list(k)) for w, d, k in pstate.ready_passes] == [
+        ("walk_a", False, [(0, 0)]),
+        ("walk_b", False, [(2, 0)]),
+        ("walk_c", True, [(1, 0)]),
+    ]
+
+    for _ in range(3):
+        c._process_done_forward("r", "B")
+    assert pstate.graph_walk == "walk_c"
+    assert pstate.cursor == 1
+    assert pstate.fwd_pass_number == 3
+    assert pstate.is_done is True

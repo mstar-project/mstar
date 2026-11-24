@@ -1533,3 +1533,232 @@ def test_dropped_row_in_resume_postprocess_stops_does_not_leak_partition_done(tm
 
     wgds = [m.body for m in _collect(conductor) if isinstance(m.body, WorkerGraphsDone)]
     assert [(w.pass_ids, w.partition_done) for w in wgds] == [([0], False)]
+
+
+@pytest.mark.parametrize("mode", ["commit_false", "follow_rollback"])
+def test_spec_rollback_does_not_leave_zombie_pass_across_set_walk(tmp_path, mode):
+    """Rolling back a speculative Pass 1 (via commit_speculation(..., False) or
+    prep_follow_spec_rids failure) must pop the empty PassState so a subsequent
+    set_walk('walk_b') runs in (walk_b, 0) across all WGs without dropping
+    partition_done on peer WGs."""
+    book = RustTensorBookkeeping()
+    comm = ZmqCommunicator(ME, str(tmp_path))
+    conductor = ZmqCommunicator("conductor", str(tmp_path))
+    wgs = [
+        {
+            "wg_id": 0, "graph_walks": ["walk_a", "walk_b"],
+            "nodes": [{
+                "name": "vocoder", "async_enabled": True,
+                "inputs": ["codes"], "streaming_inputs": ["codes"],
+                "outputs": [{
+                    "name": "wave", "dest": "post", "persist": False,
+                    "new_token": False, "streaming": False, "modality": "",
+                }],
+            }],
+            "loops": [],
+        },
+        {
+            "wg_id": 1, "graph_walks": ["walk_a", "walk_b"],
+            "nodes": [{
+                "name": "post", "async_enabled": False,
+                "inputs": ["wave"], "streaming_inputs": [],
+                "outputs": [{
+                    "name": "audio", "dest": "emit_to_client", "persist": False,
+                    "new_token": False, "streaming": False, "modality": "audio",
+                }],
+            }],
+            "loops": [],
+        },
+    ]
+    rt = GraphRuntime(
+        worker_graphs=wgs, remote_worker_graphs=[],
+        sharding={"groups": [], "shard_dim": [], "tp_enabled_nodes": []},
+        bookkeeping=book._rust, me=ME, communicator=comm,
+    )
+    r1 = rt.add_request("r1", "P", "walk_a", [0, 1], [0, 1], [ME, ME], [1, 1], [], [])
+    r2 = rt.add_request("r2", "P", "walk_a", [0, 1], [0, 1], [ME, ME], [1, 1], [], [])
+    for u in (100, 101, 102, 200, 201, 300, 301):
+        book.put_tensor(u, _info(u))
+        book.increment_ref(u, 1)
+
+    blk = ColumnarEdgeSpecs.empty()
+    blk.add(r1, "codes", [100], False, next_node="vocoder")
+    assert rt.ingest_inputs_batch(blk, False, True) == []
+    assert rt.pop_rids("vocoder", "walk_a", [r1], True) is not None
+
+    if mode == "commit_false":
+        prep = rt.prep_spec_rids({
+            "spec_node_name": "vocoder", "curr_node_name": "vocoder",
+            "graph_walk": "walk_a", "rids": [r1], "room_for_continuing": None,
+            "streaming_edges": [
+                {"signal": "codes", "uuids": [101], "is_final_streaming_chunk": False},
+            ],
+            "streaming_edges_per_rid": [1], "loop_strides": None,
+        })
+        assert prep.ready_rids == [r1]
+        assert prep.spec_id != 0
+        rt.commit_speculation(prep.spec_id, False)
+    else:
+        # r1 succeeds and allocates Pass 1; r2 fails, triggering follower rollback.
+        prep = rt.prep_follow_spec_rids({
+            "spec_node_name": "vocoder", "curr_node_name": "vocoder",
+            "graph_walk": "walk_a", "rids": [r1, r2], "room_for_continuing": None,
+            "streaming_edges": [
+                {"signal": "codes", "uuids": [101], "is_final_streaming_chunk": False},
+            ],
+            "streaming_edges_per_rid": [1, 0], "loop_strides": None,
+        })
+        assert prep is None
+
+    def _finish_step(rid, walk, node, sig, uuid_out, mark_done=False):
+        fwd = CurrentForwardPassInfo(
+            request_id="r1", graph_walk=walk, fwd_index=0, random_seed=0,
+            max_tokens=8, partition_name="P",
+        )
+        info = encode_field(fwd, CurrentForwardPassInfo)
+        route = rt.complete_and_route_batch({
+            "partition": "P", "graph_walk": walk, "node_name": node,
+            "output_signals": [sig], "rids": [rid],
+            "tensors": [uuid_out], "num_tensors": [1],
+            "walks": None, "rid_walk_idx": None,
+        })
+        if mark_done:
+            rt.mark_partition_done(rid, "P")
+        _send(rt, route.completion_id, request_infos=[(rid, info)])
+
+    _finish_step(r1, "walk_a", "vocoder", "wave", 200)
+    assert rt.pop_rids("post", "walk_a", [r1], True) is not None
+    _finish_step(r1, "walk_a", "post", "audio", 201)
+
+    assert rt.is_partition_idle(r1, "P")
+    assert rt.set_walk(r1, "P", "walk_b")
+
+    blk_b = ColumnarEdgeSpecs.empty()
+    blk_b.add(r1, "codes", [102], True, next_node="vocoder")
+    assert rt.ingest_inputs_batch(blk_b, False, True) == []
+    assert rt.pop_rids("vocoder", "walk_b", [r1], True) is not None
+    _finish_step(r1, "walk_b", "vocoder", "wave", 300, mark_done=True)
+    assert rt.pop_rids("post", "walk_b", [r1], True) is not None
+    _finish_step(r1, "walk_b", "post", "audio", 301)
+
+    wgds = [m.body for m in _collect(conductor) if isinstance(m.body, WorkerGraphsDone)]
+    assert [
+        (w.worker_graph_ids, w.graph_walk, w.pass_ids, w.partition_done)
+        for w in wgds
+    ] == [
+        ([0], "walk_a", [0], False),
+        ([1], "walk_a", [0], False),
+        ([0], "walk_b", [1], True),
+        ([1], "walk_b", [1], True),
+    ]
+
+
+def test_mark_partition_done_for_other_partition_while_postprocess_parked(tmp_path):
+    """While P1 is parked in begin_postprocess (NEED_STOPS), mark_partition_done(rid, 'P2')
+    after complete_and_route_batch('P2') must attach to P2's parked completion instead
+    of falling back to pending_partition_done and leaking to P2's next pass."""
+    book = RustTensorBookkeeping()
+    comm = ZmqCommunicator(ME, str(tmp_path))
+    conductor = ZmqCommunicator("conductor", str(tmp_path))
+    wgs = [
+        {
+            "wg_id": 0, "graph_walks": ["w1"],
+            "nodes": [{
+                "name": "p1_node", "async_enabled": False,
+                "inputs": ["x"], "streaming_inputs": [],
+                "outputs": [{
+                    "name": "x", "dest": "p1_node", "persist": False,
+                    "new_token": False, "streaming": False, "modality": "",
+                }],
+            }],
+            "loops": [{
+                "name": "L1", "max_iters": 2, "parent": None,
+                "member_nodes": ["p1_node"], "outputs": [], "accumulated": [],
+                "loop_back": [("x", "p1_node")], "external_inputs": [],
+            }],
+        },
+        {
+            "wg_id": 1, "graph_walks": ["w2"],
+            "nodes": [
+                {
+                    "name": "n2a", "async_enabled": False,
+                    "inputs": ["in2"], "streaming_inputs": ["in2"],
+                    "outputs": [{
+                        "name": "mid2", "dest": "n2b", "persist": False,
+                        "new_token": False, "streaming": False, "modality": "",
+                    }],
+                },
+                {
+                    "name": "n2b", "async_enabled": False,
+                    "inputs": ["mid2"], "streaming_inputs": [],
+                    "outputs": [{
+                        "name": "out2", "dest": "emit_to_client", "persist": False,
+                        "new_token": False, "streaming": False, "modality": "text",
+                    }],
+                },
+            ],
+            "loops": [],
+        },
+    ]
+    rt = GraphRuntime(
+        worker_graphs=wgs, remote_worker_graphs=[],
+        sharding={"groups": [], "shard_dim": [], "tp_enabled_nodes": []},
+        bookkeeping=book._rust, me=ME, communicator=comm,
+    )
+    rid = rt.add_request("r1", "P1", "w1", [0], [0, 1], [ME, ME], [1, 1], ["L1"], [2])
+    rt.add_request("r1", "P2", "w2", [1], [0, 1], [ME, ME], [1, 1], [], [])
+    for u in (10, 11, 20, 21, 30, 31):
+        book.put_tensor(u, _info(u))
+        book.increment_ref(u, 1)
+
+    blk1 = ColumnarEdgeSpecs.empty()
+    blk1.add(rid, "x", [], False, next_node="p1_node")
+    assert rt.ingest_inputs_batch(blk1) == []
+    assert rt.pop_rids("p1_node", "w1", [rid], True) is not None
+
+    # Park P1 at NEED_STOPS (runtime_stops=True with no registered stop limits).
+    step = rt.begin_postprocess(
+        "P1", "p1_node", "w1", ["x"], [rid], None, None,
+        [], [], True, 0, 0, 0, "int64", [],
+        [], 0, 0, 0, "int64", [], True, None, 1,
+    )
+    assert step.need == 1  # NEED_STOPS
+
+    # Run P2 Pass 0 (n2a -> n2b, unmarked) and Pass 1 (n2a marked done) while P1 is parked.
+    fwd2 = CurrentForwardPassInfo(
+        request_id="r1", graph_walk="w2", fwd_index=0, random_seed=0,
+        max_tokens=8, partition_name="P2",
+    )
+    info2 = encode_field(fwd2, CurrentForwardPassInfo)
+    for in_u, mid_u, out_u, final in ((10, 20, 30, False), (11, 21, 31, True)):
+        blk2 = ColumnarEdgeSpecs.empty()
+        blk2.add(rid, "in2", [in_u], final, next_node="n2a")
+        assert rt.ingest_inputs_batch(blk2, False, True) == []
+        assert rt.pop_rids("n2a", "w2", [rid], True) is not None
+        r_a = rt.complete_and_route_batch({
+            "partition": "P2", "graph_walk": "w2", "node_name": "n2a",
+            "output_signals": ["mid2"], "rids": [rid],
+            "tensors": [mid_u], "num_tensors": [1],
+            "walks": None, "rid_walk_idx": None,
+        })
+        if final:
+            rt.mark_partition_done(rid, "P2")
+        _send(rt, r_a.completion_id, request_infos=[(rid, info2)])
+
+        assert rt.pop_rids("n2b", "w2", [rid], True) is not None
+        r_b = rt.complete_and_route_batch({
+            "partition": "P2", "graph_walk": "w2", "node_name": "n2b",
+            "output_signals": ["out2"], "rids": [rid],
+            "tensors": [out_u], "num_tensors": [1],
+            "walks": None, "rid_walk_idx": None,
+        })
+        _send(rt, r_b.completion_id, request_infos=[(rid, info2)])
+
+    wgds = [m.body for m in _collect(conductor) if isinstance(m.body, WorkerGraphsDone)]
+    assert [
+        (w.worker_graph_ids, w.pass_ids, w.partition_done)
+        for w in wgds
+    ] == [
+        ([1], [0], False),
+        ([1], [1], True),
+    ]

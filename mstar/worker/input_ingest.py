@@ -90,6 +90,7 @@ class InputIngest:
         self._pending_normal_inputs: dict[int, deque[GraphEdge]] = {}
         self._pending_walk_transitions: dict[tuple[int, str], deque[tuple[object, list[GraphEdge]]]] = {}
         self._pending_walk_reads: dict[tuple[int, str], set[object]] = {}
+        self._failed_intake_rids: set[int] = set()
         self.lora_loads = LoraLoads(services)
         self._handlers = {
             WorkerMessageType.NEW_REQUEST: self._add_new_request,
@@ -231,10 +232,25 @@ class InputIngest:
                 self._streams.add_request(rid, body.request_info)
                 laps.lap("stream_buffers")
 
-                # Start RDMA reads for tensors that have tensor_info
-                self._wakeup_event.register_futures(self._tensors.start_read_tensors(
-                    rid, body.initial_inputs, graph_walk=body.request_info.graph_walk,
-                ))
+                # Track non-streaming initial tensor reads so a concurrent or
+                # parked INPUT_SIGNALS for another walk cannot call set_walk
+                # before initial_inputs finish arriving.
+                non_streaming_initial = [
+                    edge for edge in body.initial_inputs if not edge.is_streaming
+                ]
+                self._record_pending_walk_reads(
+                    rid, body.request_info.partition_name, non_streaming_initial,
+                )
+                try:
+                    # Start RDMA reads for tensors that have tensor_info
+                    self._wakeup_event.register_futures(self._tensors.start_read_tensors(
+                        rid, body.initial_inputs, graph_walk=body.request_info.graph_walk,
+                    ))
+                except Exception:
+                    self._discard_pending_walk_reads(
+                        rid, body.request_info.partition_name, non_streaming_initial,
+                    )
+                    raise
                 laps.lap("start_reads")
 
                 # Signal-only edges (tensor_info is None) can be processed immediately
@@ -423,9 +439,9 @@ class InputIngest:
 
     def remove_request(self, rid: int) -> None:
         self._pending_normal_inputs.pop(rid, None)
-        for key in [k for k in self._pending_walk_transitions if k[0] == rid]:
-            del self._pending_walk_transitions[key]
+        self._clear_pending_walk_transitions_for_rid(rid)
         self._clear_pending_walk_reads_for_rid(rid)
+        self._failed_intake_rids.discard(rid)
 
     def _edge_partition(self, node_name: str) -> str | None:
         part = self._layout.node_to_partition.get(node_name)
@@ -461,6 +477,26 @@ class InputIngest:
     def _clear_pending_walk_reads_for_rid(self, rid: int) -> None:
         for key in [k for k in self._pending_walk_reads if k[0] == rid]:
             del self._pending_walk_reads[key]
+
+    def _clear_pending_walk_transitions_for_rid(self, rid: int, ack_unread: bool = False) -> None:
+        for key in [k for k in self._pending_walk_transitions if k[0] == rid]:
+            queue = self._pending_walk_transitions.pop(key)
+            if ack_unread:
+                for _, edges in queue:
+                    self._tensors.ack_unread_tensors(edges)
+
+    def _is_walk_transition_blocked(self, rid: int) -> bool:
+        if rid not in self._request_state.per_request_info or rid in self._lifecycle.pending_removes:
+            return True
+        if rid in self._failed_intake_rids:
+            return True
+        if rid in self._lifecycle.failed_rids:
+            if not self._lifecycle._is_tp_follower:
+                return True
+            wire_rid = self._runtime.get_rid_string(rid)
+            if not wire_rid or not self._lifecycle.takes_input(wire_rid):
+                return True
+        return False
 
     def _clear_pending_walk_reads_for_edges(self, rid: int, edges: list[GraphEdge]) -> None:
         if not self._pending_walk_reads:
@@ -514,8 +550,11 @@ class InputIngest:
             return
         for key in list(self._pending_walk_transitions):
             rid, partition_name = key
-            if rid not in self._request_state.per_request_info or rid in self._lifecycle.pending_removes:
-                self._pending_walk_transitions.pop(key, None)
+            if self._is_walk_transition_blocked(rid):
+                queue = self._pending_walk_transitions.pop(key, None)
+                if queue:
+                    for _, edges in queue:
+                        self._tensors.ack_unread_tensors(edges)
                 continue
             queue = self._pending_walk_transitions[key]
             while queue:
@@ -618,6 +657,10 @@ class InputIngest:
         nothing else would fail them, and the rest of the drained messages
         would be lost. Recorded for a TP step's read check, as a failed read
         is (see ``check_ready_tensors``), and reported once per request."""
+        for rid in rids:
+            self._failed_intake_rids.add(rid)
+            self._clear_pending_walk_reads_for_rid(rid)
+            self._clear_pending_walk_transitions_for_rid(rid, ack_unread=True)
         self._lockstep.record_read_failures(
             r for r in rids if r in self._request_state.per_request_info
         )
@@ -647,7 +690,9 @@ class InputIngest:
         failed_reads = self._tensors.take_failed_reads()
         if failed_reads:
             for f in failed_reads:
+                self._failed_intake_rids.add(f.request_id)
                 self._clear_pending_walk_reads_for_rid(f.request_id)
+                self._clear_pending_walk_transitions_for_rid(f.request_id, ack_unread=True)
             self._lockstep.record_read_failures(
                 f.request_id for f in failed_reads
                 if f.request_id in self._request_state.per_request_info

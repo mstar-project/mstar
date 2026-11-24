@@ -1244,3 +1244,115 @@ def test_two_node_loop_back_speculation_targets_curr_pass_without_phantom_pass()
     assert pop_a1 is not None
     got = {e.signal: e.uuids for e in pop_a1.input_edges.edge_tuples()}
     assert got == {"codes": [101], "ext": [10], "lb": [201]}
+
+
+def test_prep_spec_rids_refuses_cross_walk_next_pass():
+    """When Pass 0 runs walk_a (`n_a`) and Pass 1 belongs to walk_b (`n_b`) on
+    the same WG, prep_spec_rids for `n_a -> n_a` in walk_a must NOT ingest
+    walk_a's chunk into walk_b's Pass 1."""
+    n_a = GraphNode(name="n_a", input_names={"codes"}, outputs=[])
+    n_a._register_streaming({"codes"})
+    n_b = GraphNode(name="n_b", input_names={"b_in"}, outputs=[])
+    src_b = GraphNode(name="src_b", input_names={"go"}, outputs=[GraphEdge(name="b_in", next_node="n_b")])
+    wg0 = WorkerGraph(
+        section=Sequential(sections=[n_a, n_b]),
+        graph_walks={"walk_a", "walk_b"},
+        ranks=[0],
+        worker_graph_id=WG_ID,
+    )
+    wg1 = WorkerGraph(
+        section=src_b,
+        graph_walks={"walk_b"},
+        ranks=[0],
+        worker_graph_id=1,
+    )
+    book = RustTensorBookkeeping()
+    rt = rust_runtime.RustGraphRuntime(
+        my_worker_id=WORKER,
+        my_worker_graphs=[wg0, wg1],
+        all_wg_ids_to_graph_walks={WG_ID: {"walk_a", "walk_b"}, 1: {"walk_b"}},
+        all_wg_ids_to_dyn_loops={WG_ID: set(), 1: set()},
+        all_wg_ids_to_nodes={WG_ID: {"n_a", "n_b"}, 1: {"src_b"}},
+        node_to_partition={"n_a": "P1", "n_b": "P2", "src_b": "P2"},
+        sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
+        bookkeeping=book,
+    )
+    wg_workers = ParallelList([WG_ID, 1], [[WORKER], [WORKER]])
+    rid = rt.add_request(
+        request_id="r1",
+        partition="P1",
+        graph_walk="walk_a",
+        partition_worker_graph_ids=[WG_ID],
+        worker_graph_to_workers=wg_workers,
+        loop_caps={},
+    )
+    rt.add_request(
+        request_id="r1",
+        partition="P2",
+        graph_walk="walk_b",
+        partition_worker_graph_ids=[WG_ID, 1],
+        worker_graph_to_workers=wg_workers,
+        loop_caps={},
+    )
+    for u in (100, 101, 200, 201):
+        book.put_tensor(u, _tensor_info(u))
+        book.increment_ref(u, 1)
+
+    # Pass 0 (walk_a): ingest n_a.
+    assert rt.ingest_inputs_batch(_ingest_block(
+        [rid], [_spec("codes", "n_a", [100])],
+    )) == []
+
+    # Route b_in from wg1 (walk_b) -> n_b (wg0) twice so Pass 1 on wg0 is allocated with walk_b.
+    for out_u in (200, 201):
+        assert rt.ingest_inputs_batch(_ingest_block(
+            [rid], [_spec("go", "src_b", [])],
+        )) == []
+        rt.pop_rids("src_b", "walk_b", [rid])
+        out_src = rt.complete_and_route_batch(RouteInput(
+            partition="P2",
+            graph_walk="walk_b",
+            node_name="src_b",
+            output_signals=["b_in"],
+            wg_ids=ParallelList([rid], [1]),
+            tensors=[out_u],
+            num_tensors=[1],
+        ))
+        rt.send_outputs(_send_input(rid, out_src.completion_id))
+
+    rt.pop_rids("n_a", "walk_a", [rid])
+
+    # Speculate n_a -> n_a in walk_a: Pass 1 belongs to walk_b, so prep must refuse.
+    prep = rt.prep_spec_rids(SpeculationPrepInput(
+        spec_node_name="n_a",
+        curr_node_name="n_a",
+        graph_walk="walk_a",
+        rids=[rid],
+        room_for_continuing=None,
+        streaming_edges=[_spec("codes", "n_a", [101])],
+        streaming_edges_per_rid=[1],
+    ))
+    assert prep.ready_rids == []
+    assert prep.consumed_streaming_edge_idxs == []
+    assert prep.spec_id == 0
+
+    # Complete Pass 0 so it retires, then verify Pass 1 (walk_b) has n_b intact and n_a did not leak into it.
+    for node_name in ("n_a", "n_b"):
+        if node_name == "n_b":
+            rt.pop_rids("n_b", "walk_b", [rid])
+        out = rt.complete_and_route_batch(RouteInput(
+            partition="P1" if node_name == "n_a" else "P2",
+            graph_walk="walk_a" if node_name == "n_a" else "walk_b",
+            node_name=node_name,
+            output_signals=[],
+            wg_ids=ParallelList([rid], [WG_ID]),
+            tensors=[],
+            num_tensors=[],
+        ))
+        rt.send_outputs(_send_input(rid, out.completion_id))
+
+    assert rt.pop_rids("n_a", "walk_a", [rid], check_ready=True) is None
+    pop_b1 = rt.pop_rids("n_b", "walk_b", [rid], check_ready=True)
+    assert pop_b1 is not None
+    got_b1 = {e.signal: e.uuids for e in pop_b1.input_edges.edge_tuples()}
+    assert got_b1 == {"b_in": [201]}

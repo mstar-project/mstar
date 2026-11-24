@@ -172,10 +172,17 @@ pub struct GraphRuntime {
     completions: FxHashMap<u64, Completion>,
     completion_counter: u64,
     /// Streaming ingests a prep staged, parked until commit_speculation
-    /// settles them: spec_id -> (wg, [(rid, spec node, [(slot, from_next, walk, walk_pass_id)])]).
+    /// settles them: spec_id -> (wg, [(rid, spec node, [(slot, from_next, walk, walk_pass_id)], allocated_walk_pass)]).
     /// The wg rides along because the undo needs the same (wg, rid) pair the
     /// prep used to reach the walk state.
-    staged_specs: FxHashMap<u32, (WgIndex, Vec<(u32, NodeId, Vec<(u8, bool, Sym, u32)>)>)>,
+    #[allow(clippy::type_complexity)]
+    staged_specs: FxHashMap<
+        u32,
+        (
+            WgIndex,
+            Vec<(u32, NodeId, Vec<(u8, bool, Sym, u32)>, Option<(Sym, u32)>)>,
+        ),
+    >,
     spec_counter: u32,
     /// (node, real walk) -> the combined walk the scheduler batches it under;
     /// a ready-scan target or exclusion may name either.
@@ -684,7 +691,9 @@ pub struct GraphRuntime {
 
         let mut out = SpecPrepOut::default();
         let mut cols = EdgeColumns::default();
-        let mut undo: Vec<(u32, NodeId, Vec<(u8, bool, Sym, u32)>)> = Vec::new();
+        #[allow(clippy::type_complexity)]
+        let mut undo: Vec<(u32, NodeId, Vec<(u8, bool, Sym, u32)>, Option<(Sym, u32)>)> =
+            Vec::new();
         let mut cursor = 0usize;
         // The source's outputs as speculation feeds them: structure only, the
         // same for every rid, so built once for the batch.
@@ -717,8 +726,8 @@ pub struct GraphRuntime {
                 &input.streaming_edges[slice.clone()],
                 &all_refs[slice.clone()], slice.start, &source_edges,
             ) {
-                Some((kept, edges, ingested)) => {
-                    undo.push((rid, spec_node, ingested));
+                Some((kept, edges, ingested, allocated_walk_pass)) => {
+                    undo.push((rid, spec_node, ingested, allocated_walk_pass));
                     out.consumed_streaming_edge_idxs.extend(kept);
                     out.ready_rids.push(rid);
                     out.wg_ids.push(wg_id);
@@ -732,8 +741,8 @@ pub struct GraphRuntime {
                 None if follower => {
                     // Undo every rid prepped so far, or this rank joins the
                     // collective with a batch the leader never sent.
-                    for (done_rid, node, slots) in undo {
-                        self.undo_spec_ingest(wg, done_rid, node, &slots);
+                    for (done_rid, node, slots, allocated_walk_pass) in undo {
+                        self.undo_spec_ingest(wg, done_rid, node, &slots, allocated_walk_pass);
                     }
                     return Ok(SpecPrepOut {
                         all_or_nothing_failed: true,
@@ -750,11 +759,16 @@ pub struct GraphRuntime {
 
     /// Park what a prep ingested, for `commit_speculation` to settle. 0 when
     /// nothing was ingested: no stage to undo, so nothing to settle.
+    #[allow(clippy::type_complexity)]
     fn stage_spec(
-        &mut self, wg: WgIndex, undo: Vec<(u32, NodeId, Vec<(u8, bool, Sym, u32)>)>,
+        &mut self,
+        wg: WgIndex,
+        undo: Vec<(u32, NodeId, Vec<(u8, bool, Sym, u32)>, Option<(Sym, u32)>)>,
     ) -> u32 {
-        let staged: Vec<_> =
-            undo.into_iter().filter(|(_, _, s)| !s.is_empty()).collect();
+        let staged: Vec<_> = undo
+            .into_iter()
+            .filter(|(_, _, s, a)| !s.is_empty() || a.is_some())
+            .collect();
         if staged.is_empty() {
             return 0;
         }
@@ -826,7 +840,12 @@ pub struct GraphRuntime {
         base_idx: usize,
         // `spec_source_edges(wg, curr_node)`, built once by the caller
         source_edges: &[RoutedEdge],
-    ) -> Option<(Vec<usize>, Vec<(Sym, Vec<u64>, bool)>, Vec<(u8, bool, Sym, u32)>)> {
+    ) -> Option<(
+        Vec<usize>,
+        Vec<(Sym, Vec<u64>, bool)>,
+        Vec<(u8, bool, Sym, u32)>,
+        Option<(Sym, u32)>,
+    )> {
         let g = self.graphs[wg as usize].clone();
         let resolved: Vec<(usize, u8, &[TensorRef], bool)> = edges
             .iter()
@@ -874,12 +893,22 @@ pub struct GraphRuntime {
             None => false,
         };
         let (target_pass, to_next, allocated_pass) = match curr_pass {
+            Some(cp) if state.pass_walk_id(cp).is_some_and(|(pw, _)| pw != walk) => {
+                return None;
+            }
             Some(cp) if next_iter && is_loop_member => (Some(cp), true, false),
             Some(cp) if next_iter => {
-                if resolved.is_empty() {
+                if let Some((pw, _)) = state.pass_walk_id(cp + 1) {
+                    if pw != walk {
+                        return None;
+                    }
+                    if resolved.is_empty() {
+                        (None, false, false)
+                    } else {
+                        (Some(cp + 1), false, false)
+                    }
+                } else if resolved.is_empty() {
                     (None, false, false)
-                } else if state.pass_walk_id(cp + 1).is_some() {
-                    (Some(cp + 1), false, false)
                 } else {
                     (Some(state.alloc_pass_idx(walk)), false, true)
                 }
@@ -903,8 +932,12 @@ pub struct GraphRuntime {
 
         let mut kept = Vec::new();
         let mut ingested = Vec::new();
+        let mut allocated_walk_pass = None;
         if let Some(tp) = target_pass {
             if let Some((pw, wpi)) = state.pass_walk_id(tp) {
+                if allocated_pass {
+                    allocated_walk_pass = Some((pw, wpi));
+                }
                 for (idx, slot, tensors, final_chunk) in resolved {
                     if state.ingest_into_pass(&g, tp, spec_node, slot, tensors, to_next, final_chunk)
                     {
@@ -960,15 +993,23 @@ pub struct GraphRuntime {
                 .collect::<Vec<(Sym, Vec<u64>, bool)>>(),
             None => Vec::new(),
         };
-        Some((kept, edges_out, ingested))
+        Some((kept, edges_out, ingested, allocated_walk_pass))
     }
 
     fn undo_spec_ingest(
-        &mut self, wg: WgIndex, rid: u32, node: NodeId, slots: &[(u8, bool, Sym, u32)],
+        &mut self,
+        wg: WgIndex,
+        rid: u32,
+        node: NodeId,
+        slots: &[(u8, bool, Sym, u32)],
+        allocated_walk_pass: Option<(Sym, u32)>,
     ) {
         if let Some(state) = self.state_mut(wg, rid) {
             for &(slot, from_next, walk, walk_pass_id) in slots {
                 state.remove_input_by_pass_id(walk, walk_pass_id, node, slot, from_next);
+            }
+            if let Some((walk, walk_pass_id)) = allocated_walk_pass {
+                state.pop_empty_pass_by_id(walk, walk_pass_id);
             }
         }
     }
@@ -1980,7 +2021,7 @@ impl GraphRuntime {
         // undo would otherwise run against whichever request takes this handle
         // next. The walk state it names is dropped just below anyway.
         self.staged_specs.retain(|_, (_, staged)| {
-            staged.retain(|&(r, _, _)| r != rid);
+            staged.retain(|&(r, _, _, _)| r != rid);
             !staged.is_empty()
         });
 
@@ -2017,11 +2058,27 @@ impl GraphRuntime {
         let Some(p) = self.interner.get(partition) else { return false };
         let walk_sym = self.interner.intern(walk);
         let live = self.live_wgs_for(rid, walk_sym);
-        let Some(info) = self.requests.get_mut(rid as usize).and_then(|r| r.as_mut())
-        else {
-            return false;
+        let (changed, all_wgs) = {
+            let Some(info) = self.requests.get_mut(rid as usize).and_then(|r| r.as_mut())
+            else {
+                return false;
+            };
+            let changed = info.set_walk(p, walk_sym, || live);
+            let all_wgs = if changed {
+                info.worker_graphs.clone()
+            } else {
+                Vec::new()
+            };
+            (changed, all_wgs)
         };
-        info.set_walk(p, walk_sym, || live)
+        if changed {
+            for wg in all_wgs {
+                if let Some(state) = self.state_mut(wg, rid) {
+                    state.clear_idle_passes();
+                }
+            }
+        }
+        changed
     }
 
     /// Python's `is_partition_idle`: whether the walk can change without
@@ -2038,24 +2095,25 @@ impl GraphRuntime {
 
     fn mark_partition_done(&mut self, rid: u32, partition: &str) {
         let Some(p) = self.interner.get(partition) else { return };
-        let step_pass = if let Some(pp) = &self.postprocess {
-            if pp.partition == partition && pp.completion_id != 0 {
+        let step_pass = self
+            .postprocess
+            .as_ref()
+            .filter(|pp| pp.partition == partition && pp.completion_id != 0)
+            .and_then(|pp| {
                 self.completions
                     .get(&pp.completion_id)
                     .and_then(|c| c.completed_step_pass.get(&rid).copied())
-            } else {
-                None
-            }
-        } else {
-            self.completions
-                .iter()
-                .filter(|(_, c)| c.partition == partition)
-                .filter_map(|(&id, c)| {
-                    c.completed_step_pass.get(&rid).copied().map(|sp| (id, sp))
-                })
-                .max_by_key(|&(id, _)| id)
-                .map(|(_, sp)| sp)
-        };
+            })
+            .or_else(|| {
+                self.completions
+                    .iter()
+                    .filter(|(_, c)| c.partition == partition)
+                    .filter_map(|(&id, c)| {
+                        c.completed_step_pass.get(&rid).copied().map(|sp| (id, sp))
+                    })
+                    .max_by_key(|&(id, _)| id)
+                    .map(|(_, sp)| sp)
+            });
         if let Some(step_pass) = step_pass {
             if let Some(info) = self.requests.get_mut(rid as usize).and_then(|r| r.as_mut()) {
                 info.mark_partition_done_pass(p, step_pass.0, step_pass.1);
@@ -2763,11 +2821,11 @@ impl GraphRuntime {
         let Some((wg, staged)) = self.staged_specs.remove(&spec_id) else {
             return Ok(()); // unknown or 0: nothing was staged
         };
-        for (rid, node, slots) in staged {
+        for (rid, node, slots, allocated_walk_pass) in staged {
             if success && !dropped_rids.contains(&rid) {
                 continue;
             }
-            self.undo_spec_ingest(wg, rid, node, &slots);
+            self.undo_spec_ingest(wg, rid, node, &slots, allocated_walk_pass);
         }
         Ok(())
     }

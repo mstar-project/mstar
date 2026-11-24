@@ -724,6 +724,43 @@ impl RequestState {
         }
     }
 
+    pub fn pop_empty_pass_by_id(&mut self, walk: Sym, walk_pass_id: u32) {
+        let Some(idx) = self
+            .passes
+            .iter()
+            .position(|p| p.walk == walk && p.walk_pass_id == walk_pass_id)
+        else {
+            return;
+        };
+        if !self.passes[idx].is_idle() {
+            return;
+        }
+        if let Some(p) = self.passes.remove(idx) {
+            if let Some(entry) = self.next_pass_by_walk.get_mut(&p.walk) {
+                if *entry == p.walk_pass_id + 1 {
+                    *entry = p.walk_pass_id;
+                }
+            }
+            self.is_done = self.passes.iter().any(|pass| pass.is_done);
+            self.refresh_summary_all();
+        }
+    }
+
+    pub fn clear_idle_passes(&mut self) {
+        if !self.is_idle() || self.passes.is_empty() {
+            return;
+        }
+        while let Some(p) = self.passes.pop_back() {
+            if let Some(entry) = self.next_pass_by_walk.get_mut(&p.walk) {
+                if *entry == p.walk_pass_id + 1 {
+                    *entry = p.walk_pass_id;
+                }
+            }
+        }
+        self.is_done = false;
+        self.refresh_summary_all();
+    }
+
     pub fn pass_walk_id(&self, idx: usize) -> Option<(Sym, u32)> {
         self.passes.get(idx).map(|p| (p.walk, p.walk_pass_id))
     }
@@ -1107,7 +1144,11 @@ impl RequestState {
     ) -> Option<Vec<TensorRef>> {
         let idx = self.active_pass_idx(node)?;
         if from_next && self.graph.node(node).loop_id.is_none() {
-            return self.remove_input_at_pass(idx + 1, node, slot, false);
+            let walk = self.passes[idx].walk;
+            if self.passes.get(idx + 1).is_some_and(|p| p.walk == walk) {
+                return self.remove_input_at_pass(idx + 1, node, slot, false);
+            }
+            return None;
         }
         self.remove_input_at_pass(idx, node, slot, from_next)
     }
@@ -1122,8 +1163,10 @@ impl RequestState {
             if self.graph.node(node).loop_id.is_some() {
                 self.passes[idx].nodes[node as usize].next.has(slot)
             } else {
+                let walk = self.passes[idx].walk;
                 self.passes
                     .get(idx + 1)
+                    .filter(|p| p.walk == walk)
                     .is_some_and(|p| p.nodes[node as usize].cur.has(slot))
             }
         } else {
@@ -1153,7 +1196,8 @@ impl RequestState {
         }
         let spec = self.graph.node(node);
         if next_iter && spec.loop_id.is_none() {
-            let Some(next_pass) = self.passes.get(idx + 1) else {
+            let walk = self.passes[idx].walk;
+            let Some(next_pass) = self.passes.get(idx + 1).filter(|p| p.walk == walk) else {
                 return Vec::new();
             };
             let st = &next_pass.nodes[node as usize];
@@ -1552,6 +1596,10 @@ impl RequestState {
             return needed == 0;
         };
         if check_next_iter && spec.loop_id.is_none() {
+            let walk = self.passes[idx].walk;
+            if self.passes.get(idx + 1).is_some_and(|p| p.walk != walk) {
+                return false;
+            }
             let next_mask = self
                 .passes
                 .get(idx + 1)
@@ -2207,5 +2255,73 @@ mod tests {
         assert_eq!(removed.iter().map(|x| x.uuid).collect::<Vec<_>>(), vec![2]);
         assert!(!st.has_input(top, 0, true));
         assert!(st.has_input(top, 0, false), "Pass 0 must remain intact");
+    }
+
+    #[test]
+    fn pop_empty_pass_by_id_removes_allocated_pass_and_resets_counter() {
+        let mut it = StrToId::default();
+        let nodes = vec![node("top", &["x"], &["x"], vec![])];
+        let g = compile_one(&mut it, &nodes, &[]).unwrap();
+        let top = 0;
+        let walk_a = it.intern("walk_a");
+        let walk_b = it.intern("walk_b");
+        let mut st = RequestState::new(g.clone());
+
+        assert!(st.ingest_for_walk(&g, top, 0, &[t(1)], false, false, walk_a));
+        let idx = st.alloc_pass_idx(walk_a);
+        assert_eq!(st.pass_walk_id(idx), Some((walk_a, 1)));
+        assert!(st.ingest_into_pass(&g, idx, top, 0, &[t(2)], false, false));
+
+        // Undo input and pop allocated pass by (walk, walk_pass_id).
+        assert_eq!(
+            st.remove_input_by_pass_id(walk_a, 1, top, 0, false)
+                .unwrap()
+                .iter()
+                .map(|x| x.uuid)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        st.pop_empty_pass_by_id(walk_a, 1);
+        assert_eq!(st.passes.len(), 1);
+
+        // Complete Pass 0 and retire it; state must be completely clean for walk_b.
+        st.clear_consumed_inputs(&g, top);
+        let done_a = st.complete_strided_for_walk(&g, top, &[], 1, walk_a);
+        assert_eq!((done_a.pass_walk, done_a.walk_pass_id), (walk_a, 0));
+        assert_eq!(st.retire_done_passes(), vec![(walk_a, 0, 0)]);
+        assert!(st.passes.is_empty());
+        assert!(st.is_idle());
+
+        // Switching to walk_b starts at (walk_b, 0), and re-entering walk_a would reuse id 1.
+        assert!(st.ingest_for_walk(&g, top, 0, &[t(3)], false, false, walk_b));
+        assert_eq!(st.pass_walk_id(0), Some((walk_b, 0)));
+    }
+
+    #[test]
+    fn cross_walk_next_pass_is_ignored_for_speculation_and_input_tensors() {
+        let mut it = StrToId::default();
+        let nodes = vec![
+            node("a", &["x"], &[], vec![]),
+            node("b", &["y"], &[], vec![]),
+        ];
+        let g = compile_one(&mut it, &nodes, &[]).unwrap();
+        let (a, b) = (0, 1);
+        let walk_a = it.intern("walk_a");
+        let walk_b = it.intern("walk_b");
+        let mut st = RequestState::new(g.clone());
+
+        assert!(st.ingest_for_walk(&g, a, 0, &[t(1)], false, false, walk_a));
+        let p1 = st.alloc_pass_idx(walk_b);
+        assert!(st.ingest_into_pass(&g, p1, b, 0, &[t(2)], false, false));
+        assert!(st.ingest_into_pass(&g, p1, a, 0, &[t(99)], false, false));
+
+        // Even though Pass 1 (walk_b) has a's slot 0 filled, walk_a Pass 0 must NOT
+        // treat Pass 1 (walk_b) as its next_iter.
+        assert!(!st.ready_for_speculation_in_pass(Some(0), a, true, false));
+        assert!(!st.ready_for_speculation_in_pass(Some(0), a, true, true));
+        assert!(st.input_tensors_in_pass(0, a, true).is_empty());
+        assert!(!st.has_input(a, 0, true));
+        assert!(st.remove_input(a, 0, true).is_none());
+        assert!(st.passes[1].nodes[a as usize].cur.has(0));
     }
 }

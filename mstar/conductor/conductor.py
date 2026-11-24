@@ -2131,12 +2131,27 @@ class Conductor:
                         *sorted(current_wgs),
                         *sorted(w for w in request_data.all_worker_graph_ids if w not in current_wgs),
                     ]
-                    for wg_id in candidate_wgs:
+                    walk_order: dict[str, tuple[int, bool, int]] = {}
+                    for pos, wg_id in enumerate(candidate_wgs):
                         qpass = pstate.wg_queued_pass.get(wg_id, 0)
                         walk_here = pstate.wg_pass_walk.get((wg_id, qpass))
-                        if walk_here and walk_here != queued_walk:
-                            queued_walk = walk_here
-                            break
+                        if not walk_here or walk_here == queued_walk:
+                            continue
+                        is_done = pstate.wg_pass_done.get((wg_id, qpass), False)
+                        if walk_here in walk_order:
+                            plan_idx, prev_done, first_pos = walk_order[walk_here]
+                            walk_order[walk_here] = (plan_idx, prev_done or is_done, first_pos)
+                        else:
+                            plan_idx = next(
+                                (
+                                    j for j in range(pstate.cursor, len(pstate.plan))
+                                    if pstate.plan[j].walk == walk_here
+                                ),
+                                len(pstate.plan),
+                            )
+                            walk_order[walk_here] = (plan_idx, is_done, pos)
+                    if walk_order:
+                        queued_walk = min(walk_order, key=walk_order.__getitem__)
                 if queued_walk and queued_walk != pstate.graph_walk and hasattr(self, "worker_graphs"):
                     required_wgs = {
                         wg_id for wg_id in request_data.all_worker_graph_ids
