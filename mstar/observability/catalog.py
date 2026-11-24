@@ -59,6 +59,11 @@ EPISODE_EVICTIONS = Family(
     "Idle episodes whose rows the conductor released after the idle timeout.",
     ("reason",),
 )
+EPISODE_COLD_STARTS = Family(
+    "mstar_episode_cold_starts_total", COUNTER,
+    "Admitted calls on an episode-capable model that started with empty episode state, by reason.",
+    ("reason",),
+)
 ROUTING_PREDICTED_SAVING = Family(
     "mstar_routing_predicted_saving_total", COUNTER,
     "Per term of the data-parallel replica cost, the saving the mirrors "
@@ -236,6 +241,6 @@ WORKER_FAMILIES: dict[str, Family] = {
 STATUS_FAMILIES: dict[str, Family] = {
     f.name: f for f in (
         CONDUCTOR_REQUESTS, COMPONENT_IN_FLIGHT, EPISODES, EPISODE_SLOTS_USED,
-        EPISODE_EVICTIONS, ROUTING_PREDICTED_SAVING,
+        EPISODE_EVICTIONS, EPISODE_COLD_STARTS, ROUTING_PREDICTED_SAVING,
     )
 } | WORKER_FAMILIES

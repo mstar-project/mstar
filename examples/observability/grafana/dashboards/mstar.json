@@ -2273,12 +2273,70 @@
       ]
     },
     {
+      "id": 52,
+      "type": "timeseries",
+      "title": "Episode cold starts per second",
+      "description": "Admitted calls on an episode-capable model that started with empty episode state, by reason.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 124,
+        "w": 24,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (reason) (rate(mstar_episode_cold_starts_total{model_name=~\"$model\"}[1m]))",
+          "legendFormat": "{{reason}}",
+          "range": true
+        }
+      ]
+    },
+    {
       "type": "row",
       "title": "Engine workers",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 124,
+        "y": 132,
         "w": 24,
         "h": 1
       },
@@ -2295,7 +2353,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 125,
+        "y": 133,
         "w": 12,
         "h": 8
       },
@@ -2421,7 +2479,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 125,
+        "y": 133,
         "w": 12,
         "h": 8
       },
@@ -2489,7 +2547,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 133,
+        "y": 141,
         "w": 12,
         "h": 8
       },
@@ -2547,7 +2605,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 133,
+        "y": 141,
         "w": 12,
         "h": 8
       },
@@ -2628,7 +2686,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 141,
+        "y": 149,
         "w": 12,
         "h": 8
       },
@@ -2723,7 +2781,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 141,
+        "y": 149,
         "w": 12,
         "h": 8
       },
@@ -2781,7 +2839,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 149,
+        "y": 157,
         "w": 12,
         "h": 8
       },
@@ -2889,7 +2947,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 149,
+        "y": 157,
         "w": 12,
         "h": 8
       },
@@ -2980,7 +3038,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 157,
+        "y": 165,
         "w": 24,
         "h": 1
       },
@@ -2997,7 +3055,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 158,
+        "y": 166,
         "w": 12,
         "h": 8
       },
@@ -3055,7 +3113,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 158,
+        "y": 166,
         "w": 12,
         "h": 8
       },
@@ -3123,7 +3181,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 166,
+        "y": 174,
         "w": 12,
         "h": 8
       },
@@ -3195,7 +3253,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 166,
+        "y": 174,
         "w": 12,
         "h": 8
       },
@@ -3263,7 +3321,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 174,
+        "y": 182,
         "w": 24,
         "h": 1
       },
@@ -3281,7 +3339,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 175,
+        "y": 183,
         "w": 12,
         "h": 8
       },
@@ -3460,7 +3518,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 175,
+        "y": 183,
         "w": 12,
         "h": 8
       },
@@ -3516,7 +3574,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 183,
+        "y": 191,
         "w": 24,
         "h": 8
       },

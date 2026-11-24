@@ -484,6 +484,8 @@ class Array:
             raise ValueError(f"{where}.max_len must be None or an int >= 0, got {self.max_len!r}")
         if self.lifetime not in ("request", "episode") or type(self.lifetime) is not str:
             raise ValueError(f"{where}.lifetime must be 'request' or 'episode', got {self.lifetime!r}")
+        if self.max_len == 0 and self.lifetime == "episode":
+            raise ValueError(f"{where}.max_len=0 keeps nothing between steps and cannot have lifetime='episode'")
         self._check_entry()
         for key, read in self.reads.items():
             self._check_read(key, read)
@@ -493,9 +495,32 @@ class Array:
             self._check_unbounded()
 
     def _check_unbounded(self) -> None:
-        """An episode log has a finite dense window derived from its reads."""
+        """An episode log has a finite dense or bounded window derived from its reads."""
         where = f"Array {self.name!r}"
-        if self.rewritable or self.positions is not None or self.entry.host or self.updates or not self.entry.tensors:
+        if self.rewritable or self.entry.host or self.updates or not self.entry.tensors:
+            raise ValueError(f"{where}.max_len=None needs an append-only tensor log without positions or updates")
+        k = self.entry.tensors.get("k")
+        is_kv = k is not None and len(k.shape) == 2 and k.shard == 0 and self.entry == Entry({"k": k, "v": k})
+        if is_kv:
+            if self.positions is not None and not (
+                isinstance(self.positions, Positions) and self.positions.rope is None
+            ):
+                raise ValueError(f"{where}.max_len=None needs an append-only tensor log without positions or updates")
+            if len(self.reads) != 1:
+                raise ValueError(f"{where}.max_len=None with KVEntry needs one bounded Window Attend read")
+            (key, read), = self.reads.items()
+            if (
+                not isinstance(read.mask, Window)
+                or not isinstance(read.op, Attend)
+                or read.packed
+                or read.queries is not None
+            ):
+                raise ValueError(
+                    f"{where}.reads[{key!r}]: max_len=None with KVEntry supports only an unpacked Attend read "
+                    "with a Window mask"
+                )
+            return
+        if self.positions is not None:
             raise ValueError(f"{where}.max_len=None needs an append-only tensor log without positions or updates")
         if not self.reads:
             raise ValueError(f"{where}.max_len=None needs at least one dense Window read")

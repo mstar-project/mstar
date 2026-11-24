@@ -152,6 +152,7 @@ class PositionConfig:
 @dataclass
 class PositionSpec(NodeResourceSpec):
     config: PositionConfig
+    episode_lifetime: bool = False
     # the sequence shard over its nodes, if any (`derive`): a split label's positions are its range's
     shard_key: str | None = field(default=None, init=False, repr=False)
 

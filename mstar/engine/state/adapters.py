@@ -190,9 +190,6 @@ def _resolve(arrays: Sequence[Array], setup: "StateSetup") -> "Resolved":
     """``arrays`` resolved by their storages, all of one storage's arrays in one call."""
     by_storage: dict[Storage, list[Array]] = {}
     for array in arrays:
-        if array.lifetime == "episode" and storage_of(array) is not DENSE_WINDOW:
-            raise _no_layout(array, "episode lifetime needs row binding and storage teardown, which this E1 slice "
-                                    "does not yet wire into the engine")
         storage = storage_of(array)
         by_storage.setdefault(storage, []).append(array)
     specs: dict[str, list[NodeResourceSpec]] = {}
@@ -330,7 +327,10 @@ def _position_spec(array: Array) -> PositionSpec:
             low_freq_factor=rope.low_freq_factor, high_freq_factor=rope.high_freq_factor,
             old_context_len=rope.old_context_len, longrope=rope.longrope,
         )
-    return PositionSpec(resource_key=position_key(array), nodes=array.nodes, config=config)
+    return PositionSpec(
+        resource_key=position_key(array), nodes=array.nodes, config=config,
+        episode_lifetime=array.lifetime == "episode",
+    )
 
 
 def _sampler_spec(sampler: Sampler) -> SamplerSpec:
@@ -2924,6 +2924,7 @@ class PagedStorage(Storage):
         return KVSpec(
             resource_key=array.name, nodes=array.nodes,
             leader=_leader(array, walks) if self.takes_leader(array) else None,
+            episode_lifetime=array.lifetime == "episode",
             config=PagedKVConfig(
                 num_layers=len(array.layers), num_qo_heads=q_heads.pop() if q_heads else None,
                 num_kv_heads=heads, head_dim=head_dim, max_seq_len=array.max_len,
@@ -3098,7 +3099,10 @@ class RingStorage(Storage):
                 raise _no_layout(array, f"max_len {array.max_len} holds no frame of {frame} entries")
             shared = next(iter(array.reads))
             resolved.specs[array.name] = [
-                KVSpec(resource_key=array.name, nodes=array.nodes, config=RingKVConfig(
+                KVSpec(
+                    resource_key=array.name, nodes=array.nodes,
+                    episode_lifetime=array.lifetime == "episode",
+                    config=RingKVConfig(
                     num_layers=len(array.layers), num_kv_heads=heads, num_qo_heads=q_heads.pop(), head_dim=head_dim,
                     tokens_per_frame=frame, max_frames=array.max_len // frame, layers=tuple(
                         RingKVLayerConfig(
@@ -3306,7 +3310,10 @@ class RollingStorage(Storage):
             bound = resolved.bound[array.name] = _bindings(self, array, setup.by_read)
             heads, head_dim = _kv_shape(array)
             resolved.specs[array.name] = [
-                RollingKVSpec(resource_key=array.name, nodes=array.nodes, config=RollingKVConfig(
+                RollingKVSpec(
+                    resource_key=array.name, nodes=array.nodes,
+                    episode_lifetime=array.lifetime == "episode",
+                    config=RollingKVConfig(
                     num_layers=len(array.layers), num_heads=heads, head_dim=head_dim, pool_tokens=array.max_len,
                     dtype=array.entry.tensors["k"].dtype,
                 )),
@@ -3369,6 +3376,7 @@ class ValueStorage(Storage):
         layouts = _field_layouts(array, bound)
         pool = RecurrentStateSpec(
             resource_key=array.name, nodes=array.nodes,
+            episode_lifetime=array.lifetime == "episode",
             config=RecurrentStateConfig(
                 num_layers=len(array.layers),
                 blocks={field: layouts[field].block(tensor) for field, tensor in array.entry.tensors.items()},
@@ -3425,7 +3433,11 @@ class SizedValueStorage(Storage):
         for array in arrays:
             resolved.bound[array.name] = _bindings(self, array)
             resolved.specs[array.name] = [
-                SizedValueSpec(resource_key=array.name, nodes=array.nodes, config=_sized_config(array)),
+                SizedValueSpec(
+                    resource_key=array.name, nodes=array.nodes,
+                    episode_lifetime=array.lifetime == "episode",
+                    config=_sized_config(array),
+                ),
             ]
         return resolved
 
@@ -3451,6 +3463,8 @@ class WithinStepStorage(Storage):
         resolved = Resolved({}, {}, {}, {})
         shared: dict[tuple, NodeResourceSpec] = {}
         for array in arrays:
+            if array.lifetime == "episode":
+                raise _no_layout(array, "max_len=0 keeps nothing between steps and cannot have lifetime='episode'")
             bound, heads, head_dim, dtype = _within_step_read(array, setup)
             resolved.bound[array.name] = (bound,)
             key, read = bound.key, bound.declared
@@ -3513,6 +3527,7 @@ class BoundedStorage(Storage):
             reach = next(iter(array.reads.values())).mask.size - 1
             resolved.specs[array.name] = [BoundedKVSpec(
                 resource_key=array.name, nodes=array.nodes,
+                episode_lifetime=array.lifetime == "episode",
                 config=BoundedKVConfig(
                     num_layers=len(array.layers), num_heads=heads, head_dim=head_dim, rows_per_request=1,
                     max_source_len=0, retention=SinkWindow(0, reach), query_window=reach, dtype=dtype,

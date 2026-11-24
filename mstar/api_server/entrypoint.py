@@ -958,6 +958,15 @@ class APIServer:
         if self.metrics is not None:
             mark_submitted()
 
+        timeout_s = getattr(self, "timeout_seconds", None)
+        deadline = (
+            time.perf_counter() + timeout_s
+            if isinstance(timeout_s, (int, float))
+            and not isinstance(timeout_s, bool)
+            and math.isfinite(timeout_s)
+            and timeout_s >= 0
+            else None
+        )
         self.preprocess_worker.new_request(PreprocessInput(
             request_id=key,
             client_request_id=request_id,
@@ -974,6 +983,7 @@ class APIServer:
             ends=ending,
             streaming=streaming,
             raw_inputs=raw_inputs,
+            deadline=deadline,
         ))
 
         request_log.debug(

@@ -1195,6 +1195,7 @@ class PreprocessWorkerThread:
                 episode_keys=episode_keys,
                 reset_episode=input.reset_episode or reset_episode,
                 episode_adapter_digest=episode_adapter_digest,
+                deadline=input.deadline,
             ),
         )
         self.communicator.send("conductor", msg)
