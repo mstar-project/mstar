@@ -100,13 +100,19 @@ class RollingKVManager(Resource):
     def build(cls, spec: RollingKVSpec, info: EngineResourceInfo) -> RollingKVManager:
         if info.joint_comm_group is not None and info.joint_comm_group.world_size > 1:
             raise NotImplementedError("rolling KV does not shard across ranks yet")
-        return cls(spec.config, info.device, info.kv_dtype, name=spec.resource_key)
+        return cls(
+            spec.config, info.device, info.kv_dtype, name=spec.resource_key,
+            episode_lifetime=spec.episode_lifetime,
+        )
 
     def __init__(self, config: RollingKVConfig, device: torch.device, kv_dtype: torch.dtype | None = None,
-                 name: str = "rolling_kv"):
+                 name: str = "rolling_kv", episode_lifetime: bool = False):
         self.config = config
         # the resource key, which a deployment's ``resources:`` block names
         self.name = name
+        self.episode_lifetime = episode_lifetime
+        self._episode_owner_by_request: dict[int | str, tuple[str, int]] = {}
+        self._owner_wants: dict[tuple[str, int], RollingKVReqConfig] = {}
         self._device = torch.device(device)
         c = config
         dtype = c.dtype or kv_dtype or torch.get_default_dtype()
@@ -178,15 +184,29 @@ class RollingKVManager(Resource):
         kv = self._pool[layer_idx]
         return kv[0, at:at + r.kept][None], kv[1, at:at + r.kept][None]
 
+    def _episode_key(self, rid):
+        if rid in self._requests or rid in self._wants:
+            return rid
+        return self._episode_owner_by_request.get(rid, rid)
+
     def written(self, rid) -> int:
         """The tokens ``rid`` committed: 0 for a request that holds no region."""
-        req = self._requests.get(rid)
+        req = self._requests.get(self._episode_key(rid))
         return 0 if req is None else req.written
 
     def declared(self, rid) -> RollingKVReqConfig | None:
         """What ``rid`` declared when it opened, None for a request that declared nothing."""
         with self._lock:
-            return self._wants.get(rid)
+            key = rid if rid in self._wants else self._episode_owner_by_request.get(rid, rid)
+            return self._wants.get(key) or self._owner_wants.get(key)
+
+    def logical_length(self, rid, label: str = "main") -> int:
+        del label
+        return self.written(rid)
+
+    def held(self, rid) -> int:
+        req = self._requests.get(self._episode_key(rid))
+        return 0 if req is None else min(req.written, req.capacity)
 
     # Request lifecycle
 
@@ -195,8 +215,70 @@ class RollingKVManager(Resource):
             with self._lock:
                 self._wants[rid] = overrides
 
+    def bind_episode(self, rid: int, slot: int, episode_id: str | None, *, cold: bool, reset: bool) -> None:
+        if episode_id is None:
+            return
+        owner = ("episode", slot)
+        with self._lock:
+            if cold:
+                if owner in self._requests or owner in self._owner_wants:
+                    raise ValueError(f"rolling KV {self.name!r}: episode slot {slot} already has state")
+            else:
+                req = self._requests.pop(owner, None)
+                prev_wants = self._owner_wants.pop(owner, None)
+                if reset:
+                    if req is not None:
+                        self._requests[owner] = req
+                        self._release(owner)
+                    if rid not in self._wants and prev_wants is not None:
+                        self._wants[rid] = prev_wants
+                else:
+                    wants = self._wants.get(rid)
+                    if req is not None:
+                        if wants is not None:
+                            if wants.tokens != req.capacity:
+                                self._requests[owner] = req
+                                if prev_wants is not None:
+                                    self._owner_wants[owner] = prev_wants
+                                raise ValueError(
+                                    f"rolling KV {self.name!r}: warm episode declared {wants.tokens} tokens, "
+                                    f"expected {req.capacity} without reset"
+                                )
+                            if prev_wants is not None and wants.sink != prev_wants.sink:
+                                self._requests[owner] = req
+                                self._owner_wants[owner] = prev_wants
+                                raise ValueError(
+                                    f"rolling KV {self.name!r}: warm episode declared sink={wants.sink}, "
+                                    f"expected {prev_wants.sink} without reset"
+                                )
+                        elif prev_wants is not None:
+                            self._wants[rid] = prev_wants
+                        self._requests[rid] = req
+                    elif wants is None and prev_wants is not None:
+                        self._wants[rid] = prev_wants
+            self._episode_owner_by_request[rid] = owner
+
+    def end_episode(self, slot: int) -> None:
+        owner = ("episode", slot)
+        with self._lock:
+            if owner in self._episode_owner_by_request.values():
+                raise ValueError(f"episode slot {slot} still has an active request")
+            self._release(owner)
+            self._owner_wants.pop(owner, None)
+
     def remove_request(self, rid):
         with self._lock:
+            owner = self._episode_owner_by_request.pop(rid, None)
+            if owner is not None:
+                self._admit_taken.discard(rid)
+                wants = self._wants.pop(rid, None)
+                self._kept -= self._reserved.pop(rid, 0)
+                req = self._requests.pop(rid, None)
+                if req is not None:
+                    self._requests[owner] = req
+                if wants is not None:
+                    self._owner_wants[owner] = wants
+                return
             self._release(rid)
             self._wants.pop(rid, None)
             self._kept -= self._reserved.pop(rid, 0)
@@ -225,6 +307,8 @@ class RollingKVManager(Resource):
 
     def reserve(self, rid, node_name: str, graph_walk: str, published: None) -> int | None:
         with self._lock:
+            if rid in self._requests or rid in self._reserved:
+                return None
             wants = self._wants.get(rid)
             need, room = 0 if wants is None else wants.tokens, self._room()
             if need > room:

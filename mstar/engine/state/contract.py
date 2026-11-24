@@ -326,7 +326,7 @@ class Positions:
 
 @dataclass(frozen=True)
 class Array:
-    """Per request, per label and per declared layer, entries at log positions 0 to n - 1, with n <= ``max_len``.
+    """Per owner, per label and per declared layer, entries at log positions 0 to n - 1.
 
     An append-only array only grows, and a rewritable one also takes writes in place. All layers of an array have
     the same length at the end of every step. ``nodes`` lists who may touch the array, and the engine places it.
@@ -350,6 +350,7 @@ class Array:
     rewritable: bool = False
     labels: frozenset[str] = frozenset({"main"})
     positions: Positions | None = None
+    lifetime: Literal["request", "episode"] = "request"
     largest: Mapping[str, int] = EMPTY    # a sized Value: the sizes of the request whose fields take the most bytes
 
     def __post_init__(self):
@@ -368,13 +369,54 @@ class Array:
             raise ValueError(f"{where}.layers is empty, and only a Value may declare no layers")
         if not self.labels:
             raise ValueError(f"{where}.labels must be non-empty")
-        if not (self.max_len is None or type(self.max_len) is int and self.max_len >= 0):
+        if self.max_len is not None and not (type(self.max_len) is int and self.max_len >= 0):
             raise ValueError(f"{where}.max_len must be None or an int >= 0, got {self.max_len!r}")
+        if self.lifetime not in ("request", "episode") or type(self.lifetime) is not str:
+            raise ValueError(f"{where}.lifetime must be 'request' or 'episode', got {self.lifetime!r}")
+        if self.max_len == 0 and self.lifetime == "episode":
+            raise ValueError(f"{where}.max_len=0 keeps nothing between steps and cannot have lifetime='episode'")
         self._check_entry()
         for key, read in self.reads.items():
             self._check_read(key, read)
         for key, update in self.updates.items():
             self._check_update(key, update)
+        if self.max_len is None and self.lifetime == "episode":
+            self._check_unbounded()
+
+    def _check_unbounded(self) -> None:
+        """An episode log has a finite dense or bounded window derived from its reads."""
+        where = f"Array {self.name!r}"
+        if self.rewritable or self.entry.host or self.updates or not self.entry.tensors:
+            raise ValueError(f"{where}.max_len=None needs an append-only tensor log without positions or updates")
+        k = self.entry.tensors.get("k")
+        is_kv = k is not None and len(k.shape) == 2 and k.shard == 0 and self.entry == Entry({"k": k, "v": k})
+        if is_kv:
+            if self.positions is not None and not (
+                isinstance(self.positions, Positions) and self.positions.rope is None
+            ):
+                raise ValueError(f"{where}.max_len=None needs an append-only tensor log without positions or updates")
+            if len(self.reads) != 1:
+                raise ValueError(f"{where}.max_len=None with KVEntry needs one bounded Window Attend read")
+            (key, read), = self.reads.items()
+            if (
+                not isinstance(read.mask, Window)
+                or not isinstance(read.op, Attend)
+                or read.packed
+                or read.queries is not None
+            ):
+                raise ValueError(
+                    f"{where}.reads[{key!r}]: max_len=None with KVEntry supports only an unpacked Attend read "
+                    "with a Window mask"
+                )
+            return
+        if self.positions is not None:
+            raise ValueError(f"{where}.max_len=None needs an append-only tensor log without positions or updates")
+        if not self.reads:
+            raise ValueError(f"{where}.max_len=None needs at least one dense Window read")
+        for key, read in self.reads.items():
+            if not isinstance(read.mask, Window) or read.op is not None or read.queries is not None:
+                raise ValueError(f"{where}.reads[{key!r}]: max_len=None supports only a no-op Window read of this "
+                                 "array; no finite retention bound is known for this read")
 
     def _check_entry(self) -> None:
         # a layer reads nothing from an array with no layers and no reads, so an axis may be 0
