@@ -155,3 +155,37 @@ def test_no_checkpoint_download_fetches_the_training_state(monkeypatch):
     for call in calls[1:]:
         assert all(fetched(f, call) for f in ["config.json", "model.safetensors.index.json",
                                                "model-00001-of-00004.safetensors"]), call
+
+
+def test_orpheus_tp2_config_validates_and_covers_all_walks():
+    """Shipped configs/orpheus_tp2.yaml: TP2 LLM feeding TP1 snac_decoder
+    validates cleanly, places worker_0 and worker_1 with matching subgroup
+    tuples, and captures every declared walk (#706)."""
+    from pathlib import Path
+
+    import yaml
+
+    from mstar.model.orpheus.submodules import SNACDecoderSubmodule
+    from mstar.validation import validate_deployment
+
+    cfg_path = Path("configs/orpheus_tp2.yaml")
+    cfg = yaml.safe_load(cfg_path.read_text())
+    model = _make_model()
+
+    validate_deployment(model, cfg, str(cfg_path))
+
+    groups = {tuple(g["node_names"]): g for g in cfg["node_groups"]}
+    assert groups[("LLM",)]["ranks"] == [0, 1]
+    assert groups[("LLM",)]["tp_size"] == 2
+    assert groups[("snac_decoder",)]["ranks"] == [0]
+
+    llm = OrpheusLLMSubmodule(None, model.config)
+    snac = SNACDecoderSubmodule(torch.nn.Linear(1, 1), model.config)
+    llm_captured = {
+        walk for c in llm.get_accelerator_graph_configs("cpu") for walk in c.replay_graph_walks
+    }
+    snac_captured = {
+        walk for c in snac.get_accelerator_graph_configs("cpu") for walk in c.replay_graph_walks
+    }
+    assert set(groups[("LLM",)]["graph_walks"]) <= llm_captured
+    assert set(groups[("snac_decoder",)]["graph_walks"]) <= snac_captured
