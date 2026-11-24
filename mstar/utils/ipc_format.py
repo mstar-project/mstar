@@ -403,6 +403,8 @@ class WorkerGraphsDone(MessageBody):
     graph_timings: GraphTimings = field(default_factory=dict)
     rx_info: list[RxInfo] = field(default_factory=list)
     tx_info: list[TxInfo] = field(default_factory=list)
+    worker_id: str = field(default="")
+    pass_ids: list[int] = field(default_factory=list)
 
 
 @dataclass

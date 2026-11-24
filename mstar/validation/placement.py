@@ -13,7 +13,7 @@ from mstar.engine.resources.context_parallel import position_pools
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
 from mstar.engine.resources.spec import NodeResourceSpec
-from mstar.graph.base import GraphNode, GraphSection, self_triggered, top_level_entities
+from mstar.graph.base import GraphNode, GraphSection, Loop, self_triggered, top_level_entities
 from mstar.model.base import Model, WorkerGraph
 
 if TYPE_CHECKING:
@@ -314,18 +314,13 @@ def _input_limits(walk_to_wgs: Mapping[str, list[WorkerGraph]]) -> Iterator[str]
 def _stream_driven_walks(model: Model, walk_to_wgs: Mapping[str, list[WorkerGraph]]) -> Iterator[str]:
     """Stream-driven walk shapes the runtime and conductor can't account for.
 
-    A self-triggered node feeding one successor in the same worker graph can
-    wait for that successor before taking another chunk. Other self-triggered
-    shapes still need pass identity: independent entities may receive different
-    numbers of chunks, and a loop can re-arm before its successor finishes.
-    A consumer gated on a non-streamed input waits for that input instead,
-    which is safe when it arrives once per pass (from the conductor, say).
-    Across worker graphs, self-triggered passes overlap with no pass
-    identity. A gated consumer waits for its next non-streamed input until the
-    conductor closes the current pass; the conductor retains the final-stream
-    flag from any report of that pass, including a different worker's. A walk
-    with no stream-consuming node is conductor driven and unaffected, and a
-    TP worker graph is one worker graph on several ranks.
+    With pass-aware accounting, a self-triggered stream consumer walk is served
+    across one or more top-level entities and worker graphs when every other
+    top-level entity in the walk is reachable from (and fed solely by) the
+    single self-triggered consumer DAG, and no self-triggered Loop is split
+    across multiple worker graphs. Independent self-triggered streams (which
+    can have disjoint chunk counts) or unrelated entities alongside a
+    self-triggered consumer remain rejected unless gated on a non-streamed input.
     """
     topology = model.get_partition_topology()
     consumer_partitions = {conn.to_partition for conn in topology.connections}
@@ -338,46 +333,102 @@ def _stream_driven_walks(model: Model, walk_to_wgs: Mapping[str, list[WorkerGrap
         if not any(wg.consumes_stream for wg in wgs):
             continue
         where = f"graph walk {walk!r} of consumer partition {walk_partition[walk]!r}"
-        entities = [top_level_entities(wg.section) for wg in wgs]
-        triggered = sorted(
-            name for ents in entities for name, e in ents.items() if self_triggered(e)
-        )
-        if len(wgs) > 1 and triggered:
+        entities_per_wg = [top_level_entities(wg.section) for wg in wgs]
+        triggered = sorted({
+            name for ents in entities_per_wg for name, e in ents.items() if self_triggered(e)
+        })
+        if not triggered:
+            continue
+
+        entity_wg_counts: dict[str, int] = {}
+        for ents in entities_per_wg:
+            for name in ents:
+                entity_wg_counts[name] = entity_wg_counts.get(name, 0) + 1
+        split_loops = sorted(name for name, cnt in entity_wg_counts.items() if cnt > 1)
+        if split_loops:
             yield (
                 f"{where} consumes a stream and spans {len(wgs)} worker graphs "
                 f"{[sorted(wg.section.get_nodes()) for wg in wgs]} on ranks "
-                f"{[wg.ranks for wg in wgs]}. Across worker graphs a stream-driven walk "
-                "is served only with every consumer gated on a non-streamed input that "
-                "arrives once per pass; otherwise run it as "
-                "one worker graph, or move the work after the consumer into a "
-                "downstream partition fed by a StreamingGraphEdge."
+                f"{[wg.ranks for wg in wgs]} with Loop(s) {split_loops} split across "
+                "worker graphs. Keep each self-triggered Loop in one worker graph, or "
+                "gate the consumer on a non-streamed input that arrives once per pass."
             )
-        # The runtime serializes a top-level all-streaming node until its
-        # worker graph ends. This only guarantees progress for a single
-        # consumer feeding one successor, with no independent input to wait
-        # for. Two separate streams can have different chunk counts and
-        # strand each other, even though both nodes are GraphNodes.
-        serial_pair = False
-        if len(wgs) == 1 and len(entities[0]) == 2 and len(triggered) == 1:
-            source = entities[0][triggered[0]]
-            other_name = next(name for name in entities[0] if name != triggered[0])
-            target = entities[0][other_name]
-            if isinstance(source, GraphNode) and isinstance(target, GraphNode):
-                delivered = {e.name for e in source.outputs if e.next_node == other_name}
-                serial_pair = bool(delivered) and target.input_names == delivered and not target.consumes_stream
-        if len(wgs) == 1 and len(entities[0]) > 1 and triggered and not serial_pair:
+            continue
+
+        if len(triggered) > 1:
             yield (
                 f"{where} has self-triggered consumers {triggered} (every input "
-                f"streamed) among {len(entities[0])} top-level entities {sorted(entities[0])} "
-                "in one worker graph. Gate the consumer on a non-streamed input that "
-                "arrives once per pass (from the conductor, say), or move the work "
-                "after it into a downstream partition fed by a StreamingGraphEdge."
+                "streamed). Multiple independent self-triggered streams in one walk "
+                "can have different chunk counts; split them into separate partitions "
+                "or gate them on a common non-streamed input."
+            )
+            continue
+
+        all_entities = {name: ent for ents in entities_per_wg for name, ent in ents.items()}
+        if len(all_entities) == 1:
+            continue
+
+        root_name = triggered[0]
+        walk_nodes = {n for wg in wgs for n in wg.section.get_nodes()}
+        node_to_entity: dict[str, str] = {}
+        for name, ent in all_entities.items():
+            if isinstance(ent, GraphNode):
+                node_to_entity[name] = name
+            else:
+                for mname in ent.get_nodes():
+                    node_to_entity[mname] = name
+
+        adj: dict[str, set[str]] = {name: set() for name in all_entities}
+        fed_edges: dict[str, set[tuple[str, str]]] = {name: set() for name in all_entities}
+        for name, ent in all_entities.items():
+            outs = ent.outputs if isinstance(ent, GraphNode) else ent.outputs + ent.accumulated_outputs
+            for edge in outs:
+                if edge.next_node in walk_nodes:
+                    dst_ent = node_to_entity[edge.next_node]
+                    if dst_ent != name:
+                        adj[name].add(dst_ent)
+                        fed_edges[name].add((edge.name, edge.next_node))
+
+        reachable = {root_name}
+        stack = [root_name]
+        while stack:
+            cur = stack.pop()
+            for nxt in adj[cur]:
+                if nxt not in reachable:
+                    reachable.add(nxt)
+                    stack.append(nxt)
+
+        fed_by_reachable = set().union(*(fed_edges[name] for name in reachable))
+        bad_entities = []
+        for name, ent in sorted(all_entities.items()):
+            if name == root_name:
+                continue
+            if name not in reachable:
+                bad_entities.append(name)
+                continue
+            nodes_in_ent = ent.get_nodes().values() if isinstance(ent, Loop) else (ent,)
+            if any(n.consumes_stream for n in nodes_in_ent):
+                bad_entities.append(name)
+                continue
+            if isinstance(ent, GraphNode):
+                ext_inputs = {(sig, ent.name) for sig in ent.input_names}
+            else:
+                ext_inputs = set(ent.section.get_inputs_outputs().ext_inputs)
+            if not ext_inputs or not (ext_inputs <= fed_by_reachable):
+                bad_entities.append(name)
+
+        if bad_entities:
+            yield (
+                f"{where} has self-triggered consumers {triggered} (every input "
+                f"streamed) alongside entities {bad_entities} not fed solely by the "
+                "consumer's outputs. Gate the consumer on a non-streamed input that "
+                "arrives once per pass (from the conductor, say), or move unrelated "
+                "work into a separate partition."
             )
 
 
 def _loop_successors(walk_to_wgs: Mapping[str, list[WorkerGraph]]) -> Iterator[str]:
-    """A Loop member with an edge to a node outside the Loop in the same
-    worker graph.
+    """A Loop member with an edge to a node outside the Loop in the same walk.
 
     A worker graph counts top-level completions, and that successor
     completes once per iteration, so the pass ends before the Loop and the
@@ -386,17 +437,23 @@ def _loop_successors(walk_to_wgs: Mapping[str, list[WorkerGraph]]) -> Iterator[s
     output once, when the Loop finishes.
     """
     for walk, wgs in walk_to_wgs.items():
+        walk_nodes = {n for wg in wgs for n in wg.section.get_nodes()}
+        loop_all_members: dict[str, set[str]] = {}
+        for wg in wgs:
+            for lname, loop in wg.section.get_loops().items():
+                loop_all_members.setdefault(lname, set()).update(loop.get_nodes())
         for wg in wgs:
             wg_nodes = wg.section.get_nodes()
             for loop in wg.section.get_loops().values():
-                members = loop.get_nodes()
-                for name, node in members.items():
+                members = loop_all_members[loop.name]
+                for name, node in loop.get_nodes().items():
                     for edge in node.outputs:
-                        if edge.next_node in wg_nodes and edge.next_node not in members:
+                        if edge.next_node in walk_nodes and edge.next_node not in members:
+                            scope = "worker graph" if edge.next_node in wg_nodes else "walk"
                             yield (
                                 f"graph walk {walk!r}: node {name!r} of Loop "
                                 f"{loop.name!r} sends {edge.name!r} to {edge.next_node!r}, "
-                                "outside the Loop in the same worker graph. The worker graph "
+                                f"outside the Loop in the same {scope}. The worker graph "
                                 "would report done before the Loop and its successor finish. "
                                 "Send it through Loop.accumulated_outputs (every iteration's "
                                 "output, once the Loop finishes) or Loop.outputs instead."

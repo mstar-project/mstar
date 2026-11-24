@@ -96,6 +96,8 @@ pub struct NodeSpec {
     pub outputs: Vec<EdgeSpec>,
     /// Innermost enclosing loop, if any.
     pub loop_id: Option<LoopId>,
+    /// Index among its parent's managed entities (root or enclosing loop).
+    pub entity_idx: u32,
 }
 
 impl NodeSpec {
@@ -124,11 +126,16 @@ pub struct LoopSpec {
     /// `external_inputs` keeps only the pairs into this graph's nodes.
     pub loop_back: Vec<(Sym, Sym)>,
     pub external_inputs: Vec<(Sym, NodeId)>,
+    /// Index among its parent's managed entities (root or parent loop).
+    pub entity_idx: u32,
 }
 
 impl LoopSpec {
     pub fn n_entities(&self) -> u32 {
         (self.member_nodes.len() + self.child_loops.len()) as u32
+    }
+    pub fn n_mask_words(&self) -> usize {
+        (self.n_entities() as usize).div_ceil(64).max(1)
     }
 }
 
@@ -150,6 +157,9 @@ impl CompiledGraph {
     }
     pub fn n_root_entities(&self) -> u32 {
         (self.root_nodes.len() + self.root_loops.len()) as u32
+    }
+    pub fn n_root_mask_words(&self) -> usize {
+        (self.n_root_entities() as usize).div_ceil(64).max(1)
     }
     pub fn n_ready_words(&self) -> usize {
         self.nodes.len().div_ceil(64).max(1)

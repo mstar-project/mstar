@@ -198,6 +198,7 @@ def test_a_completion_sends_the_conductor_a_worker_graphs_done(tmp_path):
         body=WorkerGraphsDone(
             request_id="r1", worker_graph_ids=[WG_ID], is_first_tp_rank=True,
             partition_name="default", graph_walk=WALK,
+            worker_id=ME, pass_ids=[0],
         ),
     ))]
     assert got["api_server"] == [] and got[PEER] == []
@@ -1293,3 +1294,89 @@ def test_a_withheld_signal_that_does_not_ride_inline_changes_nothing(tmp_path):
         inline_signals=["speech"], withheld_signals=["text"], withheld_rids=[[0, 1]],
     )
     assert plain == named and plain[PEER] == [_speech_frame([7, 8], ["r1", "r2"])]
+
+
+def test_pipelined_colocated_wgs_scope_partition_done_and_carry_pass_ids(tmp_path):
+    """When vocoder (WG 0) pipelines Pass 1 (final chunk) ahead of post (WG 1)
+    finishing Pass 0 on the same worker, WG 1's Pass 0 report carries
+    ``partition_done=False`` and Pass 1 carries ``partition_done=True``, each
+    stamped with ``worker_id`` and per-WG ``pass_ids``."""
+    book = RustTensorBookkeeping()
+    comm = ZmqCommunicator(ME, str(tmp_path))
+    conductor = ZmqCommunicator("conductor", str(tmp_path))
+    wgs = [
+        {
+            "wg_id": 0, "graph_walks": ["chunk"],
+            "nodes": [{
+                "name": "vocoder", "async_enabled": False,
+                "inputs": ["codes"], "streaming_inputs": ["codes"],
+                "outputs": [{
+                    "name": "wave", "dest": "post", "persist": False,
+                    "new_token": False, "streaming": False, "modality": "",
+                }],
+            }],
+            "loops": [],
+        },
+        {
+            "wg_id": 1, "graph_walks": ["chunk"],
+            "nodes": [{
+                "name": "post", "async_enabled": False,
+                "inputs": ["wave"], "streaming_inputs": [],
+                "outputs": [{
+                    "name": "audio", "dest": "emit_to_client", "persist": False,
+                    "new_token": False, "streaming": False, "modality": "audio",
+                }],
+            }],
+            "loops": [],
+        },
+    ]
+    rt = GraphRuntime(
+        worker_graphs=wgs, remote_worker_graphs=[],
+        sharding={"groups": [], "shard_dim": [], "tp_enabled_nodes": []},
+        bookkeeping=book._rust, me=ME, communicator=comm,
+    )
+    rid = rt.add_request(
+        "r1", "C", "chunk", [0, 1], [0, 1], [ME, ME], [1, 1], [], [],
+    )
+    fwd = CurrentForwardPassInfo(
+        request_id="r1", graph_walk="chunk", fwd_index=0, random_seed=0,
+        max_tokens=8, partition_name="C",
+    )
+    info = encode_field(fwd, CurrentForwardPassInfo)
+
+    def _run(node, sig, uuid_in, uuid_out, final=False):
+        if uuid_in is not None:
+            book.put_tensor(uuid_in, _info(uuid_in))
+            book.increment_ref(uuid_in, 1)
+            blk = ColumnarEdgeSpecs.empty()
+            blk.add(rid, "codes", [uuid_in], final, next_node=node)
+            assert rt.ingest_inputs_batch(blk, False, True) == []
+        popped = rt.pop_rids(node, "chunk", [rid], True)
+        assert popped is not None
+        book.put_tensor(uuid_out, _info(uuid_out))
+        book.increment_ref(uuid_out, 1)
+        if final:
+            rt.mark_partition_done(rid, "C")
+        route = rt.complete_and_route_batch({
+            "partition": "C", "graph_walk": "chunk", "node_name": node,
+            "output_signals": [sig], "rids": [rid],
+            "tensors": [uuid_out], "num_tensors": [1],
+            "walks": None, "rid_walk_idx": None,
+        })
+        _send(rt, route.completion_id, request_infos=[(rid, info)])
+
+    _run("vocoder", "wave", 100, 101, final=False)
+    _run("vocoder", "wave", 102, 103, final=True)
+    _run("post", "audio", None, 201, final=False)
+    _run("post", "audio", None, 202, final=False)
+
+    wgds = [m.body for m in _collect(conductor) if isinstance(m.body, WorkerGraphsDone)]
+    assert [
+        (w.worker_graph_ids, w.pass_ids, w.partition_done, w.worker_id)
+        for w in wgds
+    ] == [
+        ([0], [0], False, ME),
+        ([0], [1], True, ME),
+        ([1], [0], False, ME),
+        ([1], [1], True, ME),
+    ]

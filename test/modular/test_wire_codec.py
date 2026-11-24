@@ -587,6 +587,23 @@ def test_a_polymorphic_field_keeps_its_tag_when_encoded_alone():
     assert alone["kv"][0] == tag, "the subclass tag has to survive"
 
 
+def test_worker_graphs_done_preserves_worker_id_and_pass_ids():
+    from mstar.utils.ipc_format import WorkerGraphsDone
+
+    msg = WorkerGraphsDone(
+        request_id="r1", worker_graph_ids=[0, 2], is_first_tp_rank=False,
+        worker_id="worker_3", pass_ids=[1, 4],
+    )
+    decoded = decode(encode(msg))
+    assert decoded.worker_id == "worker_3"
+    assert decoded.pass_ids == [1, 4]
+
+    legacy = WorkerGraphsDone(request_id="r2", worker_graph_ids=[0], is_first_tp_rank=True)
+    decoded_legacy = decode(encode(legacy))
+    assert decoded_legacy.worker_id == ""
+    assert decoded_legacy.pass_ids == []
+
+
 @pytest.mark.parametrize("value", [
     torch.Size([2, 3]),
     torch.Size([]),

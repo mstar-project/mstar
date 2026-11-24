@@ -117,6 +117,15 @@ def _walk_io(model: Model) -> tuple[dict[str, tuple[tuple[str, str], ...]], dict
     return inputs, persists, frozenset(repeating)
 
 
+def _stream_walks(model: Model) -> frozenset[str]:
+    """All walks whose partition receives a stream and that consume at least
+    one streamed input (including walks with user Loops)."""
+    return frozenset(
+        walk for walk, graph in model.get_graph_walk_graphs().items()
+        if streamed_inputs(model, walk, graph)
+    )
+
+
 @dataclass
 class ForwardPassArgs:
     """A partition's next pass as its plan decides it: the edges its step is
@@ -885,6 +894,7 @@ class Conductor:
         }
         # what the walk plans need of each walk (`_plan_step`, `_next_plan_args`, `_consumed`)
         self._walk_inputs, self._walk_persists, self._repeating_walks = _walk_io(self.model)
+        self._stream_walks = _stream_walks(self.model)
         self._all_worker_graph_ids_to_dyn_loops: dict[int, set[str]] = {
             worker_graph_id: set(worker_graph.section.get_loops())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
@@ -1944,6 +1954,33 @@ class Conductor:
             participants=workers | {self.PREPROCESS_WORKER},
         )
 
+    @staticmethod
+    def _wg_pass_complete(
+        request_data: RequestData, pstate: PartitionState, wg_id, wg_pass: int,
+    ) -> bool:
+        expected = len(request_data.worker_graph_to_workers.get(wg_id, ()))
+        if expected == 0:
+            return False
+        return len(pstate.wg_pass_ranks.get((wg_id, wg_pass), ())) >= expected
+
+    @staticmethod
+    def _apply_persist_signals(
+        conductor: "Conductor",
+        request_id: str,
+        request_data: RequestData,
+        writer: tuple[str, int],
+        persist_signals: dict[str, list],
+    ) -> None:
+        held = request_data.persist_signals
+        for name, infos in persist_signals.items():
+            if request_data.persist_writers.get(name) != writer:
+                request_data.persist_writers[name] = writer
+                conductor._un_persist_tensors(request_id, [
+                    info for info in held.get(name, ()) if info.uuid in request_data.persist_signal_ref_cnt
+                ])
+                held[name] = []
+            held[name].extend(infos)
+
     def _process_worker_graphs_done(
         self, body: WorkerGraphsDone
     ) -> list[str]:
@@ -1990,28 +2027,10 @@ class Conductor:
             )
             return []
 
-        # Any report of the pass may carry it, not only the one that completes
-        # the pass: that can be another worker's (an encoder's, say).
-        if body.partition_done:
-            pstate.worker_reported_done = True
-
-        # Persist signals: every rank contributes its shard (different uuid +
-        # source_tp_rank); accumulate across ranks, do not dedup. What an
-        # earlier pass left held under the name is replaced: the tensors sent
-        # are released at their reader counts, and one never sent stays with
-        # its producer until the request ends. A pass is known by
-        # `fwd_pass_number`, which moves only once a routing cycle ends, so two
-        # passes a partition reports in one cycle both land under the name.
-        if body.persist_signals:
-            held, writer = request_data.persist_signals, (partition_name, pstate.fwd_pass_number)
-            for name, infos in body.persist_signals.items():
-                if request_data.persist_writers.get(name) != writer:
-                    request_data.persist_writers[name] = writer
-                    self._un_persist_tensors(body.request_id, [
-                        info for info in held.get(name, ()) if info.uuid in request_data.persist_signal_ref_cnt
-                    ])
-                    held[name] = []
-                held[name].extend(infos)
+        if body.pass_ids and len(body.pass_ids) == len(body.worker_graph_ids):
+            pass_ids = list(body.pass_ids)
+        else:
+            pass_ids = [pstate.wg_queued_pass.get(wg_id, 0) for wg_id in body.worker_graph_ids]
 
         # Resource publish info is rank-sharded. Every TP rank contributes its
         # own KV pages and transfer descriptor, and PublishedKVInfo.update()
@@ -2025,31 +2044,111 @@ class Conductor:
         if body.is_first_tp_rank and body.new_token_counts:
             pstate.num_output_tokens += sum(body.new_token_counts.values())
 
-        # The stream moves a producer-triggered partition's walk on the
-        # worker; follow it so the completion check and the plan's cursor
-        # see the walk this pass actually ran.
+        if not body.worker_graph_ids:
+            if body.partition_done:
+                pstate.worker_reported_done = True
+            if body.persist_signals:
+                self._apply_persist_signals(
+                    self, body.request_id, request_data,
+                    (partition_name, pstate.fwd_pass_number), body.persist_signals,
+                )
+            return []
+
+        for wg_id, wg_pass in zip(body.worker_graph_ids, pass_ids, strict=True):
+            key = (wg_id, wg_pass)
+            expected_workers = request_data.worker_graph_to_workers[wg_id]
+            ranks = pstate.wg_pass_ranks.setdefault(key, set())
+            if body.worker_id:
+                ranks.add(body.worker_id)
+            else:
+                fallback = next((w for w in expected_workers if w not in ranks), f"__anon_{len(ranks)}")
+                ranks.add(fallback)
+            if body.partition_done:
+                pstate.wg_pass_done[key] = True
+            if body.graph_walk:
+                pstate.wg_pass_walk[key] = body.graph_walk
+            if body.persist_signals:
+                bucket = pstate.wg_pass_persist.setdefault(key, {})
+                for name, infos in body.persist_signals.items():
+                    bucket.setdefault(name, []).extend(infos)
+
+        # Keep head-pass fields synced for legacy callers & _status().
         if (
             partition_name in self.producer_triggered_partitions
             and body.graph_walk
+            and not pstate.ready_passes
             and body.graph_walk != pstate.graph_walk
+            and any(
+                wg_pass == pstate.wg_queued_pass.get(wg_id, 0)
+                for wg_id, wg_pass in zip(body.worker_graph_ids, pass_ids, strict=True)
+            )
         ):
             pstate.graph_walk = body.graph_walk
+            pstate.queued_walk = body.graph_walk
             self._set_partition_worker_graph_ids(
                 body.request_id, partition_name, body.graph_walk,
             )
 
-        # Each wg is only marked complete when all its TP ranks have reported.
-        for wg_id in body.worker_graph_ids:
-            count = pstate.wg_rank_completions.get(wg_id, 0) + 1
-            pstate.wg_rank_completions[wg_id] = count
-            expected = len(request_data.worker_graph_to_workers[wg_id])
-            if count >= expected:
-                pstate.completed_worker_graph_ids.add(wg_id)
+        # Close completed passes in contiguous pass order.
+        done_partitions: list[str] = []
+        queued_walk = pstate.queued_walk or pstate.graph_walk
+        while True:
+            if partition_name in self.producer_triggered_partitions:
+                if pstate.ready_passes:
+                    candidate_wgs = [
+                        *pstate.current_worker_graph_ids,
+                        *(w for w in request_data.all_worker_graph_ids if w not in pstate.current_worker_graph_ids),
+                    ]
+                else:
+                    candidate_wgs = pstate.current_worker_graph_ids or request_data.all_worker_graph_ids
+                for wg_id in candidate_wgs:
+                    qpass = pstate.wg_queued_pass.get(wg_id, 0)
+                    walk_here = pstate.wg_pass_walk.get((wg_id, qpass))
+                    if walk_here and walk_here != queued_walk:
+                        queued_walk = walk_here
+                        pstate.queued_walk = queued_walk
+                        break
+                if queued_walk and queued_walk != pstate.graph_walk and hasattr(self, "worker_graphs"):
+                    required_wgs = {
+                        wg_id for wg_id in request_data.all_worker_graph_ids
+                        if queued_walk in self.worker_graphs[wg_id].graph_walks
+                    }
+                else:
+                    required_wgs = set(pstate.current_worker_graph_ids)
+            else:
+                required_wgs = set(pstate.current_worker_graph_ids)
 
-        # Check if this partition's forward pass is fully done
-        done_partitions = []
-        if pstate.current_worker_graph_ids.issubset(pstate.completed_worker_graph_ids):
+            if not required_wgs:
+                break
+            if not all(
+                self._wg_pass_complete(
+                    request_data, pstate, wg_id, pstate.wg_queued_pass.get(wg_id, 0),
+                )
+                for wg_id in required_wgs
+            ):
+                break
+
+            keys = [(wg_id, pstate.wg_queued_pass.get(wg_id, 0)) for wg_id in sorted(required_wgs)]
+            pass_done = any(pstate.wg_pass_done.get(k, False) for k in keys)
+            pass_walk = next(
+                (pstate.wg_pass_walk[k] for k in keys if k in pstate.wg_pass_walk),
+                queued_walk,
+            )
+            pstate.ready_passes.append((pass_walk, pass_done, keys))
+            for wg_id, qpass in keys:
+                pstate.wg_queued_pass[wg_id] = qpass + 1
             done_partitions.append(partition_name)
+
+        pstate.completed_worker_graph_ids = {
+            wg_id for wg_id in pstate.current_worker_graph_ids
+            if self._wg_pass_complete(
+                request_data, pstate, wg_id, pstate.wg_consumed_pass.get(wg_id, 0),
+            )
+        }
+        pstate.worker_reported_done = any(
+            pstate.wg_pass_done.get((wg_id, pstate.wg_consumed_pass.get(wg_id, 0)), False)
+            for wg_id in pstate.current_worker_graph_ids
+        )
 
         return done_partitions
 
@@ -2066,16 +2165,39 @@ class Conductor:
         pstate = request_data.partition_states[partition_name]
         # A self-triggering partition's next pass can report in the same cycle,
         # and is queued again before this pass's state is reset. When the
-        # earlier call ended the partition, on the flag the later report
-        # latched, the later call has nothing left to advance.
+        # earlier call ended the partition, the later call has nothing left to advance.
         if pstate.is_done:
             return all(ps.is_done for ps in request_data.partition_states.values())
+
+        if pstate.ready_passes:
+            pass_walk, pass_done, consumed_keys = pstate.ready_passes.popleft()
+        else:
+            pass_walk, pass_done, consumed_keys = pstate.graph_walk, pstate.worker_reported_done, []
+
+        if (
+            partition_name in self.producer_triggered_partitions
+            and pass_walk
+            and pass_walk != pstate.graph_walk
+        ):
+            pstate.graph_walk = pass_walk
+            self._set_partition_worker_graph_ids(request_id, partition_name, pass_walk)
+
+        writer = (partition_name, pstate.fwd_pass_number)
+        for key in consumed_keys:
+            persisted = pstate.wg_pass_persist.pop(key, None)
+            if persisted:
+                self._apply_persist_signals(self, request_id, request_data, writer, persisted)
+            pstate.wg_pass_ranks.pop(key, None)
+            pstate.wg_pass_done.pop(key, None)
+            pstate.wg_pass_walk.pop(key, None)
+            wg_id, wg_pass = key
+            pstate.wg_consumed_pass[wg_id] = wg_pass + 1
 
         # The worker's signal is authoritative, whatever is left of the plan:
         # the pass that consumed a stream's final chunk, or whose stop check
         # returned END_PARTITION, has run. It ends the partition, so its
         # downstream connections get `producer_done`.
-        done = pstate.worker_reported_done
+        done = pass_done
         if pstate.num_output_tokens >= request_data.max_output_tokens:
             request_log.debug(
                 "Partition %s reached max output tokens %d. Ending.",
@@ -2122,14 +2244,20 @@ class Conductor:
 
         self._un_persist_tensors(request_id, fwd_args.unpersist_tensors)
 
-        # Reset partition forward pass state
-        pstate.completed_worker_graph_ids = set()
-        pstate.current_worker_graph_ids = set()
-        pstate.wg_rank_completions = {}
-        pstate.worker_reported_done = False
         pstate.fwd_pass_number += 1
-
         self._set_partition_worker_graph_ids(request_id, partition_name, pstate.graph_walk)
+        if not pstate.ready_passes:
+            pstate.queued_walk = pstate.graph_walk
+        pstate.completed_worker_graph_ids = {
+            wg_id for wg_id in pstate.current_worker_graph_ids
+            if self._wg_pass_complete(
+                request_data, pstate, wg_id, pstate.wg_consumed_pass.get(wg_id, 0),
+            )
+        }
+        pstate.worker_reported_done = any(
+            pstate.wg_pass_done.get((wg_id, pstate.wg_consumed_pass.get(wg_id, 0)), False)
+            for wg_id in pstate.current_worker_graph_ids
+        )
 
         # Request done when ALL partitions are done
         return all(ps.is_done for ps in request_data.partition_states.values())
@@ -2189,6 +2317,10 @@ class Conductor:
             # tensors went with the first, and a later step may still hold them
             return self._plan_step(request_data, pstate, k, with_tensors=False)
         if k + 1 >= len(plan):
+            if walk in getattr(self, "_stream_walks", ()):
+                if self._walk_inputs.get(walk):
+                    return self._plan_step(request_data, pstate, k, with_tensors=False)
+                return stay
             stay.request_done = True
             return stay
         args = self._plan_step(request_data, pstate, k + 1)

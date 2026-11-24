@@ -252,6 +252,8 @@ pub struct WorkerGraphsDone<'a> {
     /// `rx_info`, `tx_info`, `graph_timings`, in that order: only populated
     /// under enable_prof, and already encoded when they reach us.
     pub profiling: [Option<Value>; 3],
+    pub worker_id: &'a str,
+    pub pass_ids: &'a [u32],
 }
 
 impl WorkerGraphsDone<'_> {
@@ -299,6 +301,11 @@ impl WorkerGraphsDone<'_> {
                 if let Some(v) = value {
                     w_value(m.key(key), v);
                 }
+            }
+            w_str(m.key("worker_id"), self.worker_id);
+            w_arr(m.key("pass_ids"), self.pass_ids.len() as u32);
+            for &p in self.pass_ids {
+                w_u64(m.buf(), p as u64);
             }
         });
     }
@@ -845,5 +852,43 @@ mod tests {
         assert_eq!(entries.len(), 2, "the nested map is ONE parent entry");
         let Value::Map(inner) = &entries[1].1 else { panic!("not nested") };
         assert_eq!(inner.len(), 2);
+    }
+
+    #[test]
+    fn worker_graphs_done_encodes_worker_id_and_pass_ids() {
+        let it = StrToId::default();
+        let bk = StrToId::default();
+        let wg_ids = [2u32, 5u32];
+        let pass_ids = [0u32, 3u32];
+        let frame = WorkerGraphsDone {
+            request_id: "r1",
+            worker_graph_ids: &wg_ids,
+            is_first_tp_rank: true,
+            persist_signals: Vec::new(),
+            new_token_counts: &[],
+            output_signal_names: Vec::new(),
+            partition_name: "C",
+            partition_done: true,
+            graph_walk: "chunk",
+            stream_items_sent: Vec::new(),
+            resource_publish_info: None,
+            profiling: [None, None, None],
+            worker_id: "worker_1",
+            pass_ids: &pass_ids,
+        };
+        let bytes = frame.encode(&it, &bk);
+        let Value::Array(outer) = rmpv::decode::read_value(&mut &bytes[..]).unwrap() else {
+            panic!("not outer array");
+        };
+        let Value::Map(top) = &outer[1] else { panic!("not top map") };
+        let body = top.iter().find(|(k, _)| k.as_str() == Some("body")).unwrap();
+        let Value::Array(tagged) = &body.1 else { panic!("not tagged body") };
+        let Value::Map(fields) = &tagged[1] else { panic!("not body map") };
+        let worker_id = fields.iter().find(|(k, _)| k.as_str() == Some("worker_id")).unwrap().1.as_str();
+        assert_eq!(worker_id, Some("worker_1"));
+        let Value::Array(pids) = &fields.iter().find(|(k, _)| k.as_str() == Some("pass_ids")).unwrap().1 else {
+            panic!("not pass_ids array");
+        };
+        assert_eq!(pids.iter().map(|v| v.as_u64().unwrap()).collect::<Vec<_>>(), vec![0, 3]);
     }
 }

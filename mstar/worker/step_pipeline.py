@@ -969,6 +969,7 @@ class StepPipeline:
             self.admission.lift_caps(freed)
         laps.lap("engine")
         self.streams.remove_request(rid)
+        self.ingest.remove_request(rid)
         self.request_state.remove_request(rid)
         self.tensor_manager.force_cleanup_request(rid)
         laps.lap("worker_state_tensors")

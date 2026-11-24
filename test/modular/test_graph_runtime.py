@@ -1302,3 +1302,106 @@ def test_cleanup_takes_the_consumed_node_out_of_the_ready_set():
 
     runtime.cleanup_consumed_inputs("prefill", [rid], [0])
     assert _ready(runtime) == []
+
+
+def test_graph_state_registry_counts_distinct_entities():
+    from mstar.graph.base import GraphNode, Sequential, WorkerGraphStateRegistry
+
+    section = Sequential([
+        GraphNode(name="a", input_names=["x"], outputs=[]),
+        GraphNode(name="b", input_names=["y"], outputs=[]),
+    ])
+    reg = WorkerGraphStateRegistry(section)
+    reg.mark_entity_complete("a")
+    assert not reg.is_done
+    reg.mark_entity_complete("a")
+    assert not reg.is_done, "completing the same entity twice must not finish the graph"
+    reg.mark_entity_complete("b")
+    assert reg.is_done
+
+
+def test_input_ingest_buffers_refused_pipelined_normal_inputs():
+    """Cross-worker pipelining >2 passes ahead triggers 2-slot refusal in Rust;
+    InputIngest parks refused edges in _pending_normal_inputs and drains them FIFO."""
+    from types import SimpleNamespace
+
+    from mstar.communication.event import EventWakeup
+    from mstar.graph.base import GraphNode
+    from mstar.worker.input_ingest import InputIngest
+    from mstar.worker.request_lifecycle import RequestLifecycle
+    from mstar.worker.services import WorkerLayout
+    from mstar.worker.stream_buffers import StreamBufferManager
+
+    section = GraphNode(name="post", input_names=["wave"], outputs=[])
+    req_state, runtime, rid = _build(section, 0, "w", {"post"})
+    ready_batches = {}
+    tensor_stub = SimpleNamespace(
+        get_ready_tensors=lambda: ready_batches.pop("next", {}),
+        take_failed_reads=lambda: [],
+        bookkeeping=runtime.tensor_store.bookkeeping,
+    )
+    streams = StreamBufferManager(
+        request_state=req_state, tensor_manager=tensor_stub, connections=[], graph_runtime=runtime,
+    )
+    layout = WorkerLayout()
+    lifecycle = RequestLifecycle(layout, runtime)
+    lifecycle.add(rid, "rid")
+    services = SimpleNamespace(
+        worker_id="worker_0", graph_runtime=runtime, engine_manager=None,
+        tensor_manager=tensor_stub, request_state=req_state, streams=streams,
+        communicator=None,
+    )
+    lockstep = SimpleNamespace(
+        note_reads=lambda r: None,
+        record_read_failures=lambda f: None,
+        enqueue_follow=lambda *a, **k: None,
+        enqueue_no_spec=lambda *a, **k: None,
+        last_consumed_seq=0,
+    )
+    ingest = InputIngest(services, layout, lifecycle, lockstep, EventWakeup())
+
+    edges = [
+        GraphEdge(name="wave", next_node="post", tensor_info=[_info_with_uuid(u)])
+        for u in (11, 12, 13)
+    ]
+    for u in (11, 12, 13):
+        runtime.tensor_store.bookkeeping.put_tensor(u, _info_with_uuid(u))
+        runtime.tensor_store.increment_ref(u, 1)
+
+    ready_batches["next"] = {rid: edges}
+    ingest.check_ready_tensors()
+    assert len(ingest._pending_normal_inputs[rid]) == 1
+    assert ingest._pending_normal_inputs[rid][0].tensor_info[0].uuid == 13
+
+    # Complete Pass 0 (uuid 11) -> check_ready_tensors drains uuid 13 cleanly!
+    pop0 = runtime.pop_rids("post", "w", [rid], check_ready=True)
+    assert pop0.input_edges.edge_tuples()[0].uuids == [11]
+    runtime.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk="w", node_name="post",
+        output_signals=[], wg_ids=ParallelList([rid], [0]),
+        tensors=[], num_tensors=[],
+    ))
+    ingest.check_ready_tensors()
+    assert rid not in ingest._pending_normal_inputs
+
+    pop1 = runtime.pop_rids("post", "w", [rid], check_ready=True)
+    assert pop1.input_edges.edge_tuples()[0].uuids == [12]
+    runtime.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk="w", node_name="post",
+        output_signals=[], wg_ids=ParallelList([rid], [0]),
+        tensors=[], num_tensors=[],
+    ))
+    pop2 = runtime.pop_rids("post", "w", [rid], check_ready=True)
+    assert pop2.input_edges.edge_tuples()[0].uuids == [13]
+
+    ingest.remove_request(rid)
+    assert rid not in ingest._pending_normal_inputs
+
+
+def _info_with_uuid(u):
+    from mstar.utils.ipc_format import TensorPointerInfo
+
+    return TensorPointerInfo(
+        dims=[1], dtype=None, nbytes=4, address=0, stride=[1],
+        uuid=u, source_session_id="s", source_entity="worker_0",
+    )

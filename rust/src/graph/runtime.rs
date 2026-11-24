@@ -235,7 +235,7 @@ pub struct GraphRuntime {
     ) -> Option<(Vec<Sym>, Vec<(Sym, u32)>, u32)> {
         let state = self.state(wg, rid)?;
         let g = self.g(wg);
-        let fwd = state.num_times_run;
+        let fwd = state.active_wg_pass_idx(node);
         // A node outside every loop has no context, only the pass index.
         let Some(lid) = g.node(node).loop_id else {
             return Some((vec![], vec![], fwd));
@@ -246,7 +246,7 @@ pub struct GraphRuntime {
             .loops
             .iter()
             .enumerate()
-            .map(|(i, lp)| (lp.name, state.loop_iter(i as LoopId)))
+            .map(|(i, lp)| (lp.name, state.loop_iter_for_node(node, i as LoopId)))
             .collect();
         Some((order, indices, fwd))
     }
@@ -336,10 +336,13 @@ pub struct GraphRuntime {
     /// signals, token counts and emitted signal names -- they accumulate
     /// across sends and flush onto the next completion, so a persist signal
     /// cannot race the message announcing it.
+    #[allow(clippy::too_many_arguments)]
     fn worker_graphs_done_frame(
         &mut self,
         rid: u32,
         worker_graph_ids: &[u32],
+        pass_ids: &[u32],
+        walk_passes: &[(Sym, u32)],
         is_first_tp_rank: bool,
         partition_name: &str,
         graph_walk: &str,
@@ -351,22 +354,27 @@ pub struct GraphRuntime {
         // `and not speculative`, as Python has it: a speculatively-scheduled
         // node has not really finished the partition, so reporting it done
         // here would tell the conductor the stream ended a pass early.
+        let partition = self.interner.get(partition_name);
         let partition_done = !speculative
-            && self
-                .interner
-                .get(partition_name)
-                .and_then(|p| self.info(rid).map(|i| i.partition_done(p)))
+            && partition
+                .and_then(|p| {
+                    self.info(rid).map(|i| {
+                        walk_passes
+                            .iter()
+                            .any(|&(w, wp)| i.is_partition_done(p, w, wp))
+                    })
+                })
                 .unwrap_or(false);
 
-        let partition = self.interner.get(partition_name);
         let (persist, new_tokens, output_signals, stream_items) =
             match self.requests[rid as usize].as_mut() {
-                Some(info) => info.pending.take_for_send(partition),
+                Some(info) => info.pending.take_for_send(partition, walk_passes),
                 None => (vec![], vec![], vec![], vec![]),
             };
         let persist_signals: Vec<(Sym, Vec<crate::tensors::TensorPointerInfo>)> =
             persist.into_iter().map(|(sig, uuids)| (sig, self.infos(&uuids))).collect();
 
+        let worker_id = self.interner.name(self.shard.me).to_string();
         let frame = frames::WorkerGraphsDone {
             request_id: &request_id,
             worker_graph_ids,
@@ -380,6 +388,8 @@ pub struct GraphRuntime {
             stream_items_sent: stream_items,
             resource_publish_info: frames::spliced_value(publication_encoded),
             profiling: frames::split_profiling(profiling_encoded),
+            worker_id: &worker_id,
+            pass_ids,
         };
         let bk = self.bookkeeping.lock().unwrap();
         Ok(frame.encode(&self.interner, bk.strings()))
@@ -466,8 +476,8 @@ pub struct GraphRuntime {
                 if is_streaming && !state.is_ready_for_streaming(node) {
                     continue;
                 }
-                if state.ingest(
-                    g, node, slot, tensors, can_buffer, final_chunk,
+                if state.ingest_for_walk(
+                    g, node, slot, tensors, can_buffer, final_chunk, part.graph_walk,
                 ) {
                     return true;
                 }
@@ -703,6 +713,7 @@ pub struct GraphRuntime {
 
             match self.prep_one(
                 wg, rid, spec_node, curr_node, same_node,
+                self.interner.get(&input.graph_walk).unwrap_or(0),
                 &input.streaming_edges[slice.clone()],
                 &all_refs[slice.clone()], slice.start, &source_edges,
             ) {
@@ -807,6 +818,7 @@ pub struct GraphRuntime {
         spec_node: NodeId,
         curr_node: NodeId,
         same_node: bool,
+        walk: Sym,
         edges: &[EdgeSpecArg],
         // Parallel to `edges`; resolved once for the whole batch by the caller,
         // rather than taking the bookkeeping lock per edge in here.
@@ -831,6 +843,23 @@ pub struct GraphRuntime {
             .collect();
 
         let state = self.state_mut(wg, rid)?;
+        let curr_pass = state.active_pass_idx(curr_node);
+        if !same_node {
+            match curr_pass {
+                Some(cp) => {
+                    let ok = state.active_pass_idx(spec_node) == Some(cp)
+                        || state.shares_active_loop_in_pass(cp, curr_node, spec_node);
+                    if !ok {
+                        return None;
+                    }
+                }
+                None => {
+                    if state.active_pass_idx(spec_node).is_some() {
+                        return None;
+                    }
+                }
+            }
+        }
         // Held true across the ingest so a streaming input cannot re-add the
         // node to the ready queue underneath us. Saved rather than assumed
         // false: the node may already be in flight from a committed batch, and
@@ -845,15 +874,22 @@ pub struct GraphRuntime {
         let mut ingested = Vec::new();
         for (idx, slot, tensors, final_chunk) in resolved {
             let already = state.has_input(spec_node, slot, false);
-            if state.ingest(&g, spec_node, slot, tensors, same_node, final_chunk)
+            if state.ingest_for_walk(&g, spec_node, slot, tensors, same_node, final_chunk, walk)
             {
                 kept.push(idx);
                 ingested.push((slot, already));
             }
         }
 
-        state.ingest_for_speculation(&g, curr_node, source_edges);
-        let ready = state.ready_for_speculation(spec_node, same_node, false);
+        let spec_nodes = state.ingest_for_speculation(&g, curr_node, source_edges);
+        let target_pass = curr_pass.or_else(|| state.active_pass_idx(spec_node));
+        let ready = match target_pass {
+            Some(tp) => state.ready_for_speculation_in_pass(Some(tp), spec_node, same_node, false),
+            None => {
+                g.node(spec_node).streaming_mask == 0
+                    && spec_nodes.iter().any(|sn| sn.node == spec_node)
+            }
+        };
         state.clear_speculative_inputs();
         // Restore, not force-false: the node may still be in flight.
         state.set_in_flight(spec_node, was_in_flight);
@@ -868,13 +904,16 @@ pub struct GraphRuntime {
         // Interned names, resolved once per DISTINCT name when the caller
         // folds these into its columns -- not a String per edge, and no
         // `next_node` at all.
-        let edges_out = state
-            .input_tensors(spec_node, same_node)
-            .into_iter()
-            .map(|(name, tensors, final_chunk)| {
-                (name, tensors.iter().map(|t| t.uuid).collect(), final_chunk)
-            })
-            .collect::<Vec<(Sym, Vec<u64>, bool)>>();
+        let edges_out = match target_pass {
+            Some(tp) => state
+                .input_tensors_in_pass(tp, spec_node, same_node)
+                .into_iter()
+                .map(|(name, tensors, final_chunk)| {
+                    (name, tensors.iter().map(|t| t.uuid).collect(), final_chunk)
+                })
+                .collect::<Vec<(Sym, Vec<u64>, bool)>>(),
+            None => Vec::new(),
+        };
         Some((kept, edges_out, ingested))
     }
 
@@ -973,6 +1012,7 @@ pub struct GraphRuntime {
         let walk_name = self.interner.name(walk).to_string();
         let Some(owner) = self.owner_of(node_name, &walk_name) else { return };
         let g = self.graphs[owner as usize].clone();
+        let owner_node = self.nid(owner, node_name);
         for &sym in &syms {
             let Some(&lid) = g.loop_by_name.get(&sym) else { continue };
             let Some(state) = self.state(owner, rid) else {
@@ -986,12 +1026,18 @@ pub struct GraphRuntime {
             let indices: FxHashMap<Sym, u32> = g
                 .loop_order(lid)
                 .into_iter()
-                .map(|l| (g.lp(l).name, state.loop_iter(l)))
+                .map(|l| {
+                    let it = owner_node
+                        .map_or_else(|| state.loop_iter(l), |n| state.loop_iter_for_node(n, l));
+                    (g.lp(l).name, it)
+                })
                 .collect();
+            let wg_fwd_pass_idx = owner_node
+                .map_or(state.num_times_run, |n| state.active_wg_pass_idx(n));
             let stop = LoopStopTime {
                 loop_name_order: order,
                 loop_indices: indices,
-                wg_fwd_pass_idx: state.num_times_run,
+                wg_fwd_pass_idx,
             };
             if let Some(info) = self.requests[rid as usize].as_mut() {
                 info.loop_stop_times.insert(sym, stop);
@@ -1212,8 +1258,12 @@ pub struct SendPlan {
     /// rid -> the log-prob its emits carry, inline or tensor.
     pub logprobs: FxHashMap<u32, f64>,
     /// (rid, finished worker graph ids, is_first_tp_rank, the walk the rid
-    /// ran -- its own, not a mixed step's combined label)
-    #[pyo3(get)] pub completed: Vec<(u32, Vec<u32>, bool, Option<Sym>)>,
+    /// ran -- its own, not a mixed step's combined label, wg pass ids)
+    #[pyo3(get)] pub completed: Vec<(u32, Vec<u32>, bool, Option<Sym>, Vec<u32>)>,
+    /// Per rid: `(walk, walk_pass_id)` of retired passes for `done_passes` & persist lookup.
+    pub completed_walk_passes: FxHashMap<u32, Vec<(Sym, u32)>>,
+    /// Per rid: `(walk, walk_pass_id)` of the completing step's pass.
+    pub persist_step_pass: FxHashMap<u32, (Sym, u32)>,
     /// The pre-completion loop context, snapshotted at route time.
     pub nested: FxHashMap<u32, (Vec<Sym>, Vec<(Sym, u32)>, u32)>,
 }
@@ -1389,7 +1439,9 @@ pub struct Completion {
     /// a rank other than 0 the replicated fanout drops it -- and with it the
     /// conductor's only record that this rank produced the signal.
     pub persist: FxHashMap<u32, Vec<(Sym, Vec<TensorRef>)>>,
-    pub completed_wgs: FxHashMap<u32, Vec<u32>>,
+    pub completed_wgs: FxHashMap<u32, Vec<(u32, u32)>>,
+    pub completed_walk_passes: FxHashMap<u32, Vec<(Sym, u32)>>,
+    pub completed_step_pass: FxHashMap<u32, (Sym, u32)>,
     /// Per rid: is this rank the TP group's rank 0 for the completed node?
     /// Computed at completion, not at send: the conductor counts one report
     /// per request, so every rank claiming rank 0 multiplies it by tp_size.
@@ -1869,6 +1921,8 @@ impl GraphRuntime {
         self.completions.retain(|_, c| {
             c.routing.remove(&rid);
             c.completed_wgs.remove(&rid);
+            c.completed_walk_passes.remove(&rid);
+            c.completed_step_pass.remove(&rid);
             c.persist.remove(&rid);
             c.first_tp_rank.remove(&rid);
             c.speculative.remove(&rid);
@@ -1938,8 +1992,22 @@ impl GraphRuntime {
 
     fn mark_partition_done(&mut self, rid: u32, partition: &str) {
         let Some(p) = self.interner.get(partition) else { return };
+        if let Some(pp) = &self.postprocess {
+            if pp.partition == partition && pp.completion_id != 0 {
+                if let Some(step_pass) = self
+                    .completions
+                    .get(&pp.completion_id)
+                    .and_then(|c| c.completed_step_pass.get(&rid).copied())
+                {
+                    if let Some(info) = self.requests.get_mut(rid as usize).and_then(|r| r.as_mut()) {
+                        info.mark_partition_done_pass(p, step_pass.0, step_pass.1);
+                    }
+                    return;
+                }
+            }
+        }
         if let Some(info) = self.requests.get_mut(rid as usize).and_then(|r| r.as_mut()) {
-            info.mark_partition_done(p);
+            info.mark_partition_done_pending(p);
         }
     }
 
@@ -2737,7 +2805,9 @@ impl GraphRuntime {
         let mut routing: FxHashMap<u32, Vec<RoutedEdge>> = FxHashMap::default();
         let mut persist: FxHashMap<u32, Vec<(Sym, Vec<TensorRef>)>> =
             FxHashMap::default();
-        let mut completed_wgs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        let mut completed_wgs: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+        let mut completed_walk_passes: FxHashMap<u32, Vec<(Sym, u32)>> = FxHashMap::default();
+        let mut completed_step_pass: FxHashMap<u32, (Sym, u32)> = FxHashMap::default();
         let mut first_tp_rank: FxHashMap<u32, bool> = FxHashMap::default();
         let mut speculative: FxHashMap<u32, bool> = FxHashMap::default();
         let mut staged: FxHashSet<u64> = FxHashSet::default();
@@ -2862,7 +2932,17 @@ impl GraphRuntime {
             // Before complete(), which clears the flag.
             let was_speculative = state.is_in_flight(node);
             let stride = input.loop_strides.as_ref().map_or(1, |s| s[i]);
-            let completed = state.complete_strided(&g, node, &out_tensors, stride);
+            let completed = state.complete_strided_for_walk(g, node, &out_tensors, stride, walk);
+            let step_pass = (completed.pass_walk, completed.walk_pass_id);
+            completed_step_pass.insert(rid, step_pass);
+            let partition_sym_step = self.interner.get(&input.partition);
+            if let Some(p_sym) = partition_sym_step {
+                if let Some(info) = self.requests[rid as usize].as_mut() {
+                    if info.take_pending_partition_done(p_sym) {
+                        info.mark_partition_done_pass(p_sym, step_pass.0, step_pass.1);
+                    }
+                }
+            }
             let mut pre_shard_edges = completed.edges;
             let freed_inputs = completed.freed;
             let transferred = completed.transferred;
@@ -2996,14 +3076,16 @@ impl GraphRuntime {
             };
             for w in sweep {
                 let Some(st) = self.state_mut(w, rid) else { continue };
-                if !st.is_done {
-                    continue;
+                for (retired_walk, retired_walk_pass, retired_wg_pass) in st.retire_done_passes() {
+                    completed_wgs
+                        .entry(rid)
+                        .or_default()
+                        .push((self.wg_ids[w as usize], retired_wg_pass));
+                    completed_walk_passes
+                        .entry(rid)
+                        .or_default()
+                        .push((retired_walk, retired_walk_pass));
                 }
-                st.reset();
-                completed_wgs
-                    .entry(rid)
-                    .or_default()
-                    .push(self.wg_ids[w as usize]);
             }
 
             // Local destinations ingest now, so a consumer on this worker sees
@@ -3071,10 +3153,16 @@ impl GraphRuntime {
                             {
                                 // A declining graph falls through to the wire,
                                 // as Python's `leftover` branch does.
-                                took = st.ingest(
-                                    owner_g, d, slot, &e.tensors,
-                                    true, false,
-                                );
+                                took = match e.dest {
+                                    Dest::Local(_) => st.ingest_in_pass(
+                                        owner_g, step_pass.0, step_pass.1,
+                                        d, slot, &e.tensors, true, false,
+                                    ),
+                                    _ => st.ingest_for_walk(
+                                        owner_g, d, slot, &e.tensors,
+                                        true, false, walk,
+                                    ),
+                                };
                             }
                         }
                     }
@@ -3092,7 +3180,18 @@ impl GraphRuntime {
             // check so it, the registration, the reference count and
             // take_send_plan all agree.
             for (e, &took) in edges.iter_mut().zip(&ingested_locally) {
-                e.declined_local = !took && matches!(e.dest, Dest::Local(_));
+                let is_local_dest = match e.dest {
+                    Dest::Local(_) => true,
+                    Dest::External(_) if !e.streaming => {
+                        e.worker.is_none_or(|w| w == me_sym)
+                            && walk_sym.is_some_and(|w| {
+                                self.node_owner.contains_key(&(w, e.dest_sym))
+                                    && self.runs_for_request(rid, e.dest_sym)
+                            })
+                    }
+                    _ => false,
+                };
+                e.declined_local = !took && is_local_dest;
             }
 
             // Which rids will actually produce a frame carrying
@@ -3432,6 +3531,8 @@ impl GraphRuntime {
                 routing,
                 persist,
                 completed_wgs,
+                completed_walk_passes,
+                completed_step_pass,
                 first_tp_rank,
                 speculative,
                 nested: nested_snapshot,
@@ -3796,6 +3897,8 @@ impl GraphRuntime {
         let mut plan = SendPlan {
             partition: c.partition.clone(),
             node_name: c.node_name.clone(),
+            completed_walk_passes: std::mem::take(&mut c.completed_walk_passes),
+            persist_step_pass: std::mem::take(&mut c.completed_step_pass),
             nested: c.nested.clone(),
             logprobs: std::mem::take(&mut c.logprobs),
             ..Default::default()
@@ -3908,7 +4011,7 @@ impl GraphRuntime {
                         };
                         let me_sym = self.shard.me;
                         for worker in workers {
-                            if mine && worker == me_sym {
+                            if mine && worker == me_sym && !e.declined_local {
                                 continue;
                             }
                             let (shard_dim, total_fanin) =
@@ -3954,11 +4057,14 @@ impl GraphRuntime {
             }
             if let Some(wgs) = c.completed_wgs.get(&rid) {
                 let _ = &g;
+                let wg_ids: Vec<u32> = wgs.iter().map(|&(id, _)| id).collect();
+                let pass_ids: Vec<u32> = wgs.iter().map(|&(_, p)| p).collect();
                 plan.completed.push((
                     rid,
-                    wgs.clone(),
+                    wg_ids,
                     c.first_tp_rank.get(&rid).copied().unwrap_or(true),
                     walk,
+                    pass_ids,
                 ));
             }
         }
@@ -3984,7 +4090,7 @@ impl GraphRuntime {
                 .pending
                 .persist
                 .iter()
-                .map(|(sig, _)| self.interner.name(*sig).to_string())
+                .map(|(_, sig, _)| self.interner.name(*sig).to_string())
                 .collect(),
             None => vec![],
         }
@@ -4326,8 +4432,9 @@ impl GraphRuntime {
 
             for (rid, signal, uuids) in plan.persist {
                 let sig = self.interner.intern(&signal);
+                let step_pass = plan.persist_step_pass.get(&rid).copied();
                 if let Some(info) = self.requests[rid as usize].as_mut() {
-                    info.pending.add_persist(sig, uuids);
+                    info.pending.add_persist(step_pass, sig, uuids);
                 }
             }
             let partition_sym = self.interner.intern(&partition);
@@ -4337,12 +4444,17 @@ impl GraphRuntime {
                 }
             }
 
-            for (rid, wg_ids, is_first_tp_rank, walk) in plan.completed {
+            for (rid, wg_ids, is_first_tp_rank, walk, pass_ids) in plan.completed {
                 let graph_walk = walk
                     .map(|w| self.interner.name(w).to_string())
                     .unwrap_or_default();
+                let walk_passes = plan
+                    .completed_walk_passes
+                    .get(&rid)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
                 let bytes = self.worker_graphs_done_frame(
-                    rid, &wg_ids, is_first_tp_rank, &partition, &graph_walk,
+                    rid, &wg_ids, &pass_ids, walk_passes, is_first_tp_rank, &partition, &graph_walk,
                     publications.get(&rid).and_then(|b| b.as_deref()),
                     profiling.get(&rid).and_then(|b| b.as_deref()),
                     spec_flags.get(&rid).copied().unwrap_or(false),

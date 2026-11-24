@@ -158,7 +158,7 @@ pub(super) struct Postprocess {
     stops: Option<Vec<(u32, Vec<String>)>>,
     stopped: Vec<u32>,
     stored: Option<Stored>,
-    completion_id: u64,
+    pub(super) completion_id: u64,
 }
 
 impl Postprocess {
@@ -589,7 +589,25 @@ impl GraphRuntime {
     fn pp_send_frames(
         &mut self, pp: &Postprocess, args: SendArgs,
     ) -> PyResult<(Vec<u32>, Vec<(String, Vec<u8>)>)> {
-        for &rid in &pp.partition_done {
+        let p_sym = self.interner.get(&pp.partition);
+        let step_passes: Vec<(u32, Option<(Sym, u32)>)> = pp
+            .partition_done
+            .iter()
+            .map(|&rid| {
+                let sp = self
+                    .completions
+                    .get(&pp.completion_id)
+                    .and_then(|c| c.completed_step_pass.get(&rid).copied());
+                (rid, sp)
+            })
+            .collect();
+        for (rid, sp) in step_passes {
+            if let (Some(p), Some((w, wp))) = (p_sym, sp) {
+                if let Some(info) = self.requests.get_mut(rid as usize).and_then(|r| r.as_mut()) {
+                    info.mark_partition_done_pass(p, w, wp);
+                    continue;
+                }
+            }
             self.mark_partition_done(rid, &pp.partition);
         }
         self.build_send_frames(

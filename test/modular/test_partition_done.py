@@ -110,9 +110,8 @@ def test_the_flag_on_any_report_ends_a_partition_without_a_stream_in(flag_on):
 
 def test_two_passes_reported_in_one_cycle_end_the_partition_once():
     """A self-triggering partition's next pass can report before the conductor
-    advances the last one. Both reports queue the partition (the completed set
-    still covers the pass), and the final one's flag latches before either call
-    runs: the first call ends the partition, the second must not advance it."""
+    advances the last one. Pass 0 closes with ``partition_done=False`` and
+    advances to Pass 1, which closes with ``partition_done=True`` once."""
     c, req, rec = _conductor()
     c.enable_prof = False
     pstate = req.partition_states["B"]
@@ -120,17 +119,19 @@ def test_two_passes_reported_in_one_cycle_end_the_partition_once():
     req.worker_graph_to_workers = {0: ["w"]}
     queued = [
         name
-        for done in (False, True)
+        for pass_id, done in ((0, False), (1, True))
         for name in c._process_worker_graphs_done(WorkerGraphsDone(
             request_id="r", partition_name="B", worker_graph_ids=[0], is_first_tp_rank=True,
-            partition_done=done,
+            partition_done=done, worker_id="w", pass_ids=[pass_id],
         ))
     ]
     assert queued == ["B", "B"]
-    for name in queued:
-        c._process_done_forward("r", name)
+    assert c._process_done_forward("r", "B") is False
+    assert pstate.is_done is False
+    assert pstate.fwd_pass_number == 1
+    assert c._process_done_forward("r", "B") is False
     assert pstate.is_done is True
-    assert pstate.fwd_pass_number == 1, "the done partition is not advanced again"
+    assert pstate.fwd_pass_number == 2
     assert rec.producer_done == [("r", "B", "C")]
 
 
@@ -192,3 +193,169 @@ def test_a_finished_consumer_is_not_told_its_producer_is_done():
     _done_forward(c, req, "B", partition_done=True)
     assert req.streaming_connections["B->C"].producer_done is True
     assert rec.producer_done == []
+
+
+def test_pipelined_passes_across_workers_keep_partition_done_per_pass():
+    """Issue #554 reproducer: vocoder (WG 0) reports pass 0 (False) and pass 1
+    (True) before post (WG 1) reports pass 0 (False) and pass 1 (False).
+    Pass 0 must close without ending the partition; Pass 1 closes with done."""
+    c, req, rec = _conductor()
+    c.enable_prof = False
+    pstate = req.partition_states["B"]
+    pstate.current_worker_graph_ids = {0, 1}
+    req.worker_graph_to_workers = {0: ["voc"], 1: ["post"]}
+
+    reports = [
+        WorkerGraphsDone(request_id="r", partition_name="B", worker_graph_ids=[0],
+                         is_first_tp_rank=True, partition_done=False, worker_id="voc", pass_ids=[0]),
+        WorkerGraphsDone(request_id="r", partition_name="B", worker_graph_ids=[0],
+                         is_first_tp_rank=True, partition_done=True, worker_id="voc", pass_ids=[1]),
+        WorkerGraphsDone(request_id="r", partition_name="B", worker_graph_ids=[1],
+                         is_first_tp_rank=True, partition_done=False, worker_id="post", pass_ids=[0]),
+        WorkerGraphsDone(request_id="r", partition_name="B", worker_graph_ids=[1],
+                         is_first_tp_rank=True, partition_done=False, worker_id="post", pass_ids=[1]),
+    ]
+    assert c._process_worker_graphs_done(reports[0]) == []
+    assert c._process_worker_graphs_done(reports[1]) == []
+    assert not pstate.worker_reported_done, "Pass 1 final flag must not leak into Pass 0"
+
+    assert c._process_worker_graphs_done(reports[2]) == ["B"]
+    c._process_done_forward("r", "B")
+    assert pstate.is_done is False
+    assert pstate.fwd_pass_number == 1
+    assert rec.producer_done == []
+
+    assert c._process_worker_graphs_done(reports[3]) == ["B"]
+    c._process_done_forward("r", "B")
+    assert pstate.is_done is True
+    assert pstate.fwd_pass_number == 2
+    assert rec.producer_done == [("r", "B", "C")]
+
+
+def test_tp2_duplicate_rank0_reports_cannot_close_pass_for_rank1():
+    """In TP=2 across passes, rank 0 reporting pass 0 and pass 1 before rank 1
+    reports pass 0 must not close pass 0 prematurely."""
+    c, req, rec = _conductor()
+    c.enable_prof = False
+    pstate = req.partition_states["B"]
+    pstate.current_worker_graph_ids = {0}
+    req.worker_graph_to_workers = {0: ["w0", "w1"]}
+
+    assert c._process_worker_graphs_done(WorkerGraphsDone(
+        request_id="r", partition_name="B", worker_graph_ids=[0], is_first_tp_rank=True,
+        partition_done=False, worker_id="w0", pass_ids=[0],
+    )) == []
+    assert c._process_worker_graphs_done(WorkerGraphsDone(
+        request_id="r", partition_name="B", worker_graph_ids=[0], is_first_tp_rank=True,
+        partition_done=True, worker_id="w0", pass_ids=[1],
+    )) == []
+    assert c._process_worker_graphs_done(WorkerGraphsDone(
+        request_id="r", partition_name="B", worker_graph_ids=[0], is_first_tp_rank=False,
+        partition_done=False, worker_id="w1", pass_ids=[0],
+    )) == ["B"]
+    c._process_done_forward("r", "B")
+    assert pstate.is_done is False
+    assert c._process_worker_graphs_done(WorkerGraphsDone(
+        request_id="r", partition_name="B", worker_graph_ids=[0], is_first_tp_rank=False,
+        partition_done=True, worker_id="w1", pass_ids=[1],
+    )) == ["B"]
+    c._process_done_forward("r", "B")
+    assert pstate.is_done is True
+
+
+def test_pipelined_persist_signals_do_not_clobber_earlier_pass():
+    """Persist signals from Pass 1 arriving before Pass 0 closes must stay
+    isolated until Pass 1's _process_done_forward applies them."""
+    from mstar.utils.ipc_format import TensorPointerInfo
+
+    c, req, _ = _conductor()
+    c.enable_prof = False
+    pstate = req.partition_states["B"]
+    pstate.current_worker_graph_ids = {0, 1}
+    req.worker_graph_to_workers = {0: ["voc"], 1: ["post"]}
+    t0 = TensorPointerInfo(
+        dims=[1], dtype=None, nbytes=4, address=0, stride=[1],
+        uuid="u0", source_session_id="s", source_entity="voc",
+    )
+    t1 = TensorPointerInfo(
+        dims=[1], dtype=None, nbytes=4, address=0, stride=[1],
+        uuid="u1", source_session_id="s", source_entity="voc",
+    )
+    c._process_worker_graphs_done(WorkerGraphsDone(
+        request_id="r", partition_name="B", worker_graph_ids=[0], is_first_tp_rank=True,
+        worker_id="voc", pass_ids=[0], persist_signals={"emb": [t0]},
+    ))
+    c._process_worker_graphs_done(WorkerGraphsDone(
+        request_id="r", partition_name="B", worker_graph_ids=[0], is_first_tp_rank=True,
+        worker_id="voc", pass_ids=[1], persist_signals={"emb": [t1]},
+    ))
+    assert req.persist_signals == {}
+    assert c._process_worker_graphs_done(WorkerGraphsDone(
+        request_id="r", partition_name="B", worker_graph_ids=[1], is_first_tp_rank=True,
+        worker_id="post", pass_ids=[0],
+    )) == ["B"]
+    c._process_done_forward("r", "B")
+    assert [i.uuid for i in req.persist_signals["emb"]] == ["u0"]
+    assert c._process_worker_graphs_done(WorkerGraphsDone(
+        request_id="r", partition_name="B", worker_graph_ids=[1], is_first_tp_rank=True,
+        worker_id="post", pass_ids=[1], partition_done=True,
+    )) == ["B"]
+    c._process_done_forward("r", "B")
+    assert [i.uuid for i in req.persist_signals["emb"]] == ["u1"]
+
+
+def test_repeating_consumer_loop_walk_does_not_end_until_partition_done():
+    """A consumer partition running a user Loop walk (not in _repeating_walks)
+    must stay active on partition_done=False and close only on partition_done=True."""
+    c, req, rec = _conductor()
+    c._stream_walks = frozenset({"b"})
+    c._repeating_walks = frozenset()  # e.g., user Loop excluded from _repeating_walks
+    assert c._process_done_forward("r", "B") is False
+    assert req.partition_states["B"].is_done is False
+    assert rec.producer_done == []
+    assert _done_forward(c, req, "B", partition_done=True) is False
+    assert req.partition_states["B"].is_done is True
+    assert rec.producer_done == [("r", "B", "C")]
+
+
+def test_producer_triggered_pipelined_walk_transition_across_disjoint_wgs():
+    """A producer-triggered partition switching from walk_a (WG 0) to walk_b
+    (WG 1) while Pass 0 is still queued closes Pass 0 under walk_a and Pass 1
+    under walk_b."""
+    from types import SimpleNamespace
+
+    c, req, rec = _conductor()
+    c.enable_prof = False
+    c.producer_triggered_partitions = {"B"}
+    c._walk_inputs = {**c._walk_inputs, "walk_a": (), "walk_b": ()}
+    c._walk_persists = {**c._walk_persists, "walk_a": frozenset(), "walk_b": frozenset()}
+    c.worker_graphs = {
+        0: SimpleNamespace(graph_walks={"walk_a"}),
+        1: SimpleNamespace(graph_walks={"walk_b"}),
+    }
+    req.all_worker_graph_ids = {0, 1}
+    req.worker_graph_to_workers = {0: ["w0"], 1: ["w1"]}
+    pstate = req.partition_states["B"]
+    pstate.plan = [WalkStep("walk_a"), WalkStep("walk_b")]
+    pstate.graph_walk = "walk_a"
+    pstate.current_worker_graph_ids = {0}
+    c._set_partition_worker_graph_ids = lambda rid, pname, walk: setattr(
+        pstate, "current_worker_graph_ids", {0} if walk == "walk_a" else {1},
+    )
+
+    queued = c._process_worker_graphs_done(WorkerGraphsDone(
+        request_id="r", partition_name="B", worker_graph_ids=[0], is_first_tp_rank=True,
+        graph_walk="walk_a", worker_id="w0", pass_ids=[0],
+    ))
+    queued += c._process_worker_graphs_done(WorkerGraphsDone(
+        request_id="r", partition_name="B", worker_graph_ids=[1], is_first_tp_rank=True,
+        graph_walk="walk_b", worker_id="w1", pass_ids=[0], partition_done=True,
+    ))
+    assert queued == ["B", "B"]
+    assert c._process_done_forward("r", "B") is False
+    assert pstate.is_done is False
+    assert pstate.fwd_pass_number == 1
+    assert c._process_done_forward("r", "B") is False
+    assert pstate.graph_walk == "walk_b"
+    assert pstate.is_done is True
+    assert rec.producer_done == [("r", "B", "C")]

@@ -4410,14 +4410,15 @@ the item itself when the chunk holds one. Don't write into a streamed input in p
 one-item chunk is the stored tensor, which the producer may also have routed to other
 destinations, and a sliding window's overlap items reappear in the next chunk.
 
-Keep a walk that consumes a stream to one node or one ``Loop`` on one node group, and move
-later work into a downstream partition fed by its own ``StreamingGraphEdge``. A consumer
-whose every input is streamed runs again as soon as the next chunk arrives, and the
-runtime and conductor count passes per worker graph, so the conductor refuses at startup
-such a consumer sharing its worker graph with another top-level node or ``Loop``, and a
-stream-consuming walk split over worker graphs, unless every consumer also waits on a
-non-streamed input and all the walk's worker graphs run on the same workers. That input
-must arrive once per pass (from the conductor, say); startup cannot check this.
+A stream-consuming walk may place a self-triggered consumer (whose every input is streamed,
+either a bare node or a whole ``Loop`` on one node group) ahead of downstream non-streamed
+successors, either in the same worker graph or across worker graphs on different node
+groups, provided every other top-level entity in the walk is fed solely by outputs reachable
+from that consumer and no self-triggered ``Loop`` is split across multiple worker graphs.
+Independent self-triggered streams in the same walk (or unrelated entities that do not
+depend on the consumer's outputs) are refused at startup unless gated on a non-streamed
+input that arrives once per pass (from the conductor, say), or split into separate
+partitions fed by ``StreamingGraphEdge``.
 
 A consumer whose walk should follow the producer's progress, rather than a count fixed at
 ingest, is *producer-triggered*: the producer decides the consumer's walk. Set the same
