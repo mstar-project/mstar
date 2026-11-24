@@ -51,7 +51,7 @@ class LingBotVLASuffixInputs(nn.Module):
                 x.float(), layer.weight.float(),
                 None if layer.bias is None else layer.bias.float(),
             )
-        return layer(x)
+        return layer(x.to(layer.weight.dtype))
 
     def forward(
         self, state: torch.Tensor, noisy_actions: torch.Tensor, timestep: torch.Tensor,

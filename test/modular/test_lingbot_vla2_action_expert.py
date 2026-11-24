@@ -58,6 +58,7 @@ def _small_config(
     top_k: int = 2,
     max_state_dim: int = 6,
     max_action_dim: int = 8,
+    action_fp32: bool = False,
     fp32_attention: bool = True,
 ) -> LingBotVLAActionExpertConfig:
     return LingBotVLAActionExpertConfig(
@@ -75,6 +76,7 @@ def _small_config(
         rms_norm_eps=1e-6,
         rope_theta=ROPE_THETA,
         mrope_section=MROPE_SECTION,
+        action_fp32=action_fp32,
         fp32_attention=fp32_attention,
     )
 
@@ -257,6 +259,8 @@ def test_action_expert_denoise_matches_eager_reference_via_kv_state(fp32_attenti
     cfg = _small_config(fp32_attention=fp32_attention)
     expert = LingBotVLAActionExpert(cfg).eval()
     _fill_weights(expert, gen, dtype)
+    expert = expert.to(dtype)
+    expert.reset_non_persistent_buffers()
 
     bs = len(prefix_lengths)
     total_pref = sum(prefix_lengths)
@@ -442,3 +446,44 @@ def test_action_expert_rejects_invalid_inputs():
         expert.denoise_actions(state, x_t, pos, num_steps=0)
     with pytest.raises((ValueError, RuntimeError)):
         expert.denoise_actions(state, torch.zeros(1, CHUNK_SIZE, cfg.max_action_dim + 1), pos)
+
+
+@pytest.mark.parametrize("action_fp32", [False, True], ids=["action_bf16", "action_fp32"])
+def test_action_expert_bfloat16_without_autocast_both_action_fp32_modes(action_fp32):
+    gen = torch.Generator().manual_seed(2027)
+    cfg = _small_config(action_fp32=action_fp32, fp32_attention=False)
+    expert = LingBotVLAActionExpert(cfg).eval()
+    _fill_weights(expert, gen, torch.bfloat16)
+    expert = expert.to(torch.bfloat16)
+    expert.reset_non_persistent_buffers()
+    assert expert.suffix_inputs.state_proj.weight.dtype == torch.bfloat16
+    assert expert.mrope_inv_freq.dtype == torch.float32
+
+    prefix_lengths = [4, 6]
+    bs = len(prefix_lengths)
+    total_pref = sum(prefix_lengths)
+    prefix_k = [
+        torch.randn(total_pref, cfg.num_key_value_heads, cfg.head_dim, generator=gen, dtype=torch.bfloat16)
+        for _ in range(cfg.num_hidden_layers)
+    ]
+    prefix_v = [
+        torch.randn(total_pref, cfg.num_key_value_heads, cfg.head_dim, generator=gen, dtype=torch.bfloat16)
+        for _ in range(cfg.num_hidden_layers)
+    ]
+    state = torch.randn(bs, cfg.max_state_dim, generator=gen, dtype=torch.float32)
+    x_t = torch.randn(bs, CHUNK_SIZE, cfg.max_action_dim, generator=gen, dtype=torch.float32)
+    prefix_end = torch.tensor(prefix_lengths, dtype=torch.long)
+
+    ref_fn = _eager_reference_attention(prefix_k, prefix_v, prefix_lengths, cfg.fp32_attention)
+    with torch.no_grad():
+        pos = torch.arange(1 + CHUNK_SIZE, dtype=torch.long).unsqueeze(0).expand(3, -1)
+        pos_batch = torch.cat([pos + p for p in prefix_lengths], dim=1)
+        step_out = expert.forward_step(
+            state, x_t, torch.full((bs,), 0.5, dtype=torch.float32), pos_batch, attn_fn=ref_fn
+        )
+        assert step_out.dtype == (torch.float32 if action_fp32 else torch.bfloat16)
+        assert torch.isfinite(step_out).all()
+
+        denoised = expert.denoise_actions(state, x_t, prefix_end, num_steps=2, attn_fn=ref_fn)
+        assert denoised.dtype == torch.float32
+        assert torch.isfinite(denoised).all()

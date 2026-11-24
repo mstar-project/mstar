@@ -107,6 +107,10 @@ SNAPSHOT = {
     "Positions": [
         ["rope", "KEYWORD_ONLY", 'None'],
     ],
+    "PrefixSuffixGroups": [
+        ["first_group_len", "POSITIONAL_OR_KEYWORD", None],
+        ["fp32_attention", "KEYWORD_ONLY", 'False'],
+    ],
     "Reached": [
         ["fields", "POSITIONAL_OR_KEYWORD", None],
         ["row_offsets", "KEYWORD_ONLY", None],

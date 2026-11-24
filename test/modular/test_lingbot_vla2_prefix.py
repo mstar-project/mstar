@@ -9,7 +9,13 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from mstar.model.components.lingbot_vla2_prefix import LingBotVLAPrefixConfig, load_prefix_weights
+from mstar.model.components.lingbot_vla2_prefix import (
+    LingBotVLA2PrefixQueries,
+    LingBotVLA2PrefixQueriesConfig,
+    LingBotVLAPrefixConfig,
+    load_prefix_query_weights,
+    load_prefix_weights,
+)
 from mstar.model.components.mrope import layout_position_ids
 from mstar.model.components.qwen3_lm import Qwen3DenseLM, Qwen3LMConfig
 from mstar.model.components.qwen_vision import QwenVisionConfig, QwenVisionModel
@@ -155,40 +161,41 @@ def test_prefix_interleaved_mrope_matches_qwen3_vl_text_tower(with_image, on_arr
     from mstar.engine.state.adapters import StateSetup, _resolve, build_handle
     from mstar.engine.state.analysis import position_key
 
-    torch.manual_seed(41)
-    cfg = Qwen3LMConfig(
-        hidden_size=32, num_hidden_layers=1, num_attention_heads=4,
-        num_key_value_heads=2, head_dim=16, intermediate_size=48,
-        vocab_size=97, rope_theta=500_000.0, tie_word_embeddings=True,
-    )
-    hf = Qwen3VLTextModel(Qwen3VLTextConfig(
-        vocab_size=cfg.vocab_size, hidden_size=cfg.hidden_size,
-        num_hidden_layers=cfg.num_hidden_layers, num_attention_heads=cfg.num_attention_heads,
-        num_key_value_heads=cfg.num_key_value_heads, head_dim=cfg.head_dim,
-        intermediate_size=cfg.intermediate_size,
-        rope_parameters={"rope_type": "default", "rope_theta": cfg.rope_theta,
-                         "mrope_interleaved": True, "mrope_section": [2, 3, 3]},
-    )).eval()
-    kwargs = {"array": KV} if on_array else {"attn_key": ATTN, "kv_key": KV}
-    text = Qwen3DenseLM(cfg, mrope_section=(2, 3, 3), **kwargs).eval()
-    text.load_weights(hf.state_dict().items())
-    if on_array:
-        array = replace(_declared(num_layers=1), positions=Positions())
-        pages, pos = _FakePages(), _FakePositions()
-        handle = build_handle(
-            array, {KV: pages, ATTN: pages, position_key(array): pos},
-            _resolve([array], StateSetup()),
+    with torch.random.fork_rng():
+        torch.manual_seed(41)
+        cfg = Qwen3LMConfig(
+            hidden_size=32, num_hidden_layers=1, num_attention_heads=4,
+            num_key_value_heads=2, head_dim=16, intermediate_size=48,
+            vocab_size=97, rope_theta=500_000.0, tie_word_embeddings=True,
         )
-        for module in text.modules():
-            if hasattr(module, "bind_state"):
-                module.bind_state({KV: handle})
-    else:
-        fake = _FakeKVAttention()
-        for module in text.modules():
-            if hasattr(module, "bind_resources") and module is not text:
-                module.bind_resources({ATTN: fake, KV: fake})
+        hf = Qwen3VLTextModel(Qwen3VLTextConfig(
+            vocab_size=cfg.vocab_size, hidden_size=cfg.hidden_size,
+            num_hidden_layers=cfg.num_hidden_layers, num_attention_heads=cfg.num_attention_heads,
+            num_key_value_heads=cfg.num_key_value_heads, head_dim=cfg.head_dim,
+            intermediate_size=cfg.intermediate_size,
+            rope_parameters={"rope_type": "default", "rope_theta": cfg.rope_theta,
+                             "mrope_interleaved": True, "mrope_section": [2, 3, 3]},
+        )).eval()
+        kwargs = {"array": KV} if on_array else {"attn_key": ATTN, "kv_key": KV}
+        text = Qwen3DenseLM(cfg, mrope_section=(2, 3, 3), **kwargs).eval()
+        text.load_weights(hf.state_dict().items())
+        if on_array:
+            array = replace(_declared(num_layers=1), positions=Positions())
+            pages, pos = _FakePages(), _FakePositions()
+            handle = build_handle(
+                array, {KV: pages, ATTN: pages, position_key(array): pos},
+                _resolve([array], StateSetup()),
+            )
+            for module in text.modules():
+                if hasattr(module, "bind_state"):
+                    module.bind_state({KV: handle})
+        else:
+            fake = _FakeKVAttention()
+            for module in text.modules():
+                if hasattr(module, "bind_resources") and module is not text:
+                    module.bind_resources({ATTN: fake, KV: fake})
 
-    tokens = torch.randint(0, cfg.vocab_size, (7,))
+        tokens = torch.randint(0, cfg.vocab_size, (7,))
     layout = {"offset": [1], "tokens": [4], "grid": [(1, 4, 4)]} if with_image else {}
     positions, _ = layout_position_ids(layout, merge_size=2, num_tokens=tokens.numel())
     with torch.no_grad():
@@ -206,3 +213,17 @@ def test_prefix_mrope_requires_positions():
         text(torch.zeros(2, cfg.hidden_size))
     with pytest.raises(ValueError, match="fill one attention head"):
         Qwen3DenseLM(cfg, mrope_section=(1, 2, 1))
+
+
+def test_load_prefix_query_weights_rejects_missing_keys(tmp_path):
+    qcfg = LingBotVLA2PrefixQueriesConfig(
+        hidden_size=16, num_task_tokens=2, use_current_patch_loss=True
+    )
+    queries = LingBotVLA2PrefixQueries(qcfg)
+    save_file({"model.depth_align_embs": torch.ones(2, 16)}, tmp_path / "model.safetensors")
+    with pytest.raises(ValueError, match="unloaded"):
+        load_prefix_query_weights(queries, tmp_path)
+
+    loaded, missing = load_prefix_query_weights(queries, tmp_path, strict=False)
+    assert loaded == {"depth_align_embs"}
+    assert missing == {"current_video_align_embs"}

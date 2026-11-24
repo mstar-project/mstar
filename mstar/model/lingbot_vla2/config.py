@@ -56,6 +56,11 @@ _QWEN3_VL_4B_DEFAULTS: dict[str, Any] = {
         "rms_norm_eps": 1e-6,
         "rope_theta": 5_000_000.0,
         "mrope_section": [24, 20, 20],
+        "rope_parameters": {
+            "rope_theta": 5_000_000.0,
+            "mrope_interleaved": True,
+            "mrope_section": [24, 20, 20],
+        },
         "tie_word_embeddings": True,
     },
 }
@@ -129,6 +134,10 @@ class LingBotVLA2Config:
             raise ValueError("max_state_dim must match action_expert.max_state_dim")
         if self.action_expert.max_action_dim != self.max_action_dim:
             raise ValueError("max_action_dim must match action_expert.max_action_dim")
+        if self.action_expert.fp32_attention != self.fp32_attention:
+            raise ValueError("fp32_attention must match action_expert.fp32_attention")
+        if self.action_expert.mrope_section != self.mrope_section:
+            raise ValueError("mrope_section must match action_expert.mrope_section")
         if self.state_dim > self.max_state_dim or self.action_dim > self.max_action_dim:
             raise ValueError("Active state_dim/action_dim cannot exceed max_state_dim/max_action_dim")
         rotary_from_mrope = 2 * sum(self.mrope_section)
@@ -176,7 +185,11 @@ class LingBotVLA2Config:
             vis = qwen["vision_config"]
             txt = qwen["text_config"]
             rope_params = txt.get("rope_parameters") or txt.get("rope_scaling") or {}
-            raw_sec = tuple(int(x) for x in rope_params.get("mrope_section", txt.get("mrope_section", (24, 20, 20))))
+            raw_sec = tuple(
+                int(x) for x in rope_params.get("mrope_section", txt.get("mrope_section", ()))
+            )
+            if not rope_params.get("mrope_interleaved") or len(raw_sec) != 3:
+                raise ValueError("LingBot-VLA 2.0 requires interleaved 3D MRoPE")
             section = (raw_sec[0], raw_sec[1], raw_sec[2])
             vision_cfg = QwenVisionConfig(
                 depth=int(vis["depth"]),
@@ -202,8 +215,14 @@ class LingBotVLA2Config:
                 max_position_embeddings=int(txt["max_position_embeddings"]),
                 rms_norm_eps=float(txt["rms_norm_eps"]),
                 rope_theta=float(rope_params.get("rope_theta", txt.get("rope_theta", 5_000_000.0))),
-                tie_word_embeddings=bool(qwen.get("tie_word_embeddings", txt.get("tie_word_embeddings", True))),
+                tie_word_embeddings=bool(
+                    txt.get("tie_word_embeddings", qwen.get("tie_word_embeddings", True))
+                ),
             )
+            if not text_cfg.tie_word_embeddings:
+                raise ValueError("LingBot-VLA 2.0 prefix requires the released VLM's tied output head")
+            if vision_cfg.out_hidden_size != text_cfg.hidden_size:
+                raise ValueError("Qwen3-VL vision and text widths differ")
 
         action_cfg = LingBotVLAActionExpertConfig(
             num_hidden_layers=text_cfg.num_hidden_layers,
@@ -349,6 +368,7 @@ class LingBotVLA2Config:
         num_flow_steps: int = 2,
         num_cameras: int = 1,
         image_size: int = 8,
+        action_fp32: bool = False,
         fp32_attention: bool = False,
         with_prefix_queries: bool = False,
         norm_stats: dict | str | None = None,
@@ -397,7 +417,7 @@ class LingBotVLA2Config:
             rope_theta=10_000.0,
             mrope_section=mrope_section,
             final_norm_adanorm=False,
-            action_fp32=False,
+            action_fp32=action_fp32,
             fp32_attention=fp32_attention,
             kv_key=LLM_KV,
         )

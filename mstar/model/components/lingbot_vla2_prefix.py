@@ -383,19 +383,37 @@ def load_prefix_query_weights(
     checkpoint_dir: str | Path,
     *,
     device: str | torch.device = "cpu",
+    strict: bool = True,
 ) -> tuple[set[str], set[str]]:
     """Load learned prefix alignment query tensors from ``model.*`` checkpoint keys."""
     if queries.config.num_query_tokens == 0:
         return set(), set()
 
+    checkpoint_dir = Path(checkpoint_dir)
     query_names = {name for name, _ in queries.named_parameters()}
     target_keys = {f"model.{name}" for name in query_names}
+    index_path = checkpoint_dir / "model.safetensors.index.json"
+    if strict and index_path.exists():
+        weight_map = json.loads(index_path.read_text())["weight_map"]
+        missing_in_index = sorted(query_names - {k.removeprefix("model.") for k in weight_map if k in target_keys})
+        if missing_in_index:
+            raise ValueError(
+                f"LingBot-VLA prefix query checkpoint left {len(missing_in_index)} key(s) unloaded, "
+                f"e.g. {missing_in_index[:5]}"
+            )
 
     def _filtered():
-        for name, tensor in iter_safetensors_shards(checkpoint_dir, device=device):
+        for name, tensor in iter_safetensors_shards(
+            checkpoint_dir, device=device, keys=target_keys
+        ):
             if name in target_keys:
                 yield name[len("model.") :], tensor
 
     loaded = load_weights_into(queries, _filtered())
     missing = query_names - loaded
+    if strict and missing:
+        sample = sorted(missing)[:5]
+        raise ValueError(
+            f"LingBot-VLA prefix query checkpoint left {len(missing)} key(s) unloaded, e.g. {sample}"
+        )
     return loaded, missing

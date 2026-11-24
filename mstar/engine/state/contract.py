@@ -139,6 +139,7 @@ class PrefixSuffixGroups(Mask):
     """
 
     first_group_len: int
+    _: KW_ONLY
     fp32_attention: bool = False
     uses_query_position = True
     sees_step_whole = True

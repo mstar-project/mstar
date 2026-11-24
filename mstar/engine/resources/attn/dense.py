@@ -277,11 +277,12 @@ class DenseAttentionManager(AttentionManager):
         # the kernel, not just the class: FA3 and each FlashInfer backend
         # differ in the last bits
         parts: list[object] = [type(self).__name__, self._wrapper_class.__name__, self._flashinfer_backend]
-        if self._prefix_suffix_first_group_len is not None:
+        first_group_len = getattr(self, "_prefix_suffix_first_group_len", None)
+        if first_group_len is not None:
             parts.extend((
-                self._prefix_suffix_first_group_len,
-                self._prefix_suffix_q_heads,
-                self._prefix_suffix_fp32,
+                first_group_len,
+                getattr(self, "_prefix_suffix_q_heads", None),
+                getattr(self, "_prefix_suffix_fp32", False),
             ))
         return fingerprint(*parts)
 

@@ -104,7 +104,13 @@ def _resolve_checkpoint_subdir(root: Path) -> Path:
     """Resolve HF snapshot root or ``checkpoints/global_step_*/hf_ckpt`` layout."""
     if (root / "config.json").exists():
         return root
-    candidates = sorted(root.glob("checkpoints/global_step_*/hf_ckpt"))
+
+    def _step_sort_key(path: Path) -> tuple[int, str]:
+        step_dir = path.parent.name
+        suffix = step_dir.removeprefix("global_step_")
+        return (int(suffix), step_dir) if suffix.isdigit() else (-1, step_dir)
+
+    candidates = sorted(root.glob("checkpoints/global_step_*/hf_ckpt"), key=_step_sort_key)
     for candidate in reversed(candidates):
         if (candidate / "config.json").exists():
             return candidate
@@ -185,15 +191,26 @@ class LingBotVLA2Model(Model):
 
         if self._yaml_config_overrides:
             valid = {f.name for f in fields(LingBotVLA2Config)}
+            expert_shared = {"fp32_attention", "max_state_dim", "max_action_dim", "mrope_section"}
+            expert_only = {"action_fp32", "final_norm_adanorm"}
             updates: dict[str, Any] = {}
+            expert_updates: dict[str, Any] = {}
             for key, value in self._yaml_config_overrides.items():
+                if key == "mrope_section" and isinstance(value, list):
+                    value = tuple(int(x) for x in value)
                 if key in valid:
                     updates[key] = value
+                    if key in expert_shared:
+                        expert_updates[key] = value
+                elif key in expert_only:
+                    expert_updates[key] = value
                 else:
                     logger.warning(
                         "LingBotVLA2Model: model_kwargs key %r is not a LingBotVLA2Config field; ignored.",
                         key,
                     )
+            if expert_updates and "action_expert" not in updates:
+                updates["action_expert"] = replace(cfg.action_expert, **expert_updates)
             if updates:
                 cfg = replace(cfg, **updates)
         return cfg
@@ -526,27 +543,32 @@ class LingBotVLA2Model(Model):
         tp_group: Any = None,
         autocast_dtype: torch.dtype | None = None,
     ) -> NodeSubmodule | None:
-        del tp_group, autocast_dtype
+        del tp_group
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
 
-        submodule = self._create_submodule(node_name, device)
+        submodule = self._create_submodule(node_name, device, autocast_dtype=autocast_dtype)
         self._submodule_cache[node_name] = submodule
         return submodule
 
-    def _create_submodule(self, node_name: str, device: str) -> NodeSubmodule | None:
+    def _create_submodule(
+        self,
+        node_name: str,
+        device: str,
+        autocast_dtype: torch.dtype | None = None,
+    ) -> NodeSubmodule | None:
         if node_name == "vit_encoder":
-            self._init_vision(device)
+            self._init_vision(device, autocast_dtype=autocast_dtype)
             return LingBotVLA2ViTEncoderSubmodule(self.vision, self.config)
         if node_name == "LLM":
-            self._init_language_model(device)
+            self._init_language_model(device, autocast_dtype=autocast_dtype)
             return LingBotVLA2LLMSubmodule(self.language_model, self.prefix_queries, self.config)
         if node_name == "action_expert":
-            self._init_action_expert(device)
+            self._init_action_expert(device, autocast_dtype=autocast_dtype)
             return LingBotVLA2ActionSubmodule(self.action_expert, self.config)
         return None
 
-    def _init_vision(self, device: str) -> None:
+    def _init_vision(self, device: str, autocast_dtype: torch.dtype | None = None) -> None:
         if self.vision is not None:
             return
         init_dev = "cpu" if self.skip_weight_loading else "meta"
@@ -556,14 +578,21 @@ class LingBotVLA2Model(Model):
                 attn_key=VISION_ATTN,
                 array=VISION_TOKENS,
             )
+        if autocast_dtype is not None:
+            vision = vision.to(dtype=autocast_dtype)
         if not self.skip_weight_loading:
             vision = vision.to_empty(device=device)
             load_prefix_weights(vision, None, self._ensure_checkpoint_dir(), device=device)
         elif device != "cpu":
             vision = vision.to(device=device)
+        vision.rotary_pos_emb.register_buffer(
+            "inv_freq",
+            vision.rotary_pos_emb._inv_freq(device),
+            persistent=False,
+        )
         self.vision = vision.eval()
 
-    def _init_language_model(self, device: str) -> None:
+    def _init_language_model(self, device: str, autocast_dtype: torch.dtype | None = None) -> None:
         if self.language_model is not None and self.prefix_queries is not None:
             return
         init_dev = "cpu" if self.skip_weight_loading else "meta"
@@ -577,31 +606,47 @@ class LingBotVLA2Model(Model):
             )
             prefix_queries = LingBotVLA2PrefixQueries(self.config.prefix_queries)
 
+        if autocast_dtype is not None:
+            lm = lm.to(dtype=autocast_dtype)
+            prefix_queries = prefix_queries.to(dtype=autocast_dtype)
         if not self.skip_weight_loading:
             checkpoint_dir = self._ensure_checkpoint_dir()
             lm = lm.to_empty(device=device)
             prefix_queries = prefix_queries.to_empty(device=device)
             load_prefix_weights(None, lm, checkpoint_dir, device=device)
-            load_prefix_query_weights(prefix_queries, checkpoint_dir, device=device)
+            _, missing_queries = load_prefix_query_weights(
+                prefix_queries, checkpoint_dir, device=device
+            )
+            if missing_queries:
+                raise ValueError(
+                    f"LingBot-VLA prefix query checkpoint left {len(missing_queries)} key(s) unloaded: "
+                    f"{sorted(missing_queries)}"
+                )
         elif device != "cpu":
             lm = lm.to(device=device)
             prefix_queries = prefix_queries.to(device=device)
 
-        lm.mrope_inv_freq = compute_inv_freq(
-            self.config.text.head_dim,
-            self.config.text.rope_theta,
-            device=device,
+        lm.register_buffer(
+            "mrope_inv_freq",
+            compute_inv_freq(
+                self.config.text.head_dim,
+                self.config.text.rope_theta,
+                device=device,
+            ),
+            persistent=False,
         )
         self.language_model = lm.eval()
         self.prefix_queries = prefix_queries.eval()
 
-    def _init_action_expert(self, device: str) -> None:
+    def _init_action_expert(self, device: str, autocast_dtype: torch.dtype | None = None) -> None:
         if self.action_expert is not None:
             return
         init_dev = "cpu" if self.skip_weight_loading else "meta"
         with torch.device(init_dev):
             expert = LingBotVLAActionExpert(self.config.action_expert)
 
+        if autocast_dtype is not None:
+            expert = expert.to(dtype=autocast_dtype)
         if not self.skip_weight_loading:
             expert = expert.to_empty(device=device)
             load_action_expert_weights(expert, self._ensure_checkpoint_dir(), device=device)

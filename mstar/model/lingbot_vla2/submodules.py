@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
@@ -33,6 +33,9 @@ from mstar.model.lingbot_vla2.config import (
 from mstar.model.pi05.kernels.image_normalize import normalize_float_images
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.utils.h2d import to_device_nonblocking
+
+if TYPE_CHECKING:
+    from mstar.engine.engine import ExecutingBatch
 
 
 def patchify_lingbot_images(
@@ -81,9 +84,9 @@ def patchify_lingbot_images(
             raise ValueError(f"Expected 1, 3, or 4 channels, got {img.shape[0]}")
 
         if img.dtype == torch.uint8:
-            img = img.to(torch.float32) / 255.0
+            img = img.to(torch.float32) / 127.5 - 1.0
         else:
-            img = img.to(torch.float32)
+            img = normalize_float_images(img.to(torch.float32))
 
         if img.shape[-2] != image_size or img.shape[-1] != image_size:
             img = F.interpolate(
@@ -95,8 +98,7 @@ def patchify_lingbot_images(
             ).squeeze(0)
         prepared.append(img)
 
-    stacked = torch.stack(prepared, dim=0)  # [N, 3, H, W] in [0, 1]
-    normalized = normalize_float_images(stacked)  # [N, 3, H, W] in [-1, 1]
+    normalized = torch.stack(prepared, dim=0)  # [N, 3, H, W] in [-1, 1]
     n_imgs, c, h, w = normalized.shape
     gh, gw = h // patch_size, w // patch_size
     bh, bw = gh // spatial_merge_size, gw // spatial_merge_size
@@ -157,17 +159,24 @@ def _image_layout_from_tokens(
 
 def _recompute_fp32_rotary_buffers(module: torch.nn.Module) -> None:
     """Keep non-persistent rotary inverse frequency tables in float32 across device/dtype casts."""
-    if isinstance(module, LingBotVLA2LLMSubmodule):
+    if isinstance(module, LingBotVLA2ViTEncoderSubmodule):
+        rotary = module.encoder.rotary_pos_emb
+        target = rotary.inv_freq.device
+        if target.type != "meta":
+            rotary.register_buffer("inv_freq", rotary._inv_freq(target), persistent=False)
+    elif isinstance(module, LingBotVLA2LLMSubmodule):
         param = next(module.language_model.parameters())
-        inv = compute_inv_freq(
-            module.config.text.head_dim,
-            module.config.text.rope_theta,
-            device=param.device,
-        )
-        module.language_model.mrope_inv_freq = inv
+        if param.device.type != "meta":
+            inv = compute_inv_freq(
+                module.config.text.head_dim,
+                module.config.text.rope_theta,
+                device=param.device,
+            )
+            module.language_model.register_buffer("mrope_inv_freq", inv, persistent=False)
     elif isinstance(module, LingBotVLA2ActionSubmodule):
         param = next(module.action_expert.parameters())
-        module.action_expert.reset_non_persistent_buffers(device=param.device)
+        if param.device.type != "meta":
+            module.action_expert.reset_non_persistent_buffers(device=param.device)
 
 
 class LingBotVLA2ViTEncoderSubmodule(NodeSubmodule):
@@ -182,11 +191,20 @@ class LingBotVLA2ViTEncoderSubmodule(NodeSubmodule):
     def bind_state(self, handles: Mapping[str, Any]) -> None:
         self.vision = handles[VISION_TOKENS]
 
-    def to(self, *args, **kwargs):
-        out = super().to(*args, **kwargs)
-        # QwenVisionModel computes inv_freq on the fly in fp32 inside forward,
-        # so nothing extra is needed unless buffers are added later.
+    def _apply(self, fn, recurse=True):
+        out = super()._apply(fn, recurse=recurse)
+        # Keep VisionRotaryEmbedding's non-persistent inv_freq buffer in float32
+        # across .to(dtype) and .bfloat16()/.float() casts.
+        _recompute_fp32_rotary_buffers(self)
         return out
+
+    def can_batch(
+        self,
+        batch: ExecutingBatch,
+        model_inputs: list[NodeInputs],
+    ) -> bool:
+        del batch
+        return len(model_inputs) > 1
 
     def prepare_inputs(
         self,
@@ -300,8 +318,8 @@ class LingBotVLA2ViTEncoderSubmodule(NodeSubmodule):
             pixel_values, indices, weights, position_ids
         )
         return {
-            "img_emb": visual_embeds,
-            "deepstack_features": deepstack_tensor,
+            "img_emb": [visual_embeds],
+            "deepstack_features": [deepstack_tensor],
         }
 
     def forward_batched(
@@ -314,22 +332,20 @@ class LingBotVLA2ViTEncoderSubmodule(NodeSubmodule):
         position_ids: torch.Tensor,
         num_images_list: list[int],
         **kwargs: Any,
-    ) -> list[NameToTensorList]:
-        del graph_walk, engine_inputs, kwargs
+    ) -> dict[str, NameToTensorList]:
+        del graph_walk, kwargs
         visual_embeds, deepstack_tensor = self._run_encoder(
             pixel_values, indices, weights, position_ids
         )
         merged_per_img = self.config.tokens_per_image
-        outputs: list[NameToTensorList] = []
+        outputs: dict[str, NameToTensorList] = {}
         offset = 0
-        for num_images in num_images_list:
+        for rid, num_images in zip(engine_inputs.request_ids, num_images_list, strict=True):
             count = num_images * merged_per_img
-            outputs.append(
-                {
-                    "img_emb": visual_embeds[offset : offset + count],
-                    "deepstack_features": deepstack_tensor[:, offset : offset + count, :],
-                }
-            )
+            outputs[rid] = {
+                "img_emb": [visual_embeds[offset : offset + count]],
+                "deepstack_features": [deepstack_tensor[:, offset : offset + count, :]],
+            }
             offset += count
         return outputs
 
@@ -351,10 +367,18 @@ class LingBotVLA2LLMSubmodule(NodeSubmodule):
     def bind_state(self, handles: Mapping[str, Any]) -> None:
         self.kv = handles[LLM_KV]
 
-    def to(self, *args, **kwargs):
-        out = super().to(*args, **kwargs)
+    def _apply(self, fn, recurse=True):
+        out = super()._apply(fn, recurse=recurse)
         _recompute_fp32_rotary_buffers(self)
         return out
+
+    def can_batch(
+        self,
+        batch: ExecutingBatch,
+        model_inputs: list[NodeInputs],
+    ) -> bool:
+        del batch
+        return len(model_inputs) > 1
 
     def prepare_inputs(
         self,
@@ -481,7 +505,7 @@ class LingBotVLA2LLMSubmodule(NodeSubmodule):
             position_ids_3d=position_ids_3d,
             deepstack_addends=deepstack_addends or None,
         )
-        return {"prefix_done": prefix_end_positions[0]}
+        return {"prefix_done": [prefix_end_positions[0]]}
 
     def forward_batched(
         self,
@@ -492,14 +516,17 @@ class LingBotVLA2LLMSubmodule(NodeSubmodule):
         deepstack_addends: list[torch.Tensor],
         prefix_end_positions: list[torch.Tensor],
         **kwargs: Any,
-    ) -> list[NameToTensorList]:
-        del graph_walk, engine_inputs, kwargs
+    ) -> dict[str, NameToTensorList]:
+        del graph_walk, kwargs
         self.language_model(
             input_embeds,
             position_ids_3d=position_ids_3d,
             deepstack_addends=deepstack_addends or None,
         )
-        return [{"prefix_done": pos} for pos in prefix_end_positions]
+        return {
+            rid: {"prefix_done": [pos]}
+            for rid, pos in zip(engine_inputs.request_ids, prefix_end_positions, strict=True)
+        }
 
 
 class LingBotVLA2ActionSubmodule(NodeSubmodule):
@@ -513,10 +540,18 @@ class LingBotVLA2ActionSubmodule(NodeSubmodule):
     def bind_state(self, handles: Mapping[str, Any]) -> None:
         self.kv = handles[LLM_KV]
 
-    def to(self, *args, **kwargs):
-        out = super().to(*args, **kwargs)
+    def _apply(self, fn, recurse=True):
+        out = super()._apply(fn, recurse=recurse)
         _recompute_fp32_rotary_buffers(self)
         return out
+
+    def can_batch(
+        self,
+        batch: ExecutingBatch,
+        model_inputs: list[NodeInputs],
+    ) -> bool:
+        del batch
+        return len(model_inputs) > 1
 
     def prepare_inputs(
         self,
@@ -603,7 +638,7 @@ class LingBotVLA2ActionSubmodule(NodeSubmodule):
             prefix_end_positions,
             num_steps=self.config.num_flow_steps,
         )
-        return {"actions": actions[0]}
+        return {"actions": [actions[0]]}
 
     def forward_batched(
         self,
@@ -613,15 +648,18 @@ class LingBotVLA2ActionSubmodule(NodeSubmodule):
         noisy_actions: torch.Tensor,
         prefix_end_positions: torch.Tensor,
         **kwargs: Any,
-    ) -> list[NameToTensorList]:
-        del graph_walk, engine_inputs, kwargs
+    ) -> dict[str, NameToTensorList]:
+        del graph_walk, kwargs
         actions = self.action_expert.denoise_actions(
             state,
             noisy_actions,
             prefix_end_positions,
             num_steps=self.config.num_flow_steps,
         )
-        return [{"actions": actions[i]} for i in range(actions.shape[0])]
+        return {
+            rid: {"actions": [actions[i]]}
+            for i, rid in enumerate(engine_inputs.request_ids)
+        }
 
 
 __all__ = [

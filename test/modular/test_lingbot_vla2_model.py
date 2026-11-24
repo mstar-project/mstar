@@ -21,16 +21,22 @@ from tokenizers.pre_tokenizers import Whitespace
 from mstar.api_server.openpi import OpenpiPolicy
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.distributed.communication import WorkerParallelGroups
+from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import StepRunner
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import StepContext
 from mstar.engine.state import Layout, Span
 from mstar.engine.state.adapters import StateSetup, node_handles, node_resources, state_steps
 from mstar.integrations.dynamo.bridges import get_tensor_spec
 from mstar.model.components.lingbot_vla2_action_expert import LingBotVLAActionExpert
-from mstar.model.components.lingbot_vla2_prefix import LingBotVLA2PrefixQueries
+from mstar.model.components.lingbot_vla2_prefix import LingBotVLA2PrefixQueries, compact_prefix
+from mstar.model.components.mrope import compute_inv_freq, layout_position_ids
 from mstar.model.components.qwen3_lm import Qwen3DenseLM
+from mstar.model.components.qwen3_vit import vision_interpolation
+from mstar.model.components.qwen3_vit import vision_position_ids as vision_grid_position_ids
 from mstar.model.components.qwen_vision import QwenVisionModel
 from mstar.model.lingbot_vla2 import (
     ACTION_WALK,
@@ -44,6 +50,7 @@ from mstar.model.lingbot_vla2 import (
     LingBotVLA2Config,
     LingBotVLA2Model,
 )
+from mstar.model.lingbot_vla2.lingbot_vla2_model import _resolve_checkpoint_subdir
 from mstar.model.lingbot_vla2.normalization import (
     LingBotVLA2NormStats,
     QuantileStats,
@@ -51,9 +58,10 @@ from mstar.model.lingbot_vla2.normalization import (
     pad_vector,
     slice_vector,
 )
-from mstar.model.lingbot_vla2.submodules import patchify_lingbot_images
+from mstar.model.lingbot_vla2.submodules import _image_layout_from_tokens, patchify_lingbot_images
 from mstar.model.multimodal import TEXT, PromptPart
 from mstar.model.registry import HF_MODELS, MODEL_REGISTRY
+from mstar.model.submodule_base import BatchedModelOutput, InputMetadata, ModelInputsFromEngine
 
 _VISION_PREFIX = "model.qwenvl_with_expert.qwenvl.model.visual."
 _TEXT_PREFIX = "model.qwenvl_with_expert.qwenvl.model.language_model."
@@ -99,6 +107,7 @@ def _create_synthetic_sharded_checkpoint(
     seed: int = 123,
     use_current_patch_loss: bool = True,
     nested_hf_ckpt: bool = False,
+    action_fp32: bool = False,
 ) -> tuple[Path, LingBotVLA2Config, dict[str, torch.Tensor]]:
     gen = torch.Generator().manual_seed(seed)
     cfg = LingBotVLA2Config.for_dummy(
@@ -118,6 +127,7 @@ def _create_synthetic_sharded_checkpoint(
         num_flow_steps=2,
         num_cameras=3,
         image_size=16,
+        action_fp32=action_fp32,
         fp32_attention=True,
         with_prefix_queries=use_current_patch_loss,
     )
@@ -241,6 +251,7 @@ def _create_synthetic_sharded_checkpoint(
         "img_size": cfg.image_size,
         "chunk_size": cfg.chunk_size,
         "num_steps": cfg.num_flow_steps,
+        "action_fp32": cfg.action_expert.action_fp32,
         "pad_token_id": cfg.pad_token_id,
         "num_task_tokens": cfg.prefix_queries.num_task_tokens,
         "use_current_patch_loss": cfg.prefix_queries.use_current_patch_loss,
@@ -314,8 +325,9 @@ def _build_full_engine_runner(model: LingBotVLA2Model, *, dtype: torch.dtype = t
     built_handles: dict = {}
     submodules = {}
     for node in ("vit_encoder", "LLM", "action_expert"):
-        sub = model.get_submodule(node, device="cpu")
+        sub = model.get_submodule(node, device="cpu", autocast_dtype=dtype)
         assert sub is not None
+        sub = sub.to(device="cpu", dtype=dtype)
         sub.bind_node_resources(resources)
         handles = node_handles(model, node, resources, setup=setup, built=built_handles)
         sub.bind_node_state(handles)
@@ -339,8 +351,12 @@ def _execute_node_step(
     request_ids: tuple[str, ...],
     per_req_inputs: list[dict],
     seed: int,
+    *,
+    use_autocast: bool = False,
+    autocast_dtype: torch.dtype = torch.float32,
 ):
     node_inputs = []
+    per_request_info = {}
     for req_idx, (rid, req_in) in enumerate(zip(request_ids, per_req_inputs, strict=True)):
         fwd_info = CurrentForwardPassInfo(
             request_id=rid,
@@ -349,6 +365,7 @@ def _execute_node_step(
             random_seed=seed + req_idx,
             max_tokens=1024,
         )
+        per_request_info[rid] = fwd_info
         node_inputs.append(submodule.prepare_inputs(walk, fwd_info, req_in))
 
     declared = submodule.declare_step(walk, list(request_ids), node_inputs)
@@ -367,18 +384,32 @@ def _execute_node_step(
         plan_results=plan,
     )
     expanded.set_ctx(planned_ctx)
-    preprocessed = submodule.preprocess(walk, None, node_inputs)
+    engine_inputs = ModelInputsFromEngine(
+        request_ids=list(request_ids),
+        per_request_info=per_request_info,
+    )
+    preprocessed = submodule.preprocess(walk, engine_inputs, node_inputs)
     expanded.begin_calls()
     try:
         with torch.no_grad():
-            if len(request_ids) == 1:
-                result = [submodule.forward(walk, None, **preprocessed)]
+            if use_autocast:
+                with torch.autocast("cpu", dtype=autocast_dtype):
+                    raw = (
+                        {request_ids[0]: submodule.forward(walk, engine_inputs, **preprocessed)}
+                        if len(request_ids) == 1
+                        else submodule.forward_batched(walk, engine_inputs, **preprocessed)
+                    )
             else:
-                result = submodule.forward_batched(walk, None, **preprocessed)
+                raw = (
+                    {request_ids[0]: submodule.forward(walk, engine_inputs, **preprocessed)}
+                    if len(request_ids) == 1
+                    else submodule.forward_batched(walk, engine_inputs, **preprocessed)
+                )
+        coerced = BatchedModelOutput.coerce(raw)
         expanded.check_calls()
         runner.commit(expanded)
         expanded.commit_calls()
-        return result
+        return [coerced.per_rid_outputs[rid] for rid in request_ids]
     finally:
         expanded.end_calls()
 
@@ -574,15 +605,27 @@ def test_prompt_processing_image_io_and_state_validation():
 
 
 @pytest.mark.parametrize("use_queries", [False, True], ids=["no_queries", "with_align_queries"])
-def test_full_synthetic_sharded_checkpoint_e2e_step_runner(tmp_path, use_queries):
+@pytest.mark.parametrize(
+    ("dtype", "use_autocast", "action_fp32"),
+    [
+        (torch.float32, False, False),
+        (torch.bfloat16, False, False),
+        (torch.bfloat16, True, False),
+        (torch.bfloat16, False, True),
+    ],
+    ids=["fp32", "bf16_no_autocast", "bf16_autocast", "bf16_action_fp32"],
+)
+def test_full_synthetic_sharded_checkpoint_e2e_step_runner(
+    tmp_path, use_queries, dtype, use_autocast, action_fp32
+):
     ckpt_dir, cfg, _ = _create_synthetic_sharded_checkpoint(
-        tmp_path, seed=777, use_current_patch_loss=use_queries
+        tmp_path, seed=777, use_current_patch_loss=use_queries, action_fp32=action_fp32
     )
     model = LingBotVLA2Model(str(ckpt_dir))
     assert model.norm_stats is not None
     assert model.tokenizer is not None
 
-    runner, handles, submodules, _ = _build_full_engine_runner(model, dtype=torch.float32)
+    runner, handles, submodules, _ = _build_full_engine_runner(model, dtype=dtype)
 
     gen = torch.Generator().manual_seed(9001)
     img1 = torch.randint(0, 256, (3, 16, 16), dtype=torch.uint8, generator=gen)
@@ -626,6 +669,8 @@ def test_full_synthetic_sharded_checkpoint_e2e_step_runner(tmp_path, use_queries
                 rids,
                 [{"image_inputs": imgs} for _, _, imgs in requests],
                 seed=seed,
+                use_autocast=use_autocast,
+                autocast_dtype=dtype,
             )
             llm_out = _execute_node_step(
                 runner,
@@ -636,12 +681,14 @@ def test_full_synthetic_sharded_checkpoint_e2e_step_runner(tmp_path, use_queries
                 [
                     {
                         "text_inputs": req.new_input_tensors["text_inputs"],
-                        "img_emb": [vo["img_emb"]],
-                        "deepstack_features": [vo["deepstack_features"]],
+                        "img_emb": vo["img_emb"],
+                        "deepstack_features": vo["deepstack_features"],
                     }
                     for (_, req, _), vo in zip(requests, vit_out, strict=True)
                 ],
                 seed=seed,
+                use_autocast=use_autocast,
+                autocast_dtype=dtype,
             )
             act_out = _execute_node_step(
                 runner,
@@ -651,12 +698,14 @@ def test_full_synthetic_sharded_checkpoint_e2e_step_runner(tmp_path, use_queries
                 rids,
                 [
                     {
-                        "prefix_done": [lo["prefix_done"]],
+                        "prefix_done": lo["prefix_done"],
                         "robot_state": req.new_input_tensors["robot_state"],
                     }
                     for (_, req, _), lo in zip(requests, llm_out, strict=True)
                 ],
                 seed=seed,
+                use_autocast=use_autocast,
+                autocast_dtype=dtype,
             )
             return act_out
         finally:
@@ -666,21 +715,22 @@ def test_full_synthetic_sharded_checkpoint_e2e_step_runner(tmp_path, use_queries
     # bs=1 determinism & valid action bytes output
     run1 = _run_requests([("r1", req_a, [img1, img2])], seed=42)
     run2 = _run_requests([("r1_again", req_a, [img1, img2])], seed=42)
-    torch.testing.assert_close(run1[0]["actions"], run2[0]["actions"], rtol=0, atol=0)
-    assert torch.isfinite(run1[0]["actions"]).all()
+    torch.testing.assert_close(run1[0]["actions"][0], run2[0]["actions"][0], rtol=0, atol=0)
+    assert torch.isfinite(run1[0]["actions"][0]).all()
 
-    raw_bytes = model.postprocess(run1[0]["actions"], "action")
+    raw_bytes = model.postprocess(run1[0]["actions"][0], "action")
     decoded = np.frombuffer(raw_bytes, dtype=np.float32).reshape(cfg.chunk_size, cfg.action_dim)
     assert np.isfinite(decoded).all()
 
     # Different noise seed changes actions, confirming genuine denoising path.
     run_diff_seed = _run_requests([("r1_seed", req_a, [img1, img2])], seed=43)
-    assert not torch.allclose(run1[0]["actions"], run_diff_seed[0]["actions"])
+    assert not torch.allclose(run1[0]["actions"][0], run_diff_seed[0]["actions"][0])
 
     # Batched bs=2 execution matches single-request execution closely.
     batched = _run_requests([("b1", req_a, [img1, img2]), ("b2", req_b, [img1])], seed=42)
     assert len(batched) == 2
-    torch.testing.assert_close(batched[0]["actions"], run1[0]["actions"], rtol=1e-5, atol=1e-5)
+    tol = 1e-5 if dtype == torch.float32 else 2e-2
+    torch.testing.assert_close(batched[0]["actions"][0], run1[0]["actions"][0], rtol=tol, atol=tol)
 
     # Different state produces different actions.
     req_a2 = model.process_prompt(
@@ -691,7 +741,7 @@ def test_full_synthetic_sharded_checkpoint_e2e_step_runner(tmp_path, use_queries
         robot_state=[0.9, 0.9, -0.8, 0.5, -0.5, 0.7],
     )
     run_diff_state = _run_requests([("r_state", req_a2, [img1, img2])], seed=42)
-    assert not torch.allclose(run1[0]["actions"], run_diff_state[0]["actions"])
+    assert not torch.allclose(run1[0]["actions"][0], run_diff_state[0]["actions"][0])
 
 
 def test_openpi_and_dynamo_integration_specs(tmp_path):
@@ -773,3 +823,377 @@ def test_declaration_digests_deterministic_across_hash_seeds():
     assert decls[LLM_KV].nodes == LLM_NODES
     assert set(decls[LLM_KV].reads) == {LLM_ATTN, SUFFIX_ATTN}
     assert set(decls[VISION_TOKENS].reads) == {VISION_ATTN}
+
+
+class _StubKVTransfer:
+    def __init__(self, *args, **kwargs):
+        del args, kwargs
+
+    def get_kv_transfer_info(self, **kwargs):
+        del kwargs
+
+    def cleanup(self):
+        pass
+
+    def start_async_retrieve(self, **kwargs):
+        del kwargs
+
+    def owns_transfer_info(self, transfer_info, **kwargs):
+        del transfer_info, kwargs
+        return False
+
+    def remove_request(self, request_id):
+        del request_id
+
+
+@pytest.mark.parametrize("autocast_dtype", [None, torch.bfloat16], ids=["no_autocast", "bf16_autocast"])
+def test_engine_exec_and_postprocess_batched_bfloat16(tmp_path, monkeypatch, autocast_dtype):
+    monkeypatch.setattr(kv_mod, "KVTransferManager", _StubKVTransfer)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    ckpt_dir, _, _ = _create_synthetic_sharded_checkpoint(tmp_path, seed=314, use_current_patch_loss=True)
+    model = LingBotVLA2Model(str(ckpt_dir))
+
+    setup = StateSetup()
+    specs = node_resources(model, setup=setup)
+    for spec in specs:
+        if spec.resource_key == LLM_KV:
+            spec.config.max_num_pages = 32
+            spec.config.page_size = 16
+            spec.config.dtype = torch.bfloat16
+
+    submodules = {}
+    for node in ("vit_encoder", "LLM", "action_expert"):
+        sub = model.get_submodule(node, device="cpu", autocast_dtype=torch.bfloat16)
+        assert sub is not None
+        submodules[node] = sub.to(device="cpu", dtype=torch.bfloat16)
+
+    engine = Engine(None, autocast_dtype=autocast_dtype, state_setup=setup)
+    engine.load_model(
+        submodules,
+        specs,
+        parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
+        device=torch.device("cpu"),
+        transfer_engine_info=TransferEngineInfo(
+            my_entity_id="e",
+            my_session_id="s",
+            transfer_engine=LocalTransferEngine("localhost"),
+        ),
+        kv_cache_type=torch.bfloat16,
+        model=model,
+    )
+    engine.warmup()
+
+    gen = torch.Generator().manual_seed(404)
+    img1 = torch.randint(0, 256, (3, 16, 16), dtype=torch.uint8, generator=gen)
+    img2 = torch.randint(0, 256, (3, 20, 20), dtype=torch.uint8, generator=gen)
+    req_a = model.process_prompt(
+        "pick up the red block",
+        ["image", "text"],
+        ["action"],
+        tensors={"image_inputs": [img1, img2]},
+        robot_state=[0.2, -0.4, 0.1, 0.0, 0.3, -0.1],
+    )
+    req_b = model.process_prompt(
+        "pick left cube",
+        ["image", "text"],
+        ["action"],
+        tensors={"image_inputs": [img1]},
+        robot_state=[-0.1, 0.5, -0.2, 0.1, -0.3, 0.4],
+    )
+
+    def _run_batch(items: list[tuple[str, object, list[torch.Tensor]]]):
+        rids = [rid for rid, _, _ in items]
+        for rid in rids:
+            engine.add_request(rid, {})
+
+        def _exec(node: str, walk: str, tensors_by_rid: dict[str, dict]):
+            info = {
+                rid: CurrentForwardPassInfo(
+                    request_id=f"wire-{rid}",
+                    rid_handle=rid,
+                    graph_walk=walk,
+                    fwd_index=0,
+                    random_seed=77,
+                    max_tokens=1024,
+                )
+                for rid in rids
+            }
+            batch = ExecutingBatch(
+                node_name=node,
+                per_request_info=info,
+                per_request_input_tensors=tensors_by_rid,
+                per_request_input_metadata={rid: InputMetadata() for rid in rids},
+                step_context=StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0, capture=False),
+            )
+            engine.prepare_inputs(batch)
+            assert not batch.failed_requests, batch.failed_requests
+            assert batch.running_batched is (len(rids) > 1)
+            out = engine.exec_and_postprocess(batch)
+            assert batch.admit_error is None, batch.admit_error
+            engine.finalize_batch(batch)
+            return out
+
+        try:
+            vit_out = _exec(
+                "vit_encoder",
+                PREFILL_WALK,
+                {rid: {"image_inputs": imgs} for rid, _, imgs in items},
+            )
+            llm_out = _exec(
+                "LLM",
+                PREFILL_WALK,
+                {
+                    rid: {
+                        "text_inputs": req.new_input_tensors["text_inputs"],
+                        **vit_out.per_rid_outputs[rid],
+                    }
+                    for rid, req, _ in items
+                },
+            )
+            act_out = _exec(
+                "action_expert",
+                ACTION_WALK,
+                {
+                    rid: {
+                        "prefix_done": llm_out.per_rid_outputs[rid]["prefix_done"],
+                        "robot_state": req.new_input_tensors["robot_state"],
+                    }
+                    for rid, req, _ in items
+                },
+            )
+            return {rid: act_out.per_rid_outputs[rid]["actions"][0] for rid in rids}
+        finally:
+            for rid in rids:
+                engine.remove_request(rid)
+
+    single = _run_batch([("s1", req_a, [img1, img2])])
+    batched = _run_batch([("b1", req_a, [img1, img2]), ("b2", req_b, [img1])])
+    assert torch.isfinite(single["s1"]).all()
+    assert torch.isfinite(batched["b1"]).all() and torch.isfinite(batched["b2"]).all()
+    torch.testing.assert_close(batched["b1"], single["s1"], rtol=2e-2, atol=2e-2)
+
+
+def test_meta_init_checkpoint_parity_and_fp32_rotary_buffers(tmp_path):
+    ckpt_dir, cfg, raw_weights = _create_synthetic_sharded_checkpoint(
+        tmp_path, seed=515, use_current_patch_loss=True
+    )
+    model = LingBotVLA2Model(str(ckpt_dir))
+
+    # Build eager non-meta reference towers directly from the same checkpoint weights.
+    ref_vit = QwenVisionModel(cfg.vision).eval()
+    ref_vit.load_state_dict(
+        {k.removeprefix(_VISION_PREFIX): v for k, v in raw_weights.items() if k.startswith(_VISION_PREFIX)}
+    )
+    ref_lm = Qwen3DenseLM(cfg.text, mrope_section=list(cfg.mrope_section)).eval()
+    ref_lm.load_weights(
+        (k.removeprefix(_TEXT_PREFIX), v) for k, v in raw_weights.items() if k.startswith(_TEXT_PREFIX)
+    )
+    ref_queries = LingBotVLA2PrefixQueries(cfg.prefix_queries).eval()
+    ref_queries.load_state_dict(
+        {
+            k.removeprefix("model."): v
+            for k, v in raw_weights.items()
+            if k.startswith("model.") and k.removeprefix("model.") in dict(ref_queries.named_parameters())
+        }
+    )
+
+    vit_sub = model.get_submodule("vit_encoder", device="cpu")
+    llm_sub = model.get_submodule("LLM", device="cpu")
+    act_sub = model.get_submodule("action_expert", device="cpu")
+    assert vit_sub is not None and llm_sub is not None and act_sub is not None
+
+    # Meta-loaded rotary buffers must be initialized and equal to eager non-meta references.
+    torch.testing.assert_close(
+        vit_sub.encoder.rotary_pos_emb.inv_freq,
+        ref_vit.rotary_pos_emb.inv_freq,
+        rtol=0,
+        atol=0,
+    )
+    expected_mrope = compute_inv_freq(cfg.text.head_dim, cfg.text.rope_theta, device=torch.device("cpu"))
+    torch.testing.assert_close(llm_sub.language_model.mrope_inv_freq, expected_mrope, rtol=0, atol=0)
+    torch.testing.assert_close(act_sub.action_expert.mrope_inv_freq, expected_mrope, rtol=0, atol=0)
+
+    # Eager non-meta parity on ViT forward (catches uninitialized vision.rotary_pos_emb.inv_freq).
+    from mstar.model.components.diffusion.attention import FrameSDPA
+    from mstar.model.components.qwen_vision import VISION_ATTN as QWEN_VISION_ATTN
+
+    gen = torch.Generator().manual_seed(616)
+    img = torch.randint(0, 256, (3, 16, 16), dtype=torch.uint8, generator=gen)
+    patches, grid = patchify_lingbot_images(
+        [img],
+        image_size=cfg.image_size,
+        patch_size=cfg.vision.patch_size,
+        temporal_patch_size=cfg.vision.temporal_patch_size,
+        spatial_merge_size=cfg.vision.spatial_merge_size,
+    )
+    indices, weights = vision_interpolation(grid, cfg.vision.num_grid_per_side, cfg.vision.spatial_merge_size)
+    pos_ids = vision_grid_position_ids(grid, cfg.vision.spatial_merge_size)
+    gh = cfg.image_size // cfg.vision.patch_size
+    frame_attn = FrameSDPA([gh * gh])
+    for block in ref_vit.blocks:
+        block.attn.bind_resources({QWEN_VISION_ATTN: frame_attn})
+    for block in vit_sub.encoder.blocks:
+        block.attn.bind_resources({VISION_ATTN: frame_attn})
+
+    with torch.no_grad():
+        ref_vis, ref_ds = ref_vit(patches, indices, weights, pos_ids)
+        got_vis, got_ds = vit_sub.encoder(patches, indices, weights, pos_ids)
+    torch.testing.assert_close(got_vis, ref_vis, rtol=1e-5, atol=1e-5)
+    for g_d, r_d in zip(got_ds, ref_ds, strict=True):
+        torch.testing.assert_close(g_d, r_d, rtol=1e-5, atol=1e-5)
+
+    # Eager non-meta parity on compact_prefix + LLM embedding/query assembly.
+    prompt_out = model.process_prompt(
+        "pick block",
+        ["image", "text"],
+        ["action"],
+        tensors={"image_inputs": [img]},
+        robot_state=[0.1] * cfg.state_dim,
+    )
+    text_ids = prompt_out.new_input_tensors["text_inputs"][0]
+    layout = _image_layout_from_tokens(
+        text_ids,
+        image_token_id=cfg.image_token_id,
+        gh=gh,
+        gw=gh,
+        tokens_per_image=cfg.tokens_per_image,
+    )
+    pos_3d, _ = layout_position_ids(layout, cfg.vision.spatial_merge_size, int(text_ids.numel()))
+    with torch.no_grad():
+        ref_packed = compact_prefix(
+            ref_lm.embed(text_ids),
+            pos_3d,
+            text_ids == cfg.image_token_id,
+            visual_embeds=ref_vis,
+            deepstack_features=ref_ds,
+            extra_prefix_tokens=ref_queries(),
+        )
+        got_packed = compact_prefix(
+            llm_sub.language_model.embed(text_ids),
+            pos_3d,
+            text_ids == cfg.image_token_id,
+            visual_embeds=got_vis,
+            deepstack_features=got_ds,
+            extra_prefix_tokens=llm_sub.prefix_queries(),
+        )
+    torch.testing.assert_close(got_packed.input_embeds, ref_packed.input_embeds, rtol=1e-5, atol=1e-5)
+
+    # Both .to(torch.bfloat16) AND .bfloat16() must keep rotary inv_freq buffers in float32.
+    for sub in (vit_sub, llm_sub, act_sub):
+        sub.bfloat16()
+        if sub is vit_sub:
+            assert sub.encoder.rotary_pos_emb.inv_freq.dtype == torch.float32
+        elif sub is llm_sub:
+            assert sub.language_model.mrope_inv_freq.dtype == torch.float32
+        else:
+            assert sub.action_expert.mrope_inv_freq.dtype == torch.float32
+        sub.to(torch.bfloat16)
+        if sub is vit_sub:
+            assert sub.encoder.rotary_pos_emb.inv_freq.dtype == torch.float32
+        elif sub is llm_sub:
+            assert sub.language_model.mrope_inv_freq.dtype == torch.float32
+        else:
+            assert sub.action_expert.mrope_inv_freq.dtype == torch.float32
+
+    # autocast_dtype=torch.bfloat16 must materialize meta-loaded parameters directly in bfloat16
+    # while keeping rotary buffers in float32.
+    bf16_model = LingBotVLA2Model(str(ckpt_dir))
+    bf16_vit = bf16_model.get_submodule("vit_encoder", device="cpu", autocast_dtype=torch.bfloat16)
+    bf16_llm = bf16_model.get_submodule("LLM", device="cpu", autocast_dtype=torch.bfloat16)
+    bf16_act = bf16_model.get_submodule("action_expert", device="cpu", autocast_dtype=torch.bfloat16)
+    assert bf16_vit is not None and bf16_llm is not None and bf16_act is not None
+    assert next(bf16_vit.parameters()).dtype == torch.bfloat16
+    assert next(bf16_llm.parameters()).dtype == torch.bfloat16
+    assert next(bf16_act.parameters()).dtype == torch.bfloat16
+    assert bf16_vit.encoder.rotary_pos_emb.inv_freq.dtype == torch.float32
+    assert bf16_llm.language_model.mrope_inv_freq.dtype == torch.float32
+    assert bf16_act.action_expert.mrope_inv_freq.dtype == torch.float32
+
+
+def test_checkpoint_numeric_step_ordering_and_missing_query_rejection(tmp_path):
+    multi_root = tmp_path / "multi_step"
+    for step in (5000, 10000):
+        ckpt = multi_root / "checkpoints" / f"global_step_{step}" / "hf_ckpt"
+        ckpt.mkdir(parents=True)
+        (ckpt / "config.json").write_text(json.dumps({"vlm_family": "qwen3_vl"}))
+    assert _resolve_checkpoint_subdir(multi_root) == multi_root / "checkpoints" / "global_step_10000" / "hf_ckpt"
+
+    # Missing learned prefix query keys must fail loudly instead of leaving uninitialized to_empty memory.
+    bad_root = tmp_path / "missing_queries"
+    ckpt_dir, _, _ = _create_synthetic_sharded_checkpoint(bad_root, seed=99, use_current_patch_loss=True)
+    index_path = ckpt_dir / "model.safetensors.index.json"
+    index_data = json.loads(index_path.read_text())
+    index_data["weight_map"].pop("model.depth_align_embs")
+    index_path.write_text(json.dumps(index_data))
+
+    bad_model = LingBotVLA2Model(str(ckpt_dir))
+    with pytest.raises(ValueError, match="unloaded"):
+        bad_model.get_submodule("LLM", device="cpu")
+
+
+def test_config_override_propagation_and_inline_validation(tmp_path):
+    cfg = LingBotVLA2Config.for_dummy()
+    model = LingBotVLA2Model(
+        "unused",
+        skip_weight_loading=True,
+        config=cfg,
+        fp32_attention=True,
+        action_fp32=True,
+        max_state_dim=32,
+        max_action_dim=32,
+    )
+    assert model.config.fp32_attention is True
+    assert model.config.action_expert.fp32_attention is True
+    assert model.config.action_expert.action_fp32 is True
+    assert model.config.max_state_dim == 32
+    assert model.config.action_expert.max_state_dim == 32
+    assert model.config.max_action_dim == 32
+    assert model.config.action_expert.max_action_dim == 32
+
+    from dataclasses import replace
+
+    with pytest.raises(ValueError, match="fp32_attention"):
+        replace(cfg, fp32_attention=True)
+
+    # Embedded qwen3_vl/config.json must validate mrope_interleaved & tie_word_embeddings.
+    ckpt = tmp_path / "embedded_bad"
+    (ckpt / "qwen3_vl").mkdir(parents=True)
+    (ckpt / "config.json").write_text(json.dumps({"vlm_family": "qwen3_vl"}))
+    bad_qwen = {
+        "model_type": "qwen3_vl",
+        "tie_word_embeddings": True,
+        "vision_config": asdict(cfg.vision),
+        "text_config": {
+            **asdict(cfg.text),
+            "rope_parameters": {
+                "rope_theta": cfg.text.rope_theta,
+                "mrope_interleaved": False,
+                "mrope_section": list(cfg.mrope_section),
+            },
+        },
+    }
+    (ckpt / "qwen3_vl" / "config.json").write_text(json.dumps(bad_qwen))
+    with pytest.raises(ValueError, match="interleaved 3D MRoPE"):
+        LingBotVLA2Config.from_pretrained(ckpt)
+
+    bad_qwen["text_config"]["rope_parameters"]["mrope_interleaved"] = True
+    bad_qwen["text_config"]["tie_word_embeddings"] = False
+    (ckpt / "qwen3_vl" / "config.json").write_text(json.dumps(bad_qwen))
+    with pytest.raises(ValueError, match="tied output head"):
+        LingBotVLA2Config.from_pretrained(ckpt)
+
+
+def test_patchify_lingbot_images_mixed_ranges():
+    img_neg1_1 = torch.full((3, 16, 16), -0.5, dtype=torch.float32)
+    img_0_1 = torch.full((3, 16, 16), 0.25, dtype=torch.float32)  # maps to -0.5 in [-1, 1]
+    patches, grid = patchify_lingbot_images(
+        [img_neg1_1, img_0_1],
+        image_size=16,
+        patch_size=4,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+    )
+    assert grid == [(1, 4, 4), (1, 4, 4)]
+    per_img = patches.shape[0] // 2
+    torch.testing.assert_close(patches[:per_img], patches[per_img:], rtol=1e-6, atol=1e-6)
