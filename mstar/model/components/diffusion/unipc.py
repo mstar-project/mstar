@@ -81,13 +81,13 @@ def make_unipc_tables(num_inference_steps: int, flow_shift: float) -> tuple[torc
     return sigmas, timesteps
 
 
-def unipc_effective_order(step_index: int, num_inference_steps: int) -> int:
+def unipc_effective_order(step_index: int, num_inference_steps: int, reset_step: int = 0) -> int:
     """Predictor order at step k.
 
     Capped both by the steps remaining (so the last step is order 1) and by the
-    warmup ramp. Step k's corrector reuses step k-1's value.
+    warmup ramp since ``reset_step``. Step k's corrector reuses step k-1's value.
     """
-    lower_order_nums = min(step_index, SOLVER_ORDER)
+    lower_order_nums = min(max(step_index - reset_step, 0), SOLVER_ORDER)
     this_order = min(SOLVER_ORDER, num_inference_steps - step_index)
     return min(this_order, lower_order_nums + 1)
 
@@ -226,23 +226,26 @@ def unipc_step(
     sigmas: torch.Tensor,
     step_index: int,
     num_steps: int,
+    reset_step: int = 0,
 ) -> UniPCStep:
     """One ``UniPCMultistepScheduler.step``: conversion, corrector, predictor.
 
     ``sample`` and ``model_output`` carry a leading batch dim of 1 and ``state`` the
     tensors of :func:`initial_state` over that sample. ``host_sigmas`` is the CPU
     table (see :func:`unipc_convert_model_output`), ``sigmas`` the same table staged
-    on the sample's device.
+    on the sample's device. When ``reset_step > 0``, the order ramp and corrector
+    restart from ``reset_step`` (matching a fresh scheduler over ``sigmas[reset_step:]``).
     """
     converted = unipc_convert_model_output(model_output, sample, host_sigmas, step_index)
-    if step_index > 0:
+    if step_index - reset_step > 0:
         sample = unipc_corrector_step(
             state, this_model_output=converted, this_sample=sample, sigmas=sigmas,
-            step_index=step_index, order=unipc_effective_order(step_index - 1, num_steps),
+            step_index=step_index,
+            order=unipc_effective_order(step_index - 1, num_steps, reset_step=reset_step),
         )
     model_outputs = torch.stack([state.model_outputs[1], converted])
     next_sample = unipc_predictor_step(
         UniPCState(model_outputs=model_outputs, last_sample=sample), sample=sample, sigmas=sigmas,
-        step_index=step_index, order=unipc_effective_order(step_index, num_steps),
+        step_index=step_index, order=unipc_effective_order(step_index, num_steps, reset_step=reset_step),
     )
     return UniPCStep(next_sample, model_outputs, sample)

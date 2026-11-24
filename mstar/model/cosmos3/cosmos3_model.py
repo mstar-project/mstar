@@ -105,6 +105,7 @@ from mstar.model.cosmos3.components.packing import (
 from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.submodules import (
     ACTION_GEN_LOOP,
+    ACTION_ROLLOUT_GEN_LOOP,
     ACTION_VIDEO_GEN_LOOP,
     ACTION_WALKS,
     ATTN,
@@ -176,14 +177,73 @@ _REQUEST_KWARGS = frozenset({
     "guidance_interval", "flow_shift", "use_karras_sigmas", "max_sequence_length",
     "negative_prompt", "use_system_prompt", "use_resolution_template", "use_duration_template",
     "condition_frame_indexes_vision", "condition_video_keep",
-    "action_mode", "action_chunk_size", "action_fps", "action", "domain_id", "domain_name",
-    "raw_action_dim", "robot_state", "generate_sound", "sound_gen", "sound_duration",
+    "action_mode", "action_chunk_size", "action_fps", "action", "action_view_point",
+    "domain_id", "domain_name", "raw_action_dim", "robot_state", "rollout",
+    "generate_sound", "sound_gen", "sound_duration",
     "window_mode", "window_frames", "overlap_frames", "context_frames", "stream_video",
     "session_id", "resume_session", "end_session", "session_timeout_s",
 })
 
 # the loops built with max_iters = max_inference_steps, one iteration per step; not the windowed one
-DENOISE_LOOPS = (IMAGE_GEN_LOOP, VIDEO_GEN_LOOP, VIDEO_SOUND_GEN_LOOP, ACTION_GEN_LOOP, ACTION_VIDEO_GEN_LOOP)
+DENOISE_LOOPS = (
+    IMAGE_GEN_LOOP, VIDEO_GEN_LOOP, VIDEO_SOUND_GEN_LOOP,
+    ACTION_GEN_LOOP, ACTION_ROLLOUT_GEN_LOOP, ACTION_VIDEO_GEN_LOOP,
+)
+
+_ROLLOUT_KEYS = frozenset({
+    "sde_type", "noise_level", "sde_step", "return_state", "ignore_last", "video_solver",
+})
+
+
+def _validate_rollout(raw_rollout, steps: int) -> dict:
+    if not isinstance(raw_rollout, dict):
+        raise ValueError(f"Cosmos3 rollout must be a mapping; got {type(raw_rollout).__name__}.")
+    unknown = set(raw_rollout) - _ROLLOUT_KEYS
+    if unknown:
+        raise ValueError(f"Unknown Cosmos3 rollout keys: {sorted(unknown)}.")
+    sde_type = _str_kwarg(raw_rollout, "sde_type")
+    if sde_type not in ("flow_sde", "flow_ode"):
+        raise ValueError(
+            f"Cosmos3 rollout.sde_type must be 'flow_sde' or 'flow_ode'; got {raw_rollout.get('sde_type')!r}."
+        )
+    noise_level = _num_kwarg(raw_rollout, "noise_level", 0.5)
+    if noise_level < 0.0:
+        raise ValueError(f"Cosmos3 rollout.noise_level must be >= 0.0; got {noise_level!r}.")
+    ignore_last = _bool_kwarg(raw_rollout, "ignore_last", False)
+    return_state = _bool_kwarg(raw_rollout, "return_state", True)
+    video_solver = _str_kwarg(raw_rollout, "video_solver", "hybrid_unipc")
+    if video_solver not in ("hybrid_unipc", "euler"):
+        raise ValueError(
+            f"Cosmos3 rollout.video_solver must be 'hybrid_unipc' or 'euler'; got {video_solver!r}."
+        )
+    raw_step = raw_rollout.get("sde_step")
+    if raw_step is None:
+        sde_step: str | int = "random"
+    elif isinstance(raw_step, str):
+        if raw_step != "random":
+            raise ValueError(
+                f"Cosmos3 rollout.sde_step must be 'random' or an int; got {raw_step!r}."
+            )
+        sde_step = "random"
+    elif isinstance(raw_step, bool) or not isinstance(raw_step, int):
+        raise ValueError(
+            f"Cosmos3 rollout.sde_step must be 'random' or an int; got {raw_step!r}."
+        )
+    else:
+        max_step = steps - 2 if (ignore_last and steps > 1) else steps - 1
+        if not (0 <= raw_step <= max_step):
+            raise ValueError(
+                f"Cosmos3 rollout.sde_step must be in [0, {max_step}]; got {raw_step}."
+            )
+        sde_step = raw_step
+    return {
+        "sde_type": sde_type,
+        "noise_level": noise_level,
+        "sde_step": sde_step,
+        "return_state": return_state,
+        "ignore_last": ignore_last,
+        "video_solver": video_solver,
+    }
 
 
 def _int_kwarg(mk: dict, key: str, default, lo: int | None = None, hi: int | None = None):
@@ -272,6 +332,7 @@ class Cosmos3Model(Model):
     VIDEO_DECODE_AR_WALK = constants.VIDEO_DECODE_AR_WALK
     VIDEO_SOUND_GEN_WALK = constants.VIDEO_SOUND_GEN_WALK
     ACTION_GEN_WALK = constants.ACTION_GEN_WALK
+    ACTION_ROLLOUT_GEN_WALK = constants.ACTION_ROLLOUT_GEN_WALK
     ACTION_VIDEO_GEN_WALK = constants.ACTION_VIDEO_GEN_WALK
     REASONER_PREFILL_WALK = constants.REASONER_PREFILL_WALK
     REASONER_PREFILL_VISION_WALK = constants.REASONER_PREFILL_VISION_WALK
@@ -812,6 +873,36 @@ class Cosmos3Model(Model):
             ]
         )
 
+        action_rollout_gen = Sequential(
+            [
+                Loop(
+                    name=ACTION_ROLLOUT_GEN_LOOP,
+                    section=GraphNode(
+                        name=DIT_NODE,
+                        input_names=self._denoise_inputs("latents", "action_latents"),
+                        outputs=[
+                            *self._denoise_loop_back("latents", "action_latents"),
+                            GraphEdge(next_node=DIT_NODE, name="rollout_state"),
+                        ],
+                        enable_async_scheduling=True,
+                    ),
+                    max_iters=self.config.max_inference_steps,
+                    outputs=[
+                        GraphEdge(
+                            next_node=EMIT_TO_CLIENT,
+                            name="action_latents",
+                            output_modality="action",
+                        ),
+                        GraphEdge(
+                            next_node=EMIT_TO_CLIENT,
+                            name="rollout_state",
+                            output_modality="tensor",
+                        ),
+                    ],
+                ),
+            ]
+        )
+
         # action_video_gen (forward dynamics): the same joint video+action denoise,
         # but the action is the clean condition and the predicted video is decoded
         # and emitted. The loop's terminal output reuses the "latents" loop-back
@@ -854,6 +945,7 @@ class Cosmos3Model(Model):
             self.IMAGE_GEN_WALK: image_gen,
             self.VIDEO_GEN_WALK: video_gen,
             self.ACTION_GEN_WALK: action_gen,
+            self.ACTION_ROLLOUT_GEN_WALK: action_rollout_gen,
         }
         # The sound walk references the audio_decoder node, which only exists
         # (and only needs a node_groups entry) when sound serving is enabled.
@@ -1172,6 +1264,8 @@ class Cosmos3Model(Model):
             vision_layout,
         )
 
+        if model_kwargs and model_kwargs.get("rollout") is not None:
+            raise ValueError("Cosmos3 rollout is only supported for action generation requests.")
         if not self._reasoner_enabled():
             raise ValueError("This Cosmos3 checkpoint/deployment does not serve the reasoner (text output).")
         if self.tokenizer is None:
@@ -1249,6 +1343,11 @@ class Cosmos3Model(Model):
             MEDIA_LAYOUT: layout,
             "kv_layout": {KV_CACHE: {REASONER_LABEL: main, UNCOND_LABEL: LabelLayout()}},
         })
+
+    def load_decoded_image(self, image: torch.Tensor, device: str):
+        from mstar.model.base import TensorAndMetadata
+
+        return TensorAndMetadata(image.to(device).float().div_(255.0))
 
     def load_video(self, filepath: str, device: str):
         """Decode a conditioning / reasoner video to ``[T, C, H, W]`` in [0, 1].
@@ -1377,6 +1476,8 @@ class Cosmos3Model(Model):
             state_dim = self._robot_state_dim(mk) if self._is_policy(mk) else 0
             x = self._invert_action_dims(x[1 if state_dim else 0:], int(mk.get("raw_action_dim") or state_dim))
             return x.cpu().numpy().tobytes()
+        if modality == "tensor":
+            return output.detach().cpu().contiguous().numpy().tobytes()
         if modality == "audio":
             # The audio decoder emits a [channels, samples] waveform in [-1, 1];
             # the serving convention for audio is headerless interleaved 16-bit
@@ -1464,11 +1565,15 @@ class Cosmos3Model(Model):
                     "action_chunk_size or action_chunk_size + 1; got "
                     f"num_frames={num_frames}, action_chunk_size={action_chunk}."
                 )
-            # A bare action request runs the 480p tier (832x480) — the released
-            # policy serving resolution, and the tier whose training shift the
-            # action flow-shift default (5.0) matches.
+            # A bare action request runs the deployment's video_size_default when
+            # set, else the 480p tier (832x480) — the released policy serving
+            # resolution, and the tier whose training shift the action flow-shift
+            # default (5.0) matches.
             if "size" not in mk and "width" not in mk and "height" not in mk:
-                width, height = 832, 480
+                if self.config.video_size_default is not None:
+                    width, height = int(self.config.video_size_default[0]), int(self.config.video_size_default[1])
+                else:
+                    width, height = 832, 480
         else:
             action_chunk = None
             # A video request without an explicit frame count gets the video
@@ -1648,6 +1753,24 @@ class Cosmos3Model(Model):
                 params["action_state_rows"] = 1
             if mk.get("action_fps") is not None:
                 params["action_fps"] = _num_kwarg(mk, "action_fps", None, positive=True)
+        view_point = _str_kwarg(mk, "action_view_point")
+        if view_point is not None:
+            if not view_point.strip():
+                raise ValueError("Cosmos3 action_view_point must be a non-empty string.")
+            if action_mode is None and "action" not in (output_modalities or []):
+                raise ValueError("Cosmos3 action_view_point is only supported for action requests.")
+            params["action_view_point"] = view_point
+        raw_rollout = mk.get("rollout")
+        if raw_rollout is not None:
+            if self.config.is_distilled or self.config.distilled_sigmas:
+                raise ValueError("Cosmos3 rollout is not supported on distilled checkpoints.")
+            if (
+                action_mode is None
+                or "action" not in (output_modalities or [])
+                or action_mode == ACTION_MODE_FORWARD_DYNAMICS
+            ):
+                raise ValueError("Cosmos3 rollout is only supported for action generation requests.")
+            params["rollout"] = _validate_rollout(raw_rollout, steps)
         # Opt-in sound generation: video-only (image and action requests carry
         # no sound band), and only when the served checkpoint/config enable it.
         if _bool_kwarg(mk, "generate_sound") or _bool_kwarg(mk, "sound_gen"):
@@ -1855,6 +1978,8 @@ class Cosmos3Model(Model):
             params = {} if is_text else self._resolve_gen_params(model_kwargs, input_modalities, output_modalities)
             return [WalkStep(self.VIDEO_DECODE_AR_WALK, step_metadata=params)]
         if is_text:
+            if model_kwargs and model_kwargs.get("rollout") is not None:
+                raise ValueError("Cosmos3 rollout is only supported for action generation requests.")
             if not self._reasoner_enabled():
                 raise ValueError("This Cosmos3 deployment does not serve the reasoner (text output).")
             knobs = {
@@ -1893,6 +2018,8 @@ class Cosmos3Model(Model):
         if params.get("action_mode") == "forward_dynamics":
             return self.ACTION_VIDEO_GEN_WALK
         if "action" in output_modalities:
+            if (params.get("rollout") or {}).get("return_state"):
+                return self.ACTION_ROLLOUT_GEN_WALK
             return self.ACTION_GEN_WALK
         if is_video and params.get("window_mode"):
             return self.VIDEO_GEN_AR_WALK
