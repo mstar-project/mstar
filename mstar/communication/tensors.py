@@ -290,6 +290,11 @@ class TransferReadInfo:
     remote_ptr: int
     nbytes: int
     fp: FutureAndPointers | None = None
+    # For TCP host-staged CUDA receives: Mooncake writes into ``host_buf``
+    # (pinned CPU RAM, avoiding Mooncake's legacy-default-stream cudaMemcpy),
+    # then the reader H2D-copies into ``copy_dst`` on its non-blocking stream.
+    host_buf: torch.Tensor | None = None
+    copy_dst: torch.Tensor | None = None
 
 
 # transfer_check_status: COMPLETED and FAILED free the batch; WAITING, and
@@ -390,11 +395,17 @@ class AsyncMooncakeReader:
         """Non-blocking: enqueue a batch of READs.
 
         On a device, records a CUDA event on the current stream to ensure GPU data
-        is ready before the background thread reads it.
+        is ready before the background thread reads it (not needed for host-staged
+        TCP reads whose destination is allocated on ``_copy_stream``).
         """
         if not read_info:
             return
-        event = torch.cuda.current_stream().record_event() if self._copy_stream is not None else None
+        host_staged = any(info.copy_dst is not None for info in read_info)
+        event = (
+            torch.cuda.current_stream(self._copy_stream.device).record_event()
+            if self._copy_stream is not None and not host_staged
+            else None
+        )
         future = self._executor.submit(self._do_read, read_info, event)
         self._pending.append(future)
         # Prune completed futures to avoid unbounded growth
@@ -402,13 +413,24 @@ class AsyncMooncakeReader:
         return future
 
     def _do_read(self, read_info: list["TransferReadInfo"], event: torch.cuda.Event | None):
-        """Worker thread: wait for GPU data via CUDA event, then PUT."""
+        """Worker thread: wait for GPU data via CUDA event, then READ."""
         if event is not None:
             self._copy_stream.wait_event(event)
             self._copy_stream.synchronize()
 
         start_time = time.perf_counter()
         self._read(read_info)
+        if any(info.copy_dst is not None for info in read_info):
+            if self._copy_stream is not None:
+                with torch.cuda.stream(self._copy_stream):
+                    for info in read_info:
+                        if info.copy_dst is not None:
+                            info.copy_dst.copy_(info.host_buf, non_blocking=True)
+                self._copy_stream.synchronize()
+            else:
+                for info in read_info:
+                    if info.copy_dst is not None:
+                        info.copy_dst.copy_(info.host_buf)
         end_time = time.perf_counter()
         # The caller points every read of one edge at its FutureAndPointers
         # only when it wants the time (--log-stats or transfer metrics).
@@ -669,6 +691,19 @@ class BufferedShards:
 
 EdgeNameToTxInfo = dict[str, TxInfo]
 SourceAndEdgeToRxInfo = dict[tuple[str, str], RxInfo]
+
+
+def _flat_byte_view(tensor: torch.Tensor) -> torch.Tensor:
+    """Zero-copy 1-D uint8 view of ``tensor.nbytes`` bytes from ``data_ptr()``.
+
+    Works for contiguous tensors, dense permutations (transposes), and 0-dim
+    scalars without permuting or copying.
+    """
+    return torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(
+        tensor.untyped_storage(),
+        tensor.storage_offset() * tensor.element_size(),
+        (tensor.nbytes,),
+    )
 
 
 def _is_dense(tensor: torch.Tensor) -> bool:
@@ -1730,6 +1765,15 @@ class TensorCommunicationManager(ABC):
         failed, self._failed_reads = self._failed_reads, []
         return failed
 
+    def _take_read_buffer_for_keep(self, uuid: int) -> torch.Tensor:
+        """The buffer Mooncake is actively writing into for ``uuid``, kept until
+        its in-flight transfer stops. Subclasses that stage receives into a
+        separate host buffer override this to hand over the staging buffer."""
+        return self.tensor_store.get_tensor(uuid)
+
+    def _release_completed_read_buffers(self, transfer_uuids: list[int]) -> None:  # noqa: B027
+        """Release any transient receive staging buffers once a read completes."""
+
     def _keep_read_buffers(self, ep: FutureAndPointers, error: BaseException | None) -> None:
         """Take a read's buffers out of the store, so the request's teardown
         cannot free them, and keep them until its transfers stop. ``error`` is
@@ -1738,7 +1782,7 @@ class TensorCommunicationManager(ABC):
         for uuid in ep.transfer_uuids:
             if not self.tensor_store.check_uuid_presence(uuid):
                 continue
-            buffers.append(self.tensor_store.get_tensor(uuid))
+            buffers.append(self._take_read_buffer_for_keep(uuid))
             registered.append(self.tensor_store.is_registered(uuid))
             self.uuid_to_shard_dim.pop(uuid, None)
             self.uuid_to_edge_name.pop(uuid, None)
@@ -1846,6 +1890,8 @@ class TensorCommunicationManager(ABC):
                 self._drop_failed_read(ep, error)
                 continue
             if done and ep.request_id not in waiting:
+                if ep.transfer_uuids:
+                    self._release_completed_read_buffers(ep.transfer_uuids)
                 if stats is not None and ep.read_src is not None:
                     self._record_transfer(stats, ep)
                 for edge in ep.graph_edges:
@@ -2242,6 +2288,15 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         # the consumer has the engine copy ``nbytes`` from ``address + offset``
         # into a buffer it views with the descriptor's strides
         self.needs_flat_layout = protocol in (CommProtocol.RDMA, CommProtocol.TCP)
+        # Mooncake's TcpTransport uses synchronous cudaMemcpy on the legacy
+        # default stream (stream 0) when given CUDA pointers, which serializes
+        # behind GPU compute and deadlocks if a TP rank enters an NCCL
+        # collective while a peer reads from it over TCP (#739). Stage CUDA
+        # tensors through pinned host memory on non-blocking copy streams so
+        # Mooncake TCP only ever touches host RAM.
+        self._tcp_send_buffers: dict[int, torch.Tensor] = {}
+        self._tcp_recv_buffers: dict[int, torch.Tensor] = {}
+        self._tcp_send_stream: torch.cuda.Stream | None = None
         self._async_reader = TrackedMooncakeReader(
             engine._engine, device=device,
             device_filter=tcp_transfer_device if protocol == CommProtocol.TCP else "",
@@ -2249,14 +2304,68 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         self._transfer_status = self._async_reader.transfer_status
 
     @property
+    def _tcp_host_staging(self) -> bool:
+        return self.protocol == CommProtocol.TCP
+
+    def _send_buffers(self) -> dict[int, torch.Tensor]:
+        bufs = self.__dict__.get("_tcp_send_buffers")
+        if bufs is None:
+            bufs = self._tcp_send_buffers = {}
+        return bufs
+
+    def _recv_buffers(self) -> dict[int, torch.Tensor]:
+        bufs = self.__dict__.get("_tcp_recv_buffers")
+        if bufs is None:
+            bufs = self._tcp_recv_buffers = {}
+        return bufs
+
+    @property
     def transport_label(self) -> str:
         return self.protocol.value
 
+    def _stage_cuda_for_tcp_send(self, uuids: Iterable[int]) -> dict[int, torch.Tensor]:
+        """Copy unregistered CUDA send tensors to pinned host buffers on a
+        non-blocking stream, with one stream sync for the batch."""
+        if not self._tcp_host_staging:
+            return {}
+        send_bufs = self._send_buffers()
+        staged: dict[int, torch.Tensor] = {}
+        stream: torch.cuda.Stream | None = None
+        for uuid in uuids:
+            if uuid in staged or uuid in send_bufs or self.tensor_store.is_registered(uuid):
+                continue
+            tensor = self.tensor_store.get_tensor(uuid)
+            if not tensor.is_cuda or not tensor.nbytes:
+                continue
+            if stream is None:
+                stream = self.__dict__.get("_tcp_send_stream")
+                if stream is None:
+                    stream = self._tcp_send_stream = torch.cuda.Stream(device=tensor.device)
+            host_buf = torch.empty(tensor.nbytes, dtype=torch.uint8, pin_memory=True)
+            with torch.cuda.stream(stream):
+                host_buf.copy_(_flat_byte_view(tensor), non_blocking=True)
+            staged[uuid] = host_buf
+        if stream is not None and staged:
+            stream.synchronize()
+        return staged
+
     def register_for_send(self, request_id, tensor_infos, skip_cuda_sync=False):
         if not skip_cuda_sync and self._on_cuda:
-            torch.cuda.default_stream().synchronize()
+            torch.cuda.default_stream(self.device).synchronize()
+        staged = self._stage_cuda_for_tcp_send(info.uuid for info in tensor_infos)
+        send_bufs = self._send_buffers()
+        addr_uuids: list[int] = []
+        addr_vals: list[int] = []
         for info in tensor_infos:
-            self._register_one(request_id, info.uuid)
+            staged_addr = self._register_one(request_id, info.uuid, staged.get(info.uuid))
+            if staged_addr is not None:
+                addr_uuids.append(info.uuid)
+                addr_vals.append(staged_addr)
+                info.address = staged_addr
+            elif info.uuid in send_bufs:
+                info.address = send_bufs[info.uuid].data_ptr()
+        if addr_uuids:
+            self.tensor_store.set_addresses(addr_uuids, addr_vals)
 
     def register_for_send_uuids(
         self,
@@ -2267,31 +2376,49 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         but the uuid -- the tensor itself comes from the store -- so taking
         uuids avoids rebuilding one per tensor."""
         if not skip_cuda_sync and self._on_cuda:
-            torch.cuda.default_stream().synchronize()
+            torch.cuda.default_stream(self.device).synchronize()
+        staged = self._stage_cuda_for_tcp_send(
+            uuid for _, uuids in per_request for uuid in uuids
+        )
+        addr_uuids: list[int] = []
+        addr_vals: list[int] = []
         failed: dict[Rid, str] = {}
         for request_id, uuids in per_request:
             try:
                 for uuid in uuids:
-                    self._register_one(request_id, uuid)
+                    staged_addr = self._register_one(request_id, uuid, staged.get(uuid))
+                    if staged_addr is not None:
+                        addr_uuids.append(uuid)
+                        addr_vals.append(staged_addr)
             except MemoryRegistrationError as exc:
                 failed[request_id] = str(exc)
+        if addr_uuids:
+            self.tensor_store.set_addresses(addr_uuids, addr_vals)
         return failed or None
 
-    def _register_one(self, request_id: Rid, uuid: int) -> None:
-        """Pin one tensor for remote reads. The caller owns the CUDA sync."""
+    def _register_one(
+        self, request_id: Rid, uuid: int, staged: torch.Tensor | None = None,
+    ) -> int | None:
+        """Pin one tensor for remote reads. The caller owns the CUDA sync.
+
+        Returns the staged host address when a CUDA tensor was staged to host
+        memory for TCP, else None.
+        """
         already_registered = self.tensor_store.is_registered(uuid)
+        staged_addr: int | None = None
         if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP):
             if already_registered:
-                return
+                return None
             logger.debug("Registering %s for send", uuid)
             tensor = self.tensor_store.get_tensor(uuid)
+            reg_tensor = staged if staged is not None else tensor
             t0 = time.perf_counter()
             # Mooncake rejects a 0-byte region, and a reader of an empty
             # tensor copies nothing (see start_read_tensors), so there is
             # nothing to pin.
             ret_value = self.transfer_engine.register_memory(
-                tensor.data_ptr(), tensor.nbytes
-            ) if tensor.nbytes else 0
+                reg_tensor.data_ptr(), reg_tensor.nbytes
+            ) if reg_tensor.nbytes else 0
             if PHASE_PERIOD:
                 phase_record(
                     "tensors.register_memory", time.perf_counter() - t0,
@@ -2301,8 +2428,11 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     f"Mooncake memory registration failed for request id "
                     f"{self.rid_to_str(request_id)}, uuid {uuid}: {ret_value}"
                 )
+            if staged is not None:
+                self._send_buffers()[uuid] = staged
+                staged_addr = staged.data_ptr()
             if self.enable_prof:
-                # RDMA: the receiver does the actual read, so the sender-side
+                # RDMA/TCP: the receiver does the actual read, so the sender-side
                 # cost is the memory-pinning (register) time.
                 self._record_tx(
                     request_id, uuid, tensor.nbytes, time.perf_counter() - t0
@@ -2311,10 +2441,43 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             tensor = self.tensor_store.get_tensor(uuid)
             self._record_tx(request_id, uuid, tensor.nbytes, 0.0)
         self.tensor_store.set_metadata(uuid, mem_registered=True)
+        return staged_addr
+
+    def _take_read_buffer_for_keep(self, uuid: int) -> torch.Tensor:
+        recv_bufs = self.__dict__.get("_tcp_recv_buffers")
+        rx_host = recv_bufs.pop(uuid, None) if recv_bufs else None
+        if rx_host is not None:
+            return rx_host
+        return self.tensor_store.get_tensor(uuid)
+
+    def _release_completed_read_buffers(self, transfer_uuids: list[int]) -> None:
+        recv_bufs = self.__dict__.get("_tcp_recv_buffers")
+        if not recv_bufs:
+            return
+        for uuid in transfer_uuids:
+            rx_host = recv_bufs.pop(uuid, None)
+            if rx_host is None:
+                continue
+            if rx_host.nbytes:
+                ret_value = self.transfer_engine.unregister_memory(rx_host.data_ptr())
+                if ret_value != 0:
+                    self._unreleasable_buffers.append(rx_host)
+                    logger.error(
+                        "Mooncake memory unregistration failed for uuid %s: %s; "
+                        "keeping its %d bytes allocated so the address is not "
+                        "reused while it may still be registered",
+                        uuid, ret_value, rx_host.nbytes,
+                    )
+            if self.tensor_store.check_uuid_presence(uuid):
+                self.tensor_store.set_metadata(uuid, mem_registered=False)
 
     def _cleanup_by_uuid(self, uuid: int, registered: bool | None = None):
         super()._cleanup_by_uuid(uuid, registered)
         logger.debug("Deleting tensor uuid %s", uuid)
+        send_bufs = self.__dict__.get("_tcp_send_buffers")
+        recv_bufs = self.__dict__.get("_tcp_recv_buffers")
+        staged = send_bufs.pop(uuid, None) if send_bufs else None
+        rx_host = recv_bufs.pop(uuid, None) if recv_bufs else None
         if not self.tensor_store.check_uuid_presence(uuid):
             logger.warning("Trying to cleanup tensor %s, but uuid not found", uuid)
             return
@@ -2322,9 +2485,10 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             registered = self.tensor_store.is_registered(uuid)
         if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP) and registered:
             tensor = self.tensor_store.get_tensor(uuid)
+            reg_buf = staged if staged is not None else (rx_host if rx_host is not None else tensor)
             # an empty tensor is marked ready without being registered
-            if tensor.nbytes:
-                ret_value = self.transfer_engine.unregister_memory(tensor.data_ptr())
+            if reg_buf.nbytes:
+                ret_value = self.transfer_engine.unregister_memory(reg_buf.data_ptr())
                 if ret_value != 0:
                     # Logged, not raised: a raise would abort the rest of a
                     # request's teardown (from REMOVE_REQUEST, in the worker's
@@ -2332,12 +2496,12 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     # tensor is kept for the life of the process: freed, its
                     # address goes back to the allocator, and a later request's
                     # tensor there is refused as an overlap (-7).
-                    self._unreleasable_buffers.append(tensor)
+                    self._unreleasable_buffers.append(reg_buf)
                     logger.error(
                         "Mooncake memory unregistration failed for uuid %s: %s; "
                         "keeping its %d bytes allocated so the address is not "
                         "reused while it may still be registered",
-                        uuid, ret_value, tensor.nbytes,
+                        uuid, ret_value, reg_buf.nbytes,
                     )
         self.tensor_store.remove_tensor(uuid)
 
@@ -2368,6 +2532,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             )
             # why the engine refused to pin a buffer of this edge, if it did
             refused: str | None = None
+            copy_stream = getattr(self._async_reader, "_copy_stream", None)
             for info in graph_edge.tensor_info:
                 if info.source_entity == self.my_entity_id:
                     self._slice_existing_tensor(
@@ -2379,16 +2544,34 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     continue
                 if self._take_cached_read(request_id, info):
                     continue
-                buffer = torch.empty(
-                    info.dims, dtype=info.dtype, device=self.device
-                ).as_strided(info.dims, stride=info.stride)
+                stage_rx = self._tcp_host_staging and self._on_cuda and info.nbytes > 0
+                raw_dst: torch.Tensor | None = None
+                if stage_rx:
+                    # Allocate on the reader's non-blocking copy stream so the
+                    # caching allocator hands out a block free of pending work
+                    # on the default stream (which may be inside an NCCL
+                    # collective).
+                    stream_ctx = (
+                        torch.cuda.stream(copy_stream)
+                        if copy_stream is not None
+                        else _nullcontext()
+                    )
+                    with stream_ctx:
+                        raw_dst = torch.empty(info.nbytes, dtype=torch.uint8, device=self.device)
+                    raw_dst.record_stream(torch.cuda.default_stream(self.device))
+                    buffer = torch.empty(
+                        0, dtype=info.dtype, device=self.device,
+                    ).set_(raw_dst.untyped_storage(), 0, info.dims, info.stride)
+                else:
+                    buffer = torch.empty(
+                        info.dims, dtype=info.dtype, device=self.device
+                    ).as_strided(info.dims, stride=info.stride)
                 self.tensor_store.put_tensor(
                     request_id=request_id, uuid=info.uuid, tensor=buffer, info=info,
                 )
                 # +1 for transit (released by get_ready_tensors)
                 # +1 for graph-node usage (released by _cleanup_consumed_inputs)
-                self.tensor_store.increment_ref(info.uuid, 2
-                )
+                self.tensor_store.increment_ref(info.uuid, 2)
                 if stats is not None:
                     fp.count_read(info)
                 # Nothing to read, and Mooncake rejects a 0-byte region: the
@@ -2402,11 +2585,18 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 if refused is not None:
                     continue  # the read will not run: nothing more to pin
 
+                rx_host: torch.Tensor | None = None
+                if stage_rx:
+                    rx_host = torch.empty(info.nbytes, dtype=torch.uint8, pin_memory=True)
+                    reg_ptr = rx_host.data_ptr()
+                else:
+                    reg_ptr = buffer.data_ptr()
+
                 # Marked only once registered: teardown unregisters what is
                 # marked.
                 ret_value = (
                     self.transfer_engine.register_memory(
-                        buffer.data_ptr(), info.nbytes,
+                        reg_ptr, info.nbytes,
                     )
                     if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP)
                     else 0
@@ -2418,13 +2608,17 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                         f"{info.uuid}: {ret_value}"
                     )
                     continue
+                if rx_host is not None:
+                    self._recv_buffers()[info.uuid] = rx_host
                 self.tensor_store.set_metadata(info.uuid, mem_registered=True)
 
                 read_info.append(TransferReadInfo(
                     source_session_id=info.source_session_id,
-                    local_ptr=buffer.data_ptr(),
+                    local_ptr=reg_ptr,
                     remote_ptr=info.address + info.offset,
                     nbytes=info.nbytes,
+                    host_buf=rx_host,
+                    copy_dst=raw_dst,
                 ))
                 logger.debug("Started transfer read for uuid %s", info.uuid)
             if self.enable_prof or fp.read_src is not None:

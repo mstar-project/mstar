@@ -597,6 +597,22 @@ impl Bookkeeping {
     /// spilled this one to its own file), which is what a consumer reads as
     /// the file fallback.
     ///
+    /// Update transfer addresses on descriptors already held (e.g. host-staged
+    /// Mooncake TCP send buffers). An untracked uuid is skipped.
+    fn set_addresses(&mut self, uuids: Vec<u64>, addresses: Vec<u64>) -> PyResult<()> {
+        if uuids.len() != addresses.len() {
+            return Err(PyValueError::new_err(
+                "set_addresses: uuids and addresses must have the same length",
+            ));
+        }
+        for (uuid, address) in uuids.into_iter().zip(addresses) {
+            if let Some(info) = self.tensor_info.get_mut(&uuid) {
+                info.address = address;
+            }
+        }
+        Ok(())
+    }
+
     /// An untracked uuid is skipped, matching every other mutator here: a
     /// late stamp for a tensor already collected is benign.
     fn set_shm_placement(
@@ -996,6 +1012,10 @@ impl TensorBookkeeping {
         self.inner.lock().unwrap().register_shm_segment(index, name)
     }
 
+    fn set_addresses(&self, uuids: Vec<u64>, addresses: Vec<u64>) -> PyResult<()> {
+        self.inner.lock().unwrap().set_addresses(uuids, addresses)
+    }
+
     fn set_shm_placement(
         &self,
         uuids: Vec<u64>,
@@ -1232,5 +1252,34 @@ mod tests {
         b.set_mem_registered(1, true);
         assert!(b.is_registered(1));
         assert!(b.can_gc(1), "registration does not hold a reference");
+    }
+
+    #[test]
+    fn set_addresses_updates_tracked_descriptors_and_rejects_mismatch() {
+        let mut b = bk();
+        track(&mut b, 1);
+        b.tensor_info.insert(
+            1,
+            TensorPointerInfo {
+                dims: vec![4],
+                dtype: 0,
+                nbytes: 8,
+                address: 0x1000,
+                stride: vec![1],
+                uuid: 1,
+                source_session_id: 0,
+                source_entity: 0,
+                offset: 0,
+                source_tp_size: 1,
+                source_tp_rank: 0,
+                shm_segment: None,
+                shm_offset: 0,
+                source_node_name: None,
+                source_graph_walk: None,
+            },
+        );
+        b.set_addresses(vec![1, 99], vec![0x2000, 0x3000]).unwrap();
+        assert_eq!(b.info_raw(1).unwrap().address, 0x2000);
+        assert!(b.set_addresses(vec![1], vec![]).is_err());
     }
 }
