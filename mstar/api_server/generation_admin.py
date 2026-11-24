@@ -79,8 +79,8 @@ class GenerationAdmin:
         body = body or {}
         op_id = f"generation-{uuid.uuid4().hex}"
         if op == "pause_generation":
-            mode = body.get("mode", "abort")
-            if mode not in ("abort", "wait"):
+            mode = body.get("mode")
+            if not isinstance(mode, str) or mode not in ("abort", "wait"):
                 raise ValueError("mode must be 'abort' or 'wait'")
             message_type, payload = ConductorMessageType.PAUSE_GENERATION, PauseGeneration(op_id, mode)
         elif op == "continue_generation":
