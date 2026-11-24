@@ -9,7 +9,7 @@ the request ends.
 """
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -56,6 +56,12 @@ class SizedValueConfig:
     def budget(self) -> int:
         return self.bytes_at(self.largest) if self.max_bytes is None else self.max_bytes
 
+    @property
+    def usable_slots(self) -> int:
+        """Concurrent worst-case (``largest``) requests/episodes that fit within ``budget``."""
+        per_request = max(1, self.bytes_at(self.largest))
+        return self.budget // per_request
+
 
 @dataclass
 class SizedValueReqConfig(ResourceReqConfig):
@@ -84,12 +90,30 @@ class SizedValueStep(ResourceStep):
 @dataclass
 class SizedValueSpec(NodeResourceSpec):
     config: SizedValueConfig
+    episode_lifetime: bool = False
 
     @property
     def resource_class(self) -> "type[Resource]":
         from mstar.engine.resources.sized.store import SizedValueStore
 
         return SizedValueStore
+
+    def capacity_problem(
+        self, requests: int, request: ResourceReqConfig | None, axis_sizes: Sequence[Mapping[str, int]] = (),
+    ) -> str | None:
+        del axis_sizes
+        per_request = (
+            request.bytes(self.config) if isinstance(request, SizedValueReqConfig)
+            else self.config.bytes_at(self.config.largest)
+        )
+        need = requests * per_request
+        if need <= self.config.budget:
+            return None
+        return (
+            f"{requests} concurrent requests (max_concurrent_requests) need {need} bytes of "
+            f"resources.{self.resource_key} ({per_request} per request), which has {self.config.budget}; "
+            "raise max_bytes or lower max_concurrent_requests"
+        )
 
     @property
     def restores_prefix(self) -> bool:

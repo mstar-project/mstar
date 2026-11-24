@@ -11,7 +11,7 @@ from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.recurrent.dense_window import DenseWindowPool, DenseWindowSpec
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
-from mstar.engine.state import Array, ArrayStep, Block, Entry, KVEntry, Read, TensorType, Window
+from mstar.engine.state import Array, ArrayStep, Attend, Block, Causal, Entry, KVEntry, Read, TensorType, Window
 from mstar.engine.state.adapters import DENSE_WINDOW, PAGED, build_specs, node_handles, state_steps, storage_of
 from mstar.engine.state.episodes import EpisodeRowBindings
 from mstar.utils.ipc_format import EndEpisode, RemoveRequest, WorkerMessage, WorkerMessageType
@@ -22,7 +22,7 @@ from mstar.worker.step_pipeline import StepPipeline
 def _kv(**overrides):
     return Array(
         "kv", nodes={"llm"}, layers={0}, entry=KVEntry(heads=2, head_dim=8),
-        max_len=16, **overrides,
+        max_len=16, reads={"attn": Read(mask=Causal(), op=Attend(q_heads=2))}, **overrides,
     )
 
 
@@ -32,8 +32,10 @@ def test_lifetime_is_declared_without_selecting_a_second_kv_storage():
     assert request.lifetime == "request"
     assert storage_of(request) is storage_of(episode) is PAGED
     assert request != episode and hash(episode) == hash(_kv(lifetime="episode"))
-    with pytest.raises(ValueError, match="episode lifetime needs row binding and storage teardown"):
-        build_specs([episode])
+    request_specs = build_specs([request])
+    episode_specs = build_specs([episode])
+    assert not request_specs[0].episode_lifetime
+    assert episode_specs[0].episode_lifetime and episode_specs[0].resource_key == "kv"
 
 
 @pytest.mark.parametrize("bad", [None, "session", "", 1, True])
@@ -620,10 +622,10 @@ def test_engine_binds_warm_episode_and_releases_it_only_on_explicit_end():
     assert first_batch.episode_held[11] == {"frames": 3}
     terminal_batch = ExecutingBatch("action_head", {}, StepContext([11], "decode", 0, False))
     engine.finalize_batch(terminal_batch)
-    assert terminal_batch.episode_held[11] == {"frames": 3}
+    assert terminal_batch.episode_held[11] == {}
     records = EpisodeRecords()
     records.admit("a", "request", 0, Placement({0: 0}, {}))
-    records.finish("a", "request", terminal_batch.episode_held[11])
+    records.finish("a", "request", {**first_batch.episode_held[11], **terminal_batch.episode_held[11]})
     assert records.view("a").held["frames"] == 3
     assert read(11, 2).shape[0] == 4
     second_batch = ExecutingBatch("decoder", {}, StepContext([11], "decode", 0, False))
