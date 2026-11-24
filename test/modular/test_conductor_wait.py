@@ -16,14 +16,38 @@ from mstar.api_server.request_types import ConductorStatus  # noqa: E402
 from mstar.communication.communicator import OutboxCommunicator  # noqa: E402
 from mstar.communication.rust_communicator import RustZMQCommunicator  # noqa: E402
 from mstar.conductor.conductor import Conductor  # noqa: E402
+from mstar.conductor.episodes import EpisodeSlots  # noqa: E402
+from mstar.conductor.routing import Placement  # noqa: E402
+from mstar.observability import catalog  # noqa: E402
+from mstar.observability.recorders import Counter as MetricCounter  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ConductorMessage,
     ConductorMessageType,
+    NewRequestConductor,
     ReadsDone,
 )
 
 FAR_S = 60.0  # no check but the one under test comes due during a test
 DUE_S = 0.4
+
+
+def _episode_idle_due(c, at):
+    c._episode_array_names = frozenset({"frames"})
+    c._episode_idle_timeout_s = 10.0
+    c._episode_slots = EpisodeSlots(1)
+    c._episode_evictions = MetricCounter(catalog.EPISODE_EVICTIONS)
+    c._episode_slots.reserve("episode:robot-a", {"w0"})
+    c._episode_records.admit("robot-a", "c1", 0, Placement({0: 0}, {}), workers={"w0"})
+    c._episode_records.finish("robot-a", "c1", {"frames": 4})
+    c._episode_records._records["robot-a"].last_end = at - c._episode_idle_timeout_s
+
+
+def _waiting_deadline_due(c, at):
+    c._queued_since = {}
+    c.waiting_queue.append(NewRequestConductor(
+        "expired-waiter", {}, ["text"], ["text"], {}, {}, deadline=at,
+    ))
+
 
 TIMED_CHECKS = {
     "liveness": lambda c, at: setattr(c, "_next_liveness_check", at),
@@ -32,6 +56,8 @@ TIMED_CHECKS = {
     "early_reads_done": lambda c, at: c._early_reads_done_deadlines.append((at, "r")),
     "early_abort": lambda c, at: c._early_abort_deadlines.append((at, "r")),
     "lora_op": lambda c, at: setattr(c, "_lora_ops_cache", _lora_op_due(at)),
+    "episode_idle": _episode_idle_due,
+    "waiting_deadline": _waiting_deadline_due,
 }
 
 

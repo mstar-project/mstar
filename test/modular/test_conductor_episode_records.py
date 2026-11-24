@@ -1,9 +1,12 @@
 """Episode placement and planning views use one conductor-owned record."""
 
+import math
 from types import SimpleNamespace
 
 import pytest
 
+import mstar.conductor.conductor as conductor_mod
+import mstar.conductor.episodes as episodes_mod
 from mstar.conductor.conductor import Conductor
 from mstar.conductor.episodes import EpisodeCapacityError, EpisodeRecords, EpisodeSlots
 from mstar.conductor.routing import Placement
@@ -456,3 +459,116 @@ def test_multireplica_slots_reuse_only_after_both_idle_timeouts():
     }
     assert conductor._episode_slots.used_by_worker() == {"w0": 1, "w1": 1}
     assert conductor._episode_evictions.snapshot().values == [2.0]
+
+
+def test_ms_to_next_timed_check_includes_earliest_non_queued_idle_episode(monkeypatch):
+    now = 1000.0
+    monkeypatch.setattr(conductor_mod.time, "perf_counter", lambda: now)
+    monkeypatch.setattr(episodes_mod.time, "perf_counter", lambda: now)
+
+    conductor = object.__new__(Conductor)
+    conductor._next_liveness_check = now + 60.0
+    conductor._status_interval_s = None
+    conductor._next_summary = None
+    conductor._draining_deadlines = ()
+    conductor._early_reads_done_deadlines = ()
+    conductor._early_abort_deadlines = ()
+    conductor.waiting_queue = []
+    conductor._episode_array_names = frozenset({"frames"})
+    conductor._episode_idle_timeout_s = 10.0
+    conductor._episode_records = EpisodeRecords({"frames"})
+
+    # No idle episodes: falls back to liveness check.
+    assert conductor._ms_to_next_timed_check() == 60_000
+
+    # Two idle episodes: picks the earliest last_end + idle_timeout_s.
+    conductor._episode_records.admit("ep-later", "c1", 0, _placement(0))
+    now = 1002.0
+    conductor._episode_records.finish("ep-later", "c1", {"frames": 1})
+    conductor._episode_records.admit("ep-earlier", "c2", 1, _placement(0))
+    now = 1001.0
+    conductor._episode_records.finish("ep-earlier", "c2", {"frames": 1})
+    now = 1003.0
+    assert conductor._ms_to_next_timed_check() == math.ceil((1001.0 + 10.0 - 1003.0) * 1000)
+
+    # In-flight or already-evicted episodes are ignored.
+    conductor._episode_records.evict("ep-earlier", "idle")
+    assert conductor._ms_to_next_timed_check() == math.ceil((1002.0 + 10.0 - 1003.0) * 1000)
+    conductor._episode_records.admit("ep-live", "c3", 0, _placement(0))
+    assert conductor._ms_to_next_timed_check() == math.ceil((1002.0 + 10.0 - 1003.0) * 1000)
+    conductor._episode_records.finish("ep-live", "c3", {"frames": 1})
+
+    # Already-expired non-queued idle episode clamps to 1 ms.
+    now = 1015.0
+    assert conductor._ms_to_next_timed_check() == 1
+
+    # Queued idle episode is skipped (even if overdue) so it does not spin at 1 ms.
+    conductor.waiting_queue = [
+        NewRequestConductor("wait-later", {}, [], [], {}, {}, episode="ep-later"),
+    ]
+    # ep-live finished at now=1003.0, so it expires at 1013.0 -> still overdue -> 1 ms;
+    # set ep-live to finish at 1020.0 (expires at 1030.0) while ep-later is overdue at 1012.0.
+    conductor._episode_records.admit("ep-live", "c4", 0, _placement(0))
+    now = 1020.0
+    conductor._episode_records.finish("ep-live", "c4", {"frames": 1})
+    assert conductor._ms_to_next_timed_check() == 10_000
+
+    # If every idle episode is queued, falls back to liveness deadline (40s remaining from 1020 -> 1060).
+    conductor.waiting_queue.append(
+        NewRequestConductor("wait-live", {}, [], [], {}, {}, episode="ep-live"),
+    )
+    assert conductor._ms_to_next_timed_check() == 40_000
+
+    # Non-episode model or disabled idle timeout ignores episode deadlines.
+    conductor.waiting_queue = []
+    conductor._episode_idle_timeout_s = None
+    assert conductor._ms_to_next_timed_check() == 40_000
+    conductor._episode_idle_timeout_s = 10.0
+    conductor._episode_array_names = frozenset()
+    assert conductor._ms_to_next_timed_check() == 40_000
+
+
+def test_worker_loss_marks_idle_and_in_flight_episodes_lost_and_keeps_call_budget():
+    episodes = EpisodeRecords({"frames"})
+    episodes.admit("ep-idle", "c1", 0, _placement(0), workers={"w0"}, max_calls=3)
+    episodes.finish("ep-idle", "c1", {"frames": 21})
+
+    episodes.admit("ep-run", "c2", 1, _placement(0), workers={"w0", "w1"}, max_calls=3)
+    episodes.admit("ep-ok", "c3", 0, _placement(1), workers={"w2"})
+    episodes.finish("ep-ok", "c3", {"frames": 7})
+
+    episodes.admit("ep-end", "c4", 2, _placement(0), workers={"w0"})
+    episodes.mark_ending("ep-end")
+
+    episodes.admit("ep-cold", "c5", 0, _placement(2), workers={"w3"})
+    episodes.finish("ep-cold", "c5", {"frames": 3})
+    episodes.evict("ep-cold", "idle")
+
+    lost = episodes.lose_workers({"w0"})
+    assert {(ep, slot, frozenset(workers), frozenset(surviving), in_flight)
+            for ep, slot, workers, surviving, in_flight in lost} == {
+        ("ep-idle", 0, frozenset({"w0"}), frozenset(), None),
+        ("ep-run", 1, frozenset({"w0", "w1"}), frozenset({"w1"}), "c2"),
+        ("ep-end", 2, frozenset({"w0"}), frozenset(), "c4"),
+    }
+
+    for ep in ("ep-idle", "ep-run"):
+        view = episodes.view(ep)
+        assert (view.calls, dict(view.held), view.cold) == (1, {"frames": 0}, "lost")
+        assert episodes.slot_for(ep) is None
+        assert not episodes.busy(ep)
+        assert episodes.placement_for(ep, lambda: _placement(1)).replicas == {0: 1}
+        admitted = episodes.admit(ep, f"next-{ep}", 0, _placement(1), workers={"w2"}, max_calls=3)
+        assert (admitted.calls, admitted.cold) == (1, "lost")
+        episodes.finish(ep, f"next-{ep}", {"frames": 9})
+        assert episodes.view(ep).cold is None
+        assert episodes.view(ep).calls == 2
+
+    # Healthy and already-cold episodes are untouched; ending episode was closed.
+    assert (episodes.view("ep-ok").calls, dict(episodes.view("ep-ok").held), episodes.view("ep-ok").cold) == (
+        1, {"frames": 7}, None,
+    )
+    assert episodes.view("ep-cold").cold == "idle"
+    assert episodes.closed_or_ending("ep-end")
+    with pytest.raises(ValueError, match="has ended"):
+        episodes.can_admit("ep-end")

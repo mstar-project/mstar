@@ -10,6 +10,9 @@ DEFAULT_PARTITION = "default"
 # Step metadata a walk plan sets on the step that samples the reply's first
 # token, the last prefill before decode (`TokenStop.last_prefill_flag`).
 FINAL_PREFILL = "final_prefill"
+# Step metadata the conductor stamps on every step of an episode-capable
+# model: 0-based count of admitted calls in the episode before this one.
+EPISODE_CALLS = "episode_calls"
 
 
 @dataclass

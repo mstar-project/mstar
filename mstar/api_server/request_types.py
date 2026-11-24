@@ -189,6 +189,9 @@ class PreprocessInput:
     # in place of that modality's files (an image is RGB uint8 ``[3, H, W]``):
     # each goes to ``Model.load_decoded_<modality>``, with no file between.
     raw_inputs: dict[str, list["torch.Tensor"]] | None = None
+    # ``time.perf_counter()`` deadline after which the conductor refuses to
+    # admit the request while waiting in its admission queue (None: no deadline).
+    deadline: float | None = None
 
 
 @dataclass
