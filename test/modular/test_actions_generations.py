@@ -612,13 +612,45 @@ def test_pi05_400_validation_cases(monkeypatch, tmp_path):
         {"input": {"tokenized_prompt": [1, 2, 3], "tokenized_prompt_mask": [True, False, True], "images": img}},
         {"input": {"tokenized_prompt": [-1, 2], "images": img}},
         {"input": {"tokenized_prompt": np.array([1.5, 2.5], dtype=np.float32), "images": img}},
+        {"input": {"tokenized_prompt": np.array([2**63], dtype=np.uint64), "images": img}},
         {"input": {"tokenized_prompt": [1, 2], "images": np.zeros((2, 2, 3, 4, 4), dtype=np.uint8)}},
         {"input": {"prompt": "pick", "images": np.zeros((1, 4, 3, 4, 4), dtype=np.uint8)}},
         {"input": {"prompt": "pick", "images": img, "robot_state": [float("nan")]}},
+        {"input": {"prompt": "pick", "images": img}, "parameters": {"seeds": np.array([2**63], dtype=np.uint64)}},
+        {"input": {"prompt": "pick", "images": img}, "parameters": {"big": np.array([2**63], dtype=np.uint64)}},
     ]
     for payload in bad_inputs:
         resp = _post(client, _pack_bytes_keys(payload))
         assert resp.status_code == 400, payload
+
+
+def test_uint64_max_int64_and_cosmos3_explicit_none_robot_state(monkeypatch, tmp_path):
+    fake_pi05 = _FakeActionsServer(_pi05_model(), tmp_path / "pi05", model_name="pi05_libero")
+    monkeypatch.setattr(entrypoint, "api_server", fake_pi05)
+    resp = _post(
+        TestClient(entrypoint.app),
+        _pack_bytes_keys({
+            "input": {
+                "tokenized_prompt": np.array([[2**63 - 1]], dtype=np.uint64),
+                "images": np.zeros((1, 2, 3, 4, 4), dtype=np.uint8),
+            },
+            "parameters": {"seeds": np.array([2**63 - 1], dtype=np.uint64)},
+        }),
+    )
+    assert resp.status_code == 200
+    assert fake_pi05.submitted[0]["model_kwargs"]["tokenized_prompt"] == [2**63 - 1]
+    assert fake_pi05.submitted[0]["model_kwargs"]["seed"] == 2**63 - 1
+
+    fake_c3 = _FakeActionsServer(_Cosmos3StubModel(), tmp_path / "c3", model_name="cosmos3")
+    monkeypatch.setattr(entrypoint, "api_server", fake_c3)
+    for payload in (
+        {"input": {"prompt": "pick", "robot_state": None}, "parameters": {"robot_state": [0.1, 0.2]}},
+        {"input": {"prompt": "pick", "robot_state": [0.1, 0.2]}, "parameters": {"robot_state": None}},
+    ):
+        fake_c3.submitted.clear()
+        r = _post(TestClient(entrypoint.app), _pack_bytes_keys(payload))
+        assert r.status_code == 200
+        assert fake_c3.submitted[0]["model_kwargs"]["robot_state"] == [0.1, 0.2]
 
 
 def test_data_worker_attaches_action_shape_and_rollout_state_metadata():

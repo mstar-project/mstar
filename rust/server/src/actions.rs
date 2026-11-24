@@ -37,7 +37,7 @@ fn default_num_cameras() -> usize {
 }
 
 /// Action-model metadata exported by `mstar/api_server/rust_frontend.py::actions_facts`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ActionsFacts {
     pub family: String,
     #[allow(dead_code)]
@@ -54,13 +54,28 @@ pub struct ActionsFacts {
     pub num_flow_steps: Option<usize>,
 }
 
-impl ActionsFacts {
+/// Parsed `MSTAR_ACTIONS` launcher configuration (`None` when env is unset).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionsConfig {
+    Enabled(ActionsFacts),
+    Disabled,
+}
+
+impl ActionsConfig {
+    pub fn parse(raw: &str) -> Result<Self, serde_json::Error> {
+        let val: Value = serde_json::from_str(raw)?;
+        if val.is_null() || val.get("enabled").and_then(Value::as_bool) == Some(false) {
+            return Ok(Self::Disabled);
+        }
+        Ok(Self::Enabled(serde_json::from_value(val)?))
+    }
+
     pub fn from_env() -> Option<Self> {
-        static FACTS: OnceLock<Option<ActionsFacts>> = OnceLock::new();
-        FACTS
+        static CONFIG: OnceLock<Option<ActionsConfig>> = OnceLock::new();
+        CONFIG
             .get_or_init(|| {
                 let raw = std::env::var(ACTIONS_ENV).ok().filter(|s| !s.is_empty())?;
-                Some(serde_json::from_str(&raw).expect("MSTAR_ACTIONS is the launcher's JSON"))
+                Some(Self::parse(&raw).expect("MSTAR_ACTIONS is the launcher's JSON"))
             })
             .clone()
     }
@@ -68,8 +83,19 @@ impl ActionsFacts {
 
 /// Resolve whether this frontend serves `/v1/actions/generations` and its capabilities.
 pub fn resolve_actions(st: &AppState) -> Result<ActionsFacts, Response> {
-    if let Some(facts) = &st.actions {
-        return Ok(facts.clone());
+    match &st.actions {
+        Some(ActionsConfig::Enabled(facts)) => return Ok(facts.clone()),
+        Some(ActionsConfig::Disabled) => {
+            return Err(crate::error(
+                404,
+                &format!(
+                    "Model '{}' does not support /v1/actions/generations",
+                    st.model_name
+                ),
+                "invalid_request_error",
+            ))
+        }
+        None => {}
     }
     if let Some(policy) = crate::ws::openpi::policy() {
         return Ok(ActionsFacts {
@@ -98,14 +124,15 @@ pub fn resolve_actions(st: &AppState) -> Result<ActionsFacts, Response> {
         });
     }
     if st.model_name == "pi05" || st.model_name.starts_with("pi05_") {
+        let is_libero = st.model_name == "pi05_libero";
         return Ok(ActionsFacts {
             family: "pi05".to_string(),
-            action_horizon: 50,
+            action_horizon: if is_libero { 10 } else { 50 },
             action_dim: 32,
             state_kwarg: "robot_state".to_string(),
             state_dim: 32,
             num_cameras: 3,
-            num_flow_steps: Some(10),
+            num_flow_steps: Some(if is_libero { 3 } else { 10 }),
         });
     }
     Err(crate::error(
@@ -1651,9 +1678,10 @@ fn reshape_action(
     if let Some(arr) = metadata.get("shape").and_then(Value::as_array) {
         if arr.len() == 2 {
             if let (Some(h), Some(d)) = (arr[0].as_u64(), arr[1].as_u64()) {
-                let (h, d) = (h as usize, d as usize);
-                if h > 0 && d > 0 && h * d == n_floats {
-                    return Ok(([h, d], data));
+                if let (Ok(h), Ok(d)) = (usize::try_from(h), usize::try_from(d)) {
+                    if h > 0 && d > 0 && h.checked_mul(d) == Some(n_floats) {
+                        return Ok(([h, d], data));
+                    }
                 }
             }
         }
@@ -1950,7 +1978,7 @@ mod tests {
     fn test_state(model_name: &str, actions: Option<ActionsFacts>) -> AppState {
         let mut st = crate::tests::state(None);
         st.model_name = model_name.to_string();
-        st.actions = actions;
+        st.actions = actions.map(ActionsConfig::Enabled);
         st
     }
 
@@ -2223,5 +2251,46 @@ mod tests {
 
         // Keep compiler happy about unused Arc/Mutex import if not used above
         let _ = Arc::new(Mutex::new(()));
+    }
+
+    #[tokio::test]
+    async fn explicit_disabled_mstar_actions_returns_404_even_for_cosmos3_adapter() {
+        assert_eq!(ActionsConfig::parse("null").unwrap(), ActionsConfig::Disabled);
+        assert_eq!(
+            ActionsConfig::parse(r#"{"enabled": false}"#).unwrap(),
+            ActionsConfig::Disabled
+        );
+
+        let mut st = crate::tests::state(None);
+        st.model_name = "cosmos3".to_string();
+        st.python_adapter = "Cosmos3Adapter".to_string();
+        st.actions = Some(ActionsConfig::Disabled);
+        let resp = router(st)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/actions/generations")
+                    .header(CONTENT_TYPE, "application/msgpack")
+                    .body(Body::from(vec![0x80]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn standalone_pi05_libero_fallback_uses_3_flow_steps_and_reshape_checks_overflow() {
+        let mut st = crate::tests::state(None);
+        st.model_name = "pi05_libero".to_string();
+        let facts = resolve_actions(&st).unwrap();
+        assert_eq!(facts.action_horizon, 10);
+        assert_eq!(facts.num_flow_steps, Some(3));
+
+        // Overflowing metadata.shape falls back to facts.action_dim without panicking
+        let data = vec![0u8; 10 * 32 * 4];
+        let meta = json!({"shape": [usize::MAX as u64, 2]});
+        let (shape, _) = reshape_action(data, &meta, &facts).unwrap();
+        assert_eq!(shape, [10, 32]);
     }
 }

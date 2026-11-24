@@ -31,7 +31,14 @@ from fastapi.testclient import TestClient
 from test_rust_frontend import BINARY, _Chunk, _free_port, _wait_healthy
 
 from mstar.api_server import auth, entrypoint
-from mstar.api_server.rust_frontend import ACTIONS_ENV, OPENAI_ADAPTER_ENV, RustFrontendBridge, openai_adapter_class
+from mstar.api_server.rust_frontend import (
+    ACTIONS_ENV,
+    OPENAI_ADAPTER_ENV,
+    RustFrontendBridge,
+    actions_facts,
+    launch_rust_server,
+    openai_adapter_class,
+)
 
 pytestmark = pytest.mark.skipif(BINARY is None, reason="mstar-server binary not built")
 
@@ -573,3 +580,92 @@ def test_f9_pi05_4d_images_and_f10_cosmos3_8env_seeds_parity(monkeypatch, tmp_pa
     assert ps == rs == 200 and len(psub) == 8 and psub == rsub
     assert [s["mk"]["seed"] for s in psub] == [100 + i for i in range(8)]
     _assert_response_parity(pb, rb, expect_rollout=True)
+
+
+def test_non_action_cosmos3_launched_404_uint64_bounds_and_nil_state_parity(monkeypatch, tmp_path):
+    # 1. Video-only and distilled Cosmos3 launched via launch_rust_server -> 404 on both frontends
+    for label, model_name, model_cfg in (
+        ("video_only", "cosmos3", SimpleNamespace(action_gen=False, is_distilled=False)),
+        ("distilled", "cosmos3_droid", SimpleNamespace(action_gen=True, is_distilled=True)),
+    ):
+        model = SimpleNamespace(ACTION_GEN_WALK="action_gen", config=model_cfg)
+        updir = tmp_path / f"up_{label}"
+        updir.mkdir()
+        stub = _ActionsStub(model, model_name, str(updir))
+        body = _pack_bytes_keys({"input": {"prompt": "a"}})
+
+        monkeypatch.setattr(entrypoint, "api_server", stub)
+        py_resp = TestClient(entrypoint.app).post(
+            "/v1/actions/generations", content=body, headers={"Content-Type": "application/msgpack"},
+        )
+        assert py_resp.status_code == 404
+
+        port = _free_port()
+        bridge_dir = tempfile.mkdtemp(prefix=f"mstar_c3_404_{label}_")
+        proc = launch_rust_server(
+            BINARY, model_name, port, bridge_dir, str(updir), actions=actions_facts(stub),
+        )
+        bridge = RustFrontendBridge(stub, bridge_dir)
+        thread = threading.Thread(target=bridge.run, daemon=True)
+        thread.start()
+        try:
+            assert _wait_healthy(port)
+            rs, _, _ = _http_post(port, body, "application/msgpack")
+        finally:
+            bridge.stop()
+            proc.terminate()
+            proc.wait(timeout=10)
+        assert rs == 404
+        assert stub.submitted == []
+
+    # 2. Standalone MSTAR_ACTIONS absent for pi05_libero checks sde_step < 3
+    bad_step_body = _pack_bytes_keys({
+        "input": {"prompt": "pick", "images": np.zeros((1, 1, 3, 4, 4), dtype=np.uint8)},
+        "parameters": {"rollout": {"sde_type": "flow_sde", "sde_step": 5}},
+    })
+    (ps, _, _, _), (rs, _, _, _), _ = _both(
+        monkeypatch, tmp_path / "pi05_step", "pi05_libero", _FakePi05Model(), None, bad_step_body,
+    )
+    assert ps == rs == 400
+
+    # 3. uint64 >= 2**63 rejected (400) in parameters, seeds, tokenized_prompt, and NaN __npgeneric__
+    pi05_facts = {"family": "pi05", "action_horizon": 10, "action_dim": 32, "num_cameras": 3, "num_flow_steps": 3}
+    img = np.zeros((1, 2, 3, 4, 4), dtype=np.uint8)
+    for idx, payload in enumerate([
+        {"input": {"prompt": "pick", "images": img}, "parameters": {"big": np.array([2**63], dtype=np.uint64)}},
+        {"input": {"prompt": "pick", "images": img}, "parameters": {"seeds": np.array([2**63], dtype=np.uint64)}},
+        {"input": {"tokenized_prompt": np.array([2**63], dtype=np.uint64), "images": img}},
+        {
+            "input": {"prompt": "pick", "images": img},
+            "parameters": {"extra": {b"__npgeneric__": True, b"data": float("nan"), b"dtype": "<i4"}},
+        },
+    ]):
+        (ps, _, _, psub), (rs, _, _, rsub), _ = _both(
+            monkeypatch, tmp_path / f"u64_bad_{idx}", "pi05_libero", _FakePi05Model(), pi05_facts,
+            _pack_bytes_keys(payload),
+        )
+        assert ps == rs == 400 and psub == rsub == []
+
+    # uint64 boundary 2**63 - 1 accepted identically
+    ok_u64 = _pack_bytes_keys({
+        "input": {"tokenized_prompt": np.array([[2**63 - 1]], dtype=np.uint64), "images": img},
+        "parameters": {"seeds": np.array([2**63 - 1], dtype=np.uint64)},
+    })
+    (ps, _, pb, psub), (rs, _, rb, rsub), _ = _both(
+        monkeypatch, tmp_path / "u64_ok", "pi05_libero", _FakePi05Model(), pi05_facts, ok_u64,
+    )
+    assert ps == rs == 200 and psub == rsub
+    _assert_response_parity(pb, rb, expect_rollout=False)
+
+    # 4. Cosmos3 explicit None robot_state in input or parameters
+    c3_facts = {"family": "cosmos3", "action_horizon": 16, "action_dim": 64, "num_cameras": 1, "num_flow_steps": 30}
+    for idx, payload in enumerate([
+        {"input": {"prompt": "a", "robot_state": None}, "parameters": {"robot_state": [0.1, 0.2]}},
+        {"input": {"prompt": "a", "robot_state": [0.1, 0.2]}, "parameters": {"robot_state": None}},
+    ]):
+        (ps, _, pb, psub), (rs, _, rb, rsub), _ = _both(
+            monkeypatch, tmp_path / f"c3_nil_{idx}", "cosmos3", _FakeCosmos3Model(), c3_facts,
+            _pack_bytes_keys(payload),
+        )
+        assert ps == rs == 200 and psub == rsub
+        _assert_response_parity(pb, rb, expect_rollout=False)

@@ -102,6 +102,8 @@ def _to_json_value(value, path: str):
             raise ValueError(f"{path} has unsupported dtype {value.dtype}")
         if value.dtype.kind == "f" and not np.isfinite(value).all():
             raise ValueError(f"{path} contains non-finite float values")
+        if value.dtype.kind == "u" and value.dtype.itemsize >= 8 and (value > np.uint64(_INT64_MAX)).any():
+            raise ValueError(f"{path} must fit in a signed 64-bit integer")
         return value.tolist()
     if isinstance(value, (list, tuple)):
         return [_to_json_value(item, f"{path}[]") for item in value]
@@ -193,6 +195,10 @@ def _parse_seeds(parameters: dict, batch_size: int) -> list[int | None]:
         if isinstance(raw_seeds, np.ndarray):
             if raw_seeds.ndim != 1 or raw_seeds.dtype.kind not in "iu":
                 raise ValueError("parameters.seeds must be a 1D integer list or array")
+            if raw_seeds.dtype.kind == "u" and raw_seeds.dtype.itemsize >= 8 and (
+                raw_seeds > np.uint64(_INT64_MAX)
+            ).any():
+                raise ValueError("seeds[] must fit in a signed 64-bit integer")
             items = [int(x) for x in raw_seeds.tolist()]
         elif isinstance(raw_seeds, list):
             items = [_check_int64(x, "seeds[]") for x in raw_seeds]
@@ -295,10 +301,11 @@ def _build_cosmos3_rows(
     rollout_cfg = _validate_rollout(parameters.get("rollout"), effective_steps)
     seeds = _parse_seeds(parameters, batch_size)
 
-    if "robot_state" in inp or "robot_states" in inp:
-        if "robot_state" in parameters or "robot_states" in parameters:
-            raise ValueError("Provide robot_state/robot_states in either input or parameters, not both")
-    src_state = parameters if ("robot_state" in parameters or "robot_states" in parameters) else inp
+    in_rs = inp.get("robot_state") is not None or inp.get("robot_states") is not None
+    pa_rs = parameters.get("robot_state") is not None or parameters.get("robot_states") is not None
+    if in_rs and pa_rs:
+        raise ValueError("Provide robot_state/robot_states in either input or parameters, not both")
+    src_state = parameters if pa_rs else inp
     if src_state.get("robot_state") is not None and src_state.get("robot_states") is not None:
         raise ValueError("Provide either 'robot_state' or 'robot_states', not both")
     raw_state = src_state.get("robot_state") if src_state.get("robot_state") is not None else src_state.get(
@@ -368,10 +375,14 @@ def _parse_tokenized_prompt_rows(raw_tp, raw_mask) -> tuple[list[list[int]], lis
         if raw_tp.ndim == 1:
             if raw_tp.shape[0] == 0:
                 raise ValueError("tokenized_prompt must not be empty")
+            if raw_tp.dtype.kind == "u" and raw_tp.dtype.itemsize >= 8 and (raw_tp > np.uint64(_INT64_MAX)).any():
+                raise ValueError("tokenized_prompt[] must fit in a signed 64-bit integer")
             tp_rows = [[int(x) for x in raw_tp.tolist()]]
         elif raw_tp.ndim == 2:
             if raw_tp.shape[0] == 0 or raw_tp.shape[1] == 0:
                 raise ValueError("tokenized_prompt must not be empty")
+            if raw_tp.dtype.kind == "u" and raw_tp.dtype.itemsize >= 8 and (raw_tp > np.uint64(_INT64_MAX)).any():
+                raise ValueError("tokenized_prompt[] must fit in a signed 64-bit integer")
             tp_rows = [[int(x) for x in row] for row in raw_tp.tolist()]
         else:
             raise ValueError(f"tokenized_prompt must be 1D or 2D, got {raw_tp.ndim}D")

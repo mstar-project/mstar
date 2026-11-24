@@ -68,8 +68,9 @@ def test_the_websocket_facts_are_the_launchers_and_never_inherited(launched, mon
     monkeypatch.setenv("MSTAR_CLIENT_STREAMS", '["stale"]')
     rust_frontend.launch_rust_server("bin", "kokoro", 8000, "/b", "/u")
     env = launched["env"]
-    assert not {"MSTAR_OPENPI", "MSTAR_WS_MAX_BYTES", "MSTAR_REALTIME", "MSTAR_ACTIONS"} & env.keys()
+    assert not {"MSTAR_OPENPI", "MSTAR_WS_MAX_BYTES", "MSTAR_REALTIME"} & env.keys()
     assert json.loads(env["MSTAR_CLIENT_STREAMS"]) == []
+    assert json.loads(env["MSTAR_ACTIONS"]) is None
     openpi = {"image_keys": ["cam"], "metadata": ""}
     realtime = {"onnxruntime": None, "silero": None, "smart_turn_problem": "x", "tokenizer": None}
     actions = {"family": "pi05", "action_horizon": 10, "action_dim": 32, "num_cameras": 3, "num_flow_steps": 3}

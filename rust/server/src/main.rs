@@ -177,7 +177,7 @@ async fn main() {
         bridge,
         refusals: refusals.clone(),
         served,
-        actions: actions::ActionsFacts::from_env(),
+        actions: actions::ActionsConfig::from_env(),
     };
 
     // Allow-all CORS, matching mstar's CORSMiddleware configuration. A

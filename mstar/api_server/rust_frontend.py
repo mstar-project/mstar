@@ -408,7 +408,11 @@ def actions_facts(server) -> dict | None:
             }
         if hasattr(model, "ACTION_GEN_WALK"):
             cfg = getattr(model, "config", None)
-            if getattr(cfg, "action_gen", False) and not getattr(cfg, "is_distilled", False):
+            if (
+                getattr(cfg, "action_gen", False)
+                and not getattr(cfg, "is_distilled", False)
+                and not getattr(cfg, "distilled_sigmas", None)
+            ):
                 return {
                     "family": "cosmos3",
                     "action_horizon": int(getattr(cfg, "policy_action_chunk_size", None) or 16),
@@ -477,9 +481,10 @@ def launch_rust_server(binary: str, model_name: str, port: int,
     env.pop(REALTIME_ENV, None)
     if realtime is not None:
         env[REALTIME_ENV] = json.dumps(realtime)
-    env.pop(ACTIONS_ENV, None)
-    if actions is not None:
-        env[ACTIONS_ENV] = json.dumps(actions)
+    # Explicitly pass "null" when actions is None so mstar-server knows the
+    # launcher disabled /v1/actions/generations (e.g. video-only or distilled
+    # Cosmos3) rather than falling back to adapter-name heuristics.
+    env[ACTIONS_ENV] = json.dumps(actions)
     env.pop(LIBSNDFILE_ENV, None)
     if (libsndfile := soundfile_library()) is not None:
         env[LIBSNDFILE_ENV] = libsndfile

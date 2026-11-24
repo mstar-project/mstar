@@ -345,7 +345,7 @@ fn unpack_array(pairs: Vec<(Obs, Obs)>) -> Result<Obs, String> {
         ) else {
             return Err("a scalar needs data and dtype".into());
         };
-        let (value, int) = match data {
+        let (value, mut int) = match data {
             Obs::Bool(b) => (*b as u8 as f64, Some(*b as i128)),
             Obs::Int(i) => (*i as f64, Some(*i)),
             Obs::Float(f) => (*f, None),
@@ -357,22 +357,40 @@ fn unpack_array(pairs: Vec<(Obs, Obs)>) -> Result<Obs, String> {
             }
         };
         let dtype = numeric_dtype(dtype)?;
-        if let (Some(i), 'i' | 'u') = (int, dtype.kind) {
-            let bits = 8 * dtype.size as u32;
-            let (lo, hi) = if dtype.kind == 'u' {
-                (0, (1i128 << bits) - 1)
-            } else {
-                (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
-            };
-            if !(lo..=hi).contains(&i) {
-                return Err(format!(
-                    "Python integer {i} out of bounds for {}",
-                    dtype.name()
-                ));
+        if matches!(dtype.kind, 'i' | 'u') {
+            if int.is_none() {
+                if value.is_nan() {
+                    return Err("cannot convert float NaN to integer".into());
+                }
+                if !value.is_finite() {
+                    return Err("cannot convert float infinity to integer".into());
+                }
+                let t = value.trunc();
+                if !(-9223372036854775808.0..18446744073709551616.0).contains(&t) {
+                    return Err(format!(
+                        "Python integer {t} out of bounds for {}",
+                        dtype.name()
+                    ));
+                }
+                int = Some(t as i128);
+            }
+            if let Some(i) = int {
+                let bits = 8 * dtype.size as u32;
+                let (lo, hi) = if dtype.kind == 'u' {
+                    (0, (1i128 << bits) - 1)
+                } else {
+                    (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+                };
+                if !(lo..=hi).contains(&i) {
+                    return Err(format!(
+                        "Python integer {i} out of bounds for {}",
+                        dtype.name()
+                    ));
+                }
             }
         }
         let int = match dtype.kind {
-            'i' | 'u' => Some(int.unwrap_or(value.trunc() as i128)),
+            'i' | 'u' => int,
             'b' => Some((value != 0.0) as i128),
             _ => None,
         };
@@ -652,5 +670,20 @@ mod tests {
             unpack_raw(&trailing).unwrap_err(),
             "unpack(b) received extra data."
         );
+
+        for (bad_val, dtype) in [
+            (Mp::F64(f64::NAN), "<i4"),
+            (Mp::F64(f64::INFINITY), "<i4"),
+            (Mp::F64(1e30), "<i4"),
+            (Mp::F64(-2.5), "<u1"),
+            (Mp::F64(9223372036854775808.0), "<i8"),
+        ] {
+            let scalar = encode(&Mp::Map(vec![
+                (Mp::String("__npgeneric__".into()), Mp::Boolean(true)),
+                (Mp::String("data".into()), bad_val),
+                (Mp::String("dtype".into()), Mp::String(dtype.into())),
+            ]));
+            assert!(unpack_raw(&scalar).is_err());
+        }
     }
 }
