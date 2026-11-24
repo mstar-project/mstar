@@ -76,6 +76,7 @@ from mstar.engine.resources.step import (
 from mstar.engine.state.adapters import StateSetup, node_handles
 from mstar.engine.state.analysis import host_field_holders, split_read_problems
 from mstar.engine.state.contract import Array
+from mstar.engine.state.episodes import EpisodeRowBindings
 from mstar.engine.state.state_op import bind_state_ops
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import keyed_labels
@@ -537,6 +538,9 @@ class ExecutingBatch:
     resource_publish_info: dict[str, dict[str, PublishedInfo]] = field(
         default_factory=dict
     )
+    # Per-rid episode rows after this batch's commit. Postprocess may run after
+    # the next batch, so it must not sample live pool lengths then.
+    episode_held: dict[int, dict[str, int]] = field(default_factory=dict)
     # What finalize_batch snapshotted instead of publishing (MSTAR_LAZY_PUBLISH);
     # ``Engine.materialize_publish`` turns entries into resource_publish_info.
     publish_snapshots: dict[str, dict[str, Any]] | None = None
@@ -702,6 +706,10 @@ class Engine:
         # node -> `chunk_alignment`, filled on first ask
         self._chunk_alignment: dict[str, int] = {}
         self._resources: dict[str, Resource] = {}
+        self._episode_rows = EpisodeRowBindings()
+        self._episode_pools: dict[str, Resource] = {}
+        self._episode_aux: dict[str, Resource] = {}
+        self._episode_host_arrays: dict[str, Array] = {}
         # resource key -> the nodes on this engine that use it
         self._resource_nodes: dict[str, frozenset[str]] = {}
         # (node, combined walk) -> the walks whose rows a step of it runs last
@@ -882,6 +890,14 @@ class Engine:
             enable_nvtx=self._enable_nvtx,
             declared_by=declared_by,
         )
+        self._episode_pools = {
+            key: resource for key, resource in self._resources.items()
+            if resource.episode_lifetime and resource.reports_episode_held
+        }
+        self._episode_aux = {
+            key: resource for key, resource in self._resources.items()
+            if resource.episode_lifetime and not resource.reports_episode_held
+        }
 
         for kv in self.paged_kv_caches():
             if kv.nodes & self._tp_leader_nodes:
@@ -926,6 +942,7 @@ class Engine:
                 # reads them back on the device (see DeviceLoopback)
                 resources[loopback.sampler].enable_device_loopback_reader()
         share_slot_rotations(self._submodules.values())
+        self._episode_host_arrays = dict(self._state_setup.host_fields.episode_arrays)
         if model is not None:
             self._check_rebuild_policies(model)
             self._check_host_fields(model)
@@ -2734,6 +2751,23 @@ class Engine:
                 batch.request_ids if publish_request_ids is None
                 else publish_request_ids
             )
+            if self._has_episode_state:
+                active = {
+                    key: pool for key, pool in self._episode_pools.items()
+                    if batch.node_name in self._resource_nodes.get(key, ())
+                }
+                host_fields = self._state_setup.host_fields
+                host_only = [
+                    key for key, array in host_fields.episode_arrays.items()
+                    if key not in self._episode_pools and batch.node_name in array.nodes
+                ]
+                batch.episode_held = {
+                    rid: {
+                        **{key: pool.held(rid) for key, pool in active.items()},
+                        **{key: host_fields.held(rid, key) for key in host_only},
+                    }
+                    for rid in rids
+                }
             if _LAZY_PUBLISH:
                 # Snapshot now, on the gpu thread, so the lengths are this
                 # step's; finish in ``materialize_publish`` for the rids whose
@@ -3956,22 +3990,57 @@ class Engine:
         resource = self._submodules[node_name].resources.get(resource_label)
         return 0.0 if resource is None else resource.get_offload_priority(request_id)
 
+    @property
+    def _has_episode_state(self) -> bool:
+        return bool(
+            getattr(self, "_episode_pools", None)
+            or getattr(self, "_episode_aux", None)
+            or getattr(self, "_episode_host_arrays", None)
+            or self._state_setup.host_fields.has_episode_arrays
+        )
+
     def add_request(
         self, request_id: str,
         overrides: Mapping[str, ResourceReqConfig] | None = None,
         request_info: CurrentForwardPassInfo | None = None,
+        *, episode_id: str | None = None, episode_slot: int | None = None, reset_episode: bool = False,
+        episode_clear: Sequence[str] = (),
     ) -> None:
         """Open the request on every resource, then tell each submodule. All or
         nothing: a raise leaves the request on none of them."""
+        if self._has_episode_state and episode_slot is None:
+            raise ValueError("episode arrays need a conductor-assigned episode_slot before request ingest")
+        # The conductor validates names globally. A worker may hold only some
+        # episode arrays, so names owned by other workers are ignored here.
         self._runner.ingest_request(request_id, overrides, None if request_info is None else request_info.arrival)
         self._state_setup.host_fields.open(request_id)
-        if request_info is None:
-            return
+        binding = None
         try:
-            for submodule_mgmt in self._submodules.values():
-                submodule_mgmt.submodule.on_request_added(request_id, request_info)
+            if self._has_episode_state:
+                binding = self._episode_rows.bind(request_id, episode_slot, episode_id)
+                for key, pool in self._episode_pools.items():
+                    pool.bind_episode(request_id, episode_slot, episode_id,
+                                      cold=binding.cold, reset=reset_episode or key in episode_clear)
+                for key, aux in getattr(self, "_episode_aux", {}).items():
+                    kv_key = getattr(aux, "_kv_cache_name", None)
+                    reset = reset_episode or key in episode_clear or (kv_key is not None and kv_key in episode_clear)
+                    aux.bind_episode(request_id, episode_slot, episode_id, cold=binding.cold, reset=reset)
+                host_fields = self._state_setup.host_fields
+                if host_fields.has_episode_arrays:
+                    reset_host = [
+                        key for key in host_fields.episode_arrays
+                        if reset_episode or key in episode_clear
+                    ]
+                    host_fields.bind_episode(
+                        request_id, episode_slot, episode_id, cold=binding.cold, reset_arrays=reset_host,
+                    )
+            if request_info is not None:
+                for submodule_mgmt in self._submodules.values():
+                    submodule_mgmt.submodule.on_request_added(request_id, request_info)
         except Exception:
             self.remove_request(request_id)
+            if binding is not None and binding.cold and episode_id is not None:
+                self.end_episode(episode_id, episode_slot)
             raise
 
     @property
@@ -3998,6 +4067,11 @@ class Engine:
             if resource.reclaimable(request_id)
         }
         self._runner.remove_request(request_id)
+        if self._has_episode_state:
+            try:
+                self._episode_rows.unbind(request_id)
+            except KeyError:
+                pass
         self._state_setup.host_fields.remove_request(request_id)
         self._chunking.forget_request(request_id)
         for submodule_mgmt in self._submodules.values():
@@ -4005,6 +4079,30 @@ class Engine:
             if submodule_mgmt.resident is not None:
                 submodule_mgmt.resident.release(request_id)
         return freed
+
+    def end_episode(self, episode_id: str, episode_slot: int) -> bool:
+        """Release an idle episode after all its requests reached drained teardown."""
+        try:
+            slot = self._episode_rows.idle_slot(episode_id)
+        except ValueError:
+            return False
+        if slot is None:
+            return True
+        if slot != episode_slot:
+            raise ValueError(f"episode {episode_id!r} owns slot {slot}, not {episode_slot}")
+        for pool in self._episode_pools.values():
+            pool.end_episode(slot)
+        for aux in getattr(self, "_episode_aux", {}).values():
+            aux.end_episode(slot)
+        self._state_setup.host_fields.end_episode(slot)
+        self._episode_rows.end(episode_id)
+        return True
+
+    def episode_slot_busy(self, slot: int) -> bool:
+        return self._episode_rows.slot_busy(slot) if self._has_episode_state else False
+
+    def episode_slot_available(self, slot: int, episode_id: str | None) -> bool:
+        return self._episode_rows.slot_available(slot, episode_id) if self._has_episode_state else True
 
     def shutdown(self):
         for resource in self._resources.values():

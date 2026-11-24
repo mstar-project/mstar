@@ -49,11 +49,14 @@ class RingKVManager(AttentionResource):
         name: str,
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
+        episode_lifetime: bool = False,
     ):
         self.config = config
         self.name = name
         self.device = torch.device(device)
         self.dtype = dtype
+        self.episode_lifetime = episode_lifetime
+        self._episode_owner_by_request: dict[int | str, tuple[str, int]] = {}
 
         # ``total_sessions`` == ``num_sessions`` + 1: the extra session is the shared
         # scratch that ``plan`` parks a replay's padding tail on. It is never in
@@ -104,6 +107,7 @@ class RingKVManager(AttentionResource):
             name=spec.resource_key,
             device=info.device,
             dtype=info.kv_dtype,
+            episode_lifetime=spec.episode_lifetime,
         )
         # allocated once, for every session, so a deployment sees the cost of its num_sessions here
         logger.info("ring KV %r holds %.1f MiB for %d sessions and the padding session", manager.name,
@@ -131,15 +135,35 @@ class RingKVManager(AttentionResource):
         length of the KV view a read attends."""
         return self.layers[layer_idx].total_slots
 
+    def _state_key(self, rid: str | int):
+        if rid in self._sessions or rid in self._committed_frames:
+            return rid
+        return self._episode_owner_by_request.get(rid, rid)
+
     def position(self, rid: str, label: str) -> int:
         """The entries of the frames ``rid`` has committed, where its next frame starts."""
         del label
-        return self._committed_frames.get(rid, 0) * self.tokens_per_frame
+        return self._committed_frames.get(self._state_key(rid), 0) * self.tokens_per_frame
+
+    def logical_length(self, rid: str, label: str = "main") -> int:
+        del label
+        return self._committed_frames.get(self._state_key(rid), 0) * self.tokens_per_frame
+
+    def held(self, rid: str) -> int:
+        committed = self._committed_frames.get(self._state_key(rid), 0)
+        if committed <= 0:
+            return 0
+        retained = {
+            frame
+            for layer in self.layers
+            for frame in range(0, committed, layer.pinned_dilation)[-layer.ring_frames:]
+        }
+        return len(retained) * self.tokens_per_frame
 
     def session_of(self, rid: str) -> int | None:
         """``rid``'s session index, or None if it holds none. Host-side
         introspection; the forward reads the staged tensor, never this."""
-        return self._sessions.get(rid)
+        return self._sessions.get(self._state_key(rid))
 
     def write(self, k: Tensor, v: Tensor, layer_idx: int, *, keep: bool) -> None:
         """Write one step's K/V for ``layer_idx`` at the frames and sessions
@@ -254,7 +278,7 @@ class RingKVManager(AttentionResource):
                 ok=False, ready=False,
                 reason=AdmitRuntimeError(
                     f"ring KV {self.name!r} was handed a batch naming "
-                    f"{sorted({rid for rid in rids if rids.count(rid) > 1})} more "
+                    f"{sorted({rid for rid in rids if rids.count(rid) > 1}, key=str)} more "
                     "than once; a step batches distinct sessions, one row per request."
                 ),
             )
@@ -264,7 +288,7 @@ class RingKVManager(AttentionResource):
         # Check every rid before claiming any session: a refused admit must not
         # leave a session half-claimed by the first rid of a batch it rejected.
         wanted = {rid for rid in rids if rid not in self._sessions}
-        for rid in sorted(wanted):
+        for rid in sorted(wanted, key=str):
             if rid not in self._known_rids:
                 return AdmitOutcome(
                     ok=False, ready=False,
@@ -289,8 +313,8 @@ class RingKVManager(AttentionResource):
                 reason=AllocationFailed(
                     message=(
                         f"ring KV {self.name!r} holds all {self.num_sessions} of "
-                        f"its sessions ({sorted(self._sessions)}); request(s) "
-                        f"{sorted(wanted)} wait for one to be released"
+                        f"its sessions ({sorted(self._sessions, key=str)}); request(s) "
+                        f"{sorted(wanted, key=str)} wait for one to be released"
                     ),
                     pages_short=len(wanted) - len(self._free_sessions),
                     label="session",
@@ -367,8 +391,42 @@ class RingKVManager(AttentionResource):
         del free
         self._release_session(rid)
 
+    def bind_episode(self, rid: int, slot: int, episode_id: str | None, *, cold: bool, reset: bool) -> None:
+        if episode_id is None:
+            return
+        owner = ("episode", slot)
+        if cold:
+            if owner in self._sessions or owner in self._committed_frames:
+                raise ValueError(f"ring KV {self.name!r}: episode slot {slot} already has session state")
+        else:
+            session = self._sessions.pop(owner, None)
+            frames = self._committed_frames.pop(owner, None)
+            if session is not None:
+                self._sessions[rid] = session
+            if frames is not None:
+                self._committed_frames[rid] = frames
+            if reset:
+                self._reset_session(rid)
+        self._episode_owner_by_request[rid] = owner
+
+    def end_episode(self, slot: int) -> None:
+        owner = ("episode", slot)
+        if owner in self._episode_owner_by_request.values():
+            raise ValueError(f"episode slot {slot} still has an active request")
+        self._release_session(owner)
+
     def remove_request(self, rid: str) -> None:
         """The request is gone: drop its session, its claim, and its registration."""
+        owner = self._episode_owner_by_request.pop(rid, None)
+        if owner is not None:
+            session = self._sessions.pop(rid, None)
+            if session is not None:
+                self._sessions[owner] = session
+            frames = self._committed_frames.pop(rid, None)
+            if frames is not None:
+                self._committed_frames[owner] = frames
+            self._known_rids.discard(rid)
+            return
         self._release_session(rid)
         self._known_rids.discard(rid)
 
@@ -387,7 +445,7 @@ class RingKVManager(AttentionResource):
 
         if self._sessions:
             raise RuntimeError(
-                f"ring KV {self.name!r} is still claimed by {sorted(self._sessions)} "
+                f"ring KV {self.name!r} is still claimed by {sorted(self._sessions, key=str)} "
                 "after accelerator graph capture; a capture dummy rid was never reset, "
                 "and the session it holds is gone from the pool for good."
             )
@@ -401,7 +459,8 @@ class RingKVManager(AttentionResource):
         if self._committed_frames:
             raise RuntimeError(
                 f"ring KV {self.name!r} counted committed frames "
-                f"({sorted(self._committed_frames.items())}) during accelerator graph capture; "
+                f"({sorted(self._committed_frames.items(), key=lambda item: str(item[0]))}) "
+                "during accelerator graph capture; "
                 "the first real request would write its first frame that many slots on."
             )
         for i, layer in enumerate(self.layers):

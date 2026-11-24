@@ -62,6 +62,10 @@ Conventions
     combinations.
   - ``modality``: one of those modality names.
   - ``state``: ``waiting``, ``running``, ``draining``.
+  - For ``mstar_episodes``, ``state`` is ``cold``, ``running`` or ``idle``.
+  - ``worker``: a configured worker id.
+  - ``reason``: ``idle`` for an expired episode slot; for ``mstar_episode_cold_starts_total``,
+    ``new``, ``temporary``, ``reset``, ``identity``, ``idle`` or ``lost``.
   - ``component``: a graph node name from the config's ``node_groups``.
   - ``graph_walk``: a graph walk name of the model.
   - ``resource``: the key of a paged KV cache in the model.
@@ -226,6 +230,27 @@ From the conductor's status message, sent every second while metrics are on.
    not finished. ``draining``: completed, aborted or failed, and waiting for every
    reader to release its outputs before the workers free its state; it still counts
    toward ``max_concurrent_requests``.
+
+``mstar_episodes{model_name, state}``
+   Gauge, up to a second old. Named episodes held by the conductor. ``cold`` has no
+   reserved row, ``running`` has a call in flight, and ``idle`` has a reserved row but
+   no call in flight.
+
+``mstar_episode_slots_used{model_name, worker}``
+   Gauge, up to a second old. Logical episode rows reserved on each worker, including
+   temporary rows held by calls without an episode id. A row shared by several workers
+   appears once for each worker.
+
+``mstar_episode_evictions_total{model_name, reason}``
+   Counter, up to a second old. Idle named episodes whose rows the conductor released
+   after the idle timeout. Explicit closes and failed calls do not count as evictions.
+
+``mstar_episode_cold_starts_total{model_name, reason}``
+   Counter, up to a second old. Admitted calls on an episode-capable model that
+   started with empty episode state: ``new`` (first call of a named episode),
+   ``temporary`` (call without an episode id), ``reset``, ``identity``, ``idle``
+   or ``lost``. Warm continuations are not counted, even when ``episode_keys``
+   clears individual arrays.
 
 ``mstar_component_in_flight{model_name, component}``
    Gauge, up to a second old. Running requests with a pass on the graph node that the

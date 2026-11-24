@@ -16,6 +16,7 @@ the range here is one slice, so the same kernel over the same keys gives the
 same bits as a cache the model kept itself.
 """
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -44,6 +45,11 @@ class RollingKVConfig:
     def token_bytes(self, tokens: int, dtype: torch.dtype) -> int:
         """``tokens`` a layer, keys and values of every layer."""
         return self.num_layers * 2 * tokens * self.num_heads * self.head_dim * dtype.itemsize
+
+    @property
+    def usable_slots(self) -> int:
+        """Maximum concurrent requests/episodes assuming at least 1 token each."""
+        return self.pool_tokens
 
 
 class RollingPosition(NamedTuple):
@@ -94,12 +100,29 @@ class RollingKVStep(ResourceStep):
 @dataclass
 class RollingKVSpec(NodeResourceSpec):
     config: RollingKVConfig
+    episode_lifetime: bool = False
 
     @property
     def resource_class(self) -> "type[Resource]":
         from mstar.engine.resources.kv.rolling.manager import RollingKVManager
 
         return RollingKVManager
+
+    def capacity_problem(
+        self, requests: int, request: ResourceReqConfig | None, axis_sizes: Sequence[Mapping[str, int]] = (),
+    ) -> str | None:
+        del axis_sizes
+        if not self.episode_lifetime and not isinstance(request, RollingKVReqConfig):
+            return None
+        need = requests * request.tokens if isinstance(request, RollingKVReqConfig) else requests
+        if need <= self.config.pool_tokens:
+            return None
+        per_req = f" ({request.tokens} tokens each)" if isinstance(request, RollingKVReqConfig) else ""
+        return (
+            f"{requests} concurrent requests (max_concurrent_requests) need {need} tokens{per_req} of "
+            f"resources.{self.resource_key}, which has {self.config.pool_tokens}; raise pool_tokens or lower "
+            "max_concurrent_requests"
+        )
 
     def request_config(self, model_kwargs: dict | None) -> RollingKVReqConfig | None:
         """The sink and window of the one label a request's ``kv_layout`` row gives this store, a kept window's

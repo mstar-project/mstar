@@ -2099,12 +2099,244 @@
       ]
     },
     {
+      "id": 49,
+      "type": "timeseries",
+      "title": "Episodes by state",
+      "description": "Named episodes held by the conductor: cold has no reserved row, running has a call in flight, and idle has a reserved row.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 108,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (state) (mstar_episodes{model_name=~\"$model\"})",
+          "legendFormat": "{{state}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 50,
+      "type": "timeseries",
+      "title": "Episode slots used by worker",
+      "description": "Logical episode rows reserved on each worker, including temporary calls without an episode id. A shared row appears once per worker.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 116,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (worker) (mstar_episode_slots_used{model_name=~\"$model\"})",
+          "legendFormat": "{{worker}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 51,
+      "type": "timeseries",
+      "title": "Episode evictions per second",
+      "description": "Idle episodes whose rows the conductor released after the idle timeout, by reason.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 116,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (reason) (rate(mstar_episode_evictions_total{model_name=~\"$model\"}[1m]))",
+          "legendFormat": "{{reason}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 52,
+      "type": "timeseries",
+      "title": "Episode cold starts per second",
+      "description": "Admitted calls on an episode-capable model that started with empty episode state, by reason.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 124,
+        "w": 24,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (reason) (rate(mstar_episode_cold_starts_total{model_name=~\"$model\"}[1m]))",
+          "legendFormat": "{{reason}}",
+          "range": true
+        }
+      ]
+    },
+    {
       "type": "row",
       "title": "Engine workers",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 116,
+        "y": 132,
         "w": 24,
         "h": 1
       },
@@ -2121,7 +2353,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 117,
+        "y": 133,
         "w": 12,
         "h": 8
       },
@@ -2247,7 +2479,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 117,
+        "y": 133,
         "w": 12,
         "h": 8
       },
@@ -2315,7 +2547,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 125,
+        "y": 141,
         "w": 12,
         "h": 8
       },
@@ -2373,7 +2605,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 125,
+        "y": 141,
         "w": 12,
         "h": 8
       },
@@ -2454,7 +2686,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 133,
+        "y": 149,
         "w": 12,
         "h": 8
       },
@@ -2549,7 +2781,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 133,
+        "y": 149,
         "w": 12,
         "h": 8
       },
@@ -2607,7 +2839,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 141,
+        "y": 157,
         "w": 12,
         "h": 8
       },
@@ -2715,7 +2947,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 141,
+        "y": 157,
         "w": 12,
         "h": 8
       },
@@ -2806,7 +3038,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 149,
+        "y": 165,
         "w": 24,
         "h": 1
       },
@@ -2823,7 +3055,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 150,
+        "y": 166,
         "w": 12,
         "h": 8
       },
@@ -2881,7 +3113,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 150,
+        "y": 166,
         "w": 12,
         "h": 8
       },
@@ -2949,7 +3181,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 158,
+        "y": 174,
         "w": 12,
         "h": 8
       },
@@ -3021,7 +3253,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 158,
+        "y": 174,
         "w": 12,
         "h": 8
       },
@@ -3089,7 +3321,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 166,
+        "y": 182,
         "w": 24,
         "h": 1
       },
@@ -3107,7 +3339,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 167,
+        "y": 183,
         "w": 12,
         "h": 8
       },
@@ -3286,7 +3518,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 167,
+        "y": 183,
         "w": 12,
         "h": 8
       },
@@ -3342,7 +3574,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 175,
+        "y": 191,
         "w": 24,
         "h": 8
       },

@@ -344,6 +344,7 @@ class RecurrentStateConfig:
 @dataclass
 class RecurrentStateSpec(NodeResourceSpec):
     config: RecurrentStateConfig
+    episode_lifetime: bool = False
 
     @property
     def storage(self) -> "Storage":

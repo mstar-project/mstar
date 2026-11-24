@@ -50,9 +50,18 @@ from mstar.distributed.base import node_group_axis_sizes
 from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items, variant_root
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG
+from mstar.engine.resources.lora.identity import adapter_prefix_root
 from mstar.engine.resources.position.config import MAX_POSITION_KWARG
 from mstar.engine.resources.spec import NodeResourceSpec
-from mstar.engine.state.adapters import kv_layouts, sized_values, state_sizes
+from mstar.engine.state.adapters import (
+    CHUNK_CAUSAL_LAYOUT_KWARG,
+    EXPERT_LAYOUT_KWARG,
+    chunk_causal_layouts,
+    expert_layouts,
+    kv_layouts,
+    sized_values,
+    state_sizes,
+)
 from mstar.engine.state.contract import Array
 from mstar.model.base import (
     KEEP_ADAPTER,
@@ -679,6 +688,9 @@ class PreparedInput(NamedTuple):
     model_kwargs: dict
     # for the response's usage (``Model.prompt_tokens``)
     prompt_tokens: int
+    episode_keys: dict[str, str] | None = None
+    reset_episode: bool = False
+    episode_adapter_digest: bytes | None = None
 
 
 class PreparingInput(NamedTuple):
@@ -974,6 +986,24 @@ class PreprocessWorkerThread:
         Runs on the prepare pool when there is one, so it reads only what
         ``__init__`` fixed and writes nothing the thread owns."""
         file_states: dict[str, list[tuple[int, int, int]]] = {}
+        raw_inputs = input.raw_inputs
+        positronic_kwargs = {}
+        positronic_observation = None
+        if input.positronic_frame is not None:
+            if input.file_paths or raw_inputs:
+                raise ValueError("Positronic observations cannot also carry file or raw inputs")
+            from mstar.api_server.positronic_input import decode_praxis_frame
+
+            embodiment = getattr(getattr(self.model, "config", None), "embodiment", None)
+            expected_rows = (input.model_kwargs or {}).get("executed_rows", 0)
+            positronic_observation = decode_praxis_frame(input.positronic_frame, embodiment, expected_rows)
+            raw_inputs = {"image": positronic_observation.images}
+            positronic_kwargs = {
+                "robot_state": positronic_observation.robot_state,
+                "pose_descriptor": positronic_observation.pose_descriptor,
+                "action_format": "positronic",
+                "executed_rows": positronic_observation.executed_rows,
+            }
 
         # First, load raw modality tensors from file_paths (images, audio, video)
         # so they can be passed to process_prompt() below.
@@ -982,10 +1012,13 @@ class PreprocessWorkerThread:
             # is hashed, its KV would be keyed by bytes we never decoded.
             for modality, paths in input.file_paths.items():
                 file_states[modality] = [_file_state(path) for path in paths]
-        if input.raw_inputs and self._keyed_labels and _prefix_cache(input.model_kwargs or {}):
+        if raw_inputs and self._keyed_labels and _prefix_cache(input.model_kwargs or {}):
             # a prefix key hashes each input's file, and these have none
             raise ValueError("this deployment keys prompts by their media files; send the media as files")
-        tensors, input_metadata = self._load_media(input.file_paths, input.raw_inputs)
+        tensors, input_metadata = self._load_media(input.file_paths, raw_inputs)
+        if positronic_observation is not None:
+            tensors["executed_frame_inputs"] = positronic_observation.executed_frames
+            tensors["executed_pose_inputs"] = [positronic_observation.executed_poses]
 
 
         # Then, tokenize the prompt and let the model augment/transform the
@@ -994,6 +1027,7 @@ class PreprocessWorkerThread:
         # above).  process_prompt receives the raw multimodal tensors
         # and returns any additional tensors to merge into the final dict.
         model_kwargs = dict(input.model_kwargs or {})
+        model_kwargs.update(positronic_kwargs)
         # only this worker keys a prompt: a client that sent its own could name
         # another request's pages and be served that request's KV, and a stream
         # lead past the edge's context would raise in the worker's ingest.
@@ -1002,12 +1036,17 @@ class PreprocessWorkerThread:
         # and only this worker knows which client streams the opening leaves open.
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
         for name in (
-            "prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "state_layout", "state_sizes", "keyed_spans",
-            "prefix_root", "stream_lead_items", "open_streams", MAX_POSITION_KWARG, *internal,
+            "prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "state_layout", "state_sizes",
+            "keyed_spans", "prefix_root",
+            "stream_lead_items", "open_streams", MAX_POSITION_KWARG, CHUNK_CAUSAL_LAYOUT_KWARG,
+            EXPERT_LAYOUT_KWARG, *internal,
         ):
             model_kwargs.pop(name, None)
         open_streams = self._client_edges - input.ends
         num_prompt_tokens = 0
+        episode_keys = None
+        reset_episode = positronic_observation.reset_episode if positronic_observation is not None else False
+        episode_adapter_digest = None
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
                 input.text,
@@ -1021,6 +1060,8 @@ class PreprocessWorkerThread:
             )
             root = input.prefix_root
             if isinstance(prompt_tensors, ProcessPromptOutput):
+                episode_keys = dict(prompt_tensors.episode_keys or {})
+                reset_episode = reset_episode or prompt_tensors.reset_episode
                 selected = input.model_kwargs or {}
                 model_kwargs.update(prompt_tensors.metadata)
                 if prompt_tensors.lora_adapter is not KEEP_ADAPTER or any(
@@ -1028,6 +1069,10 @@ class PreprocessWorkerThread:
                 ):
                     model_kwargs, root = self._model_chose(prompt_tensors, model_kwargs, selected, root)
                 prompt_tensors = prompt_tensors.new_input_tensors
+            if model_kwargs.get(LORA_ADAPTER_KWARG) is not None:
+                digest = model_kwargs.get(LORA_DIGEST_KWARG)
+                if type(digest) is bytes and root == adapter_prefix_root(digest):
+                    episode_adapter_digest = digest
             if prompt_tensors:
                 tensors.update(prompt_tensors)
             state_layout = model_kwargs.pop("state_layout", None)
@@ -1036,6 +1081,13 @@ class PreprocessWorkerThread:
                 model_kwargs.pop("kv_layout", {}) if state_layout is None
                 else kv_layouts(self._declarations, state_layout, keyed_spans)
             )
+            if state_layout is not None:
+                chunk_layout = chunk_causal_layouts(self._declarations, state_layout, allow_missing_arrays=True)
+                if chunk_layout:
+                    model_kwargs[CHUNK_CAUSAL_LAYOUT_KWARG] = chunk_layout
+                expert_layout = expert_layouts(self._declarations, state_layout, allow_missing_arrays=True)
+                if expert_layout:
+                    model_kwargs[EXPERT_LAYOUT_KWARG] = expert_layout
             if self._sized:
                 model_kwargs["state_sizes"] = state_sizes(self._sized, state_layout or {})
             num_prompt_tokens = self.model.prompt_tokens(tensors, layouts)
@@ -1064,7 +1116,10 @@ class PreprocessWorkerThread:
             tensors["text_inputs"] = [torch.tensor(
                 list(byte_data), dtype=torch.uint8, device=self.device
             )]
-        return PreparedInput(tensors, input_metadata, model_kwargs, num_prompt_tokens)
+        return PreparedInput(
+            tensors, input_metadata, model_kwargs, num_prompt_tokens, episode_keys, reset_episode,
+            episode_adapter_digest,
+        )
 
     def _model_chose(
         self, output: ProcessPromptOutput, model_kwargs: dict, selected: dict, root: bytes,
@@ -1101,7 +1156,8 @@ class PreprocessWorkerThread:
         self, input: PreprocessInput, prepared: PreparedInput, profile: DataWorkerProfile | None,
     ) -> None:
         """Store a prepared request's tensors and hand it to the conductor."""
-        tensors, input_metadata, model_kwargs, num_prompt_tokens = prepared
+        (tensors, input_metadata, model_kwargs, num_prompt_tokens, episode_keys, reset_episode,
+         episode_adapter_digest) = prepared
 
         # A client stream's first chunk, not a prompt signal: a one-shot upload
         # is a stream of one chunk. Stored before the request reaches the
@@ -1135,6 +1191,11 @@ class PreprocessWorkerThread:
                 input_open=bool(self._client_edges - input.ends),
                 streaming=input.streaming,
                 prompt_tokens=num_prompt_tokens,
+                episode=input.episode,
+                episode_keys=episode_keys,
+                reset_episode=input.reset_episode or reset_episode,
+                episode_adapter_digest=episode_adapter_digest,
+                deadline=input.deadline,
             ),
         )
         self.communicator.send("conductor", msg)

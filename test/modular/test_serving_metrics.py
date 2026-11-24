@@ -1350,7 +1350,7 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
         fatal_error = None
         model_config: dict = {}
         model = None
-        served_models = openpi_policy = None
+        served_models = openpi_policy = positronic_policy = None
         client_streams = frozenset()
 
         def __init__(self, **kwargs):
@@ -1484,7 +1484,7 @@ def _serve_against(monkeypatch, tmp_path, server_code: str, bridge_runs: bool):
         fatal_error = None
         model_config: dict = {}
         model = None
-        served_models = openpi_policy = None
+        served_models = openpi_policy = positronic_policy = None
         client_streams = frozenset()
 
         def __init__(self, **kwargs):
@@ -1720,3 +1720,22 @@ def test_a_missing_package_is_reported_and_a_broken_one_raises(monkeypatch):
     finally:
         importlib.reload(metrics_module)
     assert metrics_module.MISSING_DEPENDENCY is None
+
+
+def test_episode_cold_starts_total_renders_from_conductor_status(served):
+    cold_starts = Counter(catalog.EPISODE_COLD_STARTS)
+    cold_starts.inc(("new",))
+    cold_starts.inc(("idle",), amount=2.0)
+    cold_starts.inc(("lost",))
+    served.conductor.inbox.put(APIServerMessage(
+        "conductor_status", ConductorStatus([cold_starts.snapshot()]),
+    ))
+    samples = _scrape_until(
+        served,
+        lambda s: ("mstar_episode_cold_starts_total", _labels(reason="idle")) in s,
+    )
+    assert samples[("mstar_episode_cold_starts_total", _labels(reason="new"))] == 1.0
+    assert samples[("mstar_episode_cold_starts_total", _labels(reason="idle"))] == 2.0
+    assert samples[("mstar_episode_cold_starts_total", _labels(reason="lost"))] == 1.0
+    text = TestClient(entrypoint.app).get("/metrics").text
+    assert "# TYPE mstar_episode_cold_starts_total counter" in text

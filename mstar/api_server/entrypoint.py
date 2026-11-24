@@ -46,6 +46,8 @@ from mstar.api_server.body_limit import BodyLimitMiddleware, max_body_bytes
 from mstar.api_server.data_worker import PreprocessWorker, unlink_files
 from mstar.api_server.lora_admin import LoraAdmin
 from mstar.api_server.openpi import OpenpiPolicy, serve_connection
+from mstar.api_server.positronic import PositronicPolicy
+from mstar.api_server.positronic import serve_connection as serve_positronic_connection
 from mstar.api_server.request_types import (
     USAGE,
     APIServerMessage,
@@ -589,6 +591,10 @@ class APIServer:
         self.openpi_policy = (
             None if openpi_block is None else OpenpiPolicy.from_config(openpi_block, model)
         )
+        positronic_block = (model_config or {}).get("positronic")
+        self.positronic_policy = (
+            None if positronic_block is None else PositronicPolicy.from_config(positronic_block, model)
+        )
         # what an OpenAI request's `model` field may name: the base model, or an adapter
         self.served_models = ServedModels.of(
             model_name, model_config, lora.adapter_digests if lora is not None else None,
@@ -846,6 +852,9 @@ class APIServer:
         file_streams: dict[str, list[str | None]] | None = None,
         raw_inputs: dict[str, list[torch.Tensor]] | None = None,
         report_usage: bool = False,
+        episode: str | None = None,
+        reset_episode: bool = False,
+        positronic_frame: bytes | None = None,
     ) -> str:
         """Build a :class:`NewRequestConductor` and send it to the conductor.
 
@@ -949,10 +958,22 @@ class APIServer:
         if self.metrics is not None:
             mark_submitted()
 
+        timeout_s = getattr(self, "timeout_seconds", None)
+        deadline = (
+            time.perf_counter() + timeout_s
+            if isinstance(timeout_s, (int, float))
+            and not isinstance(timeout_s, bool)
+            and math.isfinite(timeout_s)
+            and timeout_s >= 0
+            else None
+        )
         self.preprocess_worker.new_request(PreprocessInput(
             request_id=key,
             client_request_id=request_id,
             text=text,
+            episode=episode,
+            reset_episode=reset_episode,
+            positronic_frame=positronic_frame,
             file_paths=file_paths,
             input_modalities=input_modalities,
             output_modalities=output_modalities,
@@ -962,6 +983,7 @@ class APIServer:
             ends=ending,
             streaming=streaming,
             raw_inputs=raw_inputs,
+            deadline=deadline,
         ))
 
         request_log.debug(
@@ -969,6 +991,14 @@ class APIServer:
             request_id, key, input_modalities, output_modalities,
         )
         return request_id
+
+    def end_episode(self, episode_id: str) -> None:
+        """Ask the conductor to release a connection's retained episode state."""
+        from mstar.utils.ipc_format import ConductorMessage, ConductorMessageType, EndEpisodeConductor
+
+        self.preprocess_worker.send_to_conductor(
+            ConductorMessage(ConductorMessageType.END_EPISODE, EndEpisodeConductor(episode_id))
+        )
 
     def lora_kwargs(self, model: str | None, model_kwargs: dict | None) -> Selected:
         """``model_kwargs`` naming the LoRA adapter ``model`` or a ``lora_adapter`` kwarg
@@ -3006,6 +3036,14 @@ async def openpi_ws(websocket: WebSocket):
     await serve_connection(websocket, api_server)
 
 
+@app.websocket("/api/v1/session")
+async def positronic_ws(websocket: WebSocket):
+    if api_server is None:
+        await websocket.close(code=1013, reason="Server not ready")
+        return
+    await serve_positronic_connection(websocket, api_server)
+
+
 @app.get("/metrics", include_in_schema=False)
 async def metrics():
     """Prometheus metrics, when the server runs with ``--enable-metrics``."""
@@ -3336,6 +3374,7 @@ def main(argv: list[str] | None = None):
                 RustFrontendBridge,
                 launch_rust_server,
                 openpi_facts,
+                positronic_facts,
                 realtime_facts,
                 transcription_facts,
             )
@@ -3353,6 +3392,7 @@ def main(argv: list[str] | None = None):
                 served_models=api_server.served_models,
                 transcription=transcription_facts(api_server, get_adapter(model_name)),
                 openpi=openpi_facts(api_server.openpi_policy),
+                positronic=positronic_facts(api_server.positronic_policy),
                 ws_max_bytes=_ws_max_size(config),
                 client_streams=api_server.client_streams,
                 realtime=realtime_facts(api_server, get_adapter(model_name), bridge_dir))

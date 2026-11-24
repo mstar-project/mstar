@@ -38,6 +38,7 @@ PORTED = (
     "mstar/model/nemotron_duplex", "mstar/model/components/fastconformer.py",
     "mstar/model/components/fastconformer_stream.py",
     "mstar/model/waypoint", "mstar/model/lingbot_world",
+    "mstar/model/praxis1",
 )
 # The list only shrinks: a package leaves it when its port lands, and nothing is added to it.
 UNPORTED = (

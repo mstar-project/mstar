@@ -51,6 +51,19 @@ from mstar.model.submodule_base import (
 from mstar.model.utils import TextChunkDetokenizer, TextOutput, drop_stop_tokens
 
 
+class EpisodeView(NamedTuple):
+    """The conductor's snapshot of state held before a request's first walk.
+
+    Models receive this only when they declare an episode-lifetime array.
+    ``held`` counts resident entries, not the total appended over the episode.
+    """
+
+    id: str | None
+    calls: int
+    held: Mapping[str, int]
+    cold: str | None = None
+
+
 def _wrap_node_in_loop(
     section: GraphSection, node_name: str, graph_walk: str,
     policy: "ChunkingPolicy",
@@ -191,6 +204,8 @@ class ProcessPromptOutput(NamedTuple):
     new_input_tensors: NameToTensorList
     metadata: dict
     lora_adapter: str | None | KeepAdapter = KEEP_ADAPTER
+    episode_keys: Mapping[str, str] | None = None
+    reset_episode: bool = False
 
 
 class ClientChunk(NamedTuple):
@@ -688,7 +703,8 @@ class Model(ABC):
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
     # Request keys the conductor or data worker reads for every model, never logged as ignored.
     ENGINE_KWARGS: tuple[str, ...] = (
-        "seed", "prefix_cache", "return_token_ids", "return_logprobs", LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG,
+        "seed", "episode_seed", "prefix_cache", "return_token_ids", "return_logprobs",
+        LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG,
     )
     # Output modalities a client plays as they stream, where a pause is a gap. A streamed request with one of
     # them reserves its whole KV footprint and is never preempted. ``unpausable_outputs`` in the serving config
@@ -1047,6 +1063,8 @@ class Model(ABC):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict,
+        *,
+        episode: EpisodeView | None = None,
     ) -> list[WalkStep]:
         """The walks ``partition_name`` runs for this request, in order, decided
         at ingest; ``[]`` when the request doesn't use the partition.
@@ -1068,6 +1086,13 @@ class Model(ABC):
         moves, the conductor moves past a step on its first report when it is
         the last step or the next step takes inputs it sends, so such a step
         must run once.
+
+        A node with a declared within-step attention mask needs mask lengths on
+        every planned walk that contains it. The conductor checks those lengths
+        before dispatch, even if the node skips that read on one walk, since
+        ``Array.nodes`` does not say which walks use the read. A step may give
+        read-keyed lengths in ``step_metadata``; these override the same read's
+        request-level lengths returned by ``process_prompt``.
         """
 
     @abstractmethod
