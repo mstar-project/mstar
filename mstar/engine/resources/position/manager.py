@@ -82,6 +82,7 @@ class PositionManager(Resource):
     prefix_skip_safe = True
     # a split label's ids are its range's (`apply_qk`)
     supports_split_steps = True
+    reports_episode_held = False
 
     # NOTE: not an `AttentionResource`, so no label/layer cursors — this is
     # called once per step, not per layer. Layers reach `apply_qk` with the
@@ -98,6 +99,7 @@ class PositionManager(Resource):
                 max_seq_len=kv_spec.config.max_seq_len,
                 head_dim=kv_spec.config.head_dim,
                 dtype=info.kv_dtype,
+                episode_lifetime=spec.episode_lifetime,
             )
             manager._shard_key = spec.shard_key
             return manager
@@ -128,8 +130,11 @@ class RopeManager(PositionManager):
         max_seq_len: int = 32768,
         head_dim: int | None = None,
         dtype: torch.dtype = torch.bfloat16,
+        episode_lifetime: bool = False,
     ):
         self._config = config
+        self.episode_lifetime = episode_lifetime
+        self._episode_owner_by_request: dict[int | str, tuple[str, int]] = {}
         self._device = device
         self._kv_cache_name = config.kv_cache
         self._max_seq_len = max_seq_len
@@ -251,15 +256,52 @@ class RopeManager(PositionManager):
         del overrides
         self._counters[rid] = {}
 
+    def bind_episode(self, rid: int, slot: int, episode_id: str | None, *, cold: bool, reset: bool) -> None:
+        if episode_id is None:
+            return
+        owner = ("episode", slot)
+        if cold:
+            if owner in self._counters:
+                raise ValueError(f"position resource {self._kv_cache_name!r}: episode slot {slot} already has counters")
+            self._counters.setdefault(rid, {})
+        else:
+            existing = self._counters.pop(owner, None)
+            if reset:
+                self._counters[rid] = {}
+            elif existing is not None:
+                self._counters[rid] = existing
+        self._episode_owner_by_request[rid] = owner
+
+    def end_episode(self, slot: int) -> None:
+        owner = ("episode", slot)
+        if owner in self._episode_owner_by_request.values():
+            raise ValueError(f"episode slot {slot} still has an active request")
+        self._counters.pop(owner, None)
+
     def remove_request(self, rid: str):
-        self._counters.pop(rid, None)
+        owner = self._episode_owner_by_request.pop(rid, None)
+        counters = self._counters.pop(rid, None)
+        self._preplan_fork_undo = [entry for entry in self._preplan_fork_undo if entry[0] != rid]
+        if owner is not None:
+            self._counters[owner] = {} if counters is None else counters
 
     def reset_request(self, rid: str, free: bool=False):
         self._counters[rid].clear()
 
-    supports_drop = True
+    @property
+    def supports_drop(self) -> bool:
+        return not self.episode_lifetime
+
+    def check_drop(self, rid: str, tokens: int) -> str | None:
+        del rid, tokens
+        if self.episode_lifetime:
+            return f"position resource {self._kv_cache_name!r}: episode positions cannot be dropped"
+        return None
 
     def drop(self, rid: str, tokens: int) -> int:
+        refusal = self.check_drop(rid, tokens)
+        if refusal is not None:
+            raise RuntimeError(refusal)
         # Recomputing the KV starts positions from zero, and `apply_cached_prefix` never moves a counter back.
         self.reset_request(rid)
         return 0
@@ -644,7 +686,8 @@ class RopeManager(PositionManager):
 
     def position(self, rid: str, label: str) -> int:
         # by the worker's handle (AGENTS.md invariant 14): the wire id raises
-        return self._counters[rid].get(label, 0)
+        key = rid if rid in self._counters else self._episode_owner_by_request.get(rid, rid)
+        return self._counters[key].get(label, 0)
 
     def pos_ids(self, label: str) -> torch.Tensor | None:
         return self._current_pos_ids.get(label)
@@ -837,13 +880,17 @@ class LongRopeManager(RopeManager):
         max_seq_len: int = 32768,
         head_dim: int | None = None,
         dtype: torch.dtype = torch.bfloat16,
+        episode_lifetime: bool = False,
     ):
         if device.type == "xpu":
             raise NotImplementedError("LongRoPE is not implemented for XPU")
         if config.llama31_params or config.rope_scale != 1.0:
             raise NotImplementedError("LongRoPE does not combine with rope_scale or Llama 3.1 scaling")
         # the plain manager without a table of its own; this one builds its own below
-        super().__init__(dataclasses.replace(config, rope_table_dtype=None), device, max_seq_len, head_dim, dtype)
+        super().__init__(
+            dataclasses.replace(config, rope_table_dtype=None), device, max_seq_len, head_dim, dtype,
+            episode_lifetime=episode_lifetime,
+        )
         self._config = config  # what the prefix fingerprint covers
         self._longrope: LongRoPE = config.longrope
         rotary_dim = config.rotary_dim or head_dim
@@ -905,9 +952,33 @@ class LongRopeManager(RopeManager):
         if overrides is not None and self._longrope.is_long(overrides.max_position):
             self._long_rids.add(rid)
 
+    def bind_episode(self, rid: int, slot: int, episode_id: str | None, *, cold: bool, reset: bool) -> None:
+        if episode_id is None:
+            return
+        owner = ("episode", slot)
+        if cold:
+            if owner in self._long_rids:
+                raise ValueError(f"position resource {self._kv_cache_name!r}: episode slot {slot} already has state")
+        elif reset:
+            self._long_rids.discard(owner)
+        else:
+            was_long = owner in self._long_rids
+            self._long_rids.discard(owner)
+            if was_long:
+                self._long_rids.add(rid)
+        super().bind_episode(rid, slot, episode_id, cold=cold, reset=reset)
+
+    def end_episode(self, slot: int) -> None:
+        super().end_episode(slot)
+        self._long_rids.discard(("episode", slot))
+
     def remove_request(self, rid: str):
-        super().remove_request(rid)
+        owner = self._episode_owner_by_request.get(rid)
+        is_long = rid in self._long_rids
         self._long_rids.discard(rid)
+        super().remove_request(rid)
+        if owner is not None and is_long:
+            self._long_rids.add(owner)
 
     def clear_preplan(self):
         super().clear_preplan()

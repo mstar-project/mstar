@@ -2,7 +2,7 @@ import logging
 import os
 import threading
 from collections import Counter
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -600,9 +600,13 @@ class KVManager(AttentionResource):
         leads: bool = True,
         nodes: Collection[str] | None = None,
         host_allowance: StepAllowance | None = None,
+        episode_lifetime: bool = False,
     ):
         self.config = cfg
         self._host_allowance = host_allowance
+        self.episode_lifetime = episode_lifetime
+        self._episode_owner_by_request: dict[int | str, tuple[str, int]] = {}
+        self._episode_owners: set[tuple[str, int]] = set()
         if len(cfg.groups) > 1 and needs_remote_transfer:
             raise ValueError(
                 f"KV {name}: a node on another instance reads this pool (replicas, or walks "
@@ -860,6 +864,7 @@ class KVManager(AttentionResource):
             leads=spec.leader is None or spec.leader in info.nodes,
             nodes=info.nodes,
             host_allowance=info.host_allowance,
+            episode_lifetime=spec.episode_lifetime,
         )
 
     def build_accelerator_graph_buffers(
@@ -1893,10 +1898,59 @@ class KVManager(AttentionResource):
         there for it count as an overrun."""
         layout = self._held_layout(rid, label)
         if layout is not None:
-            stream.footprint = layout.pages(self._overrides[rid].loop_caps, self.config.tokens_per_page)
-            stream.span_cursor = SpanCursor(layout.spans)
+            caps = self._overrides[rid].loop_caps
+            stream.footprint = len(stream.page_indices) + self._stream_extra_pages(stream, layout, caps)
+            stream.span_cursor = SpanCursor(layout.spans) if stream.stored_len == 0 else None
         elif self._overrides.get(rid) is not None and self._overrides[rid].kv_layout:
-            stream.footprint = 0
+            stream.footprint = len(stream.page_indices) if stream.stored_len else 0
+
+    def _stream_extra_pages(
+        self, stream: CacheStream | None, layout: StreamLayout, caps: Mapping[str, int] | None,
+    ) -> int:
+        caps = caps or {}
+        if stream is None or (
+            not stream.stored_len and not stream.page_indices and not any(part.page_indices for part in stream.later)
+        ):
+            return self.config.stream_pages(layout, caps)
+        extra = 0
+        for g, group in enumerate(self.config.groups):
+            part = stream.group(g)
+            retention = layout.retention if g == 0 else group.retention
+            if not part.stored_len and not part.page_indices:
+                total = layout.pages(caps, group.page_size, retention)
+            else:
+                peak, end = layout.slots(caps) + layout.scratch, 0
+                for span in layout.spans:
+                    peak = max(peak, end + span.scratch)
+                    end += span.length
+                pages = -(-(part.stored_len + peak) // group.page_size)
+                if retention is None:
+                    total = pages
+                else:
+                    prefix = retention.protected_prefix
+                    step, start, end_pos, scratch = layout.scratch, 0, 0, 0
+                    for span in layout.spans:
+                        if span.opens_step:
+                            start, scratch = end_pos, 0
+                        scratch = max(scratch, end_pos - start + span.scratch)
+                        end_pos += span.length
+                        if max(end_pos, start + scratch) > prefix:
+                            step = max(step, end_pos - start, scratch)
+                    step = max([step, *(slots for _, slots in layout.growth)])
+                    total = min(pages, retention.max_pages(group.page_size, step))
+            extra += max(0, total - len(part.page_indices))
+        return extra
+
+    def _request_extra_pages(self, rid: str, caps: Mapping[str, int]) -> int:
+        overrides = self._overrides[rid]
+        layouts = overrides.kv_layout or {}
+        streams = self._streams.get(rid, {})
+        if not streams:
+            return overrides.pages(self._nodes, caps, self.config)
+        return sum(
+            self._stream_extra_pages(streams.get(label), layouts[label], caps)
+            for label in overrides.opened_labels(self._nodes) if label in layouts
+        )
 
     def _held_layout(self, rid: str, label: str) -> StreamLayout | None:
         overrides = self._overrides.get(rid)
@@ -3504,7 +3558,9 @@ class KVManager(AttentionResource):
     def supports_eviction(self):
         return self._cpu_pool is not None
 
-    supports_drop = True
+    @property
+    def supports_drop(self) -> bool:
+        return not self.episode_lifetime
 
     def is_offloaded(self, rid: str) -> bool:
         """True from the moment an offload claims the request, not just once
@@ -3536,6 +3592,8 @@ class KVManager(AttentionResource):
             return any(stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values())
 
     def check_drop(self, rid: str, tokens: int) -> str | None:
+        if self.episode_lifetime:
+            return f"KV {self.name}: episode KV state cannot be rebuilt from a single request's token ids"
         if self._world_size > 1 and not self._counts:
             return (
                 f"KV {self.name}: dropping {rid} on one of {self._world_size} ranks "
@@ -3862,6 +3920,8 @@ class KVManager(AttentionResource):
 
     def can_offload(self, rid: str) -> bool:
         """False for a guaranteed request, which reserves what it grows into so that nothing preempts it."""
+        if self.episode_lifetime or rid in self._episode_owners:
+            return False
         return rid not in self._guaranteed
 
     def can_reload(self, rid: str) -> bool:
@@ -4018,6 +4078,8 @@ class KVManager(AttentionResource):
     def reclaimable(self, rid: str) -> int:
         """The device pages ``rid`` holds, or 0 when offloading it would free none
         of them, when it is offloaded already, or when it is admitted but hasn't run."""
+        if self.episode_lifetime or rid in self._episode_owners:
+            return 0
         with self._lock:
             streams = self._streams.get(rid, {})
             for stream in streams.values():
@@ -4259,11 +4321,72 @@ class KVManager(AttentionResource):
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
 
+    def _episode_key(self, rid):
+        return rid if rid in self._streams else self._episode_owner_by_request.get(rid, rid)
+
+    def logical_length(self, rid, label: str = "main") -> int:
+        stream = self._streams.get(self._episode_key(rid), {}).get(label)
+        return 0 if stream is None else stream.stored_len + stream.released
+
+    def held(self, rid) -> int:
+        return sum(stream.stored_len for stream in self._streams.get(self._episode_key(rid), {}).values())
+
+    def bind_episode(self, rid: int, slot: int, episode_id: str | None, *, cold: bool, reset: bool) -> None:
+        if episode_id is None:
+            return
+        owner = ("episode", slot)
+        self._touch_plan_cache(rid)
+        with self._lock:
+            if cold:
+                if owner in self._streams:
+                    raise ValueError(f"KV {self.name}: episode slot {slot} already has streams")
+                if reset:
+                    self.reset_request(rid, free=True)
+            else:
+                existing = self._streams.pop(owner, None)
+                self._episode_owners.discard(owner)
+                if existing is None:
+                    raise ValueError(f"KV {self.name}: episode slot {slot} has no streams to resume")
+                if reset:
+                    self._streams[owner] = existing
+                    self.reset_request(owner, free=True)
+                    self._streams.pop(owner, None)
+                    for s in existing.values():
+                        s.free_lists()
+                else:
+                    fresh = self._streams.pop(rid, {})
+                    for s in fresh.values():
+                        s.free_lists()
+                    self._streams[rid] = existing
+                    for label, stream in existing.items():
+                        stream.converted = False
+                        stream.step_in_flight = False
+                        stream.lent.clear()
+                        self._lay_out(rid, label, stream)
+                        if stream.stored_len > 0:
+                            stream.forget_chain()
+                            stream.span_cursor = None
+                        else:
+                            stream.forget_chain()
+                            self._seed_keys(rid, label, stream)
+            self._episode_owner_by_request[rid] = owner
+            self._readonly_epoch += 1
+
+    def end_episode(self, slot: int) -> None:
+        owner = ("episode", slot)
+        with self._lock:
+            if owner in self._episode_owner_by_request.values():
+                raise ValueError(f"episode slot {slot} still has an active request")
+            self._episode_owners.discard(owner)
+        if owner in self._streams:
+            self.remove_request(owner)
+
     def remove_request(self, rid: str):
         self._touch_plan_cache(rid)
         with self._lock:
             # its waiting tokens first, before the handle can name another request
             self._drain_chain_backlog(rid)
+            owner = self._episode_owner_by_request.pop(rid, None)
         streams = self._streams.get(rid)
         if streams is not None:
             # drain in-flight reads outside the lock; see reset_request
@@ -4271,6 +4394,42 @@ class KVManager(AttentionResource):
                 if stream.read_future is not None:
                     wait([stream.read_future])
         with self._lock:
+            if owner is not None:
+                room = self._spare()
+                allotment = self._allotments.pop(rid, None)
+                if allotment is not None:
+                    self._count(rid, allotment, 0, 0)
+                self._asks.pop(rid, None)
+                self._stalled.discard(rid)
+                self._forget_reservations(rid)
+                moved = self._streams.pop(rid, None)
+                if moved is not None:
+                    for stream in moved.values():
+                        self._release_lease(rid, stream)
+                        self._release_hold(rid, stream)
+                        stream.step_in_flight = False
+                        stream.converted = False
+                    self._streams[owner] = moved
+                    self._episode_owners.add(owner)
+                self._looked_up.discard(rid)
+                self._overrides.pop(rid, None)
+                self._exact.pop(rid, None)
+                self._classify(rid, guaranteed=False)
+                self._footprints.pop(rid, None)
+                self._dropped.pop(rid, None)
+                self._rebuilt.pop(rid, None)
+                self._chain_lookup.pop(rid, None)
+                self._transfer.remove_request(rid)
+                self._settle(rid, self._spare() - room, allotment)
+                self._forget_earmark(rid)
+                self._ran_short.pop(rid, None)
+                self._passers.discard(rid)
+                self._preplan_new_labels = [(r, lbl) for r, lbl in self._preplan_new_labels if r != rid]
+                self._image_ends = [(r, s) for r, s in self._image_ends if r != rid]
+                self._readonly_epoch += 1
+                if _DEBUG_ASSERTS:
+                    self.assert_pages_conserved()
+                return
             if _DEBUG_ASSERTS and rid in self._streams:
                 self._report_underuse(rid)
             room = self._spare()
@@ -4545,16 +4704,18 @@ class KVManager(AttentionResource):
         if rid in self._asks:
             return None
         overrides = self._overrides[rid]
-        prompt = overrides.pages(self._nodes, dict.fromkeys(overrides.loop_caps or (), 0), self.config)
+        prompt = self._request_extra_pages(rid, dict.fromkeys(overrides.loop_caps or (), 0))
         # A request that no drop here can free, and that no host can take, would wait holding its pages once
         # it ran short, so it reserves what it grows into.
-        if overrides.unpausable or not (overrides.rebuildable or self._cpu_pool is not None):
+        rebuildable = overrides.rebuildable and not self.episode_lifetime
+        if overrides.unpausable or not (rebuildable or (self._cpu_pool is not None and not self.episode_lifetime)):
             self._classify(rid, guaranteed=True)
         pages = self._footprint(rid) if rid in self._guaranteed else prompt
+        already = self._held(rid)
         capacity = self.config.request_pages
-        if pages > capacity:
+        if already + pages > capacity:
             return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
-                f"KV {self.name}: request {rid} needs {self.config.pages_of(pages, round_up=True)} pages "
+                f"KV {self.name}: request {rid} needs {self.config.pages_of(already + pages, round_up=True)} pages "
                 f"to be admitted, and the pool has {self.config.pages_of(capacity)} for requests"
             ))
         self._asks[rid] = pages
@@ -4573,7 +4734,7 @@ class KVManager(AttentionResource):
         if rid not in self._footprints:
             overrides = self._overrides[rid]
             caps = {loop: cap if loop in self.local_loops else 0 for loop, cap in (overrides.loop_caps or {}).items()}
-            self._footprints[rid] = overrides.pages(self._nodes, caps, self.config)
+            self._footprints[rid] = self._request_extra_pages(rid, caps)
         return self._footprints[rid]
 
     def reserve(
@@ -4687,7 +4848,8 @@ class KVManager(AttentionResource):
         else:
             returning = self._return_pages(rid) if self._on_host(rid) else None
             self._allotments[rid] = Allotment(
-                pages=pages, asks_again=self._asks.pop(rid), returning=returning, passed=passed, kept=kept,
+                pages=self._held(rid) + pages, asks_again=self._asks.pop(rid), returning=returning, passed=passed,
+                kept=kept,
             )
             self._recount(rid)
             self._made = rid
@@ -4857,7 +5019,10 @@ class KVManager(AttentionResource):
         """What moving every preemptible request would free, walked again only once a page, an allotment or a
         request's class has changed since the last walk. Caller holds the lock."""
         def walk() -> int:
-            return self._frees([rid for rid in self._streams if rid not in self._guaranteed])
+            return self._frees([
+                rid for rid in self._streams
+                if rid not in self._guaranteed and rid not in self._episode_owners
+            ])
 
         counts = (self._arena.changes, self._changes, self._index_counts())
         if self._reclaim is None or self._reclaim[0] != counts:

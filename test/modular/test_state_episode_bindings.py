@@ -9,7 +9,7 @@ from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.recurrent.dense_window import DenseWindowPool, DenseWindowSpec
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
-from mstar.engine.state import Array, ArrayStep, Block, Entry, KVEntry, Read, TensorType, Window
+from mstar.engine.state import Array, ArrayStep, Attend, Block, Causal, Entry, KVEntry, Read, TensorType, Window
 from mstar.engine.state.adapters import DENSE_WINDOW, PAGED, build_specs, node_handles, state_steps, storage_of
 from mstar.engine.state.episodes import EpisodeRowBindings
 from mstar.utils.ipc_format import EndEpisode, RemoveRequest, WorkerMessage, WorkerMessageType
@@ -20,7 +20,7 @@ from mstar.worker.step_pipeline import StepPipeline
 def _kv(**overrides):
     return Array(
         "kv", nodes={"llm"}, layers={0}, entry=KVEntry(heads=2, head_dim=8),
-        max_len=16, **overrides,
+        max_len=16, reads={"attn": Read(mask=Causal(), op=Attend(q_heads=2))}, **overrides,
     )
 
 
@@ -30,8 +30,10 @@ def test_lifetime_is_declared_without_selecting_a_second_kv_storage():
     assert request.lifetime == "request"
     assert storage_of(request) is storage_of(episode) is PAGED
     assert request != episode and hash(episode) == hash(_kv(lifetime="episode"))
-    with pytest.raises(ValueError, match="episode lifetime needs row binding and storage teardown"):
-        build_specs([episode])
+    request_specs = build_specs([request])
+    episode_specs = build_specs([episode])
+    assert not request_specs[0].episode_lifetime
+    assert episode_specs[0].episode_lifetime and episode_specs[0].resource_key == "kv"
 
 
 @pytest.mark.parametrize("bad", [None, "session", "", 1, True])
