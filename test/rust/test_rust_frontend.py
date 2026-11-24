@@ -1525,6 +1525,104 @@ def test_a_generate_stream_reads_as_pythons_down_to_a_late_error(binary):
     assert items(rust_body) == items(python_body)
 
 
+class _VersionedFailsMidStreamStub(_StubAPIServer):
+    def __init__(self, version):
+        super().__init__()
+        self.version = version
+
+    async def iter_result_chunks(self, request_id):
+        wv = {"weight_version": self.version} if self.version is not None else {}
+        yield _Chunk("text", b"Hel", {"token_ids": [1], **wv})
+        yield _Chunk("error", b"Error in worker: boom", {"status": 500, **wv})
+
+
+@pytest.mark.parametrize("binary", [False, True], ids=["ndjson", "frames"])
+@pytest.mark.parametrize("version", ["v1", None], ids=["versioned", "unversioned"])
+def test_streaming_generate_error_chunk_carries_weight_version_like_python(version, binary):
+    from mstar.api_server.entrypoint import (
+        BINARY_STREAM_MEDIA_TYPE,
+        _chunk_to_binary_frame,
+        _chunk_to_ndjson_payload,
+    )
+
+    wv = {"weight_version": version} if version is not None else {}
+    sent = [
+        _Chunk("text", b"Hel", {"token_ids": [1], **wv}),
+        _Chunk("error", b"Error in worker: boom", {"status": 500, **wv}),
+    ]
+    if binary:
+        python_body = b"".join(b"".join(_chunk_to_binary_frame(c)) for c in sent)
+    else:
+        python_body = "".join(_chunk_to_ndjson_payload(c) for c in sent).encode()
+
+    def items(body: bytes):
+        if binary:
+            return _frames(body)
+        return [(m["modality"], m["data"], m["metadata"]) for m in map(json.loads, body.splitlines())]
+
+    data = urllib.parse.urlencode({"text": "hi", "output_modalities": "text"}).encode()
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    if binary:
+        headers["Accept"] = BINARY_STREAM_MEDIA_TYPE
+    with _model_stack("qwen3_omni", _VersionedFailsMidStreamStub(version)) as (port, _up):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/generate", data=data, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            rust_body = r.read()
+    got = items(rust_body)
+    assert got == items(python_body)
+    expected_meta = {"status": 500, "weight_version": "v1"} if version == "v1" else {"status": 500}
+    assert got[-1][0] == "error" and got[-1][2] == expected_meta
+
+
+class _FixedChunksStub(_StubAPIServer):
+    def __init__(self, chunks):
+        super().__init__()
+        self._chunks = chunks
+
+    async def iter_result_chunks(self, request_id):
+        for chunk in self._chunks:
+            yield chunk
+
+
+class _FixedChunksPython(_GeneratePython):
+    def __init__(self, upload_dir, chunks):
+        super().__init__(upload_dir)
+        self._chunks = chunks
+
+    async def collect_results(self, request_id, raw_request=None):
+        return list(self._chunks)
+
+
+@pytest.mark.parametrize("chunks,expected_wv", [
+    ([], None),
+    ([_Chunk("text", b"a", {"weight_version": None})], None),
+    ([_Chunk("text", b"a", {}), _Chunk("text", b"b", {"weight_version": "v1"})], "v1"),
+    ([_Chunk("text", b"a", {"weight_version": "v1"})], "v1"),
+], ids=["empty", "null-metadata", "unversioned-then-v1", "v1"])
+def test_nonstreaming_generate_weight_version_parity(chunks, expected_wv, tmp_path, monkeypatch):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from mstar.api_server import entrypoint
+
+    monkeypatch.setattr(entrypoint, "api_server", _FixedChunksPython(tmp_path, chunks))
+    form = {"text": "hi", "output_modalities": "text", "streaming": "false"}
+    py = TestClient(entrypoint.app).post("/generate", data=form)
+    py_json = py.json()
+
+    with _model_stack("qwen3_omni", _FixedChunksStub(chunks)) as (port, _up):
+        status, rust_raw = _generate(port, urlencoded=True, fields=form)
+    rust_body = json.loads(rust_raw)
+
+    assert (status, rust_body["outputs"], "weight_version" in rust_body, rust_body.get("weight_version")) == (
+        py.status_code, py_json["outputs"], "weight_version" in py_json, py_json.get("weight_version")
+    )
+    if expected_wv is None:
+        assert "weight_version" not in rust_body
+    else:
+        assert rust_body["weight_version"] == expected_wv
+
+
 @pytest.mark.parametrize("root", ["/proj/job", "/proj/job/"], ids=["bare", "trailing-slash"])
 def test_both_frontends_route_under_a_root_path_alike(root, tmp_path, monkeypatch):
     """MSTAR_ROOT_PATH as Starlette's ``root_path`` routes it: a path under the
@@ -1558,6 +1656,26 @@ def _bare_server_cmd(port) -> list[str]:
 def _listening(port) -> bool:
     with socket.socket() as s:
         return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _process_gone(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] == "Z"  # exited, not yet reaped
+    except (FileNotFoundError, ProcessLookupError):
+        # /proc can disappear after open succeeds but before read completes.
+        return True
+
+
+def test_process_gone_if_proc_stat_disappears_during_read(monkeypatch):
+    from unittest.mock import mock_open
+
+    opened = mock_open()
+    opened.return_value.__enter__.return_value.read.side_effect = ProcessLookupError
+    monkeypatch.setattr("builtins.open", opened)
+
+    assert _process_gone(123)
+    opened.assert_called_once_with("/proc/123/stat")
 
 
 def test_a_taken_port_exits_3_and_says_so():
@@ -1601,19 +1719,17 @@ def test_mstar_server_exits_when_its_launcher_is_killed():
         launcher.kill()
         launcher.wait()
 
-    def gone() -> bool:
-        try:
-            with open(f"/proc/{pid}/stat") as f:
-                return f.read().rsplit(")", 1)[1].split()[0] == "Z"  # exited, not yet reaped
-        except FileNotFoundError:
-            return True
-
     deadline = time.time() + 15
-    while not gone() and time.time() < deadline:
+    while not _process_gone(pid) and time.time() < deadline:
         time.sleep(0.1)
-    if not gone():
-        os.kill(pid, 9)
-        pytest.fail("mstar-server outlived its launcher")
+    if not _process_gone(pid):
+        try:
+            os.kill(pid, 9)
+        except ProcessLookupError:
+            # It exited between the final /proc check and our cleanup signal.
+            pass
+        else:
+            pytest.fail("mstar-server outlived its launcher")
     # the port is free again, to a server binding it as mstar-server does (mio
     # sets SO_REUSEADDR): a zombie's other threads may still hold its sockets
     # for a moment after its leader exits, so retry briefly
@@ -1628,3 +1744,47 @@ def test_mstar_server_exits_when_its_launcher_is_killed():
                 if time.time() > deadline:
                     raise
         time.sleep(0.1)
+
+
+def test_launcher_exit_cleanup_tolerates_exit_after_last_probe(monkeypatch):
+    """The server may exit after ``gone`` returns false but before cleanup kills it."""
+    import builtins
+    import io
+    import os
+    import subprocess
+    import sys
+    from types import SimpleNamespace
+
+    pid = 99999999
+    port = _free_port()
+    real_open = builtins.open
+    calls = []
+
+    class Launcher:
+        stdout = io.StringIO(f"{pid}\n")
+
+        def kill(self):
+            pass
+
+        def wait(self):
+            pass
+
+    def fake_open(path, *args, **kwargs):
+        if path == f"/proc/{pid}/stat":
+            return io.StringIO(f"{pid} (mstar-server) S 1 0 0")
+        return real_open(path, *args, **kwargs)
+
+    def exited_before_kill(target, signal):
+        calls.append((target, signal))
+        raise ProcessLookupError
+
+    clock = iter((0, 0, 0, 20, 20))
+    monkeypatch.setattr(sys.modules[__name__], "_free_port", lambda: port)
+    monkeypatch.setattr(sys.modules[__name__], "_listening", lambda _: True)
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: Launcher())
+    monkeypatch.setattr(builtins, "open", fake_open)
+    monkeypatch.setattr(os, "kill", exited_before_kill)
+    monkeypatch.setattr(sys.modules[__name__], "time", SimpleNamespace(time=lambda: next(clock), sleep=lambda _: None))
+
+    test_mstar_server_exits_when_its_launcher_is_killed()
+    assert calls == [(pid, 9)]
