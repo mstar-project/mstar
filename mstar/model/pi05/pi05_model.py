@@ -19,6 +19,7 @@ one KV cache, so both nodes have to be in one node group.
 import json
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -37,6 +38,7 @@ from mstar.model.base import (
     KVLabel,
     Model,
     ProcessPromptOutput,
+    ReloadTarget,
     RobotIO,
     TensorAndMetadata,
     WalkStep,
@@ -59,6 +61,9 @@ from mstar.model.pi05.config import (
 )
 from mstar.model.pi05.submodules import Pi05ActionSubmodule, Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
 from mstar.model.submodule_base import NodeSubmodule
+
+if TYPE_CHECKING:
+    from mstar.model.loader.reload import CheckpointSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +169,7 @@ class Pi05Model(Model):
     PREPROCESS_PARALLEL_IMAGES = True
 
     CHUNK_WALK = CHUNK_WALK
+    _checkpoint: "CheckpointSnapshot | str | None" = None
 
     def __init__(
         self,
@@ -188,6 +194,7 @@ class Pi05Model(Model):
 
         self._repo_dir: Path | None = None
         self._lerobot_flat: dict[str, torch.Tensor] | None = None
+        self._checkpoint: CheckpointSnapshot | str | None = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
         # Components, materialized lazily by get_submodule().
@@ -208,19 +215,76 @@ class Pi05Model(Model):
             cfg = Pi05Config()
         else:
             # The checkpoint's config.json sets the action horizon (chunk_size), so a
-            # deployment that cannot read it must not fall back to the default 50 steps.
-            from huggingface_hub import hf_hub_download
+            # deployment that cannot read it must not fall back to the default 50 steps,
+            # unless config.json is genuinely absent (config-less RLinf checkpoints) and
+            # action_horizon is pinned explicitly in the deployment YAML overrides.
+            local_dir = Path(self.model_path_hf)
+            if local_dir.is_dir():
+                config_file = local_dir / "config.json"
+                if config_file.is_file():
+                    try:
+                        with open(config_file) as f:
+                            cfg = load_pi05_config(json.load(f))
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"could not read the config.json of {self.model_path_hf}: {exc}"
+                        ) from exc
+                elif "action_horizon" in self._yaml_config_overrides:
+                    cfg = Pi05Config()
+                else:
+                    raise RuntimeError(
+                        f"could not read the config.json of {self.model_path_hf}: "
+                        "missing config.json and action_horizon is not set"
+                    )
+            else:
+                from huggingface_hub import hf_hub_download, snapshot_download
+                from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
 
-            try:
-                config_path = hf_hub_download(
-                    repo_id=self.model_path_hf,
-                    filename="config.json",
-                    cache_dir=self.cache_dir,
-                )
-                with open(config_path) as f:
-                    cfg = load_pi05_config(json.load(f))
-            except Exception as exc:
-                raise RuntimeError(f"could not read the config.json of {self.model_path_hf}: {exc}") from exc
+                try:
+                    config_path = hf_hub_download(
+                        repo_id=self.model_path_hf,
+                        filename="config.json",
+                        cache_dir=self.cache_dir,
+                    )
+                    with open(config_path) as f:
+                        cfg = load_pi05_config(json.load(f))
+                except LocalEntryNotFoundError as exc:
+                    if "action_horizon" not in self._yaml_config_overrides:
+                        raise RuntimeError(
+                            f"could not read the config.json of {self.model_path_hf}: {exc}"
+                        ) from exc
+                    try:
+                        snap = snapshot_download(
+                            repo_id=self.model_path_hf,
+                            cache_dir=self.cache_dir,
+                            local_files_only=True,
+                        )
+                    except Exception:
+                        raise RuntimeError(
+                            f"could not read the config.json of {self.model_path_hf}: {exc}"
+                        ) from exc
+                    config_file = Path(snap) / "config.json"
+                    if config_file.is_file():
+                        try:
+                            with open(config_file) as f:
+                                cfg = load_pi05_config(json.load(f))
+                        except Exception as cfg_exc:
+                            raise RuntimeError(
+                                f"could not read the config.json of {self.model_path_hf}: {cfg_exc}"
+                            ) from cfg_exc
+                    else:
+                        cfg = Pi05Config()
+                except EntryNotFoundError as exc:
+                    if "action_horizon" in self._yaml_config_overrides:
+                        cfg = Pi05Config()
+                    else:
+                        raise RuntimeError(
+                            f"could not read the config.json of {self.model_path_hf}: {exc}"
+                        ) from exc
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"could not read the config.json of {self.model_path_hf}: {exc}"
+                    ) from exc
 
         # Overlay yaml-driven overrides (e.g. action_horizon for DROID).
         # Applied last so they win over both HF config.json and Pi05Config
@@ -302,6 +366,10 @@ class Pi05Model(Model):
 
     def _ensure_repo(self) -> Path:
         if self._repo_dir is not None:
+            return self._repo_dir
+        local_dir = Path(self.model_path_hf)
+        if local_dir.is_dir():
+            self._repo_dir = local_dir
             return self._repo_dir
         from huggingface_hub import snapshot_download
 
@@ -396,6 +464,31 @@ class Pi05Model(Model):
         raise ValueError("no SigLIP patch embedding in the vision encoder")
 
     @staticmethod
+    def _normalize_lerobot_specs(
+        specs: dict[str, tuple[tuple[int, ...], str]],
+    ) -> dict[str, tuple[tuple[int, ...], str]]:
+        """Normalize ``PI05Policy`` checkpoint specs (``model.`` prefix +
+        duplicate tied ``embed_tokens.weight``) to match bare ``pi05_base`` /
+        ``RLinf`` specs."""
+        if not specs or not all(k.startswith(_POLICY_KEY_PREFIX) for k in specs):
+            return specs
+        out = {k.removeprefix(_POLICY_KEY_PREFIX): v for k, v in specs.items()}
+        if _PALIGEMMA_LM_HEAD in out:
+            out.pop(_PALIGEMMA_EMBED_TOKENS, None)
+        return out
+
+    @staticmethod
+    def _siglip_remap(key: str, tower_prefix: str) -> str | None:
+        if not key.startswith(_PALIGEMMA_PREFIX):
+            return None
+        inner = key.removeprefix(_PALIGEMMA_PREFIX)
+        if inner.startswith("vision_tower.vision_model."):
+            return tower_prefix + inner.removeprefix("vision_tower.vision_model.")
+        if inner.startswith("multi_modal_projector.linear."):
+            return "connector." + inner.removeprefix("multi_modal_projector.linear.")
+        return None
+
+    @staticmethod
     def _extract_siglip_state_dict(
         flat: dict[str, torch.Tensor], tower_prefix: str,
     ) -> dict[str, torch.Tensor]:
@@ -409,15 +502,21 @@ class Pi05Model(Model):
         """
         out: dict[str, torch.Tensor] = {}
         for key, tensor in flat.items():
-            if not key.startswith(_PALIGEMMA_PREFIX):
-                continue
-            inner = key.removeprefix(_PALIGEMMA_PREFIX)
-            if inner.startswith("vision_tower.vision_model."):
-                out[tower_prefix + inner.removeprefix("vision_tower.vision_model.")] = tensor
-            elif inner.startswith("multi_modal_projector.linear."):
-                sub = inner.removeprefix("multi_modal_projector.linear.")
-                out[f"connector.{sub}"] = tensor
+            if (mapped := Pi05Model._siglip_remap(key, tower_prefix)) is not None:
+                out[mapped] = tensor
         return out
+
+    def _record_startup_snapshot(self) -> None:
+        if getattr(self, "_checkpoint", None) is None and getattr(self, "_repo_dir", None) is not None:
+            from mstar.model.loader import HF_DEFAULT_SKIP_FRAGMENTS
+            from mstar.model.loader.reload import snapshot_for_reload
+
+            self._checkpoint = snapshot_for_reload(
+                self._repo_dir,
+                skip_fragments=HF_DEFAULT_SKIP_FRAGMENTS,
+                normalize_specs=self._normalize_lerobot_specs,
+                label="Pi0.5",
+            )
 
     # ------------------------------------------------------------------
     # Model ABC: structure
@@ -718,6 +817,7 @@ class Pi05Model(Model):
                 f"Pi0.5 SigLIP: {len(missing)} parameters not in the checkpoint, "
                 f"e.g. {missing[:3]}"
             )
+        self._record_startup_snapshot()
 
     def _init_llm_components(self, device: str):
         if self.embed_tokens is not None:
@@ -775,3 +875,136 @@ class Pi05Model(Model):
             stacked_params=LLAMA_STACKED_PARAMS,
             name_remapper=self._lerobot_remap,
         )
+        self._record_startup_snapshot()
+
+    def _get_reload_targets(self) -> tuple[ReloadTarget, ...]:
+        from mstar.model.loader import HF_DEFAULT_SKIP_FRAGMENTS
+
+        return (
+            ReloadTarget(
+                nodes=("vit_encoder", "LLM", "action_expert"),
+                snapshot=lambda: self._checkpoint,
+                apply_fn=self._apply_reload,
+                skip_fragments=HF_DEFAULT_SKIP_FRAGMENTS,
+                normalize_specs=self._normalize_lerobot_specs,
+                label="Pi0.5",
+            ),
+        )
+
+    def _apply_reload(self, path: str, submodules: dict[str, nn.Module]) -> None:
+        from mstar.model.loader import HF_DEFAULT_SKIP_FRAGMENTS, LLAMA_STACKED_PARAMS
+        from mstar.model.loader.base import StackedMatcher, dispatch_weight
+        from mstar.model.loader.iterators import iter_safetensors_file, iter_safetensors_shards
+        from mstar.model.loader.quantization import UnservedQuantizationError, is_quantized_part
+        from mstar.model.loader.reload import tensor_specs
+
+        vit = submodules.get("vit_encoder")
+        llm = submodules.get("LLM")
+        action = submodules.get("action_expert")
+        if vit is None and llm is None and action is None:
+            return
+
+        # Bypass and release any cached startup flat dict; reload streams directly
+        # from ``path`` on CPU so storage stays bounded and stale weights cannot leak.
+        self._lerobot_flat = None
+
+        raw_specs = tensor_specs(path, HF_DEFAULT_SKIP_FRAGMENTS)
+        policy_prefixed = bool(raw_specs) and all(k.startswith(_POLICY_KEY_PREFIX) for k in raw_specs)
+        has_lm_head = (
+            (_POLICY_KEY_PREFIX + _PALIGEMMA_LM_HEAD) in raw_specs
+            if policy_prefixed
+            else _PALIGEMMA_LM_HEAD in raw_specs
+        )
+
+        if vit is not None:
+            tower_prefix = self._siglip_tower_prefix(vit.encoder)
+            vit_params = dict(vit.encoder.named_parameters())
+            loaded_vit: set[str] = set()
+        else:
+            tower_prefix = ""
+            vit_params = {}
+            loaded_vit = set()
+
+        if llm is not None or action is not None:
+            container = nn.Module()
+            if llm is not None:
+                container.embed_tokens = llm.embed_tokens
+                container.paligemma = llm.paligemma
+            if action is not None:
+                container.action_expert = action.action_expert
+                container.action_in_proj = action.action_in_proj
+                container.action_out_proj = action.action_out_proj
+                container.time_mlp = action.time_mlp
+            llm_params = dict(container.named_parameters())
+            match_stacked = StackedMatcher(LLAMA_STACKED_PARAMS)
+            loaded_llm: set[str] = set()
+            llm_shards: dict[str, set[str | int]] = {}
+        else:
+            llm_params = {}
+            match_stacked = None
+            loaded_llm = set()
+            llm_shards = {}
+
+        src = Path(path)
+        weights = (
+            iter_safetensors_file(src, device="cpu")
+            if src.is_file()
+            else iter_safetensors_shards(src, device="cpu")
+        )
+
+        for raw_key, tensor in weights:
+            key = raw_key
+            if policy_prefixed:
+                key = key.removeprefix(_POLICY_KEY_PREFIX)
+                if has_lm_head and key == _PALIGEMMA_EMBED_TOKENS:
+                    continue
+            if any(frag in key for frag in HF_DEFAULT_SKIP_FRAGMENTS):
+                continue
+
+            if vit is not None:
+                siglip_name = self._siglip_remap(key, tower_prefix)
+                if siglip_name is not None:
+                    if siglip_name in vit_params:
+                        dispatch_weight(vit_params[siglip_name], tensor)
+                        loaded_vit.add(siglip_name)
+                    continue
+
+            if match_stacked is not None:
+                llm_name = self._lerobot_remap(key)
+                if llm_name is None:
+                    continue
+                target, shard_id = match_stacked(llm_name)
+                if target in llm_params:
+                    dispatch_weight(llm_params[target], tensor, shard_id)
+                    loaded_llm.add(target)
+                    if shard_id is not None:
+                        llm_shards.setdefault(target, set()).add(shard_id)
+                elif is_quantized_part(target):
+                    raise UnservedQuantizationError(
+                        f"Pi05Model: checkpoint key {llm_name!r} is part of a quantized weight, "
+                        "and none of this model's parameters loads it."
+                    )
+
+        if vit is not None:
+            missing_vit = sorted(vit_params.keys() - loaded_vit)
+            if missing_vit:
+                raise KeyError(
+                    f"Pi0.5 SigLIP: {len(missing_vit)} parameters not in the checkpoint, "
+                    f"e.g. {missing_vit[:3]}"
+                )
+
+        if match_stacked is not None:
+            missing_llm = sorted(llm_params.keys() - loaded_llm)
+            missing_shards = sorted(
+                f"{target} shard {shard!r}"
+                for target, got in llm_shards.items()
+                for shard in {
+                    r.shard_id for r in LLAMA_STACKED_PARAMS if r.target_suffix in target
+                } - got
+            )
+            missing_all = missing_llm + missing_shards
+            if missing_all:
+                raise RuntimeError(
+                    f"Pi0.5 LLM/action_expert reload left {len(missing_all)} parameter(s) or "
+                    f"shard(s) unloaded, e.g. {missing_all[:5]}"
+                )

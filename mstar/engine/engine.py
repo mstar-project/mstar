@@ -1051,11 +1051,17 @@ class Engine:
         model, modules = self._reload_target()
 
         def storage() -> dict[str, tuple[int, tuple[int, ...], torch.dtype]]:
-            return {
+            out = {
                 f"{node}.{name}": (param.data_ptr(), tuple(param.shape), param.dtype)
                 for node, module in modules.items()
                 for name, param in module.named_parameters()
             }
+            for node, module in modules.items():
+                named_buffers = getattr(module, "named_buffers", None)
+                if named_buffers is not None:
+                    for name, buf in named_buffers():
+                        out[f"{node}.__buffer__.{name}"] = (buf.data_ptr(), tuple(buf.shape), buf.dtype)
+            return out
 
         accelerator = self._device is not None and self._device.type != "cpu"
         before = storage()
@@ -1074,7 +1080,7 @@ class Engine:
         if moved:
             raise RuntimeError(
                 f"{type(model).__name__}.reload_weights moved or resized {len(moved)} "
-                f"parameter(s), e.g. {moved[:3]}; compiled code and captured graphs "
+                f"parameter(s) or buffer(s), e.g. {moved[:3]}; compiled code and captured graphs "
                 "still point at the old storage"
             )
 

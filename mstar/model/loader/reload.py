@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable
+import logging
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,13 @@ from typing import Any
 from safetensors import safe_open
 
 from mstar.model.reload_errors import WeightReloadRefusedError
+
+logger = logging.getLogger(__name__)
+
+SpecNormalizer = Callable[
+    [dict[str, tuple[tuple[int, ...], str]]],
+    dict[str, tuple[tuple[int, ...], str]],
+]
 
 # A dtype change between these converts on copy; any other change is refused.
 _FLOAT_DTYPES = frozenset({"F64", "F32", "F16", "BF16"})
@@ -42,6 +50,7 @@ _IGNORED_KEYS = {
         "_name_or_path", "transformers_version", "torch_dtype", "dtype", "_commit_hash",
         "use_cache", "_attn_implementation", "attn_implementation",
         "output_attentions", "output_hidden_states", "return_dict", "torchscript",
+        "device",
     }),
     "tokenizer.json": frozenset({"truncation", "padding"}),
     "tokenizer_config.json": frozenset({
@@ -153,12 +162,38 @@ class CheckpointSnapshot:
     configs: dict[str, Any]
 
 
-def snapshot_checkpoint(path: str | Path, skip_fragments: Iterable[str] = ()) -> CheckpointSnapshot:
+def snapshot_checkpoint(
+    path: str | Path,
+    skip_fragments: Iterable[str] = (),
+    *,
+    normalize_specs: SpecNormalizer | None = None,
+) -> CheckpointSnapshot:
     """Describe the checkpoint at ``path`` for later ``check_reload_compatible``
     calls. Raises ``WeightReloadRefusedError`` if it cannot be read."""
+    specs = tensor_specs(path, skip_fragments)
+    if normalize_specs is not None:
+        specs = normalize_specs(specs)
     return CheckpointSnapshot(
-        path=str(path), specs=tensor_specs(path, skip_fragments), configs=_read_configs(Path(path)),
+        path=str(path), specs=specs, configs=_read_configs(Path(path)),
     )
+
+
+def snapshot_for_reload(
+    path: str | Path,
+    skip_fragments: Iterable[str] = (),
+    *,
+    normalize_specs: SpecNormalizer | None = None,
+    label: str = "Model",
+) -> CheckpointSnapshot | str:
+    """Take a ``CheckpointSnapshot`` at startup, or return why it could not be
+    read; serving goes on either way, only reloads are refused."""
+    try:
+        return snapshot_checkpoint(
+            path, skip_fragments=skip_fragments, normalize_specs=normalize_specs,
+        )
+    except WeightReloadRefusedError as exc:
+        logger.warning("%s: weight reload disabled, %s", label, exc)
+        return str(exc)
 
 
 def _config_mismatches(new: Path, reference: CheckpointSnapshot) -> list[str]:
@@ -178,7 +213,11 @@ def _config_mismatches(new: Path, reference: CheckpointSnapshot) -> list[str]:
 
 
 def check_reload_compatible(
-    new: str | Path, reference: CheckpointSnapshot | str | Path, skip_fragments: Iterable[str] = (),
+    new: str | Path,
+    reference: CheckpointSnapshot | str | Path,
+    skip_fragments: Iterable[str] = (),
+    *,
+    normalize_specs: SpecNormalizer | None = None,
 ) -> None:
     """Raise ``WeightReloadRefusedError`` unless ``new`` can be copied in place over
     the weights ``reference`` describes (the snapshot taken when they were
@@ -187,8 +226,12 @@ def check_reload_compatible(
     same configs where both ship them."""
     new = Path(new)
     if not isinstance(reference, CheckpointSnapshot):
-        reference = snapshot_checkpoint(reference, skip_fragments)
+        reference = snapshot_checkpoint(
+            reference, skip_fragments, normalize_specs=normalize_specs,
+        )
     new_specs = tensor_specs(new, skip_fragments)
+    if normalize_specs is not None:
+        new_specs = normalize_specs(new_specs)
     ref_specs = reference.specs
     problems = []
     missing = sorted(ref_specs.keys() - new_specs.keys())

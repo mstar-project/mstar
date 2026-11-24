@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Type
 
 import torch
@@ -50,6 +51,21 @@ from mstar.model.submodule_base import (
     chunk_tick_name,
 )
 from mstar.model.utils import TextChunkDetokenizer, TextOutput, drop_stop_tokens
+
+
+@dataclass(frozen=True, slots=True)
+class ReloadTarget:
+    """Declarative in-place weight reload registration for one or more nodes."""
+
+    nodes: tuple[str, ...]
+    snapshot: Any
+    apply_fn: Callable[[str, dict[str, torch.nn.Module]], None]
+    skip_fragments: tuple[str, ...] = ()
+    normalize_specs: Callable[
+        [dict[str, tuple[tuple[int, ...], str]]],
+        dict[str, tuple[tuple[int, ...], str]],
+    ] | None = None
+    label: str = "model"
 
 
 def _wrap_node_in_loop(
@@ -872,16 +888,112 @@ class Model(ABC):
         """
         return None
 
+    def _get_reload_targets(self) -> tuple[ReloadTarget, ...]:
+        """Opt-in reload targets declared by this model. Empty by default so
+        models without verified in-place weight reload refuse safely."""
+        return tuple(getattr(self, "_reload_targets", ()))
+
+    def _register_reload_target(
+        self,
+        nodes: str | Iterable[str],
+        checkpoint_dir: str | Path | None = None,
+        apply_fn: Callable[[str, dict[str, torch.nn.Module]], None] | None = None,
+        *,
+        snapshot: Any = None,
+        skip_fragments: Iterable[str] = (),
+        normalize_specs: Callable[
+            [dict[str, tuple[tuple[int, ...], str]]],
+            dict[str, tuple[tuple[int, ...], str]],
+        ] | None = None,
+        label: str | None = None,
+    ) -> ReloadTarget:
+        """Enroll one or more nodes for shared opt-in :meth:`reload_weights`."""
+        node_tuple = (nodes,) if isinstance(nodes, str) else tuple(nodes)
+        if not node_tuple:
+            raise ValueError("ReloadTarget requires at least one node name")
+        skip_tuple = tuple(skip_fragments)
+        target_label = label or type(self).__name__
+        if snapshot is None and checkpoint_dir is not None:
+            from mstar.model.loader.reload import snapshot_for_reload
+
+            snapshot = snapshot_for_reload(
+                checkpoint_dir,
+                skip_fragments=skip_tuple,
+                normalize_specs=normalize_specs,
+                label=target_label,
+            )
+        if apply_fn is None:
+            if len(node_tuple) != 1:
+                raise ValueError("apply_fn is required when registering multiple reload nodes")
+            node = node_tuple[0]
+
+            def _default_apply(path: str, submodules: dict[str, torch.nn.Module]) -> None:
+                from mstar.model.loader import load_weights
+
+                sub = submodules[node]
+                load_weights(getattr(sub, "model", sub), path, device="cpu")
+
+            apply_fn = _default_apply
+
+        target = ReloadTarget(
+            nodes=node_tuple,
+            snapshot=snapshot,
+            apply_fn=apply_fn,
+            skip_fragments=skip_tuple,
+            normalize_specs=normalize_specs,
+            label=target_label,
+        )
+        targets = getattr(self, "_reload_targets", None)
+        if targets is None:
+            targets = []
+            self._reload_targets = targets
+        targets.append(target)
+        return target
+
     def reload_weights(
         self, path: str, submodules: dict[str, torch.nn.Module], *, check_only: bool = False,
     ) -> None:
         """Copy compatible checkpoint weights into existing modules when supported.
 
-        A model opts in by overriding this method. The engine calls the check
-        before any copy and keeps module storage stable for captured graphs.
+        Models opt in via :meth:`_register_reload_target` or by overriding
+        :meth:`_get_reload_targets` (or overriding this method directly). The
+        engine calls ``check_only=True`` before any copy and keeps module
+        storage stable for captured graphs.
         """
-        del path, submodules, check_only
-        raise WeightReloadRefusedError(f"{type(self).__name__} does not support reloading weights in place")
+        get_targets = getattr(self, "_get_reload_targets", None)
+        targets = (
+            tuple(get_targets())
+            if get_targets is not None
+            else tuple(getattr(self, "_reload_targets", ()))
+        )
+        if not targets:
+            del path, submodules, check_only
+            raise WeightReloadRefusedError(f"{type(self).__name__} does not support reloading weights in place")
+
+        matching = [target for target in targets if any(node in submodules for node in target.nodes)]
+        if not matching:
+            return
+
+        from mstar.model.loader.reload import check_reload_compatible
+
+        for target in matching:
+            loaded = target.snapshot() if callable(target.snapshot) else target.snapshot
+            if loaded is None:
+                raise WeightReloadRefusedError(f"{target.label} was not loaded from a checkpoint directory")
+            if isinstance(loaded, str):
+                raise WeightReloadRefusedError(f"the loaded checkpoint could not be read at startup: {loaded}")
+            check_reload_compatible(
+                path,
+                loaded,
+                skip_fragments=target.skip_fragments,
+                normalize_specs=target.normalize_specs,
+            )
+
+        if check_only:
+            return
+
+        for target in matching:
+            target.apply_fn(path, submodules)
 
     def preprocess_fingerprint(self) -> str:
         """What this model's preprocessing contributes to the cache's root.

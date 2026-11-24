@@ -45,7 +45,7 @@ from mstar.engine.state import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import KVLabel, Model, PrefixKeys, ProcessPromptOutput, WalkStep
+from mstar.model.base import KVLabel, Model, PrefixKeys, ProcessPromptOutput, ReloadTarget, WalkStep
 from mstar.model.components.lora.modules import PER_SEGMENT, LoraRoot
 from mstar.model.keys import MIXED
 from mstar.model.orpheus.config import ATTN, KV_CACHE, SAMPLER, OrpheusModelConfig
@@ -118,13 +118,11 @@ def _snapshot_for_reload(local_dir: str) -> "CheckpointSnapshot | str":
     """The loaded checkpoint as a reload is checked against it, or why it could
     not be read; serving goes on either way, only reloads are refused."""
     from mstar.model.loader import HF_DEFAULT_SKIP_FRAGMENTS
-    from mstar.model.loader.reload import WeightReloadRefusedError, snapshot_checkpoint
+    from mstar.model.loader.reload import snapshot_for_reload
 
-    try:
-        return snapshot_checkpoint(local_dir, skip_fragments=HF_DEFAULT_SKIP_FRAGMENTS)
-    except WeightReloadRefusedError as exc:
-        logger.warning("Orpheus: weight reload disabled, %s", exc)
-        return str(exc)
+    return snapshot_for_reload(
+        local_dir, skip_fragments=HF_DEFAULT_SKIP_FRAGMENTS, label="Orpheus",
+    )
 
 
 class OrpheusModel(Model):
@@ -484,31 +482,26 @@ class OrpheusModel(Model):
 
         return OrpheusLLMSubmodule(language_model, self.config)
 
-    def reload_weights(
-        self, path: str, submodules: dict[str, torch.nn.Module], *, check_only: bool = False,
-    ) -> None:
+    def _get_reload_targets(self) -> tuple[ReloadTarget, ...]:
         """Reload the language model in place from an HF Llama checkpoint with
         the loaded one's tensor names and shapes. The SNAC decoder's weights come
         from their own repo and stay as they are."""
         from mstar.model.loader import HF_DEFAULT_SKIP_FRAGMENTS, load_weights
-        from mstar.model.loader.reload import WeightReloadRefusedError, check_reload_compatible
 
-        llm = submodules.get("LLM")
-        if llm is None:
-            return  # this rank hosts only the SNAC decoder
-        loaded = self._llm_checkpoint
-        if loaded is None:
-            # an LLM submodule handed in from outside get_submodule
-            raise WeightReloadRefusedError("the Orpheus LLM was not loaded from a checkpoint directory")
-        if isinstance(loaded, str):
-            raise WeightReloadRefusedError(f"the loaded checkpoint could not be read at startup: {loaded}")
-        check_reload_compatible(path, loaded, skip_fragments=HF_DEFAULT_SKIP_FRAGMENTS)
-        if check_only:
-            return
-        # Read on the host: the KV pool may leave no device room for a whole
-        # tensor. load_weights routes q/k/v and gate/up into the fused
-        # parameters through their weight_loaders, as the startup load does.
-        load_weights(llm.model, path, device="cpu")
+        return (
+            ReloadTarget(
+                nodes=("LLM",),
+                snapshot=lambda: self._llm_checkpoint,
+                # Read on the host: the KV pool may leave no device room for a whole
+                # tensor. load_weights routes q/k/v and gate/up into the fused
+                # parameters through their weight_loaders, as the startup load does.
+                apply_fn=lambda path, submodules: load_weights(
+                    submodules["LLM"].model, path, device="cpu",
+                ),
+                skip_fragments=HF_DEFAULT_SKIP_FRAGMENTS,
+                label="the Orpheus LLM",
+            ),
+        )
 
     def _create_snac_submodule(self, device: str) -> NodeSubmodule:
         from mstar.model.orpheus.components.snac import SNAC
