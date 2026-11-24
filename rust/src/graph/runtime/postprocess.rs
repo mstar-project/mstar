@@ -634,6 +634,13 @@ impl GraphRuntime {
         if !withheld.signals.is_empty() {
             pp.withheld = withheld;
         }
+        if let Some(p_sym) = self.interner.get(&pp.partition) {
+            for &rid in &dropped {
+                if let Some(info) = self.requests.get_mut(rid as usize).and_then(|r| r.as_mut()) {
+                    info.take_pending_partition_done(p_sym);
+                }
+            }
+        }
         pp.keep_rows(&dropped.into_iter().collect());
         self.pp_run(py, pp)
     }

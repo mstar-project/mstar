@@ -277,7 +277,11 @@ impl PassState {
     }
 
     fn is_node_finished(&self, g: &CompiledGraph, id: NodeId) -> bool {
-        self.nodes[id as usize].completed || self.is_node_loop_done(g, id)
+        if g.node(id).loop_id.is_some() {
+            self.is_node_loop_done(g, id)
+        } else {
+            self.nodes[id as usize].completed
+        }
     }
 
     fn refresh_ready(&mut self, g: &CompiledGraph, id: NodeId, in_flight: bool) {
@@ -702,6 +706,63 @@ impl RequestState {
         idx
     }
 
+    pub fn alloc_pass_idx(&mut self, walk: Sym) -> usize {
+        self.alloc_pass(walk)
+    }
+
+    pub fn pop_empty_pass_if_tail(&mut self, idx: usize) {
+        if idx + 1 == self.passes.len() && self.passes[idx].is_idle() {
+            if let Some(p) = self.passes.pop_back() {
+                if let Some(entry) = self.next_pass_by_walk.get_mut(&p.walk) {
+                    if *entry == p.walk_pass_id + 1 {
+                        *entry = p.walk_pass_id;
+                    }
+                }
+                self.is_done = self.passes.iter().any(|pass| pass.is_done);
+                self.refresh_summary_all();
+            }
+        }
+    }
+
+    pub fn pass_walk_id(&self, idx: usize) -> Option<(Sym, u32)> {
+        self.passes.get(idx).map(|p| (p.walk, p.walk_pass_id))
+    }
+
+    pub fn is_node_completed_in_pass(&self, idx: usize, node: NodeId) -> bool {
+        self.passes
+            .get(idx)
+            .is_some_and(|p| p.nodes[node as usize].completed)
+    }
+
+    pub fn has_loop_back_edge_in_pass(&self, idx: usize, source: NodeId, dest: NodeId) -> bool {
+        let Some(p) = self.passes.get(idx) else {
+            return false;
+        };
+        if !p.shares_active_loop(&self.graph, source, dest) {
+            return false;
+        }
+        let dest_name = self.graph.node(dest).name;
+        let mut cur = self.graph.node(source).loop_id;
+        while let Some(lid) = cur {
+            let ls = self.graph.lp(lid);
+            if !p.loops[lid as usize].done
+                && self
+                    .graph
+                    .node(source)
+                    .outputs
+                    .iter()
+                    .any(|e| {
+                        matches!(e.dest, Dest::Local(d) if d == dest)
+                            && ls.loop_back.contains(&(e.name, dest_name))
+                    })
+            {
+                return true;
+            }
+            cur = ls.parent;
+        }
+        false
+    }
+
     /// Index of the oldest `PassState` in which `node` is not yet finished
     /// (FIFO pass ordering invariant per node).
     pub fn active_pass_idx(&self, node: NodeId) -> Option<usize> {
@@ -838,7 +899,8 @@ impl RequestState {
                     if spec.only_streaming && g.n_root_entities() > 1 && idx >= 2 {
                         return false;
                     }
-                    if self.passes[idx].nodes[node as usize].cur.has(slot) {
+                    let st = &self.passes[idx].nodes[node as usize];
+                    if st.cur.has(slot) || st.completed {
                         return false;
                     }
                     idx
@@ -867,13 +929,14 @@ impl RequestState {
             } else {
                 match self.active_pass_idx(node) {
                     Some(idx) => {
-                        let p = &self.passes[idx];
-                        if !p.nodes[node as usize].cur.has(slot) {
+                        let st = &self.passes[idx].nodes[node as usize];
+                        if !st.cur.has(slot) && !st.completed {
                             (idx, false)
                         } else {
                             let next_free = ((idx + 1)..self.passes.len()).find(|&j| {
                                 !self.passes[j].is_node_finished(g, node)
                                     && !self.passes[j].nodes[node as usize].cur.has(slot)
+                                    && !self.passes[j].nodes[node as usize].completed
                             });
                             let j = next_free.unwrap_or_else(|| self.alloc_pass(walk));
                             (j, false)
@@ -955,6 +1018,86 @@ impl RequestState {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest_into_pass(
+        &mut self,
+        g: &CompiledGraph,
+        idx: usize,
+        node: NodeId,
+        slot: u8,
+        tensors: &[TensorRef],
+        to_next: bool,
+        final_chunk: bool,
+    ) -> bool {
+        if idx >= self.passes.len() {
+            return false;
+        }
+        let spec = g.node(node);
+        if self.passes[idx].is_node_loop_done(g, node)
+            || (spec.loop_id.is_none() && self.passes[idx].nodes[node as usize].completed)
+        {
+            return false;
+        }
+        let name = spec.inputs[slot as usize];
+        let in_flight = self.in_flight[node as usize];
+        let pass = &mut self.passes[idx];
+        let st = &mut pass.nodes[node as usize];
+        if to_next {
+            if st.next.has(slot) {
+                return false;
+            }
+            st.next.set(slot, tensors.to_vec(), final_chunk);
+        } else {
+            if st.cur.has(slot) || st.completed {
+                return false;
+            }
+            st.cur.set(slot, tensors.to_vec(), final_chunk);
+            pass.record_external(g, node, name, tensors);
+        }
+        pass.refresh_ready(g, node, in_flight);
+        pass.note_ingested_for_streaming(g, node, in_flight);
+        self.refresh_summary_node(node);
+        true
+    }
+
+    pub fn remove_input_by_pass_id(
+        &mut self,
+        walk: Sym,
+        walk_pass_id: u32,
+        node: NodeId,
+        slot: u8,
+        from_next: bool,
+    ) -> Option<Vec<TensorRef>> {
+        let idx = self
+            .passes
+            .iter()
+            .position(|p| p.walk == walk && p.walk_pass_id == walk_pass_id)?;
+        self.remove_input_at_pass(idx, node, slot, from_next)
+    }
+
+    fn remove_input_at_pass(
+        &mut self,
+        idx: usize,
+        node: NodeId,
+        slot: u8,
+        from_next: bool,
+    ) -> Option<Vec<TensorRef>> {
+        let in_flight = self.in_flight[node as usize];
+        let pass = self.passes.get_mut(idx)?;
+        let st = &mut pass.nodes[node as usize];
+        let t = if from_next {
+            st.next.take(slot)
+        } else {
+            st.cur.take(slot)
+        };
+        pass.refresh_ready(&self.graph, node, in_flight);
+        if !from_next {
+            pass.note_ingested_for_streaming(&self.graph, node, in_flight);
+        }
+        self.refresh_summary_node(node);
+        t
+    }
+
     /// Python's `ReadySignals.remove` — speculation rollback. No dereference.
     pub fn remove_input(
         &mut self,
@@ -963,20 +1106,10 @@ impl RequestState {
         from_next: bool,
     ) -> Option<Vec<TensorRef>> {
         let idx = self.active_pass_idx(node)?;
-        let in_flight = self.in_flight[node as usize];
-        let t = {
-            let pass = &mut self.passes[idx];
-            let st = &mut pass.nodes[node as usize];
-            let t = if from_next {
-                st.next.take(slot)
-            } else {
-                st.cur.take(slot)
-            };
-            pass.refresh_ready(&self.graph, node, in_flight);
-            t
-        };
-        self.refresh_summary_node(node);
-        t
+        if from_next && self.graph.node(node).loop_id.is_none() {
+            return self.remove_input_at_pass(idx + 1, node, slot, false);
+        }
+        self.remove_input_at_pass(idx, node, slot, from_next)
     }
 
     /// Whether a slot is already filled, for inferring which slot an ingest
@@ -1373,7 +1506,14 @@ impl RequestState {
 
         dests
             .into_iter()
-            .filter(|&d| self.ready_for_speculation_in_pass(Some(src_pass), d, d == source, true))
+            .filter(|&d| {
+                self.ready_for_speculation_in_pass(
+                    Some(src_pass),
+                    d,
+                    d == source || next_iter.contains(&d),
+                    true,
+                )
+            })
             .map(|d| SpecNode {
                 node: d,
                 is_new_loop_iter: next_iter.contains(&d),
@@ -2005,5 +2145,67 @@ mod tests {
         assert!(st.ingest(&g, top, 1, &[t(3)], true, false));
         assert!(!st.ready_for_speculation(top, true, false));
         assert_eq!(st.input_tensors(top, true).len(), 1);
+    }
+
+    #[test]
+    fn two_node_streaming_loop_does_not_leak_iter1_chunk_into_pass1() {
+        let mut it = StrToId::default();
+        let nodes = vec![
+            node("vocoder", &["codes"], &["codes"], vec![edge("mid", "inner_post")]),
+            node("inner_post", &["mid"], &[], vec![]),
+        ];
+        let loops = vec![LoopArg {
+            name: "L".into(),
+            max_iters: 2,
+            parent: None,
+            member_nodes: vec!["vocoder".into(), "inner_post".into()],
+            outputs: vec![],
+            accumulated: vec![],
+            loop_back: vec![],
+            external_inputs: vec![],
+        }];
+        let g = compile_one(&mut it, &nodes, &loops).unwrap();
+        let (vocoder, inner_post) = (0, 1);
+        let mut st = RequestState::new(g.clone());
+
+        assert!(st.is_ready_for_streaming(vocoder));
+        assert!(st.ingest(&g, vocoder, 0, &[t(1)], false, false));
+        st.clear_consumed_inputs(&g, vocoder);
+        let c0 = st.complete(&g, vocoder, &[vec![t(10)]]);
+        assert!(st.ingest_in_pass(&g, c0.pass_walk, c0.walk_pass_id, inner_post, 0, &c0.edges[0].tensors, true, false));
+
+        // While inner_post has not completed iter 0, vocoder has already run iter 0
+        // and must NOT accept chunk 2 into a phantom Pass 1.
+        assert!(!st.is_ready_for_streaming(vocoder));
+        assert!(!st.ingest(&g, vocoder, 0, &[t(2)], false, true));
+        assert_eq!(st.passes.len(), 1);
+
+        // Once inner_post completes iter 0, Pass 0 advances to iter 1 and accepts chunk 2.
+        st.clear_consumed_inputs(&g, inner_post);
+        st.complete(&g, inner_post, &[]);
+        assert_eq!(st.loop_iter(0), 1);
+        assert!(st.is_ready_for_streaming(vocoder));
+        assert!(st.ingest(&g, vocoder, 0, &[t(2)], false, true));
+        assert!(st.is_ready(vocoder));
+        assert_eq!(st.passes.len(), 1);
+    }
+
+    #[test]
+    fn remove_input_from_next_removes_pass1_cur_for_root_node() {
+        let mut it = StrToId::default();
+        let nodes = vec![node("top", &["x"], &[], vec![])];
+        let g = compile_one(&mut it, &nodes, &[]).unwrap();
+        let top = 0;
+        let mut st = RequestState::new(g.clone());
+
+        assert!(st.ingest(&g, top, 0, &[t(1)], true, false));
+        assert!(st.ingest(&g, top, 0, &[t(2)], true, false));
+        assert!(st.has_input(top, 0, false));
+        assert!(st.has_input(top, 0, true));
+
+        let removed = st.remove_input(top, 0, true).unwrap();
+        assert_eq!(removed.iter().map(|x| x.uuid).collect::<Vec<_>>(), vec![2]);
+        assert!(!st.has_input(top, 0, true));
+        assert!(st.has_input(top, 0, false), "Pass 0 must remain intact");
     }
 }

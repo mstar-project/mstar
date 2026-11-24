@@ -962,6 +962,10 @@ class GraphRuntime(PhasedPostprocess, ABC):
         pass
 
     @abstractmethod
+    def get_walk(self, rid: int, partition: str) -> str | None:
+        pass
+
+    @abstractmethod
     def set_walk(self, rid: int, partition: str, walk: str):
         pass
 

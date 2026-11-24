@@ -1380,3 +1380,156 @@ def test_pipelined_colocated_wgs_scope_partition_done_and_carry_pass_ids(tmp_pat
         ([1], [0], False, ME),
         ([1], [1], True, ME),
     ]
+
+
+def test_phased_postprocess_mark_partition_done_after_complete_and_route(tmp_path):
+    """PhasedPostprocess calls complete_and_route_batch -> mark_partition_done ->
+    send_outputs; mark_partition_done must attach partition_done to that parked
+    completion instead of dropping it from Pass 1 and leaking onto Pass 0."""
+    book = RustTensorBookkeeping()
+    comm = ZmqCommunicator(ME, str(tmp_path))
+    conductor = ZmqCommunicator("conductor", str(tmp_path))
+    wgs = [
+        {
+            "wg_id": 0, "graph_walks": ["chunk"],
+            "nodes": [{
+                "name": "vocoder", "async_enabled": False,
+                "inputs": ["codes"], "streaming_inputs": ["codes"],
+                "outputs": [{
+                    "name": "wave", "dest": "post", "persist": False,
+                    "new_token": False, "streaming": False, "modality": "",
+                }],
+            }],
+            "loops": [],
+        },
+        {
+            "wg_id": 1, "graph_walks": ["chunk"],
+            "nodes": [{
+                "name": "post", "async_enabled": False,
+                "inputs": ["wave"], "streaming_inputs": [],
+                "outputs": [{
+                    "name": "audio", "dest": "emit_to_client", "persist": False,
+                    "new_token": False, "streaming": False, "modality": "audio",
+                }],
+            }],
+            "loops": [],
+        },
+    ]
+    rt = GraphRuntime(
+        worker_graphs=wgs, remote_worker_graphs=[],
+        sharding={"groups": [], "shard_dim": [], "tp_enabled_nodes": []},
+        bookkeeping=book._rust, me=ME, communicator=comm,
+    )
+    rid = rt.add_request(
+        "r1", "C", "chunk", [0, 1], [0, 1], [ME, ME], [1, 1], [], [],
+    )
+    fwd = CurrentForwardPassInfo(
+        request_id="r1", graph_walk="chunk", fwd_index=0, random_seed=0,
+        max_tokens=8, partition_name="C",
+    )
+    info = encode_field(fwd, CurrentForwardPassInfo)
+
+    def _run(node, sig, uuid_in, uuid_out, final=False):
+        if uuid_in is not None:
+            book.put_tensor(uuid_in, _info(uuid_in))
+            book.increment_ref(uuid_in, 1)
+            blk = ColumnarEdgeSpecs.empty()
+            blk.add(rid, "codes", [uuid_in], final, next_node=node)
+            assert rt.ingest_inputs_batch(blk, False, True) == []
+        popped = rt.pop_rids(node, "chunk", [rid], True)
+        assert popped is not None
+        book.put_tensor(uuid_out, _info(uuid_out))
+        book.increment_ref(uuid_out, 1)
+        route = rt.complete_and_route_batch({
+            "partition": "C", "graph_walk": "chunk", "node_name": node,
+            "output_signals": [sig], "rids": [rid],
+            "tensors": [uuid_out], "num_tensors": [1],
+            "walks": None, "rid_walk_idx": None,
+        })
+        if final:
+            rt.mark_partition_done(rid, "C")
+        _send(rt, route.completion_id, request_infos=[(rid, info)])
+
+    _run("vocoder", "wave", 100, 101, final=False)
+    _run("vocoder", "wave", 102, 103, final=True)
+    _run("post", "audio", None, 201, final=False)
+    _run("post", "audio", None, 202, final=False)
+
+    wgds = [m.body for m in _collect(conductor) if isinstance(m.body, WorkerGraphsDone)]
+    assert [
+        (w.worker_graph_ids, w.pass_ids, w.partition_done, w.worker_id)
+        for w in wgds
+    ] == [
+        ([0], [0], False, ME),
+        ([0], [1], True, ME),
+        ([1], [0], False, ME),
+        ([1], [1], True, ME),
+    ]
+
+
+def test_dropped_row_in_resume_postprocess_stops_does_not_leak_partition_done(tmp_path):
+    """If mark_partition_done is called while parked at PostprocessNeed.STOPS and
+    the rid is dropped in resume_postprocess_stops, pending_partition_done must
+    be cleared so a subsequent pass does not falsely report partition_done=True."""
+    book = RustTensorBookkeeping()
+    comm = ZmqCommunicator(ME, str(tmp_path))
+    conductor = ZmqCommunicator("conductor", str(tmp_path))
+    wgs = [{
+        "wg_id": 0, "graph_walks": ["w"],
+        "nodes": [{
+            "name": "dec", "async_enabled": False,
+            "inputs": ["x"], "streaming_inputs": [],
+            "outputs": [{"name": "x", "dest": "dec", "persist": False,
+                         "new_token": False, "streaming": False, "modality": ""}],
+        }],
+        "loops": [{
+            "name": "L", "max_iters": 2, "parent": None,
+            "member_nodes": ["dec"], "outputs": [], "accumulated": [],
+            "loop_back": [("x", "dec")], "external_inputs": [],
+        }],
+    }]
+    rt = GraphRuntime(
+        worker_graphs=wgs, remote_worker_graphs=[],
+        sharding={"groups": [], "shard_dim": [], "tp_enabled_nodes": []},
+        bookkeeping=book._rust, me=ME, communicator=comm,
+    )
+    rid = rt.add_request("r1", "P", "w", [0], [0], [ME], [1], ["L"], [2])
+    fwd = CurrentForwardPassInfo(
+        request_id="r1", graph_walk="w", fwd_index=0, random_seed=0,
+        max_tokens=8, partition_name="P",
+    )
+    info = encode_field(fwd, CurrentForwardPassInfo)
+
+    blk = ColumnarEdgeSpecs.empty()
+    blk.add(rid, "x", [], False, next_node="dec")
+    assert rt.ingest_inputs_batch(blk) == []
+    assert rt.pop_rids("dec", "w", [rid], True) is not None
+
+    step = rt.begin_postprocess(
+        "P", "dec", "w", ["x"], [rid], None, None,
+        [], [], True, 0, 0, 0, "int64", [],
+        [], 0, 0, 0, "int64", [], True, None, 1,
+    )
+    assert step.need == 1  # STOPS
+    rt.mark_partition_done(rid, "P")
+    step = rt.resume_postprocess_stops([rid], [["L"]], [rid])
+    assert step.need == 0  # DONE (all rows dropped)
+
+    # Next completion on the same rid (without mark_partition_done) must report partition_done=False.
+    route0 = rt.complete_and_route_batch({
+        "partition": "P", "graph_walk": "w", "node_name": "dec",
+        "output_signals": ["x"], "rids": [rid],
+        "tensors": [], "num_tensors": [0],
+        "walks": None, "rid_walk_idx": None,
+    })
+    _send(rt, route0.completion_id, request_infos=[(rid, info)])
+    route1 = rt.complete_and_route_batch({
+        "partition": "P", "graph_walk": "w", "node_name": "dec",
+        "output_signals": ["x"], "rids": [rid],
+        "tensors": [], "num_tensors": [0],
+        "walks": None, "rid_walk_idx": None,
+    })
+    _send(rt, route1.completion_id, request_infos=[(rid, info)])
+
+    wgds = [m.body for m in _collect(conductor) if isinstance(m.body, WorkerGraphsDone)]
+    assert [(w.pass_ids, w.partition_done) for w in wgds] == [([0], False)]

@@ -172,10 +172,10 @@ pub struct GraphRuntime {
     completions: FxHashMap<u64, Completion>,
     completion_counter: u64,
     /// Streaming ingests a prep staged, parked until commit_speculation
-    /// settles them: spec_id -> (wg, [(rid, spec node, [(slot, from_next)])]).
+    /// settles them: spec_id -> (wg, [(rid, spec node, [(slot, from_next, walk, walk_pass_id)])]).
     /// The wg rides along because the undo needs the same (wg, rid) pair the
     /// prep used to reach the walk state.
-    staged_specs: FxHashMap<u32, (WgIndex, Vec<(u32, NodeId, Vec<(u8, bool)>)>)>,
+    staged_specs: FxHashMap<u32, (WgIndex, Vec<(u32, NodeId, Vec<(u8, bool, Sym, u32)>)>)>,
     spec_counter: u32,
     /// (node, real walk) -> the combined walk the scheduler batches it under;
     /// a ready-scan target or exclusion may name either.
@@ -684,7 +684,7 @@ pub struct GraphRuntime {
 
         let mut out = SpecPrepOut::default();
         let mut cols = EdgeColumns::default();
-        let mut undo: Vec<(u32, NodeId, Vec<(u8, bool)>)> = Vec::new();
+        let mut undo: Vec<(u32, NodeId, Vec<(u8, bool, Sym, u32)>)> = Vec::new();
         let mut cursor = 0usize;
         // The source's outputs as speculation feeds them: structure only, the
         // same for every rid, so built once for the batch.
@@ -751,7 +751,7 @@ pub struct GraphRuntime {
     /// Park what a prep ingested, for `commit_speculation` to settle. 0 when
     /// nothing was ingested: no stage to undo, so nothing to settle.
     fn stage_spec(
-        &mut self, wg: WgIndex, undo: Vec<(u32, NodeId, Vec<(u8, bool)>)>,
+        &mut self, wg: WgIndex, undo: Vec<(u32, NodeId, Vec<(u8, bool, Sym, u32)>)>,
     ) -> u32 {
         let staged: Vec<_> =
             undo.into_iter().filter(|(_, _, s)| !s.is_empty()).collect();
@@ -826,7 +826,7 @@ pub struct GraphRuntime {
         base_idx: usize,
         // `spec_source_edges(wg, curr_node)`, built once by the caller
         source_edges: &[RoutedEdge],
-    ) -> Option<(Vec<usize>, Vec<(Sym, Vec<u64>, bool)>, Vec<(u8, bool)>)> {
+    ) -> Option<(Vec<usize>, Vec<(Sym, Vec<u64>, bool)>, Vec<(u8, bool, Sym, u32)>)> {
         let g = self.graphs[wg as usize].clone();
         let resolved: Vec<(usize, u8, &[TensorRef], bool)> = edges
             .iter()
@@ -860,6 +860,40 @@ pub struct GraphRuntime {
                 }
             }
         }
+        let is_loop_member = g.node(spec_node).loop_id.is_some();
+        let next_iter = match curr_pass {
+            Some(cp) => {
+                if same_node {
+                    true
+                } else {
+                    is_loop_member
+                        && (state.is_node_completed_in_pass(cp, spec_node)
+                            || state.has_loop_back_edge_in_pass(cp, curr_node, spec_node))
+                }
+            }
+            None => false,
+        };
+        let (target_pass, to_next, allocated_pass) = match curr_pass {
+            Some(cp) if next_iter && is_loop_member => (Some(cp), true, false),
+            Some(cp) if next_iter => {
+                if resolved.is_empty() {
+                    (None, false, false)
+                } else if state.pass_walk_id(cp + 1).is_some() {
+                    (Some(cp + 1), false, false)
+                } else {
+                    (Some(state.alloc_pass_idx(walk)), false, true)
+                }
+            }
+            Some(cp) => (Some(cp), false, false),
+            None => {
+                if resolved.is_empty() {
+                    (None, false, false)
+                } else {
+                    (Some(state.alloc_pass_idx(walk)), false, true)
+                }
+            }
+        };
+
         // Held true across the ingest so a streaming input cannot re-add the
         // node to the ready queue underneath us. Saved rather than assumed
         // false: the node may already be in flight from a committed batch, and
@@ -867,36 +901,47 @@ pub struct GraphRuntime {
         let was_in_flight = state.is_in_flight(spec_node);
         state.set_in_flight(spec_node, true);
 
-        // ingest reports success without saying WHICH slot it used, so the
-        // slot is inferred by peeking first -- the rollback removes from the
-        // two separately.
         let mut kept = Vec::new();
         let mut ingested = Vec::new();
-        for (idx, slot, tensors, final_chunk) in resolved {
-            let already = state.has_input(spec_node, slot, false);
-            if state.ingest_for_walk(&g, spec_node, slot, tensors, same_node, final_chunk, walk)
-            {
-                kept.push(idx);
-                ingested.push((slot, already));
+        if let Some(tp) = target_pass {
+            if let Some((pw, wpi)) = state.pass_walk_id(tp) {
+                for (idx, slot, tensors, final_chunk) in resolved {
+                    if state.ingest_into_pass(&g, tp, spec_node, slot, tensors, to_next, final_chunk)
+                    {
+                        kept.push(idx);
+                        ingested.push((slot, to_next, pw, wpi));
+                    }
+                }
             }
         }
 
         let spec_nodes = state.ingest_for_speculation(&g, curr_node, source_edges);
-        let target_pass = curr_pass.or_else(|| state.active_pass_idx(spec_node));
-        let ready = match target_pass {
-            Some(tp) => state.ready_for_speculation_in_pass(Some(tp), spec_node, same_node, false),
-            None => {
-                g.node(spec_node).streaming_mask == 0
-                    && spec_nodes.iter().any(|sn| sn.node == spec_node)
-            }
+        let ready = match curr_pass {
+            Some(cp) => state.ready_for_speculation_in_pass(Some(cp), spec_node, next_iter, false),
+            None => match target_pass {
+                Some(tp) => {
+                    state.ready_for_speculation_in_pass(Some(tp), spec_node, false, false)
+                        && (g.node(spec_node).streaming_mask == g.node(spec_node).full_mask
+                            || spec_nodes.iter().any(|sn| sn.node == spec_node))
+                }
+                None => {
+                    g.node(spec_node).streaming_mask == 0
+                        && spec_nodes.iter().any(|sn| sn.node == spec_node)
+                }
+            },
         };
         state.clear_speculative_inputs();
         // Restore, not force-false: the node may still be in flight.
         state.set_in_flight(spec_node, was_in_flight);
 
         if !ready {
-            for &(slot, from_next) in &ingested {
-                state.remove_input(spec_node, slot, from_next);
+            for &(slot, from_next, pw, wpi) in &ingested {
+                state.remove_input_by_pass_id(pw, wpi, spec_node, slot, from_next);
+            }
+            if allocated_pass {
+                if let Some(tp) = target_pass {
+                    state.pop_empty_pass_if_tail(tp);
+                }
             }
             return None;
         }
@@ -904,9 +949,10 @@ pub struct GraphRuntime {
         // Interned names, resolved once per DISTINCT name when the caller
         // folds these into its columns -- not a String per edge, and no
         // `next_node` at all.
-        let edges_out = match target_pass {
-            Some(tp) => state
-                .input_tensors_in_pass(tp, spec_node, same_node)
+        let read_pass = curr_pass.or(target_pass);
+        let edges_out = match read_pass {
+            Some(rp) => state
+                .input_tensors_in_pass(rp, spec_node, next_iter)
                 .into_iter()
                 .map(|(name, tensors, final_chunk)| {
                     (name, tensors.iter().map(|t| t.uuid).collect(), final_chunk)
@@ -918,11 +964,11 @@ pub struct GraphRuntime {
     }
 
     fn undo_spec_ingest(
-        &mut self, wg: WgIndex, rid: u32, node: NodeId, slots: &[(u8, bool)],
+        &mut self, wg: WgIndex, rid: u32, node: NodeId, slots: &[(u8, bool, Sym, u32)],
     ) {
         if let Some(state) = self.state_mut(wg, rid) {
-            for &(slot, from_next) in slots {
-                state.remove_input(node, slot, from_next);
+            for &(slot, from_next, walk, walk_pass_id) in slots {
+                state.remove_input_by_pass_id(walk, walk_pass_id, node, slot, from_next);
             }
         }
     }
@@ -1992,19 +2038,29 @@ impl GraphRuntime {
 
     fn mark_partition_done(&mut self, rid: u32, partition: &str) {
         let Some(p) = self.interner.get(partition) else { return };
-        if let Some(pp) = &self.postprocess {
+        let step_pass = if let Some(pp) = &self.postprocess {
             if pp.partition == partition && pp.completion_id != 0 {
-                if let Some(step_pass) = self
-                    .completions
+                self.completions
                     .get(&pp.completion_id)
                     .and_then(|c| c.completed_step_pass.get(&rid).copied())
-                {
-                    if let Some(info) = self.requests.get_mut(rid as usize).and_then(|r| r.as_mut()) {
-                        info.mark_partition_done_pass(p, step_pass.0, step_pass.1);
-                    }
-                    return;
-                }
+            } else {
+                None
             }
+        } else {
+            self.completions
+                .iter()
+                .filter(|(_, c)| c.partition == partition)
+                .filter_map(|(&id, c)| {
+                    c.completed_step_pass.get(&rid).copied().map(|sp| (id, sp))
+                })
+                .max_by_key(|&(id, _)| id)
+                .map(|(_, sp)| sp)
+        };
+        if let Some(step_pass) = step_pass {
+            if let Some(info) = self.requests.get_mut(rid as usize).and_then(|r| r.as_mut()) {
+                info.mark_partition_done_pass(p, step_pass.0, step_pass.1);
+            }
+            return;
         }
         if let Some(info) = self.requests.get_mut(rid as usize).and_then(|r| r.as_mut()) {
             info.mark_partition_done_pending(p);
@@ -3404,7 +3460,7 @@ impl GraphRuntime {
                                     Some(
                                         workers
                                             .iter()
-                                            .filter(|&&x| !(mine && x == me_sym))
+                                            .filter(|&&x| !(mine && x == me_sym && !e.declined_local))
                                             .count(),
                                     )
                                 }

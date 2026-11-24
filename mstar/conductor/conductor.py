@@ -2078,6 +2078,14 @@ class Conductor:
             and body.graph_walk
             and not pstate.ready_passes
             and body.graph_walk != pstate.graph_walk
+            and not any(
+                pstate.wg_pass_ranks.get((wg_id, pstate.wg_queued_pass.get(wg_id, 0)))
+                or (
+                    pstate.wg_pass_walk.get((wg_id, pstate.wg_queued_pass.get(wg_id, 0)))
+                    == pstate.graph_walk
+                )
+                for wg_id in pstate.current_worker_graph_ids
+            )
             and any(
                 wg_pass == pstate.wg_queued_pass.get(wg_id, 0)
                 for wg_id, wg_pass in zip(body.worker_graph_ids, pass_ids, strict=True)
@@ -2094,20 +2102,41 @@ class Conductor:
         queued_walk = pstate.queued_walk or pstate.graph_walk
         while True:
             if partition_name in self.producer_triggered_partitions:
-                if pstate.ready_passes:
-                    candidate_wgs = [
-                        *pstate.current_worker_graph_ids,
-                        *(w for w in request_data.all_worker_graph_ids if w not in pstate.current_worker_graph_ids),
-                    ]
+                if queued_walk and queued_walk != pstate.graph_walk and hasattr(self, "worker_graphs"):
+                    current_wgs = {
+                        wg_id for wg_id in request_data.all_worker_graph_ids
+                        if queued_walk in self.worker_graphs[wg_id].graph_walks
+                    }
                 else:
-                    candidate_wgs = pstate.current_worker_graph_ids or request_data.all_worker_graph_ids
-                for wg_id in candidate_wgs:
-                    qpass = pstate.wg_queued_pass.get(wg_id, 0)
-                    walk_here = pstate.wg_pass_walk.get((wg_id, qpass))
-                    if walk_here and walk_here != queued_walk:
-                        queued_walk = walk_here
-                        pstate.queued_walk = queued_walk
-                        break
+                    current_wgs = set(pstate.current_worker_graph_ids)
+                has_conflict = any(
+                    pstate.wg_pass_walk.get((wg_id, pstate.wg_queued_pass.get(wg_id, 0)))
+                    not in (None, queued_walk)
+                    for wg_id in current_wgs
+                )
+                has_current_progress = (not has_conflict) and any(
+                    (
+                        pstate.wg_pass_walk.get((wg_id, pstate.wg_queued_pass.get(wg_id, 0)))
+                        == queued_walk
+                        or (
+                            bool(pstate.wg_pass_ranks.get((wg_id, pstate.wg_queued_pass.get(wg_id, 0))))
+                            and pstate.wg_pass_walk.get((wg_id, pstate.wg_queued_pass.get(wg_id, 0)))
+                            in (None, queued_walk)
+                        )
+                    )
+                    for wg_id in current_wgs
+                )
+                if not has_current_progress:
+                    candidate_wgs = [
+                        *sorted(current_wgs),
+                        *sorted(w for w in request_data.all_worker_graph_ids if w not in current_wgs),
+                    ]
+                    for wg_id in candidate_wgs:
+                        qpass = pstate.wg_queued_pass.get(wg_id, 0)
+                        walk_here = pstate.wg_pass_walk.get((wg_id, qpass))
+                        if walk_here and walk_here != queued_walk:
+                            queued_walk = walk_here
+                            break
                 if queued_walk and queued_walk != pstate.graph_walk and hasattr(self, "worker_graphs"):
                     required_wgs = {
                         wg_id for wg_id in request_data.all_worker_graph_ids
@@ -2124,6 +2153,11 @@ class Conductor:
                 self._wg_pass_complete(
                     request_data, pstate, wg_id, pstate.wg_queued_pass.get(wg_id, 0),
                 )
+                and (
+                    not queued_walk
+                    or pstate.wg_pass_walk.get((wg_id, pstate.wg_queued_pass.get(wg_id, 0)))
+                    in (None, queued_walk)
+                )
                 for wg_id in required_wgs
             ):
                 break
@@ -2135,6 +2169,9 @@ class Conductor:
                 queued_walk,
             )
             pstate.ready_passes.append((pass_walk, pass_done, keys))
+            if pass_walk:
+                queued_walk = pass_walk
+                pstate.queued_walk = pass_walk
             for wg_id, qpass in keys:
                 pstate.wg_queued_pass[wg_id] = qpass + 1
             done_partitions.append(partition_name)

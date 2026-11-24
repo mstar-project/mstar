@@ -1405,3 +1405,305 @@ def _info_with_uuid(u):
         dims=[1], dtype=None, nbytes=4, address=0, stride=[1],
         uuid=u, source_session_id="s", source_entity="worker_0",
     )
+
+
+def _make_ingest_for_walk_tests(walks_to_sections, node_to_partition, tmp_path=None):
+    from mstar.communication.event import EventWakeup
+    from mstar.communication.tensor_store import RustTensorBookkeeping
+    from mstar.graph.runtime.rust import RustGraphRuntime
+    from mstar.worker.input_ingest import InputIngest
+    from mstar.worker.request_lifecycle import RequestLifecycle
+    from mstar.worker.services import WorkerLayout
+    from mstar.worker.stream_buffers import StreamBufferManager
+
+    worker_graphs = []
+    all_wg_walks = {}
+    all_wg_loops = {}
+    all_wg_nodes = {}
+    for wg_id, (walk, section) in enumerate(walks_to_sections):
+        nodes = set(section.get_nodes())
+        loops = set(section.get_loops())
+        worker_graphs.append(WorkerGraph(
+            section=section, graph_walks={walk}, ranks=[0], worker_graph_id=wg_id,
+        ))
+        all_wg_walks[wg_id] = {walk}
+        all_wg_loops[wg_id] = loops
+        all_wg_nodes[wg_id] = nodes
+
+    book = RustTensorBookkeeping()
+    runtime = RustGraphRuntime(
+        my_worker_id="worker_0",
+        my_worker_graphs=worker_graphs,
+        all_wg_ids_to_graph_walks=all_wg_walks,
+        all_wg_ids_to_dyn_loops=all_wg_loops,
+        all_wg_ids_to_nodes=all_wg_nodes,
+        node_to_partition=node_to_partition,
+        sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
+        bookkeeping=book,
+    )
+    req_state = RequestStateManager(node_to_partition=node_to_partition)
+    ready_batches = {}
+    started_reads = []
+
+    def _start_read(rid, edges, graph_walk=None):
+        started_reads.append((rid, graph_walk, [e.name for e in edges]))
+        return []
+
+    tensor_stub = SimpleNamespace(
+        get_ready_tensors=lambda: ready_batches.pop("next", {}),
+        take_failed_reads=lambda: [],
+        start_read_tensors=_start_read,
+        ack_unread_tensors=lambda edges: None,
+        bookkeeping=book,
+        register_request=lambda rid, cfg: None,
+    )
+    streams = StreamBufferManager(
+        request_state=req_state, tensor_manager=tensor_stub, connections=[], graph_runtime=runtime,
+    )
+    layout = WorkerLayout(node_to_partition=node_to_partition)
+    lifecycle = RequestLifecycle(layout, runtime)
+    services = SimpleNamespace(
+        worker_id="worker_0", graph_runtime=runtime, engine_manager=None,
+        tensor_manager=tensor_stub, request_state=req_state, streams=streams,
+        communicator=None,
+    )
+    lockstep = SimpleNamespace(
+        note_reads=lambda r: None,
+        record_read_failures=lambda f: None,
+        enqueue_follow=lambda *a, **k: None,
+        enqueue_no_spec=lambda *a, **k: None,
+        last_consumed_seq=0,
+    )
+    ingest = InputIngest(services, layout, lifecycle, lockstep, EventWakeup())
+    return runtime, req_state, lifecycle, ingest, ready_batches, started_reads, book
+
+
+def test_rust_graph_runtime_exposes_get_walk_for_input_ingest_deferral():
+    """RustGraphRuntime must expose get_walk() so InputIngest defers a walk
+    transition while the partition is still busy on the current walk."""
+    from mstar.graph.base import GraphNode
+    from mstar.utils.ipc_format import CurrentForwardPassInfo, InputSignals
+
+    runtime, req_state, lifecycle, ingest, _, _, _ = _make_ingest_for_walk_tests(
+        [
+            ("walk_a", GraphNode(name="n_a", input_names=["x"], outputs=[])),
+            ("walk_b", GraphNode(name="n_b", input_names=["y"], outputs=[])),
+        ],
+        {"n_a": "default", "n_b": "default"},
+    )
+    rid = runtime.add_request(
+        request_id="r1", partition="default", graph_walk="walk_a",
+        partition_worker_graph_ids=[0, 1],
+        worker_graph_to_workers=ParallelList([0, 1], [["worker_0"], ["worker_0"]]),
+        loop_caps={},
+    )
+    assert runtime.get_walk(rid, "default") == "walk_a"
+    fwd_a = CurrentForwardPassInfo(
+        request_id="r1", graph_walk="walk_a", fwd_index=0, random_seed=0,
+        max_tokens=8, partition_name="default",
+    )
+    req_state.add_request(rid, fwd_a)
+    lifecycle.add(rid, "r1")
+    _ingest(runtime, rid, [GraphEdge(name="x", next_node="n_a", tensor_info=[])])
+
+    fwd_b = CurrentForwardPassInfo(
+        request_id="r1", graph_walk="walk_b", fwd_index=1, random_seed=0,
+        max_tokens=8, partition_name="default",
+    )
+    ingest._process_new_inputs(InputSignals(
+        request_id="r1", partition_name="default",
+        inputs=[GraphEdge(name="y", next_node="n_b", tensor_info=[])],
+        request_info=fwd_b,
+    ))
+    assert runtime.get_walk(rid, "default") == "walk_a"
+    assert (rid, "default") in ingest._pending_walk_transitions
+
+    # Finish walk_a so partition becomes idle -> check_ready_tensors applies walk_b.
+    runtime.pop_rids("n_a", "walk_a", [rid], check_ready=True)
+    runtime.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk="walk_a", node_name="n_a",
+        output_signals=[], wg_ids=ParallelList([rid], [0]), tensors=[], num_tensors=[],
+    ))
+    ingest.check_ready_tensors()
+    assert runtime.get_walk(rid, "default") == "walk_b"
+    assert ingest.check_ready_tensors() is None
+    assert runtime.pop_rids("n_b", "walk_b", [rid], check_ready=True) is not None
+
+
+def test_input_ingest_drains_pending_normal_before_walk_transition():
+    """Queued _pending_normal_inputs for walk_a must drain before a deferred walk_b
+    transition activates, even after in-flight walk_a passes in Rust finish."""
+    from mstar.graph.base import GraphNode
+    from mstar.utils.ipc_format import CurrentForwardPassInfo, InputSignals
+
+    runtime, req_state, lifecycle, ingest, ready_batches, _, book = _make_ingest_for_walk_tests(
+        [
+            ("walk_a", GraphNode(name="n_a", input_names=["x"], outputs=[])),
+            ("walk_b", GraphNode(name="n_b", input_names=["y"], outputs=[])),
+        ],
+        {"n_a": "default", "n_b": "default"},
+    )
+    rid = runtime.add_request(
+        request_id="r1", partition="default", graph_walk="walk_a",
+        partition_worker_graph_ids=[0, 1],
+        worker_graph_to_workers=ParallelList([0, 1], [["worker_0"], ["worker_0"]]),
+        loop_caps={},
+    )
+    fwd_a = CurrentForwardPassInfo(
+        request_id="r1", graph_walk="walk_a", fwd_index=0, random_seed=0,
+        max_tokens=8, partition_name="default",
+    )
+    req_state.add_request(rid, fwd_a)
+    lifecycle.add(rid, "r1")
+
+    for u in (31, 32, 33):
+        book.put_tensor(u, _info_with_uuid(u))
+        book.increment_ref(u, 1)
+    ready_batches["next"] = {
+        rid: [GraphEdge(name="x", next_node="n_a", tensor_info=[_info_with_uuid(u)]) for u in (31, 32, 33)]
+    }
+    ingest.check_ready_tensors()
+    assert [e.tensor_info[0].uuid for e in ingest._pending_normal_inputs[rid]] == [33]
+
+    fwd_b = CurrentForwardPassInfo(
+        request_id="r1", graph_walk="walk_b", fwd_index=3, random_seed=0,
+        max_tokens=8, partition_name="default",
+    )
+    ingest._process_new_inputs(InputSignals(
+        request_id="r1", partition_name="default",
+        inputs=[GraphEdge(name="y", next_node="n_b", tensor_info=[])],
+        request_info=fwd_b,
+    ))
+    assert runtime.get_walk(rid, "default") == "walk_a"
+
+    # Complete both in-flight passes of walk_a -> partition is idle in Rust,
+    # but uuid=33 is still in _pending_normal_inputs for walk_a!
+    for u in (31, 32):
+        popped = runtime.pop_rids("n_a", "walk_a", [rid], check_ready=True)
+        assert popped.input_edges.edge_tuples()[0].uuids == [u]
+        runtime.complete_and_route_batch(RouteInput(
+            partition="default", graph_walk="walk_a", node_name="n_a",
+            output_signals=[], wg_ids=ParallelList([rid], [0]), tensors=[], num_tensors=[],
+        ))
+    assert runtime.is_partition_idle(rid, "default")
+
+    # check_ready_tensors drains uuid=33 into walk_a BEFORE switching to walk_b!
+    ingest.check_ready_tensors()
+    assert runtime.get_walk(rid, "default") == "walk_a"
+    assert rid not in ingest._pending_normal_inputs
+    pop3 = runtime.pop_rids("n_a", "walk_a", [rid], check_ready=True)
+    assert pop3.input_edges.edge_tuples()[0].uuids == [33]
+    runtime.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk="walk_a", node_name="n_a",
+        output_signals=[], wg_ids=ParallelList([rid], [0]), tensors=[], num_tensors=[],
+    ))
+
+    ingest.check_ready_tensors()
+    assert runtime.get_walk(rid, "default") == "walk_b"
+    assert runtime.pop_rids("n_b", "walk_b", [rid], check_ready=True) is not None
+
+
+def test_input_ingest_chained_async_walk_transitions_do_not_clobber():
+    """Chained tensor-backed walk transitions must not pop walk_c in the same
+    drain (or while walk_b's async RDMA read is still in flight), and another
+    partition must not be head-of-line blocked."""
+    from mstar.graph.base import GraphNode
+    from mstar.utils.ipc_format import CurrentForwardPassInfo, InputSignals
+
+    runtime, req_state, lifecycle, ingest, ready_batches, started_reads, book = _make_ingest_for_walk_tests(
+        [
+            ("walk_a", GraphNode(name="n_a", input_names=["x"], outputs=[])),
+            ("walk_b", GraphNode(name="n_b", input_names=["y"], outputs=[])),
+            ("walk_c", GraphNode(name="n_c", input_names=["z"], outputs=[])),
+            ("part2_w", GraphNode(name="p2", input_names=["q"], outputs=[])),
+            ("part2_w2", GraphNode(name="p2b", input_names=["q2"], outputs=[])),
+        ],
+        {"n_a": "default", "n_b": "default", "n_c": "default", "p2": "other", "p2b": "other"},
+    )
+    rid = runtime.add_request(
+        request_id="r1", partition="default", graph_walk="walk_a",
+        partition_worker_graph_ids=[0, 1, 2],
+        worker_graph_to_workers=ParallelList([0, 1, 2, 3, 4], [["worker_0"]] * 5),
+        loop_caps={},
+    )
+    runtime.add_request(
+        request_id="r1", partition="other", graph_walk="part2_w",
+        partition_worker_graph_ids=[3, 4],
+        worker_graph_to_workers=ParallelList([0, 1, 2, 3, 4], [["worker_0"]] * 5),
+        loop_caps={},
+    )
+    fwd_a = CurrentForwardPassInfo(
+        request_id="r1", graph_walk="walk_a", fwd_index=0, random_seed=0,
+        max_tokens=8, partition_name="default",
+    )
+    req_state.add_request(rid, fwd_a)
+    lifecycle.add(rid, "r1")
+    _ingest(runtime, rid, [GraphEdge(name="x", next_node="n_a", tensor_info=[])])
+
+    for u in (41, 42):
+        book.put_tensor(u, _info_with_uuid(u))
+        book.increment_ref(u, 1)
+
+    for idx, (wname, nname, sname, uuid) in enumerate(
+        [("walk_b", "n_b", "y", 41), ("walk_c", "n_c", "z", 42)], start=1
+    ):
+        ingest._process_new_inputs(InputSignals(
+            request_id="r1", partition_name="default",
+            inputs=[GraphEdge(name=sname, next_node=nname, tensor_info=[_info_with_uuid(uuid)])],
+            request_info=CurrentForwardPassInfo(
+                request_id="r1", graph_walk=wname, fwd_index=idx, random_seed=0,
+                max_tokens=8, partition_name="default",
+            ),
+        ))
+
+    # Another partition's walk transition drains independently while default is blocked.
+    _ingest(runtime, rid, [GraphEdge(name="q", next_node="p2", tensor_info=[])])
+    ingest._process_new_inputs(InputSignals(
+        request_id="r1", partition_name="other",
+        inputs=[GraphEdge(name="q2", next_node="p2b", tensor_info=[])],
+        request_info=CurrentForwardPassInfo(
+            request_id="r1", graph_walk="part2_w2", fwd_index=1, random_seed=0,
+            max_tokens=8, partition_name="other",
+        ),
+    ))
+    assert (rid, "other") in ingest._pending_walk_transitions
+    runtime.pop_rids("p2", "part2_w", [rid], check_ready=True)
+    runtime.complete_and_route_batch(RouteInput(
+        partition="other", graph_walk="part2_w", node_name="p2",
+        output_signals=[], wg_ids=ParallelList([rid], [3]), tensors=[], num_tensors=[],
+    ))
+    ingest.check_ready_tensors()
+    assert runtime.get_walk(rid, "other") == "part2_w2"
+    assert runtime.get_walk(rid, "default") == "walk_a"
+
+    # Finish walk_a -> check_ready_tensors pops ONLY walk_b and starts its read.
+    runtime.pop_rids("n_a", "walk_a", [rid], check_ready=True)
+    runtime.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk="walk_a", node_name="n_a",
+        output_signals=[], wg_ids=ParallelList([rid], [0]), tensors=[], num_tensors=[],
+    ))
+    ingest.check_ready_tensors()
+    assert runtime.get_walk(rid, "default") == "walk_b"
+    assert len(ingest._pending_walk_transitions[(rid, "default")]) == 1
+    assert started_reads[-1] == (rid, "walk_b", ["y"])
+
+    # Another tick while walk_b's RDMA read is still in flight must NOT pop walk_c.
+    ingest.check_ready_tensors()
+    assert runtime.get_walk(rid, "default") == "walk_b"
+    assert len(ingest._pending_walk_transitions[(rid, "default")]) == 1
+
+    # Deliver walk_b's tensor, run walk_b, then walk_c drains cleanly.
+    ready_batches["next"] = {
+        rid: [GraphEdge(name="y", next_node="n_b", tensor_info=[_info_with_uuid(41)])]
+    }
+    ingest.check_ready_tensors()
+    assert runtime.get_walk(rid, "default") == "walk_b"
+    assert runtime.pop_rids("n_b", "walk_b", [rid], check_ready=True) is not None
+    runtime.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk="walk_b", node_name="n_b",
+        output_signals=[], wg_ids=ParallelList([rid], [1]), tensors=[], num_tensors=[],
+    ))
+    ingest.check_ready_tensors()
+    assert runtime.get_walk(rid, "default") == "walk_c"
+    assert (rid, "default") not in ingest._pending_walk_transitions
+    assert started_reads[-1] == (rid, "walk_c", ["z"])
