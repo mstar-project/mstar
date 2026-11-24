@@ -230,6 +230,8 @@ class RollingKVManager(Resource):
                     if req is not None:
                         self._requests[owner] = req
                         self._release(owner)
+                    if rid not in self._wants and prev_wants is not None:
+                        self._wants[rid] = prev_wants
                 else:
                     wants = self._wants.get(rid)
                     if req is not None:

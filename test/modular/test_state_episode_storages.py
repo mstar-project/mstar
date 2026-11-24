@@ -1610,3 +1610,247 @@ def test_rolling_kv_reserve_idempotent_on_warm_and_reserved_requests():
     store.remove_request(2)
     store.end_episode(0)
     assert store.num_free_tokens() == 16
+
+
+def test_recurrent_pool_reserve_idempotent_on_reserved_and_partial_warm_episodes():
+    cfg_half = RecurrentStateConfig(
+        num_layers=1,
+        blocks={"s": RecurrentBlockConfig((4,), torch.float32)},
+        max_slots=6,  # sink + 5 usable slots
+        labels=("cond", "blank"),
+    )
+    pool = RecurrentStatePool(CPU, cfg_half, name="val", episode_lifetime=True)
+    initial_free = pool.num_free_slots
+
+    # Repeated reserve() / reserve_past() on an already-reserved request is idempotent
+    pool.ingest_request(100)
+    pool.bind_episode(100, 0, "ep-half", cold=True, reset=False)
+    assert pool.reserve(100, "llm", "step", None) is None
+    assert pool._kept == 2 and pool._reserved == {100: 2}
+    assert pool.reserve(100, "llm", "step", None) is None
+    assert pool.reserve_past(100, "llm", "step", None) is None
+    assert pool._kept == 2 and pool._reserved == {100: 2}
+    pool.unreserve(100)
+    assert pool._kept == 0 and pool._reserved == {}
+
+    # reserve_past() refuses when room < need * 2, succeeds when room >= need * 2, and is idempotent
+    assert pool.reserve_past(100, "llm", "step", None) is None
+    assert pool._kept == 2 and pool._reserved == {100: 2}
+    assert pool.reserve_past(100, "llm", "step", None) is None
+    assert pool._kept == 2 and pool._reserved == {100: 2}
+    pool.remove_request(100)
+    pool.end_episode(0)
+    assert pool._kept == 0 and pool._reserved == {}
+
+    # Partial-label warm resume: rid1 allocates only "cond", rid2 reserves 1 remaining slot ("blank")
+    pool.ingest_request(101)
+    pool.bind_episode(101, 0, "ep-half", cold=True, reset=False)
+    st1 = RecurrentStep(segments=(Segment(101, "cond", 1),))
+    ctx1 = StepContext([101], "step", 0, False)
+    assert pool.admit(st1, ctx1).ok
+    pool.commit(st1, ctx1)
+    pool.remove_request(101)
+    assert pool._kept == 0 and pool.num_free_slots == initial_free - 1
+
+    pool.ingest_request(102)
+    pool.bind_episode(102, 0, "ep-half", cold=False, reset=False)
+    assert pool.ask(102, "llm", "step") is ASKS
+    assert pool.reserve(102, "llm", "step", None) is None
+    assert pool._kept == 1 and pool._reserved == {102: 1}
+    assert pool.reserve(102, "llm", "step", None) is None
+    assert pool.reserve_past(102, "llm", "step", None) is None
+    assert pool._kept == 1 and pool._reserved == {102: 1}
+    pool.remove_request(102)
+    assert pool._kept == 0 and pool._reserved == {}
+    pool.end_episode(0)
+    assert pool.num_free_slots == initial_free
+
+    # Full-pool boundary (max_slots=4 -> sink + 3 usable slots):
+    # room == 1 after reserving 2 slots; repeated reserve()/reserve_past() must return None, not room=1
+    cfg_full = RecurrentStateConfig(
+        num_layers=1,
+        blocks={"s": RecurrentBlockConfig((4,), torch.float32)},
+        max_slots=4,
+        labels=("cond", "blank"),
+    )
+    full = RecurrentStatePool(CPU, cfg_full, name="val_full", episode_lifetime=True)
+    full.ingest_request(1)
+    full.bind_episode(1, 0, "ep-full", cold=True, reset=False)
+    assert full.reserve_past(1, "llm", "step", None) == 3
+    assert full._kept == 0 and full._reserved == {}
+    assert full.reserve(1, "llm", "step", None) is None
+    assert full._kept == 2 and full._reserved == {1: 2}
+    assert full.reserve(1, "llm", "step", None) is None
+    assert full.reserve_past(1, "llm", "step", None) is None
+    assert full._kept == 2 and full._reserved == {1: 2}
+    full.remove_request(1)
+    full.end_episode(0)
+    assert full._kept == 0 and full._reserved == {} and full.num_free_slots == 3
+
+
+def test_sized_value_and_rolling_bind_episode_reset_without_overrides():
+    # 1. Direct SizedValueStore: reset=True with overrides=None preserves prev.config
+    sz = SizedValueStore(
+        SizedValueConfig(
+            num_layers=1,
+            fields={"v": SizedField((("n", 1),), torch.float32)},
+            largest={"n": 8},
+            max_bytes=32,
+        ),
+        CPU,
+        name="sz",
+        episode_lifetime=True,
+    )
+    sz.ingest_request(1, SizedValueReqConfig(sizes={"main": {"n": 4}}))
+    sz.bind_episode(1, 0, "ep-sz", cold=True, reset=False)
+    assert sz.reserve(1, "dit", "step", None) is None
+    assert sz.take(1, "main", 0) == {"v": None}
+    sz.put(1, "main", 0, {"v": torch.arange(4, dtype=torch.float32)})
+    assert sz._used == 16 and sz.held(1) == 1
+    sz.remove_request(1)
+
+    sz.ingest_request(2, None)
+    sz.bind_episode(2, 0, "ep-sz", cold=False, reset=True)
+    assert sz.sizes(2, "main") == {"n": 4}
+    assert sz._used == 0 and sz.held(2) == 0
+    assert sz.ask(2, "dit", "step") is ASKS
+    assert sz.reserve(2, "dit", "step", None) is None
+    assert sz._used == 16
+    assert sz.take(2, "main", 0) == {"v": None}
+    sz.put(2, "main", 0, {"v": torch.ones(4, dtype=torch.float32)})
+    assert sz.held(2) == 1
+    sz.remove_request(2)
+
+    # Explicit overrides still take precedence over preserved config on reset=True
+    sz.ingest_request(3, SizedValueReqConfig(sizes={"main": {"n": 8}}))
+    sz.bind_episode(3, 0, "ep-sz", cold=False, reset=True)
+    assert sz.sizes(3, "main") == {"n": 8}
+    assert sz.reserve(3, "dit", "step", None) is None
+    assert sz._used == 32
+    sz.remove_request(3)
+    sz.end_episode(0)
+    assert sz._used == 0
+
+    # 2. Direct RollingKVManager: reset=True with overrides=None preserves prev_wants
+    roll = RollingKVManager(
+        RollingKVConfig(num_layers=1, num_heads=1, head_dim=4, pool_tokens=16, dtype=torch.float32),
+        CPU,
+        name="roll",
+        episode_lifetime=True,
+    )
+    roll.ingest_request(1, RollingKVReqConfig(tokens=8, sink=1))
+    roll.bind_episode(1, 0, "ep-roll", cold=True, reset=False)
+    assert roll.reserve(1, "llm", "step", None) is None
+    st1 = RollingKVStep(segments=(Segment(1, "main", 3),), positions={1: RollingPosition(0, 1, 7)})
+    ctx1 = StepContext([1], "step", 0, False)
+    assert roll.admit(st1, ctx1).ok
+    roll.plan(st1, ctx1)
+    roll.commit(st1, ctx1)
+    assert roll.written(1) == 3
+    roll.remove_request(1)
+
+    roll.ingest_request(2, None)
+    roll.bind_episode(2, 0, "ep-roll", cold=False, reset=True)
+    assert roll.declared(2) == RollingKVReqConfig(tokens=8, sink=1)
+    assert roll.written(2) == 0 and roll.num_free_tokens() == 16
+    assert roll.ask(2, "llm", "step") is ASKS
+    assert roll.reserve(2, "llm", "step", None) is None
+    assert roll._kept == 8
+    st2 = RollingKVStep(segments=(Segment(2, "main", 2),), positions={2: RollingPosition(0, 1, 7)})
+    ctx2 = StepContext([2], "step", 0, False)
+    assert roll.admit(st2, ctx2).ok
+    roll.plan(st2, ctx2)
+    roll.commit(st2, ctx2)
+    assert roll.written(2) == 2
+    roll.remove_request(2)
+
+    # Explicit overrides still take precedence over preserved wants on reset=True
+    roll.ingest_request(3, RollingKVReqConfig(tokens=10, sink=2))
+    roll.bind_episode(3, 0, "ep-roll", cold=False, reset=True)
+    assert roll.declared(3) == RollingKVReqConfig(tokens=10, sink=2)
+    assert roll.reserve(3, "llm", "step", None) is None
+    assert roll._kept == 10
+    roll.remove_request(3)
+    roll.end_episode(0)
+    assert roll._kept == 0 and roll.num_free_tokens() == 16
+
+
+def test_engine_episode_clear_sized_and_rolling_without_overrides():
+    roll = RollingKVManager(
+        RollingKVConfig(num_layers=1, num_heads=2, head_dim=8, pool_tokens=16, dtype=torch.float32),
+        CPU,
+        name="roll",
+        episode_lifetime=True,
+    )
+    sz = SizedValueStore(
+        SizedValueConfig(num_layers=1, fields={"v": SizedField((("n", 1),), torch.float32)}, largest={"n": 4}),
+        CPU,
+        name="sz",
+        episode_lifetime=True,
+    )
+    val = RecurrentStatePool(
+        CPU,
+        RecurrentStateConfig(
+            num_layers=1, blocks={"s": RecurrentBlockConfig(shape=(4,), dtype=torch.float32)}, max_slots=4,
+        ),
+        name="val",
+        episode_lifetime=True,
+    )
+    resources = {"roll": roll, "sz": sz, "val": val}
+    runner = StepRunner(resources, node_resources={"node0": list(resources)})
+    submod = SimpleNamespace(on_request_added=lambda rid, info: None, cleanup_request=lambda rid: None)
+    engine = make_engine(
+        _resources=resources,
+        _runner=runner,
+        _state_setup=StateSetup(),
+        _submodules={"node0": make_mgmt(submodule=submod, resources=resources)},
+        _resource_nodes={k: frozenset({"node0"}) for k in resources},
+        _episode_pools=dict(resources),
+    )
+
+    overrides = {
+        "roll": RollingKVReqConfig(tokens=8, sink=1),
+        "sz": SizedValueReqConfig(sizes={"main": {"n": 4}}),
+    }
+    engine.add_request(1, overrides=overrides, episode_id="ep-clr", episode_slot=0)
+    assert roll.reserve(1, "node0", "step", None) is None
+    rl_step1 = RollingKVStep(segments=(Segment(1, "main", 3),), positions={1: RollingPosition(0, 1, 7)})
+    rl_ctx1 = StepContext([1], "step", 0, False)
+    assert roll.admit(rl_step1, rl_ctx1).ok
+    roll.plan(rl_step1, rl_ctx1)
+    roll.commit(rl_step1, rl_ctx1)
+    assert sz.reserve(1, "node0", "step", None) is None
+    sz.take(1, "main", 0)
+    sz.put(1, "main", 0, {"v": torch.ones(4)})
+    v_step1 = RecurrentStep(segments=(Segment(1, "main", 1),))
+    v_ctx1 = StepContext([1], "step", 0, False)
+    assert val.admit(v_step1, v_ctx1).ok
+    val.commit(v_step1, v_ctx1)
+    engine.remove_request(1)
+
+    # Selective episode_clear=["sz", "roll"] with overrides=None keeps val warm and resets sz/roll cleanly
+    engine.add_request(2, episode_id="ep-clr", episode_slot=0, episode_clear=["sz", "roll"])
+    batch = ExecutingBatch("node0", {}, StepContext([2], "step", 0, False))
+    engine.finalize_batch(batch)
+    assert batch.episode_held[2] == {"roll": 0, "sz": 0, "val": 1}
+    assert sz.sizes(2, "main") == {"n": 4}
+    assert sz.ask(2, "node0", "step") is ASKS
+    assert sz.reserve(2, "node0", "step", None) is None
+    assert sz.take(2, "main", 0) == {"v": None}
+    sz.put(2, "main", 0, {"v": torch.full((4,), 2.0)})
+
+    assert roll.ask(2, "node0", "step") is ASKS
+    assert roll.reserve(2, "node0", "step", None) is None
+    rl_step2 = RollingKVStep(segments=(Segment(2, "main", 2),), positions={2: RollingPosition(0, 1, 7)})
+    rl_ctx2 = StepContext([2], "step", 0, False)
+    assert roll.admit(rl_step2, rl_ctx2).ok
+    roll.plan(rl_step2, rl_ctx2)
+    roll.commit(rl_step2, rl_ctx2)
+
+    batch2 = ExecutingBatch("node0", {}, StepContext([2], "step", 0, False))
+    engine.finalize_batch(batch2)
+    assert batch2.episode_held[2] == {"roll": 2, "sz": 1, "val": 1}
+
+    engine.remove_request(2)
+    assert engine.end_episode("ep-clr", 0) is True
+    assert roll.num_free_tokens() == 16 and sz._used == 0 and val.num_free_slots == 3

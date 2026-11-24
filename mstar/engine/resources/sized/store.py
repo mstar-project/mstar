@@ -94,6 +94,8 @@ class SizedValueStore(Resource):
                         prev.lent.clear()
                         prev.admitted = False
                         prev.nbytes = 0
+                        if rid not in self._requests:
+                            self._requests[rid] = prev
                     else:
                         cur = self._requests.get(rid)
                         if not prev.admitted:

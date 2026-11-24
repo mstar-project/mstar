@@ -288,7 +288,7 @@ class RingKVManager(AttentionResource):
         # Check every rid before claiming any session: a refused admit must not
         # leave a session half-claimed by the first rid of a batch it rejected.
         wanted = {rid for rid in rids if rid not in self._sessions}
-        for rid in sorted(wanted):
+        for rid in sorted(wanted, key=str):
             if rid not in self._known_rids:
                 return AdmitOutcome(
                     ok=False, ready=False,

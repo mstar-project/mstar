@@ -591,6 +591,8 @@ class RecurrentStatePool(Resource):
     def _reserve(self, rid: str, requests: int) -> int | None:
         """Reserve ``rid``'s slots when there is room for ``requests`` requests' slots."""
         with self._lock:
+            if rid in self._reserved:
+                return None
             need = max(0, len(self.config.labels) - len(self._slots.get(rid, ())))
             if need == 0:
                 return None
