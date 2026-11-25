@@ -99,7 +99,7 @@ class AudioWatermarkConfig:
             raise ValueError(f"audio_watermark.alpha must be a number in (0, 4], got {alpha!r}")
         generator = value.get("generator", DEFAULT_GENERATOR)
         if not isinstance(generator, str) or not generator:
-            raise ValueError("audio_watermark.generator must be an AudioSeal card name or checkpoint path")
+            raise ValueError("audio_watermark.generator must be an AudioSeal card name")
         return cls(
             enabled=enabled,
             message=_parse_message(value.get("message", 0)),
@@ -250,16 +250,9 @@ class AudioSealWatermarker:
         self._no_compile = no_compile
         self.device = next(generator.parameters()).device
         self.hop = int(generator.encoder.hop_length)
-        shapes: list[tuple[int, ...]] = []
-        lstm_slots: set[int] = set()
-        self._encoder = self._program(generator.encoder, shapes, lstm_slots)
-        self._decoder = self._program(generator.decoder, shapes, lstm_slots)
-        offsets = [0]
-        for shape in shapes:
-            offsets.append(offsets[-1] + math.prod(shape))
-        self._layout = _Layout(tuple(offsets), tuple(shapes), frozenset(lstm_slots))
+        self._encoder, self._decoder, self._layout = self._programs(generator)
         self._message_embedding = self._embed_message(generator, config)
-        self._fresh = self._fresh_caches()
+        self.fresh_caches = self._fresh_caches()
         self._capture_lengths: list[int] = []
         self._eager_logged: set[tuple[str, int]] = set()
 
@@ -292,6 +285,18 @@ class AudioSealWatermarker:
         return cls(generator, config, no_compile)
 
     # -- the generator as a function of its streaming state ------------------
+
+    @classmethod
+    def _programs(cls, generator: torch.nn.Module) -> tuple[tuple, tuple, _Layout]:
+        """The ops of the generator's encoder and decoder, and where each layer's cache sits in a stream's row."""
+        shapes: list[tuple[int, ...]] = []
+        lstm_slots: set[int] = set()
+        encoder = cls._program(generator.encoder, shapes, lstm_slots)
+        decoder = cls._program(generator.decoder, shapes, lstm_slots)
+        offsets = [0]
+        for shape in shapes:
+            offsets.append(offsets[-1] + math.prod(shape))
+        return encoder, decoder, _Layout(tuple(offsets), tuple(shapes), frozenset(lstm_slots))
 
     @classmethod
     def _program(cls, container: torch.nn.Module, shapes: list, lstm_slots: set) -> tuple:
@@ -437,7 +442,7 @@ class AudioSealWatermarker:
         return (marked.clamp(-1, 1) * 32767).to(torch.int16), new
 
     def _stacked_caches(self, streams: Sequence[WatermarkStream]) -> torch.Tensor:
-        return torch.stack([self._fresh if s.caches is None else s.caches for s in streams])
+        return torch.stack([self.fresh_caches if s.caches is None else s.caches for s in streams])
 
     @torch.no_grad()
     def apply(
@@ -483,6 +488,53 @@ class AudioSealWatermarker:
         return results  # type: ignore[return-value]
 
     @torch.no_grad()
+    def mark_pcm16(
+        self,
+        chunks: Sequence[torch.Tensor],
+        caches: torch.Tensor,
+        finals: Sequence[bool],
+        runners: Mapping[str, Any] | None = None,
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        """The next PCM16 chunk of each stream, watermarked, and the streams'
+        caches after it. Each chunk is whole frames, and ``caches``,
+        ``[B, cache_size]``, holds each stream's state before its chunk.
+
+        Chunks run as one call per length, the conversion to float and back
+        included. With ``runners`` (the engine's captures of
+        ``piecewise_configs``) a call whose length was captured replays it, and
+        a final chunk is zero-padded to the next captured length: the generator
+        is causal, so its samples change by float rounding only, and nothing
+        reads a stream's caches after its final chunk."""
+        marked_rows: dict[int, torch.Tensor] = {}
+        after: dict[int, torch.Tensor] = {}
+        groups: dict[int, list[int]] = defaultdict(list)
+        for i, (chunk, final) in enumerate(zip(chunks, finals, strict=True)):
+            samples = chunk.numel()
+            if samples == 0 or samples % self.hop:
+                raise ValueError(f"a chunk of {samples} samples is not whole {self.hop}-sample frames")
+            groups[self._captured_length(samples, runners) if final else samples].append(i)
+        for length, members in groups.items():
+            rows = [chunks[i].reshape(-1).to(self.device, torch.int16) for i in members]
+            pcm = torch.stack([
+                row if row.shape[0] == length else torch.nn.functional.pad(row, (0, length - row.shape[0]))
+                for row in rows
+            ])
+            states = torch.stack([caches[i] for i in members])
+            runner = runners.get(self.capture_label(length)) if runners else None
+            if runner is not None and runner.can_run(len(members)):
+                out = runner.run({"pcm": pcm, "caches": states}, real_bs=len(members))
+                marked, states = out["pcm"], out["caches"]
+            else:
+                if runners:
+                    self._log_eager("length" if runner is None else "batch", length, len(members))
+                marked, states = self._mark_pcm16(pcm, states)
+            for row, i in enumerate(members):
+                marked_rows[i] = marked[row, :rows[row].shape[0]]
+                after[i] = states[row]
+        order = range(len(chunks))
+        return [marked_rows[i] for i in order], torch.stack([after[i] for i in order])
+
+    @torch.no_grad()
     def apply_pcm16(
         self,
         chunks: list[torch.Tensor],
@@ -491,47 +543,29 @@ class AudioSealWatermarker:
         runners: Mapping[str, Any] | None = None,
     ) -> list[torch.Tensor]:
         """``apply`` for PCM16 chunks, quantized back the way the codecs do.
-
-        Chunks of whole frames with nothing pending (every Qwen3-TTS chunk)
-        run as one call per length, the conversion to float and back
-        included; with ``runners`` (the engine's captures of
-        ``piecewise_configs``) a call whose length was captured replays it,
-        and a final chunk is zero-padded to the next captured length (the
-        generator is causal and the stream's caches are dropped, so its
-        samples change by float rounding only). Anything else goes through
+        Chunks of whole frames with nothing pending (every Qwen3-TTS chunk) go
+        through `mark_pcm16`, ``runners`` included, and anything else through
         ``apply``."""
         finals = finals or [False] * len(chunks)
         results: list[torch.Tensor | None] = [None] * len(chunks)
-        groups: dict[int, list[int]] = defaultdict(list)
-        other = []
-        for i, (chunk, stream, final) in enumerate(zip(chunks, streams, finals, strict=True)):
+        whole, other = [], []
+        for i, (chunk, stream) in enumerate(zip(chunks, streams, strict=True)):
             if stream.finished:
                 raise RuntimeError("watermark stream got a chunk after its final one")
             samples = chunk.numel()
             if samples == 0 or samples % self.hop or (stream.pending is not None and stream.pending.numel()):
                 other.append(i)
-                continue
-            groups[self._captured_length(samples, runners) if final else samples].append(i)
-        for length, members in groups.items():
-            rows = [chunks[i].reshape(-1).to(self.device, torch.int16) for i in members]
-            pcm = torch.stack([
-                row if row.shape[0] == length else torch.nn.functional.pad(row, (0, length - row.shape[0]))
-                for row in rows
-            ])
-            caches = self._stacked_caches([streams[i] for i in members])
-            runner = runners.get(self.capture_label(length)) if runners else None
-            if runner is not None and runner.can_run(len(members)):
-                out = runner.run({"pcm": pcm, "caches": caches}, real_bs=len(members))
-                marked, caches = out["pcm"], out["caches"]
             else:
-                if runners:
-                    self._log_eager("length" if runner is None else "batch", length, len(members))
-                marked, caches = self._mark_pcm16(pcm, caches)
-            for row, i in enumerate(members):
-                stream = streams[i]
-                stream.finished = finals[i]
-                stream.caches = None if finals[i] else caches[row]
-                results[i] = marked[row, :rows[row].shape[0]]
+                whole.append(i)
+        if whole:
+            marked, caches = self.mark_pcm16(
+                [chunks[i] for i in whole], self._stacked_caches([streams[i] for i in whole]),
+                [finals[i] for i in whole], runners,
+            )
+            for row, i in enumerate(whole):
+                streams[i].finished = finals[i]
+                streams[i].caches = None if finals[i] else caches[row]
+                results[i] = marked[row]
         if other:
             if runners:
                 self._log_eager("partial", 0, len(other))
@@ -583,7 +617,7 @@ class AudioSealWatermarker:
         def static_inputs(length, shape):
             return {
                 "pcm": torch.zeros(shape.bs, length, dtype=torch.int16, device=self.device),
-                "caches": self._fresh.expand(shape.bs, -1).clone(),
+                "caches": self.fresh_caches.expand(shape.bs, -1).clone(),
             }
 
         def capture(call):
@@ -606,6 +640,27 @@ class AudioSealWatermarker:
         stream must equal. Zero-pads to whole frames like a final chunk."""
         stream = WatermarkStream()
         return self.apply([audio], [stream], [True])[0]
+
+
+def watermark_cache_size(config: AudioWatermarkConfig) -> int:
+    """``AudioSealWatermarker.cache_size`` for ``config``'s generator, read off its bundled card with no weights, so
+    every process that declares the watermark's state sizes it alike."""
+    audioseal, _ = import_audioseal()
+    from audioseal.builder import AudioSealWMConfig, create_generator
+    from audioseal.loader import load_local_model_config
+    from omegaconf import OmegaConf
+
+    card = load_local_model_config(config.generator)
+    if card is None:
+        raise ValueError(
+            "audio_watermark.generator must name an AudioSeal card the package bundles, since the watermark's state "
+            f"is sized from its card before any weights load; got {config.generator!r}"
+        )
+    card = OmegaConf.to_container(card)
+    card.pop("checkpoint")
+    with torch.device("meta"):
+        generator = create_generator(audioseal.AudioSeal.parse_config(card, AudioSealWMConfig, nbits=MESSAGE_BITS))
+    return AudioSealWatermarker._programs(generator)[2].size
 
 
 class AudioSealDetector:
