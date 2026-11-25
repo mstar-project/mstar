@@ -270,7 +270,7 @@ def judge_quality(case: Case, facts: list[dict], swings: dict[str, list[float]] 
 def limit_only(facts: list[dict], errors: dict[str, int]) -> bool:
     """Whether every session that failed did so only on its check's limit (a lower PSNR, fewer identical texts),
     with no missing, cut-short, undecodable or reshaped outputs and no extra head errors."""
-    hard = ("missing", "only_base", "head_undecodable", "shape_mismatch", "text_truncated")
+    hard = ("missing", "only_base", "head_undecodable", "shape_mismatch", "text_truncated", "audio_truncated")
     sessions = [f for f in facts if "self_base" not in f]
     return bool(sessions) and errors.get("head", 0) <= errors.get("base", 0) and not any(
         f.get(k) for f in sessions for k in hard)
@@ -315,6 +315,9 @@ def _judge_session(ck: dict, f: dict) -> tuple[str, str]:
     if f.get("head_undecodable"):
         bad = f["head_undecodable"]
         return "FAIL", f"{len(bad)} head outputs do not decode ({', '.join(bad[:3])})"
+    if f.get("audio_truncated"):
+        bad = f["audio_truncated"]
+        return "FAIL", f"{len(bad)} head audio clips are base's cut short ({', '.join(bad[:3])})"
     kind = ck["kind"]
     ok, detail = True, ""
     if kind == "text_match":
