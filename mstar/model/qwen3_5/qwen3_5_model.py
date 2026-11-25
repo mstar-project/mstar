@@ -18,12 +18,12 @@ from mstar.engine.state import (
     Positions,
     Read,
     Sampler,
-    SampleSettings,
     SeqShard,
     TensorType,
     Value,
 )
 from mstar.model.base import ProcessPromptOutput, TensorAndMetadata
+from mstar.model.components.lora.modules import LoraRoot
 from mstar.model.components.mrope import image_position_advance
 from mstar.model.keys import MIXED, PREFILL_TEXT
 from mstar.model.media_limits import read_image
@@ -37,9 +37,8 @@ from mstar.model.multimodal import (
 )
 from mstar.model.multimodal_decoder import (
     MIXED_SPLIT,
-    SAMPLING_KEYS,
+    DeclaredDecoderModel,
     MediaIntake,
-    MultimodalDecoderModel,
     PreparedMedia,
 )
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
@@ -68,7 +67,7 @@ from mstar.utils.fast_tokenize import encode_ids
 logger = logging.getLogger(__name__)
 
 # TODO: implement MoE variants
-class Qwen3_5DenseModel(MultimodalDecoderModel):
+class Qwen3_5DenseModel(DeclaredDecoderModel):
     NAME = "Qwen3.5"
     METADATA_FILES = (
         "config.json",
@@ -176,10 +175,10 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
             settings[VISION_ATTN] = {"max_segments_per_step": self._vision_segment_ceiling()}
         return settings
 
-    def get_node_resources(self):
-        from mstar.model.qwen3_5.lora import qwen3_5_lora_spec
+    def lora_roots(self) -> tuple[LoraRoot, ...]:
+        from mstar.model.qwen3_5.lora import qwen3_5_lora_roots
 
-        return [qwen3_5_lora_spec(self.config, self.vision_config)]
+        return qwen3_5_lora_roots(self.config, self.vision_config)
 
     def _vision_segment_ceiling(self) -> int:
         """Segments a captured block loop's plan holds. A segment per image, not per request: the resize floors each
@@ -190,12 +189,6 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         processor = self.image_processor
         min_patches = processor.size["shortest_edge"] // processor.patch_size ** 2
         return VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // min_patches
-
-    def get_request_resource_configs(
-        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
-    ) -> dict[str, SampleSettings]:
-        config = super().get_request_resource_configs(input_modalities, output_modalities, model_kwargs)[SAMPLER]
-        return {SAMPLER: SampleSettings(**{k: getattr(config, k) for k in SAMPLING_KEYS})}
 
     # -----------------------------------------------------------------------
     # Chunked prefill
@@ -407,12 +400,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
 
     def process_prompt(self, *args: Any, **kwargs: Any) -> ProcessPromptOutput:
         out = super().process_prompt(*args, **kwargs)
-        kv = out.metadata.pop("kv_layout")[KV_CACHE]["main"]
-        out.metadata["state_layout"] = {
-            KV_CACHE: {"main": Layout(spans=kv.spans, growth=kv.growth)}, GDN_STATE: {"main": Layout()},
-        }
-        if kv.keyed_spans is not None:
-            out.metadata["keyed_spans"] = {KV_CACHE: {"main": kv.keyed_spans}}
+        out.metadata["state_layout"][GDN_STATE] = {"main": Layout()}
         return out
 
     # ------------------------------------------------------------------

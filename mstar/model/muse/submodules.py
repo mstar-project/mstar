@@ -1,6 +1,6 @@
 """Muse Glimmer's node submodules: the LLM and the vision encoder.
 
-Both build on the shared scaffolds (`SampledTokenDecoder`,
+Both build on the shared scaffolds (`DeclaredTokenDecoder`,
 `PackedBlockLoopEncoder`). Positions are plain 1D and advance one per token,
 images included, so the position resource's own counters place every step.
 """
@@ -14,54 +14,24 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.state import (
     ArrayStep,
-    SampleStep,
-    Segment,
     SubmoduleStep,
-    at_last_token,
     kernel_setting,
-    last_sampled,
-    position,
-    sample,
 )
 from mstar.model.components.block_loop_encoder import PackedBlockLoopEncoder
-from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+from mstar.model.components.sampled_token_decoder import DeclaredTokenDecoder
 from mstar.model.muse.components.vision import tower_inputs
 from mstar.model.muse.config import (
-    KV_CACHE,
-    SAMPLER,
     VISION_ATTN,
     VISION_FRAME_TOKENS,
     VISION_FULL,
     VISION_WINDOW,
     VISION_WINDOW_TOKENS,
 )
-from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
+from mstar.model.submodule_base import NodeInputs
 
 
-class LLMSubmodule(SampledTokenDecoder):
-    def bind_state(self, handles: Mapping[str, Any]) -> None:
-        self.kv = handles[KV_CACHE]
-        self.sampler = handles[SAMPLER]
-
-    def node_step(
-        self, segments: list[Segment], prefill_tokens: Mapping[int, torch.Tensor], advance: tuple[int, ...] | None,
-    ) -> SubmoduleStep:
-        return SubmoduleStep(
-            segments=segments,
-            state={KV_CACHE: ArrayStep(advance=advance), SAMPLER: SampleStep(prompt_tokens=prefill_tokens)},
-        )
-
-    def next_position(self, rid_handle: int) -> int:
-        return position(self.kv, rid_handle, "main")
-
-    def loopback_tokens(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
-        return last_sampled(self.sampler)
-
-    def last_token_hidden(self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor) -> torch.Tensor:
-        return at_last_token(self.kv, hidden)
-
-    def sample_tokens(self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor) -> torch.Tensor:
-        return sample(self.sampler, logits)
+class LLMSubmodule(DeclaredTokenDecoder):
+    pass
 
 
 class VisionEncoderSubmodule(PackedBlockLoopEncoder):

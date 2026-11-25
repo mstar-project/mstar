@@ -30,6 +30,7 @@ from mstar.engine.state import (
     Entry,
     GatedDeltaNet,
     KVEntry,
+    LongRoPE,
     Positions,
     Read,
     Rope,
@@ -274,6 +275,16 @@ def test_positions_sit_only_on_an_append_only_array_that_keeps_entries(array):
 def test_a_rope_sets_all_three_llama_fields_or_none(rope):
     problem = _one_problem(_array(positions=Positions(rope=rope)))
     assert problem.startswith("Array 'kv'.positions.rope") and "all set or all None" in problem
+
+
+def test_a_longrope_on_the_whole_head_takes_half_the_head_dim_in_factors():
+    """``Rope`` can't count against a ``rotary_dim`` of None, so the head dim is read off the entry."""
+    longrope = LongRoPE(
+        short_factor=(1.0,) * 8, long_factor=(4.0,) * 8, original_max_position_embeddings=8, max_position_embeddings=16,
+    )
+    problem = _one_problem(_array(positions=Positions(rope=Rope(longrope=longrope))))
+    assert problem.startswith("Array 'kv'.positions.rope.longrope")
+    assert "needs 4 factors per set for the head dim 8" in problem, "the GPU would build the tables from 8 factors"
 
 
 @pytest.mark.parametrize("positions", [
@@ -763,3 +774,28 @@ def test_a_rebuild_leaves_a_whole_step_read_on_a_walk_that_takes_no_ids():
     assert state_declaration_problems(_StubModel(array, rebuild=rebuild)) == [], (
         "a walk whose rebuild rows take no sampled ids was refused"
     )
+
+
+def test_a_block_read_needs_max_len_zero_also_when_unbounded():
+    problem = _one_problem(_array(max_len=None, reads={"r": _read(mask=Block())}))
+    assert problem.startswith("Array 'kv'.reads['r'].mask") and "max_len is None" in problem, problem
+
+
+def test_positions_are_allowed_on_an_unbounded_array():
+    unbounded = _array(max_len=None, positions=Positions(), reads={"r": _read(mask=Window(4), packed=False)})
+    assert state_declaration_problems(_StubModel(unbounded)) == [], "an unbounded array keeps entries and counts them"
+
+
+def test_an_unbounded_array_digests_alike_in_two_processes():
+    """A None that read as 0, or digested by its id, would stop every server at the digest check."""
+    script = (
+        "import sys; sys.path.insert(0, 'test/modular'); "
+        "from test_state_declaration_checks import _unbounded_digests; print(_unbounded_digests())"
+    )
+    other = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True).stdout.strip()
+    assert other == str(_unbounded_digests()), "two processes digest one unbounded array differently"
+    assert _unbounded_digests() != declaration_digests([_array(max_len=0)]), "None and 0 digest alike"
+
+
+def _unbounded_digests() -> dict[str, str]:
+    return declaration_digests([_array(max_len=None, reads={"r": _read(mask=Window(4), packed=False)})])

@@ -524,6 +524,11 @@ class Cosmos3Config:
     # Empty = no video capture. COSMOS3_GEN_CAPTURE_VIDEO ("480x832x29,...",
     # height x width x frames) overrides.
     gen_capture_video: tuple[tuple[int, int, int], ...] = ()
+    # Image denoise steps to capture, as (height, width) pixel tiers. None
+    # keeps the submodule's defaults (192x320, 480x832, 720x1280); a tier
+    # above graph_max_latent_area is still skipped. COSMOS3_GEN_CAPTURE_RES
+    # ("1024x1024,...", height x width) overrides.
+    gen_capture_image: tuple[tuple[int, int], ...] | None = None
     # torch.compile the denoise compute (the generation-layer stack around the
     # attention op). Always a win in serving; the parity tests set False to keep
     # their bit-exact bounds on the eager step.
@@ -540,11 +545,23 @@ class Cosmos3Config:
     # forward) too, with the same mode: the video, image, sound and action
     # steps share one compiled layer stack. Eager, the norms, rotary and
     # residuals cost about 80 ms of GPU per extra row at
-    # 832x480x121 on a B300. Only its layer stack compiles, once, at startup,
-    # with the pack length dynamic, so no batch size or mix of resolutions
+    # 832x480x121 on a B300. Only its layer stack compiles, at startup, with
+    # only the pack length dynamic, so no batch size or mix of resolutions
     # compiles mid-traffic; the per-request patchify, rotary tables and
     # unpatchify run eager.
     compile_denoise_batched: bool = True
+    # torch.compile the captured understanding-tower prefill (one compile per
+    # token bucket), in ``denoise_compile_mode``. Its eager norms, rotary and
+    # copies are about a third of the prefill's GPU time on Super; off by
+    # default, since it changes the prefix K/V's low bits.
+    compile_prefill: bool = False
+    # [width, height] of the one-frame conditioning encode the vae_encoder node
+    # compiles, in Inductor's deterministic mode on channels-last encoder
+    # weights: a policy server's observation size, warmed at startup (a 736x544
+    # one encodes in 4.6 ms instead of 9.3 ms on an H200). Every other encode
+    # runs eager, so no request compiles mid-traffic; eager on channels-last
+    # weights is ~9% slower than stock. None (the default) keeps them all eager.
+    compile_vae_encode_size: tuple[int, int] | None = None
     # Which attention backends the DiT node declares (see
     # Cosmos3Model.get_node_resources). "dense_gen" (the default) declares the
     # paged FlashInfer backend the understanding prefill and the captured
@@ -598,10 +615,16 @@ class Cosmos3Config:
     def check_compile(self) -> None:
         """Reject compile settings that would be read as something else: a
         non-boolean switch (a yaml ``"false"`` is truthy) or an unknown mode."""
-        for name in ("compile_denoise", "compile_denoise_batched"):
+        for name in ("compile_denoise", "compile_denoise_batched", "compile_prefill"):
             value = getattr(self, name)
             if not isinstance(value, bool):
                 raise ValueError(f"Cosmos3 {name} must be true or false, got {value!r}.")
+        size = self.compile_vae_encode_size
+        if size is not None and not (
+            isinstance(size, (list, tuple)) and len(size) == 2
+            and all(isinstance(x, int) and not isinstance(x, bool) and x > 0 for x in size)
+        ):
+            raise ValueError(f"Cosmos3 compile_vae_encode_size must be [width, height] or null, got {size!r}.")
         if self.denoise_compile_mode not in DENOISE_COMPILE_MODES:
             raise ValueError(
                 f"Cosmos3 denoise_compile_mode must be one of {DENOISE_COMPILE_MODES}, "

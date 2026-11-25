@@ -118,19 +118,25 @@ def _array_problems(array: Array) -> list[str]:
     where = f"Array {array.name!r}"
     problems: list[str] = []
     for key, read in array.reads.items():
-        if isinstance(read.mask, Block) and array.max_len:
+        if isinstance(read.mask, Block) and array.max_len != 0:
             problems.append(f"{where}.reads[{key!r}].mask: Block needs max_len 0, and max_len is {array.max_len}")
-        elif not isinstance(read.mask, Block) and not array.max_len:
+        elif not isinstance(read.mask, Block) and array.max_len == 0:
             problems.append(f"{where}.reads[{key!r}].mask: every read of an array with max_len 0 is a Block read, "
                             f"and this one is {type(read.mask).__name__}")
     if array.positions is not None:
-        if array.rewritable or not array.max_len:
+        if array.rewritable or array.max_len == 0:
             problems.append(f"{where}.positions: positions sit only on an append-only array that keeps entries")
         rope = array.positions.rope
         llama31 = () if rope is None else (rope.low_freq_factor, rope.high_freq_factor, rope.old_context_len)
         if None in llama31 and any(factor is not None for factor in llama31):
             problems.append(f"{where}.positions.rope: low_freq_factor, high_freq_factor and old_context_len are "
                             f"all set or all None, and they are {llama31}")
+        # `Rope` checks the factor count only against a rotary_dim it is given, and None rotates the whole head
+        if rope is not None and rope.longrope is not None and rope.rotary_dim is None and "k" in array.entry.tensors:
+            head_dim, factors = array.entry.tensors["k"].shape[-1], len(rope.longrope.short_factor)
+            if factors != head_dim // 2:
+                problems.append(f"{where}.positions.rope.longrope: it needs {head_dim // 2} factors per set for the "
+                                f"head dim {head_dim}, which a rotary_dim of None rotates, and got {factors}")
     return problems
 
 
@@ -376,7 +382,7 @@ def split_read_problems(
     arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
     problems = []
     for array in arrays.values():
-        if array.max_len:
+        if array.max_len != 0:
             continue
         nodes = [node for node in sorted(array.nodes) if array.labels & set(split.get(node, ()))]
         if not nodes:
