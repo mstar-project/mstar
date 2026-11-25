@@ -22,8 +22,10 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.sampler.config import SamplerSpec
+from mstar.engine.state import Entry, TensorType
 from mstar.engine.state.adapters import StateSetup, _resolve, build_handle, node_resources, sampling_configs
 from mstar.engine.state.host_fields import HostFields
+from mstar.model.audio_watermark import AudioWatermarkConfig
 from mstar.model.base import ClientChunk
 from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
 from mstar.model.qwen3_tts import qwen3_tts_model
@@ -41,13 +43,14 @@ from mstar.model.qwen3_tts.config import (
     TALKER_MIXED,
     TALKER_SAMPLER,
     TALKER_TEXT,
+    WATERMARK_STATE,
     Qwen3TTSCodecConfig,
     Qwen3TTSCodePredictorConfig,
     Qwen3TTSModelConfig,
     Qwen3TTSTalkerConfig,
 )
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel, clip_digest
-from mstar.model.qwen3_tts.submodules import CodecSubmodule, TalkerSubmodule, text_stream_start
+from mstar.model.qwen3_tts.submodules import CodecSubmodule, TalkerSubmodule, WatermarkSubmodule, text_stream_start
 from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.model.submodule_base import (
     ARNodeInputs,
@@ -1935,6 +1938,198 @@ def test_qwen3_tts_codec_postprocess_uses_its_own_pass_geometry():
     out_second = {"audio_chunk": [torch.arange(4)]}
     submodule.postprocess("request", None, out_second, inputs=second)
     assert out_second["audio_chunk"][0].tolist() == [0, 1, 2, 3]
+
+
+def _watermarked_model() -> Qwen3TTSModel:
+    pytest.importorskip("audioseal")
+    from mstar.model.audio_watermark import watermark_cache_size
+
+    model = _make_model()
+    model.audio_watermark = AudioWatermarkConfig(enabled=True, message=0xBEEF)
+    model.watermark_cache_size = watermark_cache_size(model.audio_watermark)
+    return model
+
+
+def _watermark_node(config=None) -> WatermarkSubmodule:
+    from test_audio_watermark import _watermarker
+
+    return WatermarkSubmodule(_watermarker(message=0xBEEF), config or Qwen3TTSModelConfig())
+
+
+class _WatermarkDriver:
+    """The watermark node with its state pool, driven as the engine drives a step: declare, admit, plan, preprocess,
+    forward, commit. A stream is ingested on its first step."""
+
+    def __init__(self, node: WatermarkSubmodule, array=None):
+        from mstar.engine.resources.base import EngineResourceInfo
+        from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+        from mstar.engine.resources.runner import StepRunner
+        from mstar.engine.state.adapters import build_specs
+
+        self.node = node
+        array = array or next(a for a in _watermarked_model().declare_state() if a.name == WATERMARK_STATE)
+        (spec,) = build_specs([array], kernel_settings={WATERMARK_STATE: {"max_slots": 8}})
+        self.pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+        self.runner = StepRunner({WATERMARK_STATE: self.pool})
+        handle = build_handle(array, {WATERMARK_STATE: self.pool}, _resolve([array], StateSetup()))
+        self.node.bind_node_state({WATERMARK_STATE: handle})
+        self.streams: set[str] = set()
+
+    def step(self, chunks: dict[str, tuple[torch.Tensor, bool]], runners=None) -> dict[str, torch.Tensor]:
+        rids = list(chunks)
+        inputs = [
+            self.node.prepare_inputs(
+                "watermark_chunk", None, {"audio_chunk": [pcm]},
+                input_metadata=InputMetadata(stream_chunks={"audio_chunk": StreamChunkInfo(
+                    start_offset=0, context_items=0, num_items=1, is_final=final,
+                )}),
+            )
+            for pcm, final in chunks.values()
+        ]
+        for rid in rids:
+            if rid not in self.streams:
+                self.pool.ingest_request(rid)
+                self.streams.add(rid)
+        step = engine_step(self.node, "watermark_chunk", rids, inputs)
+        step.set_ctx(StepContext(request_ids=tuple(rids), graph_walk="watermark_chunk", slot=0, capture=False))
+        assert self.runner.admit(step).ok
+        self.runner.plan(step)
+        engine_inputs = ModelInputsFromEngine(
+            request_ids=rids, per_request_info={}, resources={}, step=step, piecewise_runners=runners or {},
+        )
+        packed = self.node.preprocess("watermark_chunk", engine_inputs, inputs)
+        step.begin_calls()
+        out = self.node.forward_batched("watermark_chunk", engine_inputs, **packed)
+        step.check_calls()
+        step.end_calls()
+        self.runner.commit(step)
+        return {rid: out[rid]["audio_chunk"][0] for rid in rids}
+
+
+def test_qwen3_tts_watermark_runs_in_a_partition_after_the_codec(tmp_path):
+    """With the watermark on, the codec's chunks stream to a Watermark node in a partition of its own, one codec
+    chunk a chunk, and the node's stream state is a Value of the generator's size. A deployment that places the node
+    validates, and one that leaves it out is refused before any worker starts."""
+    from mstar.engine.state import Value
+    from mstar.graph.base import GraphEdge
+    from mstar.streaming.chunk_policy import FixedChunkPolicy
+    from mstar.streaming.topology import StreamingGraphEdge
+    from mstar.validation import DeploymentError, validate_deployment
+
+    model = _watermarked_model()
+    walks = model.get_graph_walk_graphs()
+    (codec_edge,) = walks["codec_chunk"].outputs
+    assert isinstance(codec_edge, StreamingGraphEdge) and codec_edge.next_node == "Watermark"
+    (emit,) = walks["watermark_chunk"].outputs
+    assert type(emit) is GraphEdge and emit.output_modality == "audio"
+    assert [part.name for part in model.get_partitions()] == ["Talker", "Codec", "Watermark"]
+    (stream,) = [c for c in model.get_partition_topology().connections if c.to_partition == "Watermark"]
+    assert (stream.from_partition, stream.edge_name) == ("Codec", "audio_chunk")
+    policy = stream.chunk_policy_factory()
+    assert isinstance(policy, FixedChunkPolicy) and policy.window_size() == 1
+    assert [step.walk for step in model.walk_plan("Watermark", ["text"], ["audio"], {}, {})] == ["watermark_chunk"]
+    (state,) = [a for a in model.declare_state() if a.name == WATERMARK_STATE]
+    assert state == Value(
+        WATERMARK_STATE, nodes={"Watermark"}, layers={0},
+        entry=Entry({"caches": TensorType((model.watermark_cache_size,), dtype=torch.float32)}),
+    )
+    assert model.kernel_settings()[WATERMARK_STATE] == {"max_slots": model.MAX_CODEC_STREAMS + 1}
+
+    config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    placed = {**config, "node_groups": [
+        *config["node_groups"], {"node_names": ["Watermark"], "ranks": [0], "graph_walks": ["watermark_chunk"]},
+    ]}
+    path = tmp_path / "qwen3tts_watermark.yaml"
+    path.write_text(yaml.safe_dump(placed), encoding="utf-8")
+    validate_deployment(model, placed, str(path))
+    with pytest.raises(DeploymentError) as refused:
+        validate_deployment(model, config, str(CONFIG_PATH))
+    assert any("node 'Watermark'" in problem for problem in refused.value.problems), refused.value.problems
+
+
+def test_qwen3_tts_watermark_streams_like_the_whole_utterance():
+    """Two streams through the node chunk by chunk, starting a step apart, each against its offline watermark;
+    replaying the captures gives the eager samples, the short last chunk padded into a longer capture though its
+    stream doesn't mark it final, as when it lands before the codec's producer-done."""
+    from test_audio_watermark import _ReplayingRunner, _speechlike
+
+    frame = 1920
+    pcm = {
+        rid: (_speechlike(6 * frame, seed=seed).clamp(-1, 1) * 32767).to(torch.int16)
+        for rid, seed in (("a", 1), ("b", 2))
+    }
+    # per step, (rid, first frame, frames): b starts a step later, and each ends on a 2-frame remainder
+    steps = [
+        [("a", 0, 1)],
+        [("a", 1, 3), ("b", 0, 1)],
+        [("a", 4, 2), ("b", 1, 3)],
+        [("b", 4, 2)],
+    ]
+    eager, replay = _WatermarkDriver(_watermark_node()), _WatermarkDriver(_watermark_node())
+    configs = replay.node.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)
+    runners = {label: _ReplayingRunner(config, [1, 2, 4]) for label, config in configs.items()}
+    marked = {rid: [] for rid in pcm}
+    with torch.no_grad():
+        for step in steps:
+            chunks = {rid: (pcm[rid][lo * frame:(lo + n) * frame], False) for rid, lo, n in step}
+            want = eager.step(chunks)
+            got = replay.step(chunks, runners)
+            for rid in chunks:
+                assert got[rid].shape == want[rid].shape and (got[rid].int() - want[rid].int()).abs().max() <= 1
+                marked[rid].append(want[rid])
+    for rid, audio in pcm.items():
+        expected = (eager.node.watermarker.offline(audio.float() / 32767).clamp(-1, 1) * 32767).to(torch.int16)
+        streamed = torch.cat(marked[rid])
+        assert not torch.equal(streamed, audio) and (streamed.int() - expected.int()).abs().max() <= 1
+    assert runners[eager.node.watermarker.capture_label(3 * frame)].calls == [(1, 1), (2, 2), (1, 1)], (
+        "the 2-frame remainders would run eagerly rather than pad into the 3-frame capture"
+    )
+
+
+def test_qwen3_tts_watermark_declines_the_empty_flush_and_knows_the_last_chunk():
+    """A chunk is the last if its stream says so, or if the codec's schedule doesn't size it: then it's the remainder
+    the codec flushes at the end."""
+    node = _watermark_node()
+
+    def prepare(num_items, is_final, frames=1):
+        chunk = StreamChunkInfo(start_offset=0, context_items=0, num_items=num_items, is_final=is_final)
+        return node.prepare_inputs(
+            "watermark_chunk", None, {"audio_chunk": [torch.zeros(1, frames * 1920, dtype=torch.int16)]},
+            input_metadata=InputMetadata(stream_chunks={"audio_chunk": chunk}),
+        )
+
+    assert prepare(0, True) is None
+    last = prepare(1, True)
+    assert last.kwargs == {"final": True} and last.tensor_inputs["audio_chunk"].shape == (1920,)
+    assert prepare(1, False).kwargs == {"final": False}
+    assert prepare(1, False, frames=2).kwargs == {"final": True}, "a 2-frame remainder would not pad into a capture"
+
+
+def test_qwen3_tts_watermark_refuses_a_generator_that_splits_a_codec_frame():
+    """The tiny codec's 4-sample frames aren't whole 320-sample generator frames, so a stream would carry a partial
+    frame from one chunk to the next, which the node's state doesn't hold."""
+    with pytest.raises(ValueError, match="320 samples, which don't divide the codec's 4 samples per frame"):
+        _watermark_node(_tiny_model_config())
+
+
+def test_qwen3_tts_watermark_captures_each_codec_chunk_length():
+    config = Qwen3TTSModelConfig()
+    configs = _watermark_node(config).get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)
+    frames = sorted({*config.codec.chunk_schedule, config.codec.chunk_frames})
+    assert sorted(configs) == sorted(f"watermark_{f * 1920}" for f in frames)
+    assert all(c.capture_batch_sizes == WatermarkSubmodule.CAPTURE_BATCH_SIZES for c in configs.values())
+
+
+def test_qwen3_tts_watermark_state_of_another_size_is_refused_at_load():
+    """The declaration sizes the caches from the generator's card, and the node's start is the built generator's
+    fresh caches: a size that differs fails the bind."""
+    from mstar.engine.state import Value
+
+    node = _watermark_node()
+    caches = TensorType((node.watermarker.cache_size + 1,), dtype=torch.float32)
+    array = Value(WATERMARK_STATE, nodes={"Watermark"}, layers={0}, entry=Entry({"caches": caches}))
+    with pytest.raises(ValueError, match="start of field 'caches'"):
+        _WatermarkDriver(node, array)
 
 
 def test_qwen3_tts_clone_reference_tail_is_the_first_windows_context():

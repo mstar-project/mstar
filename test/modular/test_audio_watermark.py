@@ -27,6 +27,7 @@ from mstar.model.audio_watermark import (
     WatermarkStream,
     _watermark_precision,
     import_audioseal,
+    watermark_cache_size,
 )
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.testing_utils.engine import make_engine, make_mgmt
@@ -469,6 +470,21 @@ def test_capture_lengths_must_be_whole_frames():
     wmk = _watermarker()
     with pytest.raises(ValueError, match="whole"):
         wmk.piecewise_configs([wmk.hop + 1], [1])
+
+
+def test_marking_rows_of_caches_refuses_a_partial_frame():
+    """Rows of caches carry no partial frame between chunks, which only ``apply``'s streams hold."""
+    wmk = _watermarker()
+    with pytest.raises(ValueError, match="not whole 320-sample frames"):
+        wmk.mark_pcm16([torch.zeros(wmk.hop + 1, dtype=torch.int16)], wmk.fresh_caches[None], [False])
+
+
+def test_the_cache_size_is_read_off_the_card_without_its_weights():
+    """Every process that declares the watermark's state sizes it from the card, the generator built on ``meta``."""
+    pytest.importorskip("audioseal")
+    assert watermark_cache_size(AudioWatermarkConfig(enabled=True)) == _watermarker().cache_size
+    with pytest.raises(ValueError, match="must name an AudioSeal card the package bundles"):
+        watermark_cache_size(AudioWatermarkConfig(enabled=True, generator="/checkpoints/generator.pth"))
 
 
 def test_pcm16_round_trip_matches_offline_within_one_step():
