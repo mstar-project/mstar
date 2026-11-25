@@ -19,6 +19,7 @@ The dataclasses below preserve that ownership while exposing one
 """
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,8 @@ TALKER_SAMPLER = "talker_sampler"
 CODE_PRED_SAMPLER = "code_predictor"
 # Codec node: each stream's incremental decoder state
 CODEC_STATE = "codec_state"
+# Watermark node (opt-in): each stream's AudioSeal generator caches
+WATERMARK_STATE = "watermark_state"
 # Talker node: whether a request's decode has added TTS EOS
 TALKER_TEXT = "talker_text"
 # combined walk of the Talker's prefills and decode: a new prompt rides a
@@ -333,6 +336,11 @@ class Qwen3TTSCodecConfig:
             if name in data
         })
         return cls(**values)
+
+    @property
+    def samples_per_frame(self) -> int:
+        """PCM samples the decoder emits per frame."""
+        return math.prod((*self.upsample_rates, *self.upsampling_ratios))
 
     def frames_for_samples(self, num_samples: int) -> int:
         """Codec frames the encoder emits for ``num_samples`` of input audio."""

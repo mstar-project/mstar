@@ -1391,24 +1391,35 @@ Qwen3-TTS notes
   there before switching. The decode is compiled (Inductor) twice per chunk
   width, batch 1 apart: its batch dimension is dynamic.
 - Opt-in AudioSeal watermark on the codec's output (off by default; install
-  ``pip install -e '.[audioseal]'``). Turn it on in the deployment YAML::
+  ``pip install -e '.[audioseal]'``). Turn it on in the deployment YAML, and
+  place the ``Watermark`` node, which marks the codec's chunks in a partition of
+  its own before they reach the client::
 
      model_kwargs:
        audio_watermark:
          enabled: true      # default false
          message: 0xBEEF    # 16-bit payload: int 0..65535 or a 16-character 0/1 string (default 0)
          alpha: 1.0         # strength, in (0, 4] (default 1.0)
-         generator: audioseal_wm_streaming   # AudioSeal card name or checkpoint path (default)
+         generator: audioseal_wm_streaming   # an AudioSeal card the package bundles (default)
+     node_groups:
+       # the Talker and Codec groups, then
+       - node_names: [Watermark]
+         ranks: [0]
+         graph_walks: [watermark_chunk]
 
-  Unknown keys or out-of-range values fail startup, and so does ``enabled: true``
-  without the package. Each request's PCM is marked chunk by chunk with its own
-  streaming state, so a streamed utterance carries the same mark as a whole one.
+  Unknown keys or out-of-range values fail startup, and so do ``enabled: true``
+  without the package and a config that doesn't place the node. Each request's PCM is
+  marked chunk by chunk with its own streaming state, so a streamed utterance carries
+  the same mark as a whole one. A stream's state takes about 63 KiB in the ``watermark_state``
+  pool, which holds as many streams as ``codec_state`` does by default. A config that
+  raises ``codec_state``'s ``max_slots`` should raise ``watermark_state``'s to match, or
+  new streams wait for a watermark slot.
   At startup the engine captures the generator per chunk length of the codec
   schedule (by default 1, 3, 8, 16 and 25 frames) and batch bucket, so marking a step's
   chunks costs one graph replay per distinct length. The captures hold GPU memory: about
   2.5 GiB for the default 30 graphs (5 lengths, 6 batch buckets) on an H200, 5.7 GiB with
-  25 lengths. A chunk outside them (another length, more rows than the largest bucket,
-  a partial frame) runs eagerly, and the first one of each kind is logged.
+  25 lengths. A chunk outside them (another length, more rows than the largest bucket)
+  runs eagerly, and the first one of each kind is logged.
   Check files with ``python -m mstar.model.audio_watermark detect --message 0xBEEF out.wav``
   (``--message``, the deployment's payload: without it the verdict is the
   score alone, and an unmarked file re-encoded as MP3 can score above 0.5;

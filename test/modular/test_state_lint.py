@@ -108,8 +108,6 @@ ALLOWED_IN_FUNCTION = {
         "the vocoder's transformer, which keeps no state",
     ("mstar/model/qwen3_tts/components/depth_frame/frame.py", "DepthFrame.run", "disable"):
         "the depth kernel's Gluon launch, which a compiled decode can't trace; no state call sits behind it",
-    ("mstar/model/qwen3_tts/submodules.py", "CodecSubmodule.batch_postprocess", "request_state"):
-        "the opt-in watermark's per-stream state, until it moves to a watermark node's plain Value (issue #1447)",
     ("mstar/model/wan22/components/dit.py", "_token_runs", "disable"):
         "the timestep runs of a rank's share of the tokens, read off the shard's range outside the DiT's guards",
     ("mstar/model/bagel/components/vit_encoder.py", "BagelViTAttention.attend", "disable"):
@@ -470,26 +468,26 @@ def test_the_lint_lets_a_named_function_keep_its_break_and_no_other():
     assert len(found) == 1 and "at line 4" in found[0]
 
 
-_TTS = "mstar/model/qwen3_tts/submodules.py"
-_WATERMARK = (_TTS, "CodecSubmodule.batch_postprocess", "request_state")
+_NODE = "mstar/model/m/submodules.py"
+_KEPT = (_NODE, "Node.hook", "request_state")
 
 
 @pytest.mark.parametrize("path, source, found, used", [
-    (_TTS, "class CodecSubmodule:\n    def batch_postprocess(self, rid):\n        return self.request_state(rid)\n",
-     [], {_WATERMARK}),
-    (_TTS, "class CodecSubmodule:\n    def postprocess(self, rid):\n        return self.request_state(rid)\n",
+    (_NODE, "class Node:\n    def hook(self, rid):\n        return self.request_state(rid)\n", [], {_KEPT}),
+    (_NODE, "class Node:\n    def other(self, rid):\n        return self.request_state(rid)\n",
      [".request_state at line 3"], set()),
-    (_TTS, "class TalkerSubmodule:\n    def batch_postprocess(self, rid):\n        return self.request_state(rid)\n",
+    (_NODE, "class Other:\n    def hook(self, rid):\n        return self.request_state(rid)\n",
      [".request_state at line 3"], set()),
-    (_TTS, "class CodecSubmodule:\n    def batch_postprocess(self, rid):\n        return rid\n", [], set()),
-    (_TTS, "class CodecSubmodule:\n    def batch_postprocess(self, rid):\n        self.request_state(rid)\n"
-     "        return self.node_resources\n", [".node_resources at line 4"], {_WATERMARK}),
+    (_NODE, "class Node:\n    def hook(self, rid):\n        return rid\n", [], set()),
+    (_NODE, "class Node:\n    def hook(self, rid):\n        self.request_state(rid)\n"
+     "        return self.node_resources\n", [".node_resources at line 4"], {_KEPT}),
     ("mstar/model/qwen3_omni/components/code2wav.py",
      "class Qwen3OmniMoeCode2WavTransformerModel:\n    def forward(self): pass\n", [], set()),
 ], ids=["the hook", "another function", "another class's hook", "the hook without it", "the hook reading more",
         "an undecorated forward"])
-def test_an_exception_covers_only_its_own_functions_attribute(path, source, found, used):
+def test_an_exception_covers_only_its_own_functions_attribute(path, source, found, used, monkeypatch):
     """A key skips only its attribute, anywhere in its function, and is used only when it skips one."""
+    monkeypatch.setitem(ALLOWED_IN_FUNCTION, _KEPT, "a forbidden read one function keeps")
     assert _violations(source, path) == (found, used)
 
 

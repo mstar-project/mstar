@@ -14,13 +14,16 @@ Architecture (two asynchronous partitions):
     Talker     - text/voice prefill, then autoregressive 16-group codec frames
     RefEncoder - (Base) reference clip -> x-vector + codec frames, feeds the prefill
     Codec      - speech-tokenizer decoder producing PCM chunks, its state kept per stream
+    Watermark  - (opt-in) AudioSeal watermark on each PCM chunk, in a third partition
 
 Streaming topology:
     Talker --[codec_tokens, ScheduledLeftContextChunkPolicy((1, 3, 8, 16), 25, 0)]--> Codec
+    Codec --[audio_chunk, FixedChunkPolicy(1)]--> Watermark   (watermark on)
 
 Request state machine:
     Talker: talker_prefill | talker_prefill_clone -> talker_decode loop -> done on EOS/token limit
     Codec:  waits for streamed frames -> codec_chunk -> emits audio -> waits
+    Watermark: waits for streamed chunks -> watermark_chunk -> emits audio -> waits
 
 This class runs in the API/conductor side. It owns request validation, graph
 and partition declarations, walk plans, sampling defaults, and
@@ -57,6 +60,7 @@ from mstar.engine.state import (
     Sampler,
     SampleSettings,
     Span,
+    TensorType,
     Value,
 )
 from mstar.graph.base import (
@@ -68,7 +72,12 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.audio_watermark import AudioSealWatermarker, AudioWatermarkConfig, import_audioseal
+from mstar.model.audio_watermark import (
+    AudioSealWatermarker,
+    AudioWatermarkConfig,
+    import_audioseal,
+    watermark_cache_size,
+)
 from mstar.model.base import (
     ClientChunk,
     KVLabel,
@@ -97,6 +106,7 @@ from mstar.model.qwen3_tts.config import (
     TALKER_MIXED,
     TALKER_SAMPLER,
     TALKER_TEXT,
+    WATERMARK_STATE,
     Qwen3TTSModelConfig,
     mono_samples,
 )
@@ -447,6 +457,8 @@ class Qwen3TTSModel(Model):
     """
 
     DECODE_LOOP = "talker_decode_loop"
+    # the opt-in watermark, off unless ``model_kwargs`` turns it on (``__init__``)
+    audio_watermark = AudioWatermarkConfig()
     # Streams the codec state pool holds (about 5 MiB each in float32); a
     # deployment sizes it with ``resources: {codec_state: {max_slots: ...}}``.
     MAX_CODEC_STREAMS = 256
@@ -465,11 +477,13 @@ class Qwen3TTSModel(Model):
         # several of its convs on a kernel without tensor cores.
         self.codec_dtype = codec_dtype(kwargs.get("codec_dtype", "float32"))
         # Server-init knob: opt-in AudioSeal watermark on the codec's output
-        # (``mstar.model.audio_watermark``). Checked here so a missing package
-        # fails the server at startup, not at the first request.
+        # (``mstar.model.audio_watermark``), by a node of its own. Checked here
+        # so a missing package fails the server at startup, not at the first
+        # request; the stream state it declares is sized by its generator.
         self.audio_watermark = AudioWatermarkConfig.parse(kwargs.get("audio_watermark"))
         if self.audio_watermark.enabled:
             import_audioseal()
+            self.watermark_cache_size = watermark_cache_size(self.audio_watermark)
         # Server-init knob: the 1.7B CodePredictor's depth loop as one persistent kernel on Hopper
         # (``mstar.model.qwen3_tts.components.depth_frame``). Its codes can differ from the loop's in the last bits.
         self.depth_kernel = bool(kwargs.get("depth_kernel", False))
@@ -524,8 +538,8 @@ class Qwen3TTSModel(Model):
     # -----------------------------------------------------------------------
 
     def declare_state(self) -> list[Array | Sampler]:
-        """Talker paged KV with its read and positions, whether TTS EOS was fed, its two samplers, and the Codec's
-        per-stream decoder state.
+        """Talker paged KV with its read and positions, whether TTS EOS was fed, its two samplers, the Codec's
+        per-stream decoder state, and with the watermark on, its per-stream generator caches.
 
         The CodePredictor's frame-local KV scratch is its ``DepthKV``'s (overwritten every step)."""
         from mstar.model.qwen3_tts.components.incremental_codec import codec_state_entry
@@ -533,7 +547,7 @@ class Qwen3TTSModel(Model):
         talker = self.config.talker
         # min_p is on where the checkpoint defaults it on, so that default is not refused
         defaults = self._generation_defaults()
-        return [
+        states = [
             Array(
                 TALKER_KV, nodes={"Talker"}, layers=frozenset(range(talker.num_hidden_layers)),
                 entry=KVEntry(heads=talker.num_key_value_heads, head_dim=talker.head_dim),
@@ -556,6 +570,10 @@ class Qwen3TTSModel(Model):
                 entry=codec_state_entry(self.config.codec, self.codec_dtype),
             ),
         ]
+        if self.audio_watermark.enabled:
+            caches = Entry({"caches": TensorType((self.watermark_cache_size,), dtype=torch.float32)})
+            states.append(Value(WATERMARK_STATE, nodes={"Watermark"}, layers=frozenset({0}), entry=caches))
+        return states
 
     def lora_roots(self) -> tuple[LoraRoot, ...]:
         """Per-request adapters on the Talker: every linear of its stack and the
@@ -571,13 +589,16 @@ class Qwen3TTSModel(Model):
         ),)
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
-        return {
+        settings = {
             # Every checkpoint has two query heads per KV head: the CUDA-core
             # decode kernel wins, since the tensor-core one pads them to a tile
             TALKER_ATTN: {"decode_tensor_cores": False},
             # streams being decoded at once, + 1 for the pool's sink slot
             CODEC_STATE: {"max_slots": self.MAX_CODEC_STREAMS + 1},
         }
+        if self.audio_watermark.enabled:
+            settings[WATERMARK_STATE] = {"max_slots": self.MAX_CODEC_STREAMS + 1}
+        return settings
 
     # -----------------------------------------------------------------------
     # Model ABC: walk graph declaration
@@ -590,7 +611,9 @@ class Qwen3TTSModel(Model):
         crosses the asynchronous partition boundary and is buffered according
         to ``get_partition_topology`` before Codec is scheduled. Base
         checkpoints add a clone prefill (RefEncoder -> Talker) and a codec walk
-        that also receives the reference frame count to trim.
+        that also receives the reference frame count to trim. With the
+        watermark on, the codec's chunks stream to the Watermark node, whose
+        walk emits them.
         """
         def talker_prefill_node(input_names: list[str]) -> GraphNode:
             # Prefill seeds both recurrent paths: the embedding for the next
@@ -613,20 +636,15 @@ class Qwen3TTSModel(Model):
                 ],
             )
 
+        emit_audio = GraphEdge(next_node=EMIT_TO_CLIENT, name="audio_chunk", output_modality="audio")
+
         def codec_node(input_names: list[str]) -> GraphNode:
             # Codec is deliberately a separate walk/engine so waveform decoding
             # can overlap with subsequent Talker steps.
-            return GraphNode(
-                name="Codec",
-                input_names=input_names,
-                outputs=[
-                    GraphEdge(
-                        next_node=EMIT_TO_CLIENT,
-                        name="audio_chunk",
-                        output_modality="audio",
-                    ),
-                ],
-            )
+            audio = emit_audio
+            if self.audio_watermark.enabled:
+                audio = StreamingGraphEdge(next_node="Watermark", name="audio_chunk", target_partition="Watermark")
+            return GraphNode(name="Codec", input_names=input_names, outputs=[audio])
 
         # Each loop iteration predicts one complete 16-group codec frame and
         # feeds the summed codec embedding back into the next Talker step,
@@ -657,6 +675,8 @@ class Qwen3TTSModel(Model):
             "talker_decode": talker_decode,
             "codec_chunk": codec_node(["codec_tokens"]),
         }
+        if self.audio_watermark.enabled:
+            walks["watermark_chunk"] = GraphNode(name="Watermark", input_names=["audio_chunk"], outputs=[emit_audio])
         if self.config.supports_reference_audio:
             ref_encoder = GraphNode(
                 name="RefEncoder",
@@ -686,12 +706,13 @@ class Qwen3TTSModel(Model):
     # -----------------------------------------------------------------------
 
     def get_partitions(self) -> list[PartitionDefinition]:
-        """Split autoregressive generation from independently scheduled audio."""
+        """Split autoregressive generation from independently scheduled audio,
+        and with the watermark on, the watermark from the codec."""
         talker_walks = {"talker_prefill", "talker_decode"}
         codec_walks = {"codec_chunk"}
         if self.config.supports_reference_audio:
             talker_walks.add("talker_prefill_clone")
-        return [
+        partitions = [
             PartitionDefinition(
                 name="Talker",
                 graph_walks=talker_walks,
@@ -701,6 +722,9 @@ class Qwen3TTSModel(Model):
                 graph_walks=codec_walks,
             ),
         ]
+        if self.audio_watermark.enabled:
+            partitions.append(PartitionDefinition(name="Watermark", graph_walks={"watermark_chunk"}))
+        return partitions
 
     def get_partition_topology(self) -> PartitionTopology:
         """Feed the decode its text, and buffer codec frames in a ramp of
@@ -716,30 +740,40 @@ class Qwen3TTSModel(Model):
         chunk repeats earlier frames: the codec keeps its decoder state per
         stream (``CODEC_STATE``). Only an in-context clone's first chunk carries
         context, the reference tail primed into the stream.
+
+        With the watermark on, each codec chunk reaches the Watermark node as a
+        chunk of its own, so every chunk it marks is one the codec decoded.
         """
         codec = self.config.codec
-        return PartitionTopology(
-            partitions=["Talker", "Codec"],
-            connections=[
-                Connection(
-                    from_partition=CLIENT,
-                    to_partition="Talker",
-                    edge_name="text_in",
-                    chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=True),
-                    limits=ClientStreamLimits(max_items=self.config.talker.max_position_embeddings),
+        partitions = ["Talker", "Codec"]
+        connections = [
+            Connection(
+                from_partition=CLIENT,
+                to_partition="Talker",
+                edge_name="text_in",
+                chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=True),
+                limits=ClientStreamLimits(max_items=self.config.talker.max_position_embeddings),
+            ),
+            Connection(
+                from_partition="Talker",
+                to_partition="Codec",
+                edge_name="codec_tokens",
+                chunk_policy_factory=lambda: ScheduledLeftContextChunkPolicy(
+                    schedule=codec.chunk_schedule,
+                    chunk=codec.chunk_frames,
+                    left_context=0,
                 ),
-                Connection(
-                    from_partition="Talker",
-                    to_partition="Codec",
-                    edge_name="codec_tokens",
-                    chunk_policy_factory=lambda: ScheduledLeftContextChunkPolicy(
-                        schedule=codec.chunk_schedule,
-                        chunk=codec.chunk_frames,
-                        left_context=0,
-                    ),
-                ),
-            ],
-        )
+            ),
+        ]
+        if self.audio_watermark.enabled:
+            partitions.append("Watermark")
+            connections.append(Connection(
+                from_partition="Codec",
+                to_partition="Watermark",
+                edge_name="audio_chunk",
+                chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1),
+            ))
+        return PartitionTopology(partitions=partitions, connections=connections)
 
     # -----------------------------------------------------------------------
     # API preprocessing
@@ -1054,8 +1088,9 @@ class Qwen3TTSModel(Model):
         model_kwargs: dict,
     ) -> list[WalkStep]:
         """Talker prefills (a request with a reference clip takes the clone
-        prefill, whose RefEncoder runs first), then decodes. Codec has no API
-        inputs: it runs its chunk walk whenever the stream has a chunk ready.
+        prefill, whose RefEncoder runs first), then decodes. Codec and Watermark
+        have no API inputs: each runs its chunk walk whenever its stream has a
+        chunk ready.
         """
         if partition_name == "Talker":
             clone = "audio" in input_modalities
@@ -1071,6 +1106,8 @@ class Qwen3TTSModel(Model):
             return [prefill, decode]
         if partition_name == "Codec":
             return [WalkStep("codec_chunk")] if "audio" in output_modalities else []
+        if partition_name == "Watermark":
+            return [WalkStep("watermark_chunk")] if "audio" in output_modalities else []
         raise ValueError(f"Unknown Qwen3-TTS partition: {partition_name!r}")
 
     # -----------------------------------------------------------------------
@@ -1188,12 +1225,14 @@ class Qwen3TTSModel(Model):
         autocast_dtype: torch.dtype | None = None,
     ) -> NodeSubmodule | None:
         """Build only the node assigned to this worker and cache the wrapper."""
-        if node_name not in ("Talker", "Codec", "RefEncoder"):
+        if node_name not in ("Talker", "Codec", "RefEncoder", "Watermark"):
             raise ValueError(f"Unknown Qwen3-TTS node: {node_name!r}")
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
 
-        self._ensure_full_snapshot()
+        if node_name != "Watermark":
+            # the watermark's weights are AudioSeal's, outside the checkpoint
+            self._ensure_full_snapshot()
         if node_name == "Talker":
             submodule = self._create_talker_submodule(
                 device=device,
@@ -1204,6 +1243,10 @@ class Qwen3TTSModel(Model):
             submodule = self._create_ref_encoder_submodule(
                 device=device, autocast_dtype=autocast_dtype
             )
+        elif node_name == "Watermark":
+            from mstar.model.qwen3_tts.submodules import WatermarkSubmodule
+
+            submodule = WatermarkSubmodule(AudioSealWatermarker.build(self.audio_watermark, device), self.config)
         else:
             submodule = self._create_codec_submodule(device=device)
         self._submodule_cache[node_name] = submodule
@@ -1312,9 +1355,7 @@ class Qwen3TTSModel(Model):
         decoder.eval()
         if self.codec_dtype != torch.float32:
             decoder.to(dtype=self.codec_dtype)
-        watermark = getattr(self, "audio_watermark", AudioWatermarkConfig())
-        watermarker = AudioSealWatermarker.build(watermark, device) if watermark.enabled else None
-        return CodecSubmodule(decoder, self.config, watermarker=watermarker)
+        return CodecSubmodule(decoder, self.config)
 
     def _create_ref_encoder_submodule(
         self, device: str, autocast_dtype: torch.dtype | None = None,

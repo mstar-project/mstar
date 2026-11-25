@@ -1803,9 +1803,9 @@ def _tiny_decoder(config, seed: int = 0) -> torch.nn.Module:
     return decoder
 
 
-def _tiny_codec(config=None, watermarker=None) -> CodecSubmodule:
+def _tiny_codec(config=None) -> CodecSubmodule:
     config = config or _tiny_model_config()
-    return CodecSubmodule(_tiny_decoder(config), config, watermarker=watermarker)
+    return CodecSubmodule(_tiny_decoder(config), config)
 
 
 class _CodecDriver:
@@ -1935,128 +1935,6 @@ def test_qwen3_tts_codec_postprocess_uses_its_own_pass_geometry():
     out_second = {"audio_chunk": [torch.arange(4)]}
     submodule.postprocess("request", None, out_second, inputs=second)
     assert out_second["audio_chunk"][0].tolist() == [0, 1, 2, 3]
-
-
-def _codec_tail_step(submodule, chunks: dict[str, torch.Tensor], final: bool = False):
-    outputs = {rid: {"audio_chunk": [chunk]} for rid, chunk in chunks.items()}
-    inputs = [ARNodeInputs(kwargs={"is_final": final}) for _ in chunks]
-    submodule.batch_postprocess(outputs, dict.fromkeys(chunks), inputs)
-    return {rid: out["audio_chunk"][0] for rid, out in outputs.items()}
-
-
-def test_qwen3_tts_codec_without_watermark_leaves_audio_untouched():
-    submodule = _tiny_codec()
-    assert submodule.watermarker is None
-    chunk = torch.arange(-640, 640, dtype=torch.int16)
-    before = chunk.clone()
-    out = _codec_tail_step(submodule, {"a": chunk}, final=True)
-    assert out["a"] is chunk and torch.equal(out["a"], before)
-    assert "watermark_stream" not in submodule.request_state("a")
-
-
-def test_qwen3_tts_codec_without_watermark_emits_the_same_bytes_through_the_engine():
-    """Watermark off, the engine's postprocess (batch tail included) emits byte
-    for byte what per-request ``postprocess`` alone does, which is all the
-    engine ran before the tail existed: two batched streams, ramp to final."""
-    from mstar.testing_utils.engine import make_engine, make_mgmt
-
-    config = _tiny_model_config()
-    config.codec = _tiny_codec_config(chunk_schedule=(1, 3, 8, 20, 5), chunk_frames=6)
-    submodule = _tiny_codec(config)
-    driver = _CodecDriver(submodule)
-    assert submodule.watermarker is None
-    codec = config.codec
-    rids = ["a", "b"]
-    streams = {}
-    for rid in rids:
-        stream = StreamBuffer(request_id=rid, edge_name="codec_tokens", from_partition="Talker",
-                              policy=ScheduledLeftContextChunkPolicy(codec.chunk_schedule, codec.chunk_frames, 0))
-        frames = torch.randint(0, 32, (48, 4))   # below the tiny talker's codec EOS (35)
-        for i in range(frames.shape[0]):
-            stream.pre_read_register(f"t{i}")
-            stream.put(f"t{i}", frames[i])
-        stream.signal_done()
-        streams[rid] = stream
-    engine = make_engine(_submodules={"Codec": make_mgmt(submodule)})
-    finals = 0
-    with torch.no_grad():
-        while all(stream.has_chunk_ready() for stream in streams.values()):
-            chunks = {rid: stream.pop_chunk() for rid, stream in streams.items()}
-            if any(chunk.data["data"] is None for chunk in chunks.values()):
-                break
-            items = [
-                submodule.prepare_inputs(
-                    "codec_chunk", SimpleNamespace(request_id=rid, rid_handle=rid),
-                    {"codec_tokens": [chunks[rid].data["data"].reshape(-1, 4)]},
-                    input_metadata=InputMetadata(stream_chunks={"codec_tokens": chunks[rid].info}),
-                )
-                for rid in rids
-            ]
-            finals += sum(item.kwargs["is_final"] for item in items)
-            out = driver.step(dict(zip(rids, items, strict=True)), postprocess=False)   # the engine's row views
-            alone = {rid: {"audio_chunk": [out[rid]["audio_chunk"][0].clone()]} for rid in rids}
-            for rid, item in zip(rids, items, strict=True):
-                submodule.postprocess(rid, None, alone[rid], inputs=item)
-            failures = {}
-            batch = SimpleNamespace(
-                node_name="Codec", request_ids=rids, inputs=items,
-                per_request_info_wrapped={rid: None for rid in rids}, failed_requests=failures,
-                register_failure=failures.__setitem__, step_context=SimpleNamespace(graph_walk="codec_chunk"),
-            )
-            engine._postprocess_batch(batch, out)
-            assert not failures
-            for rid in rids:
-                got, want = out[rid]["audio_chunk"][0], alone[rid]["audio_chunk"][0]
-                assert got.dtype == want.dtype == torch.int16 and want.numel() > 0
-                assert got.numpy().tobytes() == want.numpy().tobytes()
-    assert finals == len(rids)
-    assert all("watermark_stream" not in submodule.request_state(rid) for rid in rids)
-
-
-def test_qwen3_tts_codec_watermark_streams_like_the_whole_utterance():
-    """Two requests through the codec tail, chunk by chunk, against each
-    request's offline watermark; the stream state goes with the request."""
-    from test_audio_watermark import _speechlike, _watermarker
-
-    watermarker = _watermarker(message=0xBEEF)
-    submodule = _tiny_codec(watermarker=watermarker)
-    pcm = {
-        rid: (_speechlike(4000, seed=s).clamp(-1, 1) * 32767).to(torch.int16)
-        for rid, s in (("a", 1), ("b", 2))
-    }
-    # chunk edges in samples (the tiny codec's 4-sample frames: ragged against 320)
-    edges = [0, 1280, 1300, 2560, 4000]
-    marked = {rid: [] for rid in pcm}
-    for i in range(len(edges) - 1):
-        step = {rid: audio[edges[i]:edges[i + 1]] for rid, audio in pcm.items()}
-        for rid, piece in _codec_tail_step(submodule, step, final=i == len(edges) - 2).items():
-            marked[rid].append(piece)
-    for rid, audio in pcm.items():
-        expected = (watermarker.offline(audio.float() / 32767).clamp(-1, 1) * 32767).to(torch.int16)
-        got = torch.cat(marked[rid])
-        assert got.shape == audio.shape and not torch.equal(got, audio)
-        assert (got.int() - expected.int()).abs().max() <= 1
-    submodule.cleanup_request("a")
-    assert "a" not in submodule.request_states
-
-
-def test_qwen3_tts_codec_declares_a_watermark_capture_per_schedule_length():
-    """Watermark on, the codec asks the engine to capture the generator per
-    chunk length of its schedule and batch bucket; off, nothing. Lengths that
-    are not whole 320-sample watermark frames (the tiny codec's) stay eager."""
-    from test_audio_watermark import _watermarker
-
-    # The engine looks up only this name; a misnamed override inherits the base's {}.
-    assert "get_piecewise_accelerator_graph_configs" in CodecSubmodule.__dict__
-    config = _tiny_model_config()
-    assert _tiny_codec(config).get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32) == {}
-    submodule = _tiny_codec(config, watermarker=_watermarker())
-    assert submodule.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32) == {}
-    submodule.total_upsample = 1920   # the real 12 Hz codec's samples per frame
-    configs = submodule.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32, 1)
-    frames = sorted({*config.codec.chunk_schedule, config.codec.chunk_frames})
-    assert sorted(configs) == sorted(f"watermark_{f * 1920}" for f in frames)
-    assert all(c.capture_batch_sizes == CodecSubmodule.WATERMARK_BATCH_SIZES for c in configs.values())
 
 
 def test_qwen3_tts_clone_reference_tail_is_the_first_windows_context():
