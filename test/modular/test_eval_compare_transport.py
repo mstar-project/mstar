@@ -220,6 +220,33 @@ def test_timeout_case_times_out_the_long_request_and_a_server_that_dies_after_it
     assert verdict == "FAIL" and "serves_after_timeout 200 to ConnectionError" in detail
 
 
+def test_timeout_speech_disables_sentence_chunking_for_long_request(tmp_path, monkeypatch):
+    """Multi-sentence speech inputs are split per sentence by default, giving each sentence a fresh --timeout budget."""
+    monkeypatch.setattr(request_path, "TIMEOUT_SETTLE_S", 0.05)
+    seen: list[dict] = []
+
+    class Record(Speech):
+        cut = threading.Event()
+        timeout_s = 1.0
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.append(body)
+            if len(body["input"]) > 200:
+                self._reply(500, b"Request timed out")
+            else:
+                self._reply(200, b"RIFF" + body["input"].encode())
+
+    srv, url = serve(Record)
+    try:
+        res = request_path.timeout_speech(url, tmp_path, tmp_path)
+    finally:
+        srv.shutdown()
+    assert res["times_out"] == {"status": 500, "ok": True}
+    long_bodies = [b for b in seen if len(b["input"]) > 200]
+    assert len(long_bodies) == 1 and long_bodies[0].get("sentence_chunking") is False
+
+
 @pytest.mark.parametrize("handler", [
     {"timeout_s": 600.0},                      # the long request beat the timeout: nothing was cancelled
     {"timeout_s": 1.0, "dies_after_cut": True, "cut": None},   # a 500 that is not the server's timeout

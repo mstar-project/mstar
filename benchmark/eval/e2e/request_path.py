@@ -470,7 +470,12 @@ def cancel_chat(url: str, inputs: Path, scratch: Path) -> dict:  # noqa: ARG001
 
 
 def timeout_speech(url: str, inputs: Path, scratch: Path) -> dict:  # noqa: ARG001
-    return _timeout_suite(_speech_req(url, SHORT_TEXT), _speech_req(url, " ".join([CANCEL_TEXT] * 4)))
+    # Disable sentence chunking so the whole text runs as one backend request against --timeout
+    # (otherwise each sentence gets its own 5 s budget and finishes in ~1-2 s on H200).
+    return _timeout_suite(
+        _speech_req(url, SHORT_TEXT),
+        _speech_req(url, " ".join([CANCEL_TEXT] * 16), sentence_chunking=False),
+    )
 
 
 def timeout_chat(url: str, inputs: Path, scratch: Path) -> dict:  # noqa: ARG001

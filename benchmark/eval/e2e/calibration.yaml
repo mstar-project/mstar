@@ -1,11 +1,12 @@
 # A/A noise floors and correctness swings per GPU type (benchmark/eval/e2e/calibrate.py); written by
 # `python -m benchmark.eval calibrate`.
-_runs: [20261017-011012-main, 20261017-014824-main, 20261017-031729-main, 20261017-165629-main, 20261018-211808-main, 576-slice-35d1d599,
-  577-cosyvoice3-b3922414, 577-lingbot_world_1_3b-a6377f82, 577-omnilingual_asr_ctc_300m-89dce5fc, 577-voxcpm2-5ef294e8, run-aa4]
+_runs: [20261017-011012-main, 20261017-014824-main, 20261017-031729-main, 20261017-165629-main, 20261018-211808-main, 575-transport-aa1-e42c465d,
+  575-transport-aa2-fedf3e1a, 576-slice-35d1d599, 577-cosyvoice3-b3922414, 577-lingbot_world_1_3b-a6377f82, 577-omnilingual_asr_ctc_300m-89dce5fc,
+  577-voxcpm2-5ef294e8, run-aa4]
 _runs_correct: [20261017-011012-main, 20261017-014824-main, 20261017-031729-main, 20261017-165629-main, 20261018-211808-main,
-  576-slice-35d1d599, 577-cosyvoice3-b3922414, 577-lingbot_world_1_3b-a6377f82, 577-omnilingual_asr_ctc_300m-89dce5fc, 577-voxcpm2-5ef294e8,
-  run-aa4]
-_runs_quality: [576-slice-35d1d599]
+  575-transport-aa1-e42c465d, 575-transport-aa2-fedf3e1a, 576-slice-35d1d599, 577-cosyvoice3-b3922414, 577-lingbot_world_1_3b-a6377f82,
+  577-omnilingual_asr_ctc_300m-89dce5fc, 577-voxcpm2-5ef294e8, run-aa4]
+_runs_quality: [575-transport-aa1-e42c465d, 575-transport-aa2-fedf3e1a, 576-slice-35d1d599]
 b200:bagel/image_in/correct:
   kind: text_match
   swings: [0.0]
@@ -408,16 +409,53 @@ h200:orpheus/tts/rtf_mean@c1:
 h200:orpheus/tts/ttfa_ms_p50@c1:
   deltas: [1.015, -0.141]
 h200:orpheus_mooncake/tts/audio_s_per_s@c8:
-  deltas: [-0.427]
+  deltas: [-0.427, -1.379, 0.6, -2.716]
 h200:orpheus_mooncake/tts/correct:
   kind: wer
-  swings: [0.0]
+  swings: [0.0, 1.57, 1.4493, 0.0, 0.2415]
 h200:orpheus_mooncake/tts/e2e_s_p50@c1:
-  deltas: [0.152]
+  deltas: [0.152, -0.107]
+h200:orpheus_mooncake/tts/mos:
+  kind: mos
+  swings: [0.0077, 0.0095, 0.0009, 0.0847, 0.0011]
 h200:orpheus_mooncake/tts/rtf_mean@c1:
-  deltas: [-0.033]
+  deltas: [-0.033, -8.533, 15.606, 0.034]
+h200:orpheus_mooncake/tts/s_per_audio_s_p50@c1:
+  deltas: [-8.683, 15.612]
 h200:orpheus_mooncake/tts/ttfa_ms_p50@c1:
-  deltas: [-0.326]
+  deltas: [-0.326, -7.656, 15.123, 0.852]
+h200:orpheus_pd_disaggregated_shm/tts/audio_s_per_s@c8:
+  deltas: [-3.411, 2.623, -2.152]
+h200:orpheus_pd_disaggregated_shm/tts/correct:
+  kind: wer
+  swings: [1.8116, 0.0, 0.0, 0.0]
+h200:orpheus_pd_disaggregated_shm/tts/e2e_s_p50@c1:
+  deltas: [0.277]
+h200:orpheus_pd_disaggregated_shm/tts/mos:
+  kind: mos
+  swings: [0.0215, 0.0446, 0.0014, 0.0065, 0.0173]
+h200:orpheus_pd_disaggregated_shm/tts/rtf_mean@c1:
+  deltas: [9.734, -20.104, 1.45]
+h200:orpheus_pd_disaggregated_shm/tts/s_per_audio_s_p50@c1:
+  deltas: [10.037, -20.364]
+h200:orpheus_pd_disaggregated_shm/tts/ttfa_ms_p50@c1:
+  deltas: [7.232, -15.305, 1.059]
+h200:orpheus_pd_disaggregated_tcp/tts/audio_s_per_s@c8:
+  deltas: [-0.192, -0.708, -3.349, -3.13]
+h200:orpheus_pd_disaggregated_tcp/tts/correct:
+  kind: wer
+  swings: [0.4831, 0.0, 0.1208, 0.0, 1.087, 0.1208]
+h200:orpheus_pd_disaggregated_tcp/tts/e2e_s_p50@c1:
+  deltas: [-0.217]
+h200:orpheus_pd_disaggregated_tcp/tts/mos:
+  kind: mos
+  swings: [0.0226, 0.0057, 0.0026, 0.0049, 0.0056, 0.0727, 0.005, 0.0012]
+h200:orpheus_pd_disaggregated_tcp/tts/rtf_mean@c1:
+  deltas: [-14.686, 0.024, -36.542, 0.436]
+h200:orpheus_pd_disaggregated_tcp/tts/s_per_audio_s_p50@c1:
+  deltas: [-14.669, -36.846, 0.304]
+h200:orpheus_pd_disaggregated_tcp/tts/ttfa_ms_p50@c1:
+  deltas: [-12.766, 0.162, -29.98, -0.237]
 h200:pi05/act/correct:
   kind: action_diff
   swings: [0.0068, 0.0]
@@ -503,6 +541,36 @@ h200:qwen3_omni/video_in/req_per_s@c8:
   deltas: [0.296, 0.061, 0.642]
 h200:qwen3_omni/video_in/ttft_p50_s@c1:
   deltas: [0.86, 0.574, 0.368]
+h200:qwen3_omni_mooncake/audio_out/audio_s_per_s@c8:
+  deltas: [-0.337, 3.39]
+h200:qwen3_omni_mooncake/audio_out/correct:
+  kind: audio_len
+  swings: [0.0, 0.0]
+h200:qwen3_omni_mooncake/audio_out/lat_p50_s@c1:
+  deltas: [-0.228, 0.726]
+h200:qwen3_omni_mooncake/audio_out/mos:
+  kind: mos
+  swings: [0.0002, 0.0001]
+h200:qwen3_omni_mooncake/audio_out/ttft_p50_s@c1:
+  deltas: [2.823, 1.855]
+h200:qwen3_omni_mooncake/image_in/correct:
+  kind: text_match
+  swings: [0.0, 0.0]
+h200:qwen3_omni_mooncake/image_in/lat_p50_s@c1:
+  deltas: [-1.821, 0.448]
+h200:qwen3_omni_mooncake/image_in/tok_per_s@c8:
+  deltas: [0.627, 2.686]
+h200:qwen3_omni_mooncake/image_in/ttft_p50_s@c1:
+  deltas: [0.853, -0.969]
+h200:qwen3_omni_mooncake/text/correct:
+  kind: text_match
+  swings: [0.0, 0.0]
+h200:qwen3_omni_mooncake/text/lat_p50_s@c1:
+  deltas: [0.55, 0.099]
+h200:qwen3_omni_mooncake/text/req_per_s@c8:
+  deltas: [2.557, -0.262]
+h200:qwen3_omni_mooncake/text/ttft_p50_s@c1:
+  deltas: [-0.017, -1.8]
 h200:qwen3_tts/tts/audio_s_per_s@c8:
   deltas: [-1.429, -2.562]
 h200:qwen3_tts/tts/correct:
@@ -514,6 +582,82 @@ h200:qwen3_tts/tts/rtf_mean@c1:
   deltas: [-0.454, 0.555]
 h200:qwen3_tts/tts/ttfa_ms_p50@c1:
   deltas: [-0.58, -2.351]
+h200:qwen3omni_pd_disaggregated_shm/audio_out/audio_s_per_s@c8:
+  deltas: [-9.023, -1.348]
+h200:qwen3omni_pd_disaggregated_shm/audio_out/correct:
+  kind: audio_len
+  swings: [6.3689, 3.7207]
+h200:qwen3omni_pd_disaggregated_shm/audio_out/lat_p50_s@c1:
+  deltas: [-5.736]
+h200:qwen3omni_pd_disaggregated_shm/audio_out/mos:
+  kind: mos
+  swings: [0.0458, 0.0131]
+h200:qwen3omni_pd_disaggregated_shm/audio_out/s_per_audio_s_p50@c1:
+  deltas: [-0.627]
+h200:qwen3omni_pd_disaggregated_shm/audio_out/ttft_p50_s@c1:
+  deltas: [0.619, 2.239]
+h200:qwen3omni_pd_disaggregated_shm/text/correct:
+  kind: text_match
+  swings: [0.0, 0.0, 0.0, 0.75, 0.75]
+h200:qwen3omni_pd_disaggregated_shm/text/lat_p50_s@c1:
+  deltas: [2.127, -1.192, 8.181]
+h200:qwen3omni_pd_disaggregated_shm/text/tok_per_s@c8:
+  deltas: [-6.16, -5.361, 5.622]
+h200:qwen3omni_pd_disaggregated_shm/text/ttft_p50_s@c1:
+  deltas: [1.182, -4.114, 0.784]
+h200:qwen3omni_pd_disaggregated_tcp/audio_out/audio_s_per_s@c8:
+  deltas: [6.51, 5.606]
+h200:qwen3omni_pd_disaggregated_tcp/audio_out/correct:
+  kind: audio_len
+  swings: [6.8021, 3.5872]
+h200:qwen3omni_pd_disaggregated_tcp/audio_out/lat_p50_s@c1:
+  deltas: [3.677]
+h200:qwen3omni_pd_disaggregated_tcp/audio_out/mos:
+  kind: mos
+  swings: [0.0454, 0.0126]
+h200:qwen3omni_pd_disaggregated_tcp/audio_out/s_per_audio_s_p50@c1:
+  deltas: [0.165]
+h200:qwen3omni_pd_disaggregated_tcp/audio_out/ttft_p50_s@c1:
+  deltas: [2.756, -0.456]
+h200:qwen3omni_pd_disaggregated_tcp/text/correct:
+  kind: text_match
+  swings: [0.0, 0.0]
+h200:qwen3omni_pd_disaggregated_tcp/text/lat_p50_s@c1:
+  deltas: [0.374, -0.563]
+h200:qwen3omni_pd_disaggregated_tcp/text/req_per_s@c8:
+  deltas: [-0.929, -0.789]
+h200:qwen3omni_pd_disaggregated_tcp/text/ttft_p50_s@c1:
+  deltas: [-2.245, -2.713]
+h200:qwen3tts_1p7b_split_shm/tts/audio_s_per_s@c8:
+  deltas: [1.128, -3.406]
+h200:qwen3tts_1p7b_split_shm/tts/correct:
+  kind: wer
+  swings: [0.0, 0.7246]
+h200:qwen3tts_1p7b_split_shm/tts/e2e_s_p50@c1:
+  deltas: [0.08]
+h200:qwen3tts_1p7b_split_shm/tts/mos:
+  kind: mos
+  swings: [0.0, 0.1117]
+h200:qwen3tts_1p7b_split_shm/tts/rtf_mean@c1:
+  deltas: [-0.026, 0.626]
+h200:qwen3tts_1p7b_split_shm/tts/s_per_audio_s_p50@c1:
+  deltas: [0.409]
+h200:qwen3tts_1p7b_split_shm/tts/ttfa_ms_p50@c1:
+  deltas: [-1.497, -3.213]
+h200:qwen3tts_1p7b_split_tcp/tts/audio_s_per_s@c8:
+  deltas: [-0.44, 0.828]
+h200:qwen3tts_1p7b_split_tcp/tts/correct:
+  kind: wer
+  swings: [0.0, 0.0]
+h200:qwen3tts_1p7b_split_tcp/tts/e2e_s_p50@c1:
+  deltas: [-4.197, 0.113]
+h200:qwen3tts_1p7b_split_tcp/tts/mos:
+  kind: mos
+  swings: [0.0, 0.0]
+h200:qwen3tts_1p7b_split_tcp/tts/rtf_mean@c1:
+  deltas: [-4.372, 0.176]
+h200:qwen3tts_1p7b_split_tcp/tts/ttfa_ms_p50@c1:
+  deltas: [-5.913, 5.74]
 h200:voxcpm2/clone/audio_s_per_s@c8:
   deltas: [-1.136]
 h200:voxcpm2/clone/correct:
