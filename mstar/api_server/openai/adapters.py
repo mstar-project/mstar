@@ -1780,6 +1780,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "z_image_turbo": DiffusionImageAdapter(),
     "glm52": TextChatAdapter(),
     "glm5_next": TextChatAdapter(),
+    "deepseek_v41": TextChatAdapter(),
     # chat with images; reasoning_effort and the sampling defaults are the model's
     "muse_glimmer": Qwen3_5Adapter(),
     # chat with images and audio (image_url, audio_url and input_audio parts)

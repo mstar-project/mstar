@@ -91,9 +91,10 @@ class Glm5NextHyperConnection(nn.Module):
         del device  # fn already carries the right device
         self.finalize_weights()
 
-    def forward(
+    def mixes(
         self, hidden_streams: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return pre, post and comb before choosing a stream collapse."""
         hc = self.hc_mult
         flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
         w = self._fn_fp32
@@ -109,6 +110,12 @@ class Glm5NextHyperConnection(nn.Module):
         comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
         comb = torch.softmax(comb_logits, dim=-1) + self.hc_eps
         comb = _dispatch_sinkhorn(comb, self.hc_sinkhorn_iters, self.hc_eps)
+        return pre, post, comb
+
+    def forward(
+        self, hidden_streams: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        pre, post, comb = self.mixes(hidden_streams)
         collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
         return post, comb, collapsed
 

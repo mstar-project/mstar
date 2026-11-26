@@ -61,6 +61,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - GLM-5.3-Flash (320B/18B): hybrid KDA linear-attention + MLA MoE causal
        LM, text in / text out, fp8 checkpoint, TP8. ``configs/glm5_next_tp8_mtp.yaml``
        drafts with MTP k=3 (greedy only).
+   * - ``deepseek_v41`` *(Experimental)*
+     - ``deepseek-ai/DeepSeek-V4.1-Flash``
+     - DeepSeek-V4.1-Flash causal LM (text-only Phase 1): 40 mHC layers, SWA +
+       CSA2 compressed sparse attention, FP4 routed MoE (upcast to FP8) + 1
+       shared FP8 expert, and Engram n-gram gating at layers 1 and 14; TP8.
    * - ``kokoro``
      - ``hexgrad/Kokoro-82M``
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
