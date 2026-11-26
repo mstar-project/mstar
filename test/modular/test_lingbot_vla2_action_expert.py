@@ -99,14 +99,20 @@ def _eager_reference_attention(
     prefix_lengths: list[int],
     fp32_attention: bool,
 ):
-    """Exact PrefixSuffixGroups(first_group_len=1) attention reference over batch rows."""
+    """Exact PrefixSuffixGroups(first_group_len=1) attention reference over batch rows.
+
+    Uses ``F.scaled_dot_product_attention`` per visibility group (state over
+    ``[prefix, state]``; actions over ``[prefix, state, actions]``) to match
+    ``PrefixSuffixPagedWrapper``'s CPU fallback numerics without 1-ULP bf16
+    kernel divergence flipping top-k MoE routing across multi-step denoising.
+    """
 
     def _attn(layer_idx: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         bs, suffix_len, q_heads, head_dim = q.shape
         assert bs == len(prefix_lengths)
         kv_heads = k.shape[2]
-        rep = q_heads // kv_heads
         scale = 1.0 / math.sqrt(head_dim)
+        enable_gqa = q_heads != kv_heads
 
         outputs = []
         pref_k = prefix_k_layers[layer_idx]
@@ -115,32 +121,83 @@ def _eager_reference_attention(
         for b in range(bs):
             p_len = prefix_lengths[b]
             q_b = q[b]
-            k_suf = k[b]
-            v_suf = v[b]
-            k_full = torch.cat([pref_k[p_offset : p_offset + p_len], k_suf], dim=0)
-            v_full = torch.cat([pref_v[p_offset : p_offset + p_len], v_suf], dim=0)
+            k_full = torch.cat([pref_k[p_offset : p_offset + p_len], k[b]], dim=0)
+            v_full = torch.cat([pref_v[p_offset : p_offset + p_len], v[b]], dim=0)
             p_offset += p_len
 
-            k_rep = k_full.repeat_interleave(rep, dim=1)
-            v_rep = v_full.repeat_interleave(rep, dim=1)
-            mask = torch.zeros((suffix_len, p_len + suffix_len), dtype=torch.bool, device=q.device)
-            mask[:, : p_len + 1] = True
-            if suffix_len > 1:
-                mask[1:, p_len + 1 :] = True
-
-            q_h = q_b.transpose(0, 1)
-            k_h = k_rep.transpose(0, 1)
-            v_h = v_rep.transpose(0, 1)
             if fp32_attention:
-                q_h, k_h, v_h = q_h.float(), k_h.float(), v_h.float()
-            scores = torch.matmul(q_h, k_h.transpose(-2, -1)) * scale
-            scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
-            probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(k_h.dtype)
-            out_b = torch.matmul(probs, v_h).transpose(0, 1).to(q.dtype)
-            outputs.append(out_b)
+                q_in, k_in, v_in = q_b.float(), k_full.float(), v_full.float()
+            else:
+                q_in, k_in, v_in = q_b, k_full.to(q_b.dtype), v_full.to(q_b.dtype)
+
+            parts = [
+                F.scaled_dot_product_attention(
+                    q_in[:1].transpose(0, 1).unsqueeze(0),
+                    k_in[: p_len + 1].transpose(0, 1).unsqueeze(0),
+                    v_in[: p_len + 1].transpose(0, 1).unsqueeze(0),
+                    scale=scale,
+                    enable_gqa=enable_gqa,
+                )
+                .squeeze(0)
+                .transpose(0, 1)
+            ]
+            if suffix_len > 1:
+                parts.append(
+                    F.scaled_dot_product_attention(
+                        q_in[1:].transpose(0, 1).unsqueeze(0),
+                        k_in.transpose(0, 1).unsqueeze(0),
+                        v_in.transpose(0, 1).unsqueeze(0),
+                        scale=scale,
+                        enable_gqa=enable_gqa,
+                    )
+                    .squeeze(0)
+                    .transpose(0, 1)
+                )
+            outputs.append(torch.cat(parts, dim=0).to(q.dtype))
         return torch.stack(outputs, dim=0)
 
     return _attn
+
+
+def _explicit_2d_masked_attention(
+    prefix_k: torch.Tensor,
+    prefix_v: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    prefix_lengths: list[int],
+    fp32_attention: bool,
+) -> torch.Tensor:
+    """Independent 2D boolean-masked matmul/softmax reference for PrefixSuffixGroups(1)."""
+    bs, suffix_len, q_heads, head_dim = q.shape
+    kv_heads = k.shape[2]
+    rep = q_heads // kv_heads
+    scale = 1.0 / math.sqrt(head_dim)
+
+    outputs = []
+    p_offset = 0
+    for b in range(bs):
+        p_len = prefix_lengths[b]
+        k_full = torch.cat([prefix_k[p_offset : p_offset + p_len], k[b]], dim=0)
+        v_full = torch.cat([prefix_v[p_offset : p_offset + p_len], v[b]], dim=0)
+        p_offset += p_len
+
+        k_rep = k_full.repeat_interleave(rep, dim=1)
+        v_rep = v_full.repeat_interleave(rep, dim=1)
+        mask = torch.zeros((suffix_len, p_len + suffix_len), dtype=torch.bool, device=q.device)
+        mask[:, : p_len + 1] = True
+        if suffix_len > 1:
+            mask[1:, p_len + 1 :] = True
+
+        q_h = q[b].transpose(0, 1).float()
+        k_h = k_rep.transpose(0, 1).float()
+        v_h = v_rep.transpose(0, 1).float()
+        scores = torch.matmul(q_h, k_h.transpose(-2, -1)) * scale
+        scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
+        probs = F.softmax(scores, dim=-1, dtype=torch.float32)
+        out_dtype = torch.float32 if fp32_attention else q.dtype
+        outputs.append(torch.matmul(probs, v_h).transpose(0, 1).to(out_dtype))
+    return torch.stack(outputs, dim=0)
 
 
 def _build_kv_state(cfg: LingBotVLAActionExpertConfig, dtype: torch.dtype):
@@ -319,8 +376,89 @@ def test_action_expert_denoise_matches_eager_reference_via_kv_state(fp32_attenti
             lambda: expert.denoise_actions(state, x_t, prefix_end, num_steps=3),
         )
 
-    tol = 1e-5 if dtype == torch.float32 else 2e-2
+    tol = 1e-5 if dtype == torch.float32 else 1e-3
     torch.testing.assert_close(actual, expected, rtol=tol, atol=tol)
+
+
+@pytest.mark.parametrize("fp32_attention", [True, False], ids=["fp32_attn", "native_attn"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("prefix_lengths", [[5], [4, 7]], ids=["bs1", "bs2"])
+def test_prefix_suffix_kv_state_attention_matches_explicit_2d_mask(fp32_attention, dtype, prefix_lengths):
+    gen = torch.Generator().manual_seed(2028)
+    cfg = _small_config(num_layers=1, fp32_attention=fp32_attention)
+    bs = len(prefix_lengths)
+    total_pref = sum(prefix_lengths)
+    suffix_len = 1 + CHUNK_SIZE
+
+    prefix_k = torch.randn(total_pref, cfg.num_key_value_heads, cfg.head_dim, generator=gen, dtype=dtype)
+    prefix_v = torch.randn(total_pref, cfg.num_key_value_heads, cfg.head_dim, generator=gen, dtype=dtype)
+    q = torch.randn(bs, suffix_len, cfg.num_attention_heads, cfg.head_dim, generator=gen, dtype=dtype)
+    k = torch.randn(bs, suffix_len, cfg.num_key_value_heads, cfg.head_dim, generator=gen, dtype=dtype)
+    v = torch.randn(bs, suffix_len, cfg.num_key_value_heads, cfg.head_dim, generator=gen, dtype=dtype)
+
+    expected = _explicit_2d_masked_attention(
+        prefix_k, prefix_v, q, k, v, prefix_lengths, fp32_attention
+    )
+
+    _, handle, runner = _build_kv_state(cfg, dtype=dtype)
+    rids = tuple(f"req_{i}" for i in range(bs))
+    for rid in rids:
+        runner.ingest_request(rid)
+
+    prefill_step = SubmoduleStep(
+        segments=tuple(Segment(rid, "main", plen) for rid, plen in zip(rids, prefix_lengths, strict=True)),
+        state={LLM_KV: ArrayStep(keep=True)},
+    )
+    prefill_ctx = StepContext(graph_walk=PREFILL_WALK, request_ids=rids, slot=0, capture=False)
+    _run_step(
+        runner,
+        handle,
+        prefill_step,
+        prefill_ctx,
+        lambda: add_read(
+            handle,
+            0,
+            torch.zeros(total_pref, cfg.num_attention_heads, cfg.head_dim, dtype=dtype),
+            k=prefix_k,
+            v=prefix_v,
+        ),
+    )
+
+    def _run_suffix(q_t: torch.Tensor, k_t: torch.Tensor, v_t: torch.Tensor) -> torch.Tensor:
+        action_step = SubmoduleStep(
+            segments=tuple(Segment(rid, "main", suffix_len) for rid in rids),
+            state={LLM_KV: ArrayStep(keep=False)},
+        )
+        action_ctx = StepContext(graph_walk=ACTION_WALK, request_ids=rids, slot=0, capture=False)
+        q_in = q_t.float() if fp32_attention else q_t
+        k_in = k_t.float() if fp32_attention else k_t
+        v_in = v_t.float() if fp32_attention else v_t
+        return _run_step(
+            runner,
+            handle,
+            action_step,
+            action_ctx,
+            lambda: add_read(
+                handle,
+                0,
+                q_in.reshape(bs * suffix_len, cfg.num_attention_heads, cfg.head_dim),
+                k=k_in.reshape(bs * suffix_len, cfg.num_key_value_heads, cfg.head_dim),
+                v=v_in.reshape(bs * suffix_len, cfg.num_key_value_heads, cfg.head_dim),
+            ),
+        ).reshape(bs, suffix_len, cfg.num_attention_heads, cfg.head_dim)
+
+    actual = _run_suffix(q, k, v)
+    tol = 1e-5 if (dtype == torch.float32 or fp32_attention) else 2e-2
+    torch.testing.assert_close(actual, expected, rtol=tol, atol=tol)
+
+    # Confirm state token (index 0) cannot see action keys/values (indices 1..).
+    k_mut = k.clone()
+    v_mut = v.clone()
+    k_mut[:, 1:] = -k_mut[:, 1:] * 3.0
+    v_mut[:, 1:] = -v_mut[:, 1:] * 3.0
+    mutated = _run_suffix(q, k_mut, v_mut)
+    torch.testing.assert_close(mutated[:, :1], actual[:, :1], rtol=0, atol=0)
+    assert not torch.allclose(mutated[:, 1:], actual[:, 1:])
 
 
 def test_action_expert_meta_init_resets_fp32_mrope_buffers():
