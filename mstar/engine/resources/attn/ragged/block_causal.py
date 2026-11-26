@@ -11,11 +11,15 @@ range per query segment) cannot express. The paged kernel can: the packed
 keys are viewed as pages of one token, and each query block is one paged
 "request" whose page list is its prefix. No key is copied; the page lists are
 host-side index arithmetic done at plan time.
+The same one-token-page layout can express two suffix query groups over a
+shared prefix, with different key prefixes for the two groups.
 """
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
+from mstar.engine.resources.attn.config import use_cpu_sdpa_fallback
 from mstar.engine.resources.attn.ragged.wrappers import padded_head_dim, zero_unplanned_rows
 from mstar.engine.resources.attn.workspace import Workspace
 from mstar.engine.resources.kv.plan import token_runs
@@ -41,6 +45,44 @@ def block_causal_layout(
             starts.append(off)
             lens.append(e)
         off += n
+    kv, indices = token_runs(np.array(starts, dtype=np.int64), np.array(lens, dtype=np.int64))
+    return qo, kv.tolist(), torch.from_numpy(indices.astype(np.int32))
+
+
+def prefix_suffix_group_layout(
+    rows: list[tuple[int, int]], first_group_len: int,
+) -> tuple[list[int], list[int], torch.Tensor]:
+    """CPU layout for two noncausal suffix query groups over packed K/V.
+
+    Each row is ``(valid_prefix_len, suffix_len)``. Its K/V are packed as
+    ``[valid prefix | first suffix group | second suffix group]``; only the
+    suffix supplies queries. A zero-length suffix contributes no query group.
+    The first query group reads the prefix and itself;
+    the second reads every key of the row. The prefix was already compacted to
+    valid tokens, and suffix tokens must all be valid.
+    """
+    if type(first_group_len) is not int or first_group_len < 1:
+        raise ValueError("first_group_len must be a positive int")
+    qo = [0]
+    starts: list[int] = []
+    lens: list[int] = []
+    off = 0
+    for prefix_len, suffix_len in rows:
+        if type(prefix_len) is not int or prefix_len < 0 or type(suffix_len) is not int or (
+            suffix_len != 0 and suffix_len < first_group_len
+        ):
+            raise ValueError("each row needs nonnegative prefix_len and suffix_len 0 or >= first_group_len")
+        if suffix_len == 0:
+            off += prefix_len
+            continue
+        starts.append(off)
+        lens.append(prefix_len + first_group_len)
+        qo.append(qo[-1] + first_group_len)
+        if suffix_len > first_group_len:
+            starts.append(off)
+            lens.append(prefix_len + suffix_len)
+            qo.append(qo[-1] + suffix_len - first_group_len)
+        off += prefix_len + suffix_len
     kv, indices = token_runs(np.array(starts, dtype=np.int64), np.array(lens, dtype=np.int64))
     return qo, kv.tolist(), torch.from_numpy(indices.astype(np.int32))
 
@@ -82,9 +124,8 @@ class RaggedBlockCausalWrapper:
         sm_scale: float | None = None,
         q_data_type: torch.dtype = torch.bfloat16,
         backend: str = "auto",
+        force_sdpa_fallback: bool = False,
     ):
-        import flashinfer
-
         self.device = device
         self.num_qo_heads = num_qo_heads
         self.num_kv_heads = num_kv_heads
@@ -99,6 +140,13 @@ class RaggedBlockCausalWrapper:
         self._num_segments = 0
         self._total_tokens = 0
         self._workspace = workspace_buffer
+        self._sdpa_fallback = force_sdpa_fallback or use_cpu_sdpa_fallback(device)
+        self._sdpa_plan: tuple[list[int], list[int], torch.Tensor] | None = None
+        if self._sdpa_fallback:
+            self.attn_wrapper = None
+            return
+
+        import flashinfer
 
         if not accelerator_graph:
             self.attn_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
@@ -168,6 +216,9 @@ class RaggedBlockCausalWrapper:
             n_blocks = self.max_blocks
         self._num_segments = n_seg
         self._total_tokens = total
+        if self._sdpa_fallback:
+            self._sdpa_plan = (qo, kv, indices.to(device=self.device, dtype=torch.long))
+            return
         self._workspace.plan(
             self.attn_wrapper.plan,
             self._pinned(qo),
@@ -196,6 +247,30 @@ class RaggedBlockCausalWrapper:
         As with the ragged wrapper, rows past the planned total are not a
         valid result; the caller slices.
         """
+        if self._sdpa_fallback:
+            assert self._sdpa_plan is not None, "plan() before run()"
+            qo, kv, indices = self._sdpa_plan
+            compute_dtype = torch.float32 if getattr(self, "fp32_attention", False) else self.q_data_type
+            q_in = q.to(compute_dtype)
+            k_in = k.to(compute_dtype)
+            v_in = v.to(compute_dtype)
+            out_parts: list[torch.Tensor] = []
+            enable_gqa = self.num_qo_heads != self.num_kv_heads
+            for g in range(len(qo) - 1):
+                qs, qe = qo[g], qo[g + 1]
+                if qs == qe:
+                    continue
+                keys = indices[kv[g]:kv[g + 1]]
+                q_g = q_in[qs:qe].transpose(0, 1).unsqueeze(0)
+                k_g = k_in[keys].transpose(0, 1).unsqueeze(0)
+                v_g = v_in[keys].transpose(0, 1).unsqueeze(0)
+                att = F.scaled_dot_product_attention(
+                    q_g, k_g, v_g, scale=self.sm_scale, enable_gqa=enable_gqa,
+                )
+                out_parts.append(att.squeeze(0).transpose(0, 1))
+            if not out_parts:
+                return q_in.new_empty(0, self.num_qo_heads, self.head_dim)
+            return torch.cat(out_parts, dim=0)
         # q/k/v padded by the caller come back padded
         padded_in = q.shape[-1] == self.padded_head_dim
         qp, kp, vp = (self._pad_head_dim(t.to(self.q_data_type)) for t in (q, k, v))
@@ -214,3 +289,49 @@ class RaggedBlockCausalWrapper:
         if self.padded_head_dim != self.head_dim and not padded_in:
             return out[..., : self.head_dim].contiguous()
         return out
+
+
+class PrefixSuffixPagedWrapper(RaggedBlockCausalWrapper):
+    """Eager FlashInfer paged prefill (or SDPA on CPU / FP32) for suffix Q over packed prefix+suffix K/V.
+
+    Reuses the one-token-page kernel and workspace of block-causal attention.
+    The containing dense resource gathers retained prefix K/V and supplies
+    fresh suffix K/V. This wrapper only plans the two overlapping key ranges.
+    """
+
+    def __init__(
+        self, workspace_buffer: Workspace, num_qo_heads: int, num_kv_heads: int, head_dim: int,
+        first_group_len: int, device: torch.device, q_data_type: torch.dtype,
+        backend: str = "auto", fp32_attention: bool = False,
+    ):
+        self.fp32_attention = fp32_attention
+        super().__init__(
+            workspace_buffer=workspace_buffer, num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
+            head_dim=head_dim, block_size=1, device=device, q_data_type=q_data_type, backend=backend,
+            force_sdpa_fallback=fp32_attention,
+        )
+        self.first_group_len = first_group_len
+
+    def plan(self, cu_q: torch.Tensor, cu_k: torch.Tensor, causal: bool = False) -> None:
+        if causal:
+            raise ValueError("PrefixSuffixPagedWrapper needs noncausal groups")
+        q_lens = (cu_q[1:] - cu_q[:-1]).tolist()
+        k_lens = (cu_k[1:] - cu_k[:-1]).tolist()
+        if len(q_lens) != len(k_lens):
+            raise ValueError("prefix/suffix query and key layouts have different row counts")
+        if not any(q_lens):
+            raise ValueError("prefix/suffix attention needs at least one active suffix row")
+        rows = [(k - q, q) for q, k in zip(q_lens, k_lens, strict=True)]
+        qo, kv, indices = prefix_suffix_group_layout(rows, self.first_group_len)
+        self._num_segments = len(rows)
+        self._total_tokens = qo[-1]
+        if self._sdpa_fallback:
+            self._sdpa_plan = (qo, kv, indices.to(device=self.device, dtype=torch.long))
+            return
+        self._workspace.plan(
+            self.attn_wrapper.plan,
+            self._pinned(qo), self._pinned(kv), self._pinned(indices),
+            self._pinned(torch.ones(len(qo) - 1, dtype=torch.int32)),
+            self.num_qo_heads, self.num_kv_heads, self.padded_head_dim, 1,
+            causal=False, sm_scale=self.sm_scale, q_data_type=self.q_data_type,
+        )

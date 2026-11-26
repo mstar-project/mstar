@@ -277,6 +277,24 @@ class AttentionManager(AttentionResource):
                     f"attention {spec.resource_key!r}: {', '.join(unsupported)} is unsupported over KV pool "
                     f"{spec.config.kv_cache!r}, which sets context_parallel"
                 )
+        if spec.config.prefix_suffix_first_group_len is not None:
+            if backend != AttnBackend.DENSE or window is not None:
+                raise ValueError("prefix/suffix group attention needs dense backend without a sliding window")
+            from mstar.engine.resources.attn.dense import DenseAttentionManager
+            from mstar.engine.resources.attn.ragged.block_causal import PrefixSuffixPagedWrapper
+
+            return DenseAttentionManager(
+                kv_cache=spec.config.kv_cache,
+                device=info.device,
+                dtype=info.kv_dtype,
+                kv_config=kv_config,
+                wrapper_class=PrefixSuffixPagedWrapper,
+                flashinfer_backend=flashinfer_backend,
+                prefix_suffix_first_group_len=spec.config.prefix_suffix_first_group_len,
+                prefix_suffix_q_heads=spec.config.prefix_suffix_q_heads,
+                prefix_suffix_fp32=spec.config.prefix_suffix_fp32,
+            )
+
         if backend == AttnBackend.DENSE:
             # A dense backend runs on FlashAttention-3 (AITER on ROCm). Where
             # that has no kernel for the GPU or does not import, the same pass

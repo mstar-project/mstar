@@ -18,6 +18,7 @@ from mstar.engine.resources.attn.config import (
     AttentionConfig,
     AttentionSpec,
     AttentionStep,
+    AttnBackend,
     CrossAttentionConfig,
     CrossAttentionSpec,
 )
@@ -85,6 +86,7 @@ from mstar.engine.state.contract import (
     Op,
     PagedNHDTarget,
     Positions,
+    PrefixSuffixGroups,
     Reached,
     Read,
     Sampler,
@@ -676,27 +678,62 @@ class PagedAttend(OpBinding):
     kernel_settings = frozenset({"splits", "decode_fmha", "decode_tensor_cores"})
 
     def check(self, array: Array, key: str, read: Read) -> None:
-        if not isinstance(read.mask, Causal | Window | Bidirectional):
-            raise _no_layout(array, f"reads[{key!r}].mask must be Causal, Window or Bidirectional, the masks "
+        if not isinstance(read.mask, Causal | Window | Bidirectional | PrefixSuffixGroups):
+            raise _no_layout(array, f"reads[{key!r}].mask must be Causal, Window, Bidirectional or "
+                                    "PrefixSuffixGroups, the masks "
                                     "AttentionConfig has")
         if not read.packed:
             raise _no_layout(array, f"reads[{key!r}].packed is False, and the paged kernels take packed queries")
+        grouped = {
+            (other.mask.first_group_len, other.mask.fp32_attention)
+            for other in array.reads.values()
+            if isinstance(other.mask, PrefixSuffixGroups) and not read_layers(array, other).isdisjoint(
+                read_layers(array, read))
+        }
+        if grouped and len(grouped) != 1:
+            raise _no_layout(array, "overlapping PrefixSuffixGroups reads need one first_group_len and fp32_attention")
 
     def specs(self, array: Array, key: str, read: Read) -> list[NodeResourceSpec]:
         windowed = isinstance(read.mask, Window)
+        grouped = read.mask.first_group_len if isinstance(read.mask, PrefixSuffixGroups) else None
+        suffix_q_heads = read.op.q_heads if isinstance(read.mask, PrefixSuffixGroups) else None
+        suffix_fp32 = read.mask.fp32_attention if isinstance(read.mask, PrefixSuffixGroups) else False
+        if isinstance(read.mask, Bidirectional | Causal):
+            partners = [other for other in array.reads.values()
+                        if isinstance(other.mask, PrefixSuffixGroups)
+                        and read_layers(array, other) == read_layers(array, read)
+                        and not _share_a_walk(other, read)]
+            if len(partners) > 1:
+                raise _no_layout(array, f"reads[{key!r}] has more than one disjoint grouped suffix partner")
+            if partners:
+                grouped = partners[0].mask.first_group_len
+                suffix_q_heads = partners[0].op.q_heads
+                suffix_fp32 = partners[0].mask.fp32_attention
         # AttentionConfig.layers counts among the pool's layers
         kv_layer = pool_layers(array)
         return [AttentionSpec(
             resource_key=key, nodes=array.nodes,
             config=AttentionConfig(
                 kv_cache=array.name,
+                backend=AttnBackend.DENSE if grouped is not None else AttnBackend.AUTO,
+                prefix_suffix_first_group_len=grouped,
+                prefix_suffix_q_heads=suffix_q_heads,
+                prefix_suffix_fp32=suffix_fp32,
                 sliding_window=read.mask.size if windowed else None,
                 layers=tuple(kv_layer[layer] for layer in sorted(read_layers(array, read))) if windowed else None,
             ),
         )]
 
     def steps(self, array: Array, key: str, read: Read, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
-        steps[key] = AttentionStep(segments=segments, causal=read.mask.uses_query_position)
+        if isinstance(read.mask, PrefixSuffixGroups) and declared.keep:
+            raise ValueError(
+                f"Array {array.name!r}.reads[{key!r}]: PrefixSuffixGroups requires keep=False; "
+                "prefill must use a separate page-writing read"
+            )
+        steps[key] = AttentionStep(
+            segments=segments, causal=isinstance(read.mask, Causal | Window),
+            grouped_suffix=isinstance(read.mask, PrefixSuffixGroups),
+        )
 
     def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
         """The decode keys go through the spec's own YAML path and its checks, as they do under `resources:`."""
@@ -1916,7 +1953,10 @@ class PagedStorage(Storage):
         if joined:
             raise _no_layout(array, f"labels {joined} hold a '+', which joins the labels of a step over several labels "
                                     "into the name of its plan")
-        q_heads = {read.op.q_heads for read in array.reads.values()}
+        q_heads = {
+            read.op.q_heads for read in array.reads.values()
+            if not isinstance(read.mask, PrefixSuffixGroups)
+        } or {read.op.q_heads for read in array.reads.values()}
         if len(q_heads) > 1:
             raise _no_layout(array, f"reads have q_heads {sorted(q_heads)}, and PagedKVConfig has one num_qo_heads")
         return KVSpec(

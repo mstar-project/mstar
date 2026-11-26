@@ -9,6 +9,7 @@ import torch
 
 from mstar.engine.resources.attn.base import AttentionManager, EagerSlotKey
 from mstar.engine.resources.attn.config import AttentionStep, AttnBackend, refuse_context_only
+from mstar.engine.resources.attn.ragged.block_causal import PrefixSuffixPagedWrapper
 from mstar.engine.resources.attn.ragged.wrappers import PrefixedPrefillWrapper, _FlashInferRaggedPrefillBase
 from mstar.engine.resources.attn.workspace import Workspace, workspace_bytes
 from mstar.engine.resources.kv.config import PagedKVConfig
@@ -157,7 +158,7 @@ class DensePlan:
     max_k: int
     causal: bool
     # the wrapper this layout was planned into
-    wrapper: PrefixedPrefillWrapper | None = None
+    wrapper: PrefixedPrefillWrapper | PrefixSuffixPagedWrapper | None = None
 
 
 @dataclass
@@ -187,8 +188,9 @@ class DenseAttentionManager(AttentionManager):
     stream's ``generation``, so a fork, a reset, or a page-table move
     invalidates it (``CacheStream.generation``).
 
-    The layer does not write its K/V to the pages here (``requires_kv_write``
-    is False) — nothing would ever read it back.
+    Ordinarily the layer does not write fresh K/V to the pages
+    (``requires_kv_write`` is False). A shared prefix/suffix resource uses
+    page writes on its prefill walk, then scratch K/V on its suffix walk.
 
     Eager-only. The gather and the concatenation are shape-dependent and
     allocate, so there is nothing to capture; a node that runs this walk under
@@ -219,8 +221,11 @@ class DenseAttentionManager(AttentionManager):
         device: torch.device,
         dtype: torch.dtype,
         kv_config: PagedKVConfig,
-        wrapper_class: type[PrefixedPrefillWrapper],
+        wrapper_class: type[PrefixedPrefillWrapper] | type[PrefixSuffixPagedWrapper],
         flashinfer_backend: str = "auto",
+        prefix_suffix_first_group_len: int | None = None,
+        prefix_suffix_q_heads: int | None = None,
+        prefix_suffix_fp32: bool = False,
     ):
         self._kv_cache_name = kv_cache
         self._device = device
@@ -232,9 +237,15 @@ class DenseAttentionManager(AttentionManager):
         self._current_plans: dict[str, DensePlan] = {}
         # (request, label) -> the prefix gathered out of the pages
         self._prefix_cache: dict[tuple[str, str], _GatheredPrefix] = {}
+        # Before the first plan, be conservative: handles probing whether an
+        # op may fuse must see the suffix's scratch-K/V behavior.
+        self._active_grouped_suffix = prefix_suffix_first_group_len is not None
 
         self._wrapper_class = wrapper_class
-        self._wrappers: dict[EagerSlotKey, PrefixedPrefillWrapper] = {}
+        self._prefix_suffix_first_group_len = prefix_suffix_first_group_len
+        self._prefix_suffix_q_heads = prefix_suffix_q_heads or kv_config.num_qo_heads
+        self._prefix_suffix_fp32 = prefix_suffix_fp32
+        self._wrappers: dict[object, PrefixedPrefillWrapper | PrefixSuffixPagedWrapper] = {}
         self._wrapper_kwargs = dict(
             num_qo_heads=kv_config.num_qo_heads,
             num_kv_heads=kv_config.num_kv_heads,
@@ -242,8 +253,13 @@ class DenseAttentionManager(AttentionManager):
             device=device,
             q_data_type=dtype,
         )
-        self._on_flashinfer = issubclass(wrapper_class, _FlashInferRaggedPrefillBase)
+        self._on_flashinfer = (
+            issubclass(wrapper_class, _FlashInferRaggedPrefillBase) or prefix_suffix_first_group_len is not None
+        )
         self._flashinfer_backend = flashinfer_backend if self._on_flashinfer else None
+        if prefix_suffix_first_group_len is not None:
+            self._wrapper_kwargs["first_group_len"] = prefix_suffix_first_group_len
+            self._wrapper_kwargs["fp32_attention"] = prefix_suffix_fp32
         if self._on_flashinfer:
             # One workspace for every wrapper, taken now rather than at the first
             # plan: it is scratch during `run` only (a plan writes the wrapper's
@@ -260,7 +276,15 @@ class DenseAttentionManager(AttentionManager):
     def fingerprint(self) -> bytes:
         # the kernel, not just the class: FA3 and each FlashInfer backend
         # differ in the last bits
-        return fingerprint(type(self).__name__, self._wrapper_class.__name__, self._flashinfer_backend)
+        parts: list[object] = [type(self).__name__, self._wrapper_class.__name__, self._flashinfer_backend]
+        first_group_len = getattr(self, "_prefix_suffix_first_group_len", None)
+        if first_group_len is not None:
+            parts.extend((
+                first_group_len,
+                getattr(self, "_prefix_suffix_q_heads", None),
+                getattr(self, "_prefix_suffix_fp32", False),
+            ))
+        return fingerprint(*parts)
 
     def can_capture(self) -> bool:
         return False
@@ -292,16 +316,32 @@ class DenseAttentionManager(AttentionManager):
                 f"FlashInfer {_flashinfer_version()}: {type(exc).__name__}: {exc}"
             ) from exc
 
-    def _wrapper(self, label: str, slot: int) -> PrefixedPrefillWrapper:
-        key = EagerSlotKey(label=label, slot=slot)
+    def _wrapper(self, label: str, slot: int) -> PrefixedPrefillWrapper | PrefixSuffixPagedWrapper:
+        grouped = self._prefix_suffix_first_group_len is not None and self._active_grouped_suffix
+        key = (EagerSlotKey(label=label, slot=slot), grouped) if self._prefix_suffix_first_group_len is not None else (
+            EagerSlotKey(label=label, slot=slot)
+        )
         wrapper = self._wrappers.get(key)
         if wrapper is None:
-            wrapper = self._wrappers[key] = self._wrapper_class(**self._wrapper_kwargs)
+            if self._prefix_suffix_first_group_len is not None and not grouped:
+                from mstar.engine.resources.attn.ragged.wrappers import FlashInferPrefixedPrefillWrapper
+
+                kwargs = {
+                    name: value for name, value in self._wrapper_kwargs.items()
+                    if name not in ("first_group_len", "fp32_attention")
+                }
+                wrapper = FlashInferPrefixedPrefillWrapper(**kwargs)
+            elif self._prefix_suffix_first_group_len is not None:
+                kwargs = {**self._wrapper_kwargs, "num_qo_heads": self._prefix_suffix_q_heads}
+                wrapper = self._wrapper_class(**kwargs)
+            else:
+                wrapper = self._wrapper_class(**self._wrapper_kwargs)
+            self._wrappers[key] = wrapper
         return wrapper
 
     @property
     def requires_kv_write(self) -> bool:
-        return False
+        return self._prefix_suffix_first_group_len is not None and not self._active_grouped_suffix
 
     # the gathered prefix is per-request state, so unlike the paged backend
     # these are not no-ops
@@ -323,6 +363,9 @@ class DenseAttentionManager(AttentionManager):
     def plan(self, step: AttentionStep, ctx: StepContext):
         refuse_context_only(step, type(self).__name__)
         self.reset_default_cursors()
+        if step.grouped_suffix and self._prefix_suffix_first_group_len is None:
+            raise ValueError("grouped_suffix step needs a grouped prefix/suffix dense resource")
+        self._active_grouped_suffix = step.grouped_suffix
         if ctx.slot_lease is not None or ctx.is_preplan:
             raise RuntimeError(
                 "dense attention is eager-only: the prefix gather and the "

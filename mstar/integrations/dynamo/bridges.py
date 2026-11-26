@@ -1084,7 +1084,19 @@ class VJepa2AcTensorSpec:
         return not bool(_parameter_value((parameters or {}).get("stream_rollout")))
 
 
+class LingBotVLA2TensorSpec(Pi05TensorSpec):
+    """lingbot_vla2: multi-camera RGB + robot state + task prompt in, 14-DoF action chunk out."""
+
+    action_dim = 14
+
+    def submit_args(self, tensors: dict[str, dict], upload_dir, parameters=None) -> SubmitArgs:
+        if tensors.get("state") is None:
+            raise ValueError("lingbot_vla2 needs 'images', 'state' and 'prompt' input tensors")
+        return super().submit_args(tensors, upload_dir, parameters=parameters)
+
+
 TENSOR_SPECS = {
+    "lingbot_vla2": LingBotVLA2TensorSpec(),
     "pi05": Pi05TensorSpec(),
     "vjepa2_ac": VJepa2AcTensorSpec(),
 }

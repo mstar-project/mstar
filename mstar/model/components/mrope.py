@@ -17,6 +17,17 @@ if TYPE_CHECKING:
     from mstar.model.submodule_base import ARNodeInputs
 
 
+class MRoPETables:
+    """The current step's rotary tables, shared by its attention layers."""
+
+    def __init__(self):
+        self.cos: torch.Tensor | None = None
+        self.sin: torch.Tensor | None = None
+
+    def set(self, cos: torch.Tensor, sin: torch.Tensor) -> None:
+        self.cos, self.sin = cos, sin
+
+
 def mrope_position_ids(pos_ids: torch.Tensor | None, inputs: list[ARNodeInputs]) -> torch.Tensor:
     """``[3, total_tokens]`` for the step, in packed request order.
 
@@ -133,6 +144,26 @@ def compute_3d_cos_sin(
     if target_dtype is not None:
         cos, sin = cos.to(target_dtype), sin.to(target_dtype)
     return cos, sin
+
+
+def apply_partial_mrope(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply rotate-half MRoPE to the leading rotary dimensions of Q and K.
+
+    Q/K are ``[tokens, heads, head_dim]`` and the tables are
+    ``[tokens, rotary_dim]``. The remaining head dimensions pass unchanged.
+    """
+    rotary_dim = cos.shape[-1]
+    cos, sin = cos[:, None, :], sin[:, None, :]
+
+    def rotate(x: torch.Tensor) -> torch.Tensor:
+        rotary, rest = x[..., :rotary_dim], x[..., rotary_dim:]
+        half = rotary_dim // 2
+        turned = torch.cat((-rotary[..., half:], rotary[..., :half]), dim=-1)
+        return torch.cat((rotary * cos + turned * sin, rest), dim=-1)
+
+    return rotate(q), rotate(k)
 
 
 def text_position_ids(

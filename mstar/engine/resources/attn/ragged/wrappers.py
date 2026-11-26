@@ -9,9 +9,11 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from mstar.engine.resources.attn.config import use_cpu_sdpa_fallback
 from mstar.engine.resources.attn.workspace import Workspace
 
 # Head dims the FlashInfer prefill kernels are instantiated for. An unsupported
@@ -348,6 +350,12 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
         super().__init__(num_qo_heads, num_kv_heads, head_dim, **kwargs)
         self.padded_head_dim = padded_head_dim(head_dim)
         self._workspace = workspace_buffer
+        self._cpu_fallback = use_cpu_sdpa_fallback(self.device)
+        self._cpu_plan: tuple[list[int], list[int], bool] | None = None
+        if self._cpu_fallback:
+            self._owns_padding = self._kv_rows = None
+            self.attn_wrapper = None
+            return
 
         import flashinfer
 
@@ -395,6 +403,9 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
     def _plan_kernel(
         self, cu: torch.Tensor, kv_cu: torch.Tensor, total_tokens: int, causal: bool,
     ) -> None:
+        if self._cpu_fallback:
+            self._cpu_plan = (cu.tolist(), kv_cu.tolist(), bool(causal))
+            return
         self._workspace.plan(
             self.attn_wrapper.plan,
             cu,
@@ -418,6 +429,67 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
     def run(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, return_lse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self._cpu_fallback:
+            assert self._cpu_plan is not None, "plan() before run()"
+            qo, kv_cu, causal = self._cpu_plan
+            q_in, k_in, v_in = (t.to(self.q_data_type) for t in (q, k, v))
+            out_parts: list[torch.Tensor] = []
+            lse_parts: list[torch.Tensor] = []
+            enable_gqa = self.num_qo_heads != self.num_kv_heads
+            for i in range(len(qo) - 1):
+                qs, qe = qo[i], qo[i + 1]
+                ks, ke = kv_cu[i], kv_cu[i + 1]
+                if qs == qe:
+                    continue
+                if ks == ke:
+                    out_parts.append(q_in.new_zeros(qe - qs, self.num_qo_heads, q_in.shape[-1]))
+                    if return_lse:
+                        lse_parts.append(torch.full(
+                            (qe - qs, self.num_qo_heads), float("-inf"), dtype=torch.float32, device=q_in.device,
+                        ))
+                    continue
+                qi = q_in[qs:qe].transpose(0, 1).unsqueeze(0)
+                ki = k_in[ks:ke].transpose(0, 1).unsqueeze(0)
+                vi = v_in[ks:ke].transpose(0, 1).unsqueeze(0)
+                if return_lse:
+                    rep = self.num_qo_heads // self.num_kv_heads
+                    kf = ki.float().repeat_interleave(rep, dim=1) if rep > 1 else ki.float()
+                    vf = vi.float().repeat_interleave(rep, dim=1) if rep > 1 else vi.float()
+                    scores = torch.matmul(qi.float(), kf.transpose(-2, -1)) * self.sm_scale
+                    if causal:
+                        nq, nk = qe - qs, ke - ks
+                        allowed = torch.arange(nk, device=qi.device)[None, :] <= (
+                            torch.arange(nq, device=qi.device)[:, None] + (nk - nq)
+                        )
+                        scores = scores.masked_fill(~allowed[None, None], float("-inf"))
+                    lse_i = torch.logsumexp(scores, dim=-1).squeeze(0).transpose(0, 1)
+                    probs = torch.softmax(scores, dim=-1)
+                    att = torch.matmul(probs, vf).to(q_in.dtype).squeeze(0).transpose(0, 1)
+                    out_parts.append(att)
+                    lse_parts.append(lse_i)
+                else:
+                    # Prefixed causal aligns queries to the end of keys; SDPA is_causal=True
+                    # aligns top-left when nq != nk, so build the explicit bottom-right causal mask if needed.
+                    nq, nk = qe - qs, ke - ks
+                    if causal and nq != nk:
+                        allowed = torch.arange(nk, device=qi.device)[None, :] <= (
+                            torch.arange(nq, device=qi.device)[:, None] + (nk - nq)
+                        )
+                        att = F.scaled_dot_product_attention(
+                            qi, ki, vi, attn_mask=allowed, scale=self.sm_scale, enable_gqa=enable_gqa,
+                        )
+                    else:
+                        att = F.scaled_dot_product_attention(
+                            qi, ki, vi, is_causal=causal, scale=self.sm_scale, enable_gqa=enable_gqa,
+                        )
+                    out_parts.append(att.squeeze(0).transpose(0, 1))
+            out = torch.cat(out_parts, dim=0) if out_parts else q_in.new_empty(0, self.num_qo_heads, q_in.shape[-1])
+            if return_lse:
+                lse = torch.cat(lse_parts, dim=0) if lse_parts else torch.empty(
+                    0, self.num_qo_heads, dtype=torch.float32, device=q_in.device,
+                )
+                return out, lse
+            return out
         # q/k/v padded by the caller come back padded (see
         # `_FlashInferRaggedManagerBase.run`)
         padded_in = q.shape[-1] == self.padded_head_dim
