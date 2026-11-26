@@ -126,6 +126,26 @@ def test_rope_plain_yarn_and_inverse_roundtrip() -> None:
     torch.testing.assert_close(rt, v2, atol=1e-5, rtol=1e-5)
 
 
+def test_rope_angles_compile_without_recompile_and_survive_meta_to_empty(dynamo_counts) -> None:
+    cfg = DeepSeekV41Config.reduced()
+    ref = DeepSeekV41Rope(cfg)
+    pos = torch.tensor([0, 3, 7], dtype=torch.long)
+
+    with torch.device("meta"):
+        rope = DeepSeekV41Rope(cfg).to(torch.bfloat16)
+    assert rope.state_dict() == {}
+    rope.to_empty(device="cpu")
+    assert rope.plain_freqs.dtype == torch.float32
+    assert rope.compress_freqs.dtype == torch.float32
+    assert torch.equal(rope.plain_freqs, ref.plain_freqs)
+    assert torch.equal(rope.compress_freqs, ref.compress_freqs)
+
+    for compressed in (False, True):
+        counts = dynamo_counts(lambda p, c=compressed: rope.angles(p, c), pos)
+        assert counts.compiles == 1
+        assert counts.graph_calls == 1
+
+
 def test_mx_rounding_and_reference_rmsnorm_bf16_fidelity() -> None:
     gen = torch.Generator().manual_seed(42)
     x = torch.randn((4, 64), generator=gen, dtype=torch.bfloat16) * 3.5

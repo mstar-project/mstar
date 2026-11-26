@@ -79,6 +79,9 @@ def rotate_tail(x: torch.Tensor, angles: Angles, inverse: bool = False) -> torch
 class DeepSeekV41Rope(nn.Module):
     """Plain (window-only) and YaRN-compressed rotary frequency tables."""
 
+    plain_freqs: torch.Tensor
+    compress_freqs: torch.Tensor
+
     def __init__(self, config: DeepSeekV41Config) -> None:
         super().__init__()
         self.config = config
@@ -91,14 +94,24 @@ class DeepSeekV41Rope(nn.Module):
             config.rope_beta_fast,
             config.rope_beta_slow,
         )
-        self._dev_tables: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.register_buffer("plain_freqs", self._plain_cpu.clone(), persistent=False)
+        self.register_buffer("compress_freqs", self._compress_cpu.clone(), persistent=False)
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        target = self.plain_freqs.device
+        if target.type == "meta":
+            self.plain_freqs = self.plain_freqs.to(dtype=torch.float32)
+            self.compress_freqs = self.compress_freqs.to(dtype=torch.float32)
+        else:
+            # Restore exact fp32 frequency tables after .to(bf16) or .to_empty(device=...).
+            self.plain_freqs = self._plain_cpu.to(device=target, dtype=torch.float32, copy=True)
+            self.compress_freqs = self._compress_cpu.to(device=target, dtype=torch.float32, copy=True)
+        return result
 
     def angles(self, positions: torch.Tensor, compressed: bool) -> Angles:
-        dev = positions.device
-        tables = self._dev_tables.get(dev)
-        if tables is None:
-            tables = (self._plain_cpu.to(dev), self._compress_cpu.to(dev))
-            self._dev_tables[dev] = tables
-        freqs = tables[1] if compressed else tables[0]
+        freqs = self.compress_freqs if compressed else self.plain_freqs
+        if freqs.device != positions.device:
+            freqs = freqs.to(positions.device)
         theta = torch.outer(positions.reshape(-1).to(torch.float32), freqs)
         return Angles(theta.cos(), theta.sin())
