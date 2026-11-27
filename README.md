@@ -95,7 +95,7 @@ for event in client.chat("Tell me a story", stream=True):   # streaming
     print(getattr(event, "text", ""), end="", flush=True)
 ```
 
-**OpenAI-compatible API** — drop-in for `bagel`, `cosmos3`, `qwen3_omni`, `orpheus`, and `kokoro`:
+**OpenAI-compatible API**, for every model whose row in the table below lists a `/v1/` route:
 
 ```python
 from openai import OpenAI
@@ -119,6 +119,11 @@ _Note_: The **first request(s) on a fresh environment can be slow** — often te
 | [Qwen3-Omni](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) | Omni | text, image, audio, video → text, speech | `/v1/chat/completions` |
 | [Qwen3.5 0.8B–27B](https://huggingface.co/Qwen/Qwen3.5-4B) / [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | Vision-language model | text, image → text (hybrid gated-DeltaNet attention) | `/v1/chat/completions`, `/generate` |
 | [Muse Glimmer 30B](https://huggingface.co/meta-models/Muse-Glimmer-30B) *(Beta)* | Vision-language model | text, image → text (sliding-window and NoPE attention layers 3:1) | `/v1/chat/completions`, `/generate` |
+| [Command A+](https://huggingface.co/CohereLabs/command-a-plus-05-2026-bf16) *(Experimental)* | Vision-language model | text, image → text (218B MoE, 25B active) | `/generate` |
+| [Phi-4-multimodal](https://huggingface.co/microsoft/Phi-4-multimodal-instruct) *(Beta)* | Multimodal LM | text, image, audio → text | `/v1/chat/completions`, `/generate` |
+| [MiniCPM-o 4.5](https://huggingface.co/openbmb/MiniCPM-o-4_5) *(Beta)* | Omni | text, image, audio → text, speech (half-duplex) | `/generate` |
+| [GLM-5.2](https://huggingface.co/zai-org/GLM-5.2-FP8) / [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | Language model | text → text (fp8 MoE, TP8, MTP drafting) | `/v1/chat/completions`, `/generate` |
+| [Ripple-65B Preview](https://huggingface.co/ricursiveAI/Ripple-65B-Preview) *(Experimental)* | Language model | text → text (sliding-window and NoPE attention layers 4:1) | `/v1/chat/completions`, `/generate` |
 | [Nemotron VoiceChat](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-VoiceChat-11B) *(Beta)* | Full-duplex speech LM | speech → text, speech (streamed) | `/generate` |
 | [Orpheus](https://huggingface.co/canopylabs/orpheus-3b-0.1-ft) | Speech LM | text → speech | `/v1/audio/speech` |
 | [Fish Audio S2-Pro](https://huggingface.co/fishaudio/s2-pro) | Speech LM | text, reference audio → speech (streamed; weights under the Fish Audio Research License, non-commercial use only) | `/v1/audio/speech` |
@@ -126,7 +131,12 @@ _Note_: The **first request(s) on a fresh environment can be slow** — often te
 | [Chatterbox / Multilingual / Turbo](https://huggingface.co/ResembleAI/chatterbox) | Speech LM | text, reference audio → speech (voice cloning; 23 languages in Multilingual) | `/v1/audio/speech` |
 | [OmniVoice](https://huggingface.co/k2-fsa/OmniVoice) | Masked-diffusion TTS | text, reference audio → speech (multilingual voice cloning) | `/v1/audio/speech` |
 | [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) | TTS | text → speech (54 voices, sentence-streamed) | `/v1/audio/speech` |
-| [Whisper large-v3](https://huggingface.co/openai/whisper-large-v3) *(Beta)* | ASR | speech → text | `/v1/audio/transcriptions` |
+| [CosyVoice3 0.5B](https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512) | Speech LM | text, reference audio → speech (streamed; voice cloning) | `/v1/audio/speech` |
+| [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) | TTS | text (+ voice description or reference audio) → speech (streamed, 48 kHz) | `/v1/audio/speech` |
+| [Whisper large-v3 / large-v3-turbo](https://huggingface.co/openai/whisper-large-v3) | ASR | speech → text | `/v1/audio/transcriptions` |
+| [Qwen3-ASR 0.6B / 1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | ASR | speech → text (30 languages; live transcription on 0.6B) | `/v1/audio/transcriptions`, `/v1/realtime` |
+| [Canary 1B v2](https://huggingface.co/nvidia/canary-1b-v2) / [Canary-Qwen 2.5B](https://huggingface.co/nvidia/canary-qwen-2.5b) | ASR | speech → text (Canary: 25 European languages and translation; Canary-Qwen: English) | `/v1/audio/transcriptions` |
+| [Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) / [Nemotron 3.5 ASR](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) | ASR | speech → text (Parakeet: 25 European languages, detected) | `/v1/audio/transcriptions` |
 | [Higgs Audio v3 STT](https://huggingface.co/bosonai/higgs-audio-v3-stt) *(Beta)* | ASR | speech → text | `/v1/audio/transcriptions` |
 | [Omnilingual ASR CTC 300M–7B](https://huggingface.co/facebook/omniASR-CTC-300M) | ASR | speech → text (1,600+ languages) | `/v1/audio/transcriptions` |
 | [Cosmos3 Nano / Super](https://huggingface.co/nvidia/Cosmos3-Nano) | World model | text, image, video → image, video (+ sound), robot actions | `/v1/images/generations`, `/v1/videos/generations` |
@@ -138,6 +148,7 @@ _Note_: The **first request(s) on a fresh environment can be slow** — often te
 | [LingBot-World-V2 1.3B](https://huggingface.co/robbyant/lingbot-world-v2-1.3b-causal-fast) | Interactive world model | text, image, camera trajectory → video (streamed chunks; weights CC-BY-NC-SA-4.0) | `/generate` |
 | [Wan2.2-TI2V-5B](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers) | Video diffusion | text, image → video | `/v1/videos/generations`, `/generate` |
 | [LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5-Diffusers) *(Beta)* | Audio-video diffusion | text → video + stereo audio (8-step distilled; gated, LTX-2.x Community License) | `/v1/videos/generations`, `/generate` |
+| [MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) *(Beta)* | Audio-video diffusion | text, first and last frame → video + stereo audio (33B DiT; MiniMax H3 Community License) | `/v1/videos/generations`, `/generate` |
 | [FLUX.2 klein 4B / 9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) | Image diffusion | text, image → image (4-step distilled, editing; 4B Apache-2.0, 9B under the FLUX Non-Commercial License) | `/v1/images/generations`, `/v1/images/edits` |
 | [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | Image diffusion | text → image (8-step distilled) | `/v1/images/generations` |
 
