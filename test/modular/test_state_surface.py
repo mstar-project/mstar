@@ -54,6 +54,7 @@ SNAPSHOT = {
     ],
     "Attend": [
         ["q_heads", "POSITIONAL_OR_KEYWORD", None],
+        ["scale", "KEYWORD_ONLY", 'None'],
     ],
     "Bidirectional": [],
     "Block": [],

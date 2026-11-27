@@ -4,11 +4,11 @@ Ported from transformers' ``modeling_muse_glimmer.py`` (Apache-2.0). Per layer:
 four Gemma-style ``(1 + w)`` sandwich norms around a gated GQA attention and a
 SwiGLU MLP. Queries and keys are RMS-normed without a weight before RoPE, which
 only the sliding layers apply; the full layers are NoPE. The query multiplier
-``qk_scale_factor`` is folded into the attention resources' softmax scale.
+``qk_scale_factor`` is folded into the reads' softmax scale.
 
 All 52 layers write one paged KV cache, which keeps only the window of the
-sliding layers' K/V; they attend it through a windowed attention resource, the
-full ones through an unwindowed one.
+sliding layers' K/V; they read it through a windowed read, the full ones
+through a causal one.
 
 TP shards by head, as Qwen3.5 does. The post-norms sit between each
 row-parallel projection and its residual add, so each reduces its
@@ -21,7 +21,7 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
-from mstar.engine.resources.convenience import AttentionCallable
+from mstar.engine.state import add_read, rope
 from mstar.model.components import RMSNorm
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
@@ -31,13 +31,7 @@ from mstar.model.components.distributed import (
 )
 from mstar.model.components.distributed.mlp import ParallelGatedMLP
 from mstar.model.components.norm import rms_norm_no_weight
-from mstar.model.muse.config import (
-    ATTN_FULL,
-    ATTN_SLIDING,
-    KV_CACHE,
-    ROPE,
-    MuseGlimmerConfig,
-)
+from mstar.model.muse.config import KV_CACHE, MuseGlimmerConfig
 
 
 class GatedQKVParallelLinear(QKVParallelLinear):
@@ -73,7 +67,7 @@ class GatedQKVParallelLinear(QKVParallelLinear):
 
 class MuseGlimmerAttention(nn.Module):
     def __init__(
-        self, config: MuseGlimmerConfig, sliding: bool, comm_group: CommGroup,
+        self, config: MuseGlimmerConfig, sliding: bool, comm_group: CommGroup, layer: int,
     ):
         super().__init__()
         tp = comm_group.world_size
@@ -94,16 +88,11 @@ class MuseGlimmerAttention(nn.Module):
             input_is_parallel=True, reduce_results=True,
         )
         self.sliding = sliding
-        self._attn_key = ATTN_SLIDING if sliding else ATTN_FULL
-        self.attn = self.kv = self.pos = None
-        self.attend: AttentionCallable | None = None
+        self.layer = torch.tensor(layer, device="cpu")
+        self.kv = None
 
-    def bind_resources(self, resources: dict) -> None:
-        self.attn = resources.get(self._attn_key)
-        self.kv = resources.get(KV_CACHE)
-        # NoPE: the full layers never rotate
-        self.pos = resources.get(ROPE) if self.sliding else None
-        self.attend = AttentionCallable(kv=self.kv, attn=self.attn)
+    def bind_state(self, handles: dict) -> None:
+        self.kv = handles[KV_CACHE]
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         n = hidden_states.shape[0]
@@ -115,20 +104,20 @@ class MuseGlimmerAttention(nn.Module):
         q = rms_norm_no_weight(q.reshape(n, self.num_heads, self.head_dim), self.eps)
         k = rms_norm_no_weight(k.reshape(n, self.num_kv_heads, self.head_dim), self.eps)
         v = v.reshape(n, self.num_kv_heads, self.head_dim)
-        if self.pos is not None:
-            # plain NEOX rope; no llama-3.1 scaling arguments
-            q, k = self.pos.apply_qk(q, k, label=self.attend.label)
-        out = self.attend(q, k, v).reshape(n, q_dim)
+        # NoPE: the full layers never rotate
+        if self.sliding:
+            q, k = rope(self.kv, q, k)
+        out = add_read(self.kv, self.layer, q, k=k, v=v).reshape(n, q_dim)
         return self.o_proj(out * torch.sigmoid(gate))
 
 
 class MuseGlimmerDecoderLayer(nn.Module):
     def __init__(
-        self, config: MuseGlimmerConfig, sliding: bool, comm_group: CommGroup,
+        self, config: MuseGlimmerConfig, sliding: bool, comm_group: CommGroup, layer: int,
     ):
         super().__init__()
         hidden = config.hidden_size
-        self.self_attn = MuseGlimmerAttention(config, sliding, comm_group)
+        self.self_attn = MuseGlimmerAttention(config, sliding, comm_group, layer)
         self.mlp = ParallelGatedMLP(
             hidden_size=hidden, intermediate_size=config.intermediate_size,
             comm_group=comm_group, activation="silu",
@@ -151,7 +140,7 @@ class MuseGlimmerTextModel(nn.Module):
             config.vocab_size, config.hidden_size, comm_group=comm_group,
         )
         self.layers = nn.ModuleList(
-            MuseGlimmerDecoderLayer(config, s, comm_group) for s in sliding
+            MuseGlimmerDecoderLayer(config, s, comm_group, i) for i, s in enumerate(sliding)
         )
         # `forward` reduces both row-parallel projections in their post-norms,
         # one fused all-reduce + norm kernel each, so they return partial sums
@@ -160,25 +149,20 @@ class MuseGlimmerTextModel(nn.Module):
             layer.mlp.down_proj.reduce_results = False
         # plain `w`, unlike the layers' norms
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # a layer of each kind, to bind the step's label on both attention resources
-        self._bind_through = (sliding.index(True), sliding.index(False))
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Token embeddings enter the stack at unit RMS, as image ones do."""
         return rms_norm_no_weight(self.embed_tokens(input_ids), self.config.rms_norm_eps)
 
     def forward(self, hidden: torch.Tensor, *, label: str) -> torch.Tensor:
-        for idx in self._bind_through:
-            self.layers[idx].self_attn.attend.bind_step(label)
+        """Each row's label comes from the step's segments, so ``label`` goes unread."""
         cg = self.comm_group
         residual = hidden
         h = self.layers[0].input_layernorm(hidden)
         out = None
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             if out is not None:
                 h, residual = layer.input_layernorm.forward_residual(out, residual)
-            # every layer is a layer of the one cache, so its stack index
-            layer.self_attn.attend.set_layer_idx(i)
             a = layer.post_attention_layernorm(layer.self_attn(h), cg)
             h, residual = layer.pre_feedforward_layernorm.forward_residual(a, residual)
             out = layer.post_feedforward_layernorm(layer.mlp(h), cg)

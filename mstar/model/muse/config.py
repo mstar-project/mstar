@@ -31,6 +31,10 @@ VISION_ATTN = keys.VISION_ATTN
 # the tower's two ragged layouts: 32x32-patch windows, and whole frames
 VISION_WINDOW = "window"
 VISION_FULL = "full"
+# an array per layout, whose reads share the one resource under `VISION_ATTN`
+VISION_WINDOW_TOKENS = "vision_window_tokens"
+VISION_FRAME_TOKENS = "vision_frame_tokens"
+VISION_FRAME_ATTN = "vision_frame_attn"
 
 
 # a mixture-of-experts text config, which this dense port would load wrong

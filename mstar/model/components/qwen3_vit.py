@@ -288,9 +288,10 @@ class VisionMLP(nn.Module):
 
 
 class VisionAttention(nn.Module):
-    """Non-causal attention over packed patches, through the plan the ragged
-    attention resource under ``attn_key`` holds for ``label`` (frames by
-    default; a windowed tower declares windows and frames as two labels).
+    """Non-causal attention over packed patches, through ``array`` at ``layer``
+    when the node binds that array's handle, and otherwise through the plan the
+    ragged attention resource under ``attn_key`` holds for ``label`` (frames by
+    default).
 
     The resource plans the layout, so this forward never sees the boundaries.
     That is what lets the tower compile: splitting per frame here gave each

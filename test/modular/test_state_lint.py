@@ -36,12 +36,12 @@ PORTED = (
     "mstar/model/bagel", "mstar/model/chatterbox", "mstar/model/whisper", "mstar/model/phi4mm",
     "mstar/model/nemotron_duplex", "mstar/model/components/fastconformer.py",
     "mstar/model/components/fastconformer_stream.py",
+    "mstar/model/ripple", "mstar/model/muse",
 )
 # The list only shrinks: a package leaves it when its port lands, and nothing is added to it.
 UNPORTED = (
     "mstar/model/cosmos3", "mstar/model/cosyvoice3", "mstar/model/glm52", "mstar/model/glm5_next",
-    "mstar/model/lingbot_world", "mstar/model/minicpm_o", "mstar/model/muse", "mstar/model/ripple",
-    "mstar/model/waypoint",
+    "mstar/model/lingbot_world", "mstar/model/minicpm_o", "mstar/model/waypoint",
 )
 # shared code under mstar/model/ that holds no model
 SHARED = ("mstar/model/components", "mstar/model/loader")

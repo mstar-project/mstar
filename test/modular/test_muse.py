@@ -20,6 +20,9 @@ import torch.nn.functional as F
 
 from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.distributed.communication import CommGroup
+from mstar.engine.resources.step import StepContext
+from mstar.engine.state import Array, ArrayStep, Segment, SubmoduleStep
+from mstar.engine.state.adapters import StateSetup, _resolve, build_handle, node_resources, sampling_configs
 from mstar.model.components.distributed.linear import RowParallelLinear
 from mstar.model.loader.base import apply_stacked
 from mstar.model.muse.components.text import (
@@ -212,39 +215,32 @@ def _attend(q, k, v, scale, window_left):
 
 
 class _Attn:
+    """Attends the step's own k and v, which a kernel that takes them at the read is handed."""
+
     requires_kv_write = False
 
     def __init__(self, scale, window_left):
         self.scale, self.window_left = scale, window_left
 
-    def set_default_label(self, label):
-        pass
-
-    def set_default_layer_idx(self, idx):
-        pass
-
-    def run(self, q, kv_cache_layer=None, k=None, v=None):
+    def run(self, q, label=None, kv_cache_layer=None, k=None, v=None, layer_idx=None):
         return _attend(q, k, v, self.scale, self.window_left)
 
 
 class _KV:
-    default_label = "main"
+    """Holds no pages: the reads take k and v at the read."""
 
-    def set_default_label(self, label):
-        pass
-
-    def set_default_layer_idx(self, idx):
-        pass
-
-    def layer_view(self):
+    def layer_view(self, i):
         return None
+
+    def opens_label(self, rid, label):
+        return True
 
 
 class _Pos:
     def __init__(self, theta):
         self.theta = theta
 
-    def apply_qk(self, q, k, label):
+    def apply_qk(self, q, k, label, rope_dtype=None):
         pos = torch.arange(q.shape[0])
         return _rope(q, pos, self.theta), _rope(k, pos, self.theta)
 
@@ -301,10 +297,18 @@ class _SumOfOneGroup(CommGroup):
         return super().allreduce_rmsnorm(*args, **kwargs)
 
 
+def _kv_handle(model, resources):
+    """The handle of ``model``'s declared KV cache, over ``resources``."""
+    (array,) = [array for array in model.declare_state() if isinstance(array, Array) and array.name == KV_CACHE]
+    return build_handle(array, resources, _resolve([array], StateSetup()))
+
+
 @pytest.mark.parametrize("tp", [1, 2])
-def test_the_text_stack_matches_the_reference_layer(ckpt_dir, tp):
+def test_the_text_stack_matches_the_reference_layer(model_dir, tp):
+    from mstar.model.muse.glimmer_model import MuseGlimmerModel
+
     torch.manual_seed(0)
-    cfg = MuseGlimmerConfig.from_hf(ckpt_dir)
+    cfg = MuseGlimmerConfig.from_hf(model_dir)
     model = MuseGlimmerForCausalLM(cfg).double()
     group = _SumOfOneGroup() if tp == 2 else None
     if group is not None:
@@ -316,18 +320,25 @@ def test_the_text_stack_matches_the_reference_layer(ckpt_dir, tp):
                 m.comm_group, m.tp_size = group, group.world_size
     for p in model.parameters():
         torch.nn.init.normal_(p, std=0.2)
+    # the stand-ins take the scale, window and theta the model declares, so a wrong one fails against the reference
+    muse = MuseGlimmerModel(str(model_dir))
+    specs = {spec.resource_key: spec for spec in node_resources(muse)}
+    sliding, full = specs[ATTN_SLIDING].config, specs[ATTN_FULL].config
     resources = {
         KV_CACHE: _KV(),
-        ATTN_SLIDING: _Attn(cfg.attn_scale, cfg.sliding_window - 1),
-        ATTN_FULL: _Attn(cfg.attn_scale, -1),
-        ROPE: _Pos(cfg.rope_theta),
+        ATTN_SLIDING: _Attn(sliding.sm_scale, sliding.sliding_window - 1),
+        ATTN_FULL: _Attn(full.sm_scale, -1),
+        ROPE: _Pos(specs[ROPE].config.rope_theta),
     }
+    kv = _kv_handle(muse, resources)
     for module in model.modules():
-        bind = getattr(module, "bind_resources", None)
-        if callable(bind):
-            bind(resources)
+        if hasattr(module, "bind_state"):
+            module.bind_state({KV_CACHE: kv})
     # long enough that the 5-token window cuts the sliding layers off
     ids = torch.randint(0, cfg.vocab_size, (13,))
+    step = SubmoduleStep(segments=[Segment(1, "main", len(ids))], state={KV_CACHE: ArrayStep()})
+    step.set_ctx(StepContext((1,), "prefill_text", 0, False))
+    kv.begin_step(step)
     hidden = model.model(model.model.embed(ids), label="main")
     ours = model.logits(hidden)
     ref = _reference_logits(model, ids, cfg)
@@ -690,26 +701,33 @@ def test_a_spelled_out_patch_is_a_bad_request(model_dir):
         )
 
 
+def _sampling(model, **kwargs):
+    """The sampler's request config the engine converts from the settings ``model`` returns."""
+    from mstar.model.muse.config import SAMPLER
+
+    return sampling_configs(model.get_request_resource_configs([], [], kwargs), model.declare_state())[SAMPLER]
+
+
 def test_the_checkpoint_sampling_defaults_apply_under_the_request(model_dir):
     from mstar.model.muse.config import SAMPLER
     from mstar.model.muse.glimmer_model import MuseGlimmerModel
 
     model = MuseGlimmerModel(str(model_dir))
-    cfg = model.get_request_resource_configs([], [], {"temperature": 0.0, "penalize_prompt": False})[SAMPLER]
+    cfg = _sampling(model, temperature=0.0, penalize_prompt=False)
     assert (cfg.temperature, cfg.top_p, cfg.top_k, cfg.penalize_prompt) == (0.0, 0.95, 64, False)
-    specs = {spec.resource_key: spec for spec in model.get_node_resources()}
+    specs = {spec.resource_key: spec for spec in node_resources(model)}
     cfg.validate(specs[SAMPLER])
     # the checkpoint sets no min_p, so the sampler has no min-p filter and a
     # request's min_p is refused at admission, not dropped
     with pytest.raises(ValueError, match="min_p"):
-        model.get_request_resource_configs([], [], {"min_p": 0.1})[SAMPLER].validate(specs[SAMPLER])
+        _sampling(model, min_p=0.1).validate(specs[SAMPLER])
     # one that does turns the filter on, and a request's min_p overrides it
     gen = json.loads((model_dir / "generation_config.json").read_text())
     (model_dir / "generation_config.json").write_text(json.dumps({**gen, "min_p": 0.05}))
     model = MuseGlimmerModel(str(model_dir))
-    (spec,) = [s for s in model.get_node_resources() if s.resource_key == SAMPLER]
-    assert model.get_request_resource_configs([], [], {})[SAMPLER].min_p == 0.05
-    cfg = model.get_request_resource_configs([], [], {"min_p": 0.2})[SAMPLER]
+    (spec,) = [s for s in node_resources(model) if s.resource_key == SAMPLER]
+    assert _sampling(model).min_p == 0.05
+    cfg = _sampling(model, min_p=0.2)
     cfg.validate(spec)
     assert (spec.enable_min_p, cfg.min_p) == (True, 0.2)
     assert set(specs) == {KV_CACHE, ATTN_SLIDING, ATTN_FULL, ROPE, "sampler", "vision_attn"}
@@ -743,7 +761,7 @@ def test_the_kv_pool_keeps_only_the_window_of_the_sliding_layers(model_dir, monk
     raw = _raw_config(52)
     model = get_model_class("muse_glimmer")(str(_write(model_dir, raw)))
     # resolved as a server resolves them, so the pool takes its windows from the attentions
-    specs = resolve_spec_dependencies(model.get_node_resources())
+    specs = resolve_spec_dependencies(node_resources(model))
     types = raw["text_config"]["layer_types"]
     assert specs[KV_CACHE].config.groups[-1].layers == tuple(
         i for i, t in enumerate(types) if t == "sliding_attention"
@@ -757,14 +775,11 @@ def test_the_kv_pool_keeps_only_the_window_of_the_sliding_layers(model_dir, monk
     info = EngineResourceInfo(device=torch.device("cpu"), dependencies={KV_CACHE: specs[KV_CACHE]})
     attn = {key: AttentionManager.build(specs[key], info) for key in (ATTN_SLIDING, ATTN_FULL)}
     lm = MuseGlimmerForCausalLM(model.config)
-    # the LLM node's resources, handed to every module that binds them as bind_node_resources does
-    resources = {KV_CACHE: MagicMock(), ROPE: MagicMock(), **attn}
-    for module in lm.modules():
-        if hasattr(module, "bind_resources"):
-            module.bind_resources(resources)
-    for i, layer in enumerate(lm.model.layers):
-        # what the stack's forward sets; the attention refuses a layer of the other group
-        layer.self_attn.attend.set_layer_idx(i)
+    kv = _kv_handle(model, {KV_CACHE: MagicMock(), ROPE: MagicMock(), **attn})
+    for layer in lm.model.layers:
+        i = int(layer.self_attn.layer)
+        # the attention a layer reads through refuses a layer of the other group
+        kv._attn[i]._check_layer(kv._pool_layer[i])
 
 
 @pytest.mark.parametrize(

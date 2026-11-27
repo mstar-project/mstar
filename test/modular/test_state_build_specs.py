@@ -152,6 +152,14 @@ def test_a_window_read_of_every_layer_lists_them_all():
     assert _by_key(_kv(reads={"attn": _read(mask=Window(6))}))["attn"].config.layers == (0, 1, 2, 3)
 
 
+def test_a_read_s_scale_is_its_attention_s_softmax_scale():
+    specs = _by_key(_kv(reads={
+        "local": _read(mask=Window(6), op=Attend(q_heads=8, scale=0.25), layers={2}), "global": _read(layers={5, 7, 9}),
+    }))
+    assert specs["local"].config.sm_scale == 0.25, "the backend would attend at head_dim ** -0.5"
+    assert specs["global"].config.sm_scale is None
+
+
 def test_a_value_becomes_one_pool_and_one_linear_attention_under_the_delta_key():
     specs = _by_key(_kv(), _gdn())
     assert set(specs) == {"kv", "attn", "gdn", "delta"}, "a CausalConv runs through the delta's spec and has none"
@@ -311,6 +319,10 @@ NO_LAYOUT = {
         reads={"x": _read(mask=Bidirectional(), queries="kv", walks={"decode"})},
     )], "reads['x'].walks"),
     "a mask of no known name": ("kv", lambda: [_kv(reads={"r": _read(mask=_OtherMask())})], "reads['r'].mask"),
+    "a scale on a cross read": ("ctx", lambda: [_kv(), Array(
+        "ctx", nodes={"llm"}, layers={2, 5, 7, 9}, entry=KVEntry(heads=4, head_dim=16), max_len=512,
+        reads={"x": _read(mask=Bidirectional(), queries="kv", op=Attend(q_heads=8, scale=0.5))},
+    )], "reads['x'].op.scale"),
     "two query head counts": ("kv", lambda: [_kv(reads={"a": _read(layers={2}), "b": _MIXED})], "q_heads"),
     "no reads": ("kv", lambda: [_kv(reads={})], "reads is empty"),
     "an entry of other fields": (
@@ -972,6 +984,11 @@ def test_an_unbounded_array_s_entry_is_a_kv_entry():
 def test_a_bounded_read_has_as_many_query_heads_as_its_entry():
     _no_layout("reads['enc_attn'].op.q_heads is 8, and the bounded kernels run one query head per head of the "
                "entry's 4", _unbounded(reads={"enc_attn": _window(op=Attend(q_heads=8))}))
+
+
+def test_a_bounded_read_takes_no_scale():
+    _no_layout("reads['enc_attn'].op.scale must be None, since the bounded kernels attend at head_dim ** -0.5",
+               _unbounded(reads={"enc_attn": _window(op=Attend(q_heads=4, scale=0.25))}))
 
 
 def test_a_bounded_read_takes_a_head_dim_the_kernels_tile():

@@ -60,12 +60,14 @@ def _entry(heads=HEADS, dtype=None) -> Entry:
 
 
 def _array(
-    name, read=None, *, queries=None, label=None, heads=HEADS, nodes=("dit",), dtype=None, packed=False,
+    name, read=None, *, queries=None, label=None, heads=HEADS, nodes=("dit",), dtype=None, packed=False, scale=None,
 ) -> Array:
     return Array(
         name, nodes=set(nodes), layers={0, 1}, entry=_entry(heads, dtype), max_len=0,
         labels={label or name},
-        reads={read or f"{name}_read": Read(mask=Block(), op=Attend(q_heads=heads), queries=queries, packed=packed)},
+        reads={read or f"{name}_read": Read(
+            mask=Block(), op=Attend(q_heads=heads, scale=scale), queries=queries, packed=packed,
+        )},
     )
 
 
@@ -178,6 +180,16 @@ def test_a_self_read_runs_ulysses_only_where_the_nodes_shard_lists_its_label(key
 def test_a_declared_dtype_reaches_the_spec():
     (spec,) = build_specs([_array("a", dtype=torch.bfloat16)])
     assert spec.config.dtype is torch.bfloat16
+
+
+def test_a_read_s_scale_reaches_its_resource_on_either_side():
+    specs = build_specs([_array("a", scale=0.25), _array("b", queries="a", scale=0.25)])
+    assert [spec.config.sm_scale for spec in specs] == [0.25, 0.25], "the kernel would attend at head_dim ** -0.5"
+
+
+def test_reads_of_two_scales_never_share_a_resource():
+    specs = build_specs([_array("a"), _array("b", scale=0.25)])
+    assert [spec.resource_key for spec in specs] == ["a_read", "b_read"], "one read would attend at the other's scale"
 
 
 def test_the_new_settings_reach_the_shared_spec_from_any_of_its_reads():
@@ -420,6 +432,11 @@ def test_a_worker_gives_its_specs_and_its_engine_one_choice_object(monkeypatch):
 
 def test_a_resource_on_sdpa_builds_no_spec():
     assert build_specs([_array("a")], setup=_on_sdpa("a_read")) == []
+
+
+def test_a_scaled_read_on_sdpa_is_refused():
+    with pytest.raises(ValueError, match=r"Array 'a': no layout yet: reads\['a_read'\]\.op\.scale must be None"):
+        build_specs([_array("a", scale=0.25)], setup=_on_sdpa("a_read"))
 
 
 def test_kernel_settings_on_a_resource_on_sdpa_set_nothing_and_still_refuse_a_bad_field():

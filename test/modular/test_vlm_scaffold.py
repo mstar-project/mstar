@@ -12,7 +12,7 @@ import torch
 from mstar.conductor.request_info import FINAL_PREFILL, WalkStep
 from mstar.graph.base import Parallel
 from mstar.model.components.sampled_token_decoder import MEDIA_EMBEDS, MEDIA_MASK
-from mstar.model.keys import KV_CACHE, MIXED, ROPE, SAMPLER
+from mstar.model.keys import KV_CACHE, MIXED, SAMPLER
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
     MediaEncoder,
@@ -401,22 +401,21 @@ def _glimmer_llm():
     return LLMSubmodule(model, SimpleNamespace(hidden_size=8, stop_token_ids=()), (VISION,))
 
 
-def test_glimmer_writes_its_steps_by_hand_on_the_scaffolds_default():
-    from mstar.engine.resources.position.config import PositionStep
-    from mstar.engine.resources.sampler.config import SamplerStep
-    from mstar.model.muse.config import ATTN_FULL
+def test_glimmer_declares_its_cache_and_sampler_on_the_scaffolds_default():
     from mstar.model.submodule_base import ARNodeInputs
 
+    tokens = torch.arange(4)
     step = _glimmer_llm().declare_step(
-        "prefill_vision", [0], [ARNodeInputs(input_seq_len=4, input_ids=torch.arange(4), resource_step_info=3)],
+        "prefill_vision", [0], [ARNodeInputs(input_seq_len=4, input_ids=tokens, resource_step_info=3)],
     )
-    assert not step.state, "Muse Glimmer has no handles to expand a declared step"
-    assert isinstance(step.steps[SAMPLER], SamplerStep) and isinstance(step.steps[ROPE], PositionStep)
-    assert step.steps[ROPE].advance == (3,) and ATTN_FULL in step.steps
+    assert step.state.keys() == {KV_CACHE, SAMPLER}
+    assert step.state[KV_CACHE].advance == (3,), "the position would move by the row's tokens, not its advance"
+    assert step.state[SAMPLER].prompt_tokens[0] is tokens
 
 
-def test_glimmer_samples_and_loops_back_off_its_resources():
-    from mstar.model.muse.config import ATTN_FULL
+def test_glimmer_samples_and_loops_back_off_its_handles():
+    from mstar.engine.state import Sampler
+    from mstar.engine.state.calls import SamplerHandle
 
     hidden = torch.arange(6.0).reshape(3, 2)
 
@@ -432,30 +431,39 @@ def test_glimmer_samples_and_loops_back_off_its_resources():
 
     llm = _glimmer_llm()
     llm.model = _Decoder()
-    engine_inputs = SimpleNamespace(request_ids=["r"], resources={
-        SAMPLER: SimpleNamespace(
-            loopback_tokens=lambda rids: torch.tensor([9]) if rids == ["r"] else None,
-            sample=lambda rids, logits: (rids, logits),
-        ),
-        ATTN_FULL: SimpleNamespace(select_last_hidden=lambda x: x[-1:]),
-    })
+    llm.kv = SimpleNamespace(at_last_token=lambda x, label=None: x[-1:])
+    sampler = SimpleNamespace(
+        loopback_tokens=lambda rids: torch.tensor([9]) if list(rids) == ["r"] else None,
+        sample=lambda rids, logits: (rids, logits),
+    )
+    llm.sampler = SamplerHandle(Sampler(SAMPLER, nodes={"LLM"}, vocab_size=8), sampler)
+    llm.sampler.rows, llm.sampler._open = ("r",), True
+    engine_inputs = SimpleNamespace(request_ids=["r"], resources={})
     rows, logits = llm._forward("prefill_text", engine_inputs)
     assert rows == ["r"] and torch.equal(logits, hidden[-1:]), "a prefill feeds the head each row's last token"
     assert llm.loopback_tokens(engine_inputs).tolist() == [9]
 
 
-def test_glimmer_reads_its_position_off_its_resource():
+def test_glimmer_reads_its_position_off_its_cache():
     llm = _glimmer_llm()
-    llm.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: {(7, "main"): 5}[rid, label])}
+    # the stream's counter is keyed by the worker's handle, not the wire id
+    llm.kv = SimpleNamespace(positions=SimpleNamespace(position=lambda rid, label: {(7, "main"): 5}[rid, label]))
     assert llm.next_position(7) == 5
 
 
-def test_glimmer_encoder_reads_its_segment_ceiling_off_its_resource():
+def _vision_handle(max_segments: int) -> SimpleNamespace:
+    """Stands in for the tower's window array, whose read reports the segment ceiling in effect."""
     from mstar.model.keys import VISION_ATTN
+
+    settings = {(VISION_ATTN, "max_segments_per_step"): max_segments}
+    return SimpleNamespace(_kernel_setting=lambda read, field: settings[read, field])
+
+
+def test_glimmer_encoder_reads_its_segment_ceiling_off_its_handle():
     from mstar.model.muse.submodules import VisionEncoderSubmodule
 
     encoder = VisionEncoderSubmodule(torch.nn.Linear(1, 1), SimpleNamespace(), "vision_embeds")
-    encoder.node_resources = {VISION_ATTN: SimpleNamespace(max_segments_per_step=2)}
+    encoder.vision = _vision_handle(2)
     assert encoder._fits_replay(16, 2) and not encoder._fits_replay(16, 3), "a YAML override should hold"
 
 
@@ -518,12 +526,11 @@ def test_a_two_label_tower_refuses_a_resource_whose_step_is_its_segments():
 
 
 def _glimmer_encoder(max_segments: int):
-    from mstar.model.keys import VISION_ATTN
     from mstar.model.muse.submodules import VisionEncoderSubmodule
 
     encoder = object.__new__(VisionEncoderSubmodule)
     encoder.config = SimpleNamespace(hidden_size=8, head_dim=4)
-    encoder.node_resources = {VISION_ATTN: SimpleNamespace(max_segments_per_step=max_segments)}
+    encoder.vision = _vision_handle(max_segments)
     return encoder
 
 

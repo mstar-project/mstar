@@ -1,43 +1,37 @@
 """Muse Glimmer's node submodules: the LLM and the vision encoder.
 
-Both build on the shared scaffolds (`SampledTokenDecoder`,
+Both build on the shared scaffolds (`DeclaredTokenDecoder`,
 `PackedBlockLoopEncoder`). Positions are plain 1D and advance one per token,
 images included, so the position resource's own counters place every step.
 """
 
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.kv.config import KVStep
-from mstar.engine.resources.step import ResourceStep
+from mstar.engine.state import (
+    ArrayStep,
+    SubmoduleStep,
+    kernel_setting,
+)
 from mstar.model.components.block_loop_encoder import PackedBlockLoopEncoder
-from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+from mstar.model.components.sampled_token_decoder import DeclaredTokenDecoder
 from mstar.model.muse.components.vision import tower_inputs
 from mstar.model.muse.config import (
-    ATTN_FULL,
-    ATTN_SLIDING,
-    KV_CACHE,
+    VISION_ATTN,
+    VISION_FRAME_TOKENS,
     VISION_FULL,
     VISION_WINDOW,
+    VISION_WINDOW_TOKENS,
 )
 from mstar.model.submodule_base import NodeInputs
 
 
-class LLMSubmodule(SampledTokenDecoder):
-    # either attention resource's plan picks each prefill row's last token
-    ATTN_KEY = ATTN_FULL
-
-    def layer_steps(self) -> dict[str, ResourceStep]:
-        # one KV cache, read through a windowed and an unwindowed resource
-        return {
-            KV_CACHE: KVStep(),
-            ATTN_SLIDING: AttentionStep(causal=True),
-            ATTN_FULL: AttentionStep(causal=True),
-        }
+class LLMSubmodule(DeclaredTokenDecoder):
+    pass
 
 
 class VisionEncoderSubmodule(PackedBlockLoopEncoder):
@@ -58,6 +52,24 @@ class VisionEncoderSubmodule(PackedBlockLoopEncoder):
     # request's own patches, so two requests' do not pack by concatenation,
     # and the config has no ``spatial_merge_size`` to cut the output apart by.
     MAX_BATCH_SIZE = 1
+    # the array each label's segments lay out
+    _TOKENS = {VISION_WINDOW: VISION_WINDOW_TOKENS, VISION_FULL: VISION_FRAME_TOKENS}
+
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.vision = handles[VISION_WINDOW_TOKENS]
+
+    def _declare(
+        self, rows: Sequence[tuple[Any, Mapping[str, Sequence[int]]]], attention: bool = True,
+    ) -> SubmoduleStep:
+        segments = super()._declare(rows).segments
+        state = {
+            array: ArrayStep(segments=tuple(segment for segment in segments if segment.label == label))
+            for label, array in self._TOKENS.items()
+        } if attention else {}
+        return SubmoduleStep(segments=segments, state=state)
+
+    def max_segments_per_step(self) -> int:
+        return kernel_setting(self.vision, VISION_ATTN, "max_segments_per_step")
 
     def prepare_inputs(
         self,
