@@ -17,8 +17,9 @@ name: Publish to PyPI
 # version and architecture that also carry the mstar_rust extension (setup.py
 # compiles rust/ only under cibuildwheel). pip prefers the Linux wheel where
 # one matches and falls back to the pure one elsewhere, which can import mstar
-# but cannot serve until the extension is built. The Linux wheels publish in
-# their own job, so a failure in `wheels` holds back only them.
+# but cannot serve until the extension is built. So nothing publishes until
+# every Linux wheel has built and passed its checks: a release of only the
+# sdist and the pure wheel would upgrade a Linux install to one that can't serve.
 
 on:
   release:
@@ -151,6 +152,8 @@ jobs:
           path: wheelhouse/*.whl
 
   pypi:
+    # Every Linux wheel first (see the top of this file).
+    needs: wheels
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
     environment: pypi
