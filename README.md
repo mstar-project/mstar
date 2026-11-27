@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/mstar-logo.svg" alt="M*" width="300">
+  <img src="https://raw.githubusercontent.com/mstar-project/mstar/main/assets/mstar-logo.svg" alt="M*" width="300">
 </p>
 
 <h3 align="center">A universal serving system for composite, any-to-any multimodal models</h3>
@@ -28,7 +28,7 @@
 ---
 
 <p align="center">
-  <img src="assets/mstar_headline.png" alt="M* performance across models and modalities — M* matches or beats state-of-the-art inference systems" width="100%">
+  <img src="https://raw.githubusercontent.com/mstar-project/mstar/main/assets/mstar_headline.png" alt="M* performance across models and modalities — M* matches or beats state-of-the-art inference systems" width="100%">
 </p>
 
 <p align="center">
@@ -106,7 +106,7 @@ client.audio.speech.create(model="orpheus", input="hi", voice="tara")   # text-t
 client.images.generate(model="bagel", prompt="a cat")                   # image generation
 ```
 
-Runnable scripts and `curl` examples live in [`examples/`](examples/). Power users can launch any
+Runnable scripts and `curl` examples live in [`examples/`](https://github.com/mstar-project/mstar/tree/main/examples). Power users can launch any
 deployment with an explicit config: `mstar-serve --config configs/<model>.yaml`.
 
 _Note_: The **first request(s) on a fresh environment can be slow** — often tens of seconds to a few minutes. mstar ``torch.compile``s the model on first use, and that compilation happens lazily on the first request that exercises each path.
@@ -175,14 +175,14 @@ primitives — `Sequential`, `Parallel`, `Loop`, and a cross-partition
 
 ### Rust extension
 
-Serving needs the `mstar_rust` extension (vendored in [`rust/`](rust/)): the graph runtime is
+Serving needs the `mstar_rust` extension (vendored in [`rust/`](https://github.com/mstar-project/mstar/tree/main/rust)): the graph runtime is
 Rust, and every process sends its control messages on the extension's ZeroMQ transport. Each
 process logs it at startup (`control mesh transport: rust <version> from <path>`).
 From a checkout, build it with [maturin](https://www.maturin.rs): `uv pip install maturin && maturin develop --release -m rust/Cargo.toml`.
-`mstar serve` serves HTTP from the `mstar-server` binary ([`rust/server/`](rust/server/)); from a checkout, build it too:
+`mstar serve` serves HTTP from the `mstar-server` binary ([`rust/server/`](https://github.com/mstar-project/mstar/tree/main/rust/server)); from a checkout, build it too:
 `cargo build --release --manifest-path rust/server/Cargo.toml`.
 The Linux wheels of `mstar-ai` on PyPI carry both, the extension with libzmq 4.3.4 statically linked under
-LGPL-3.0-or-later and its static-linking exception ([PACKAGING.md](PACKAGING.md) has where its source is).
+LGPL-3.0-or-later and its static-linking exception ([PACKAGING.md](https://github.com/mstar-project/mstar/blob/main/PACKAGING.md) has where its source is).
 See the [installation docs](https://m-star.org/mstar/installation.html) and
 [environment variables](https://m-star.org/mstar/environment_variables.html).
 
@@ -233,4 +233,4 @@ continuous batching ([vLLM](https://github.com/vllm-project/vllm)),
 
 ## License
 
-[Apache License 2.0](LICENSE).
+[Apache License 2.0](https://github.com/mstar-project/mstar/blob/main/LICENSE).
