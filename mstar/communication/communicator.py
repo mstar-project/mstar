@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 #: ``rust/`` crate's version). Every process sends on the extension's
 #: transport, so a mismatching install - e.g. a stale wheel after an upgrade -
 #: is refused at startup rather than left to carry the mesh.
-EXPECTED_MSTAR_RUST_VERSION = "0.1.1"
+EXPECTED_MSTAR_RUST_VERSION = "0.2.0"
 
 
 #: The entity whose endpoint stands for the whole deployment: the one every
