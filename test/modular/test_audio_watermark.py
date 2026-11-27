@@ -439,7 +439,7 @@ def test_engine_captures_replay_the_eager_watermark_bit_for_bit():
             label=label, config=config, resources={}, step_runner=NoResources(), device=wmk.device,
             autocast_dtype=None, num_slots=1, memory_pool=pool,
         )
-        runner.warmup_and_capture()
+        runner.warmup_and_capture(None)  # no plan: every bucket
         assert runner.any_graphs and not runner.dropped_shapes
         runners[label] = runner
     pcm = [(_speechlike(7 * frame, seed=s).clamp(-1, 1) * 32767).to(torch.int16).cuda() for s in range(30, 34)]
