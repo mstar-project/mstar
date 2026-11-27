@@ -86,7 +86,7 @@ packages carry the same version in `packaging/aliases/*/pyproject.toml`. To
 release:
 
 1. Bump the version in all three pyproject files and land it on `main`.
-2. Publish a GitHub Release with a matching tag (e.g. `v0.2.1`). The workflow
+2. Publish a GitHub Release with a matching tag (e.g. `v0.3.0`). The workflow
    refuses a tag that does not match the version.
 3. The `Publish to PyPI` workflow builds the engine and the alias packages
    and uploads them over Trusted Publishing (OIDC, no token stored in the
