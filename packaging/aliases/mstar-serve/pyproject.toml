@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 # Alias for the M* engine. Installs the real `mstar-ai` distribution.
 name = "mstar-serve"
-version = "0.2.1"
+version = "0.3.0"
 description = "Alias for the M* multimodal inference engine (installs mstar-ai)."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -16,26 +16,41 @@ dependencies = ["mstar-ai"]
 # forward to the real package instead of silently installing the bare engine.
 # Keep in sync with mstar-ai's [project.optional-dependencies].
 [project.optional-dependencies]
+omnivoice = ["mstar-ai[omnivoice]"]
+command_a_plus = ["mstar-ai[command_a_plus]"]
 dev = ["mstar-ai[dev]"]
 audio = ["mstar-ai[audio]"]
+metrics = ["mstar-ai[metrics]"]
+eval = ["mstar-ai[eval]"]
+audioseal = ["mstar-ai[audioseal]"]
+vad = ["mstar-ai[vad]"]
 dynamo = ["mstar-ai[dynamo]"]
+minicpm_o = ["mstar-ai[minicpm_o]"]
 bagel = ["mstar-ai[bagel]"]
+bagel_xpu = ["mstar-ai[bagel_xpu]"]
 cosmos3 = ["mstar-ai[cosmos3]"]
 qwen3_omni = ["mstar-ai[qwen3_omni]"]
 qwen3_tts = ["mstar-ai[qwen3_tts]"]
 fish_s2_pro = ["mstar-ai[fish_s2_pro]"]
+kokoro = ["mstar-ai[kokoro]"]
+chatterbox = ["mstar-ai[chatterbox]"]
+chatterbox_multilingual = ["mstar-ai[chatterbox_multilingual]"]
+cosyvoice3 = ["mstar-ai[cosyvoice3]"]
+voxcpm2 = ["mstar-ai[voxcpm2]"]
 orpheus = ["mstar-ai[orpheus]"]
 pi05 = ["mstar-ai[pi05]"]
 vjepa2 = ["mstar-ai[vjepa2]"]
 wan22 = ["mstar-ai[wan22]"]
 waypoint = ["mstar-ai[waypoint]"]
+lingbot_world = ["mstar-ai[lingbot_world]"]
+flux2_klein = ["mstar-ai[flux2_klein]"]
 vjepa2_ac = ["mstar-ai[vjepa2_ac]"]
 asr = ["mstar-ai[asr]"]
 glm = ["mstar-ai[glm]"]
 all = ["mstar-ai[all]"]
 
 [project.urls]
-Homepage = "https://github.com/mstar-serve/mstar"
+Homepage = "https://github.com/mstar-project/mstar"
 
 [tool.setuptools]
 packages = []
