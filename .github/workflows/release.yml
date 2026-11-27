@@ -16,9 +16,9 @@ name: Publish to PyPI
 # mstar-ai ships an sdist, a pure-Python wheel, and Linux wheels per CPython
 # version and architecture that also carry the mstar_rust extension (setup.py
 # compiles rust/ only under cibuildwheel). pip prefers the Linux wheel where
-# one matches and falls back to the pure one elsewhere, which then runs on the
-# Python transport and graph runtime. The Linux wheels publish in their own
-# job, so a failure in `wheels` holds back only them.
+# one matches and falls back to the pure one elsewhere, which can import mstar
+# but cannot serve until the extension is built. The Linux wheels publish in
+# their own job, so a failure in `wheels` holds back only them.
 
 on:
   release:
