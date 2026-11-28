@@ -1,11 +1,12 @@
 # A/A noise floors and correctness swings per GPU type (benchmark/eval/e2e/calibrate.py); written by
 # `python -m benchmark.eval calibrate`.
-_runs: [20261017-011012-main, 20261017-014824-main, 20261017-031729-main, 20261017-165629-main, 20261018-211808-main, 576-slice-35d1d599,
-  577-cosyvoice3-b3922414, 577-lingbot_world_1_3b-a6377f82, 577-omnilingual_asr_ctc_300m-89dce5fc, 577-voxcpm2-5ef294e8, run-aa4]
+_runs: [20261017-011012-main, 20261017-014824-main, 20261017-031729-main, 20261017-165629-main, 20261018-211808-main, 574-multigpu-aa2-ac97439c,
+  574-multigpu-aa3-01b686bb, 576-slice-35d1d599, 577-cosyvoice3-b3922414, 577-lingbot_world_1_3b-a6377f82, 577-omnilingual_asr_ctc_300m-89dce5fc,
+  577-voxcpm2-5ef294e8, mg-aa1-3f46aaf4, run-aa4]
 _runs_correct: [20261017-011012-main, 20261017-014824-main, 20261017-031729-main, 20261017-165629-main, 20261018-211808-main,
-  576-slice-35d1d599, 577-cosyvoice3-b3922414, 577-lingbot_world_1_3b-a6377f82, 577-omnilingual_asr_ctc_300m-89dce5fc, 577-voxcpm2-5ef294e8,
-  run-aa4]
-_runs_quality: [576-slice-35d1d599]
+  574-multigpu-aa2-ac97439c, 574-multigpu-aa3-01b686bb, 576-slice-35d1d599, 577-cosyvoice3-b3922414, 577-lingbot_world_1_3b-a6377f82,
+  577-omnilingual_asr_ctc_300m-89dce5fc, 577-voxcpm2-5ef294e8, mg-aa1-3f46aaf4, run-aa4]
+_runs_quality: [574-multigpu-aa2-ac97439c, 574-multigpu-aa3-01b686bb, 576-slice-35d1d599, mg-aa1-3f46aaf4]
 b200:bagel/image_in/correct:
   kind: text_match
   swings: [0.0]
@@ -314,6 +315,13 @@ h200:cosmos3_edge/t2i/lat_p50_s@c1:
   deltas: [-2.754]
 h200:cosmos3_edge/t2i/req_per_s@c8:
   deltas: [-0.943]
+h200:cosmos3_nano_sp2/t2i/clip:
+  kind: clip
+  swings: [0.0, 0.0, 0.0]
+h200:cosmos3_nano_sp2/t2i/lat_p50_s@c1:
+  deltas: [-0.999, 3.48, -3.868]
+h200:cosmos3_nano_sp2/t2i/req_per_s@c1:
+  deltas: [-1.271, 3.173, -3.515]
 h200:cosyvoice3/clone/audio_s_per_s@c8:
   deltas: [0.242]
 h200:cosyvoice3/clone/correct:
@@ -418,6 +426,20 @@ h200:orpheus_mooncake/tts/rtf_mean@c1:
   deltas: [-0.033]
 h200:orpheus_mooncake/tts/ttfa_ms_p50@c1:
   deltas: [-0.326]
+h200:orpheus_pd_disaggregated/tts/audio_s_per_s@c8:
+  deltas: [1.144, 4.342, 1.002]
+h200:orpheus_pd_disaggregated/tts/correct:
+  kind: wer
+  swings: [0.0, 0.0, 0.0]
+h200:orpheus_pd_disaggregated/tts/e2e_s_p50@c1:
+  deltas: [1.852, 0.099, -0.008]
+h200:orpheus_pd_disaggregated/tts/mos:
+  kind: mos
+  swings: [0.0061, 0.002, 0.0038]
+h200:orpheus_pd_disaggregated/tts/rtf_mean@c1:
+  deltas: [1.787, 0.423, 0.522]
+h200:orpheus_pd_disaggregated/tts/ttfa_ms_p50@c1:
+  deltas: [-0.708, -2.023, 0.47]
 h200:pi05/act/correct:
   kind: action_diff
   swings: [0.0068, 0.0]
@@ -514,6 +536,75 @@ h200:qwen3_tts/tts/rtf_mean@c1:
   deltas: [-0.454, 0.555]
 h200:qwen3_tts/tts/ttfa_ms_p50@c1:
   deltas: [-0.58, -2.351]
+h200:qwen3omni_pd_disaggregated/audio_out/audio_s_per_s@c8:
+  deltas: [13.904, 6.012, 2.229]
+h200:qwen3omni_pd_disaggregated/audio_out/correct:
+  kind: audio_len
+  swings: [15.6863, 0.0, 0.0]
+h200:qwen3omni_pd_disaggregated/audio_out/lat_p50_s@c1:
+  deltas: [0.226, -0.401]
+h200:qwen3omni_pd_disaggregated/audio_out/mos:
+  kind: mos
+  swings: [0.0116, 0.0008, 0.0]
+h200:qwen3omni_pd_disaggregated/audio_out/s_per_audio_s_p50@c1:
+  deltas: [-0.145]
+h200:qwen3omni_pd_disaggregated/audio_out/ttft_p50_s@c1:
+  deltas: [-5.264, 0.804, -4.73]
+h200:qwen3omni_pd_disaggregated/text/correct:
+  kind: text_match
+  swings: [0.0, 0.0, 0.0]
+h200:qwen3omni_pd_disaggregated/text/lat_p50_s@c1:
+  deltas: [-0.027, 1.852, -7.239]
+h200:qwen3omni_pd_disaggregated/text/req_per_s@c8:
+  deltas: [-2.651, 1.353, 0.709]
+h200:qwen3omni_pd_disaggregated/text/ttft_p50_s@c1:
+  deltas: [-0.865, 4.883, -0.4]
+h200:qwen3omni_thinker_tp2/audio_out/audio_s_per_s@c16:
+  deltas: [-8.885, 0.875, -1.245]
+h200:qwen3omni_thinker_tp2/audio_out/correct:
+  kind: audio_len
+  swings: [24.479, 0.0, 0.0]
+h200:qwen3omni_thinker_tp2/audio_out/lat_p50_s@c1:
+  deltas: [0.105, -0.495]
+h200:qwen3omni_thinker_tp2/audio_out/mos:
+  kind: mos
+  swings: [0.0024, 0.0006, 0.0003]
+h200:qwen3omni_thinker_tp2/audio_out/s_per_audio_s_p50@c1:
+  deltas: [0.556]
+h200:qwen3omni_thinker_tp2/audio_out/ttft_p50_s@c1:
+  deltas: [-1.176, -0.939, -3.917]
+h200:qwen3omni_thinker_tp2/image_in/correct:
+  kind: text_match
+  swings: [0.0, 0.0, 0.0]
+h200:qwen3omni_thinker_tp2/image_in/lat_p50_s@c1:
+  deltas: [3.459, 1.116, -1.708]
+h200:qwen3omni_thinker_tp2/image_in/tok_per_s@c16:
+  deltas: [1.019, 0.357, 0.044]
+h200:qwen3omni_thinker_tp2/image_in/ttft_p50_s@c1:
+  deltas: [6.772, 1.831, -2.794]
+h200:qwen3omni_thinker_tp2/text/correct:
+  kind: text_match
+  swings: [0.0, 0.0, 0.0]
+h200:qwen3omni_thinker_tp2/text/lat_p50_s@c1:
+  deltas: [1.494, -0.111, -2.006]
+h200:qwen3omni_thinker_tp2/text/req_per_s@c16:
+  deltas: [4.817, -3.313, -5.433]
+h200:qwen3omni_thinker_tp2/text/ttft_p50_s@c1:
+  deltas: [2.363, 0.99, -1.788]
+h200:qwen3tts_1p7b_split/tts/audio_s_per_s@c8:
+  deltas: [0.477, -0.165, 0.335]
+h200:qwen3tts_1p7b_split/tts/correct:
+  kind: wer
+  swings: [0.0, 0.0, 0.0]
+h200:qwen3tts_1p7b_split/tts/e2e_s_p50@c1:
+  deltas: [0.535, -0.124, -1.61]
+h200:qwen3tts_1p7b_split/tts/mos:
+  kind: mos
+  swings: [0.0, 0.0, 0.0]
+h200:qwen3tts_1p7b_split/tts/rtf_mean@c1:
+  deltas: [0.732, -0.415, -1.12]
+h200:qwen3tts_1p7b_split/tts/ttfa_ms_p50@c1:
+  deltas: [7.748, -1.196, -8.342]
 h200:voxcpm2/clone/audio_s_per_s@c8:
   deltas: [-1.136]
 h200:voxcpm2/clone/correct:
@@ -563,6 +654,24 @@ h200:whisper_large/upload/req_per_s@c8:
   deltas: [-3.709, -2.181]
 h200:whisper_large/upload/rtfx@c1:
   deltas: [-0.068, -0.088]
+h200:whisper_large_tp2/sse/correct:
+  kind: wer
+  swings: [0.0, 0.0, 0.0]
+h200:whisper_large_tp2/sse/e2e_s_p50@c1:
+  deltas: [0.488, -0.194, 2.312]
+h200:whisper_large_tp2/sse/first_text_s_p50@c1:
+  deltas: [0.575, -0.082, 2.172]
+h200:whisper_large_tp2/sse/req_per_s@c16:
+  deltas: [2.141, -2.72, 1.938]
+h200:whisper_large_tp2/upload/correct:
+  kind: wer
+  swings: [0.0, 0.0, 0.0]
+h200:whisper_large_tp2/upload/e2e_s_p50@c1:
+  deltas: [-0.8, 1.154, 4.029]
+h200:whisper_large_tp2/upload/req_per_s@c16:
+  deltas: [-4.697, 2.678, 5.204]
+h200:whisper_large_tp2/upload/rtfx@c1:
+  deltas: [-0.366, 1.87, 3.442]
 h200:z_image_turbo/t2i/correct:
   kind: psnr
   swings: [64.096, 59.9749]
