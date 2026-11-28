@@ -5,10 +5,10 @@ name: Review bot monitor
 # first scheduled run creates that issue and the skip-ai-review label. The status issue has one
 # writer: the monitor job, serialized by its concurrency group.
 #
-# Hourly, the reap job releases the live test's DigitalOcean boxes that outlived REVIEW_GPU_HOURS
-# by an hour (gpu_review.py reap): a droplet has no deadline of its own, so this is what ends one
-# whose runner died before its cleanup step. It runs no model and no PR code, and holds only the
-# DigitalOcean token.
+# Hourly, the reap job releases the live test's RunPod, Lambda and DigitalOcean boxes that outlived
+# REVIEW_GPU_HOURS by an hour (gpu_review.py reap): they have no deadline of their own, so this is
+# what ends one whose runner died before its cleanup step. It runs no model and no PR code, and holds
+# only those three providers' keys.
 
 on:
   schedule:
@@ -57,7 +57,8 @@ jobs:
   reap:
     name: Release runaway GPU boxes
     if: github.event.schedule != '0 6 * * *'
-    # Holds DIGITALOCEAN_TOKEN: the environment's branch rule keeps it from branch workflows.
+    # Holds the RunPod, Lambda and DigitalOcean keys: the environment's branch rule keeps them from branch
+    # workflows.
     environment: review-bot
     concurrency: review-reap
     runs-on: ubuntu-latest
@@ -72,6 +73,8 @@ jobs:
 
       - name: Release them
         env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          LAMBDA_API_KEY: ${{ secrets.LAMBDA_API_KEY }}
           DIGITALOCEAN_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
           HOURS: ${{ vars.REVIEW_GPU_HOURS }}
         run: python3 .github/review/gpu_review.py reap
