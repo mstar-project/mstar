@@ -27,14 +27,20 @@ class DrafterShare(NamedTuple):
     """What the engine binds into a verifying node once at load
     (`NodeSubmodule.bind_draft`), from its `VerifyNode` and the draft config, so
     no model declares it: the walk it verifies on, the sampler that verifies, k,
-    and the steps it adds for its drafter (`drafter_step`). The same on every rank."""
+    and what it adds to the node's steps for its drafter (`drafter_step`): the
+    drafter's resource steps and its carry's loop-back writes. The same on every rank."""
     verify_walk: str
     sampler_key: str
     num_draft_tokens: int
     prompt_walks: frozenset[str]
+    # the sampler loop-back state the drafter's carry is stored through, on its prompt and verify steps
+    # (`carry_writes`)
+    loopback_writes: frozenset[str]
     # the drafter's own resources' steps (`VerifyNode.prefill_steps`, `VerifyNode.verify_steps`)
     prompt_steps: Mapping[str, ResourceStep]
     verify_steps: Mapping[str, ResourceStep]
+    # the node's resources that correct a verify step's state in its graph, in dependency order
+    correcting_keys: tuple[str, ...] = ()
     # the combined walk of mixed prompt-plus-verify steps (`VerifyNode.mixed_walk`), whose steps take both sets
     mixed_walk: str | None = None
 
@@ -46,10 +52,11 @@ class DrafterShare(NamedTuple):
 
 def drafter_step(step, graph_walk: str, share: DrafterShare | None):
     """``step`` with its drafter's share, as a new step: on a prompt or verify step, the drafter's resource
-    steps. The engine derives them from the drafter's declaration, so a captured graph and each step it
-    replays agree by construction. A step with verify rows also runs the node's attentions on their verify
-    kernels, and a verify step samples one row a request: what verifying means, which a node on the state
-    contract has no step field to declare and a node on resources declares the same."""
+    steps and its loop-back writes on the node's sampler step. The engine derives all of it from the drafter's
+    declaration, so a captured graph and each step it replays agree by construction. A step with verify rows also
+    runs the node's attentions on their verify kernels, and a verify step samples one row a request: what verifying
+    means, which a node on the state contract has no step field to declare and a node on resources declares the
+    same."""
     if share is None or step is None:
         return step
     if graph_walk == share.verify_walk:
@@ -60,6 +67,7 @@ def drafter_step(step, graph_walk: str, share: DrafterShare | None):
         own = share.prompt_steps
     else:
         return step
+    writes = share.loopback_writes
     steps = dict(step.steps)
     if clash := sorted(steps.keys() & own.keys()):
         raise RuntimeError(f"a {graph_walk!r} step declares {clash}, its drafter's steps, which the engine adds")
@@ -72,6 +80,12 @@ def drafter_step(step, graph_walk: str, share: DrafterShare | None):
     if graph_walk == share.verify_walk and sampler_step is not None:
         rows = [Segment(seg.request_id, seg.label, 1) for seg in step.segments]
         steps[share.sampler_key] = replace(sampler_step, segments=rows)
+    if writes:
+        sampler_step = steps.get(share.sampler_key)
+        if sampler_step is None:
+            raise RuntimeError(f"a {graph_walk!r} step declares no {share.sampler_key!r} step, which its "
+                               f"drafter's loop-back state {sorted(writes)} is stored through")
+        steps[share.sampler_key] = replace(sampler_step, loopback_writes=sampler_step.loopback_writes | writes)
     # fresh each step, as a declaration's are: a resource may stamp its own step (KV's commit count). On a
     # mixed step the drafter's attentions run on the verify kernels too, its prompt steps' included: an
     # attention left off them plans the step's verify rows on the host, which in asynchronous mode holds
