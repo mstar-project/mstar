@@ -584,6 +584,10 @@ class NemotronDuplexModel(Model):
             out["text_inputs"] = [torch.tensor([-1], dtype=torch.long)]
         return ProcessPromptOutput(out, {"state_layout": self._state_layout(ids.numel() if prompt else 0)})
 
+    def prompt_token_ids(self, tensors: NameToTensorList) -> list[int] | None:
+        # ``text_inputs`` holds the -1 sentinel when the session has no system prompt
+        return super().prompt_token_ids(tensors) if "has_prompt" in tensors else []
+
     def _state_layout(self, prompt_len: int) -> dict[str, dict[str, Layout]]:
         """A session's layouts after a system prompt of ``prompt_len`` tokens. Its first frame writes the prompt
         along with its own row, and the talker's first frame writes its speaker warm-up."""

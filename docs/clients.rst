@@ -482,15 +482,23 @@ Endpoints and model coverage:
      - Lists the served model, and any LoRA adapters it serves (each with ``parent``
        naming the base model; see the Qwen3.5 notes in :doc:`models`).
    * - ``POST /v1/chat/completions``
-     - ``bagel``, ``qwen3_omni``
+     - the Qwen3.5 sizes, ``qwen3_8_27b``, ``qwen3_omni``, ``bagel``, ``cosmos3_edge``,
+       ``cosmos3_edge_droid``, ``phi4mm``, ``muse_glimmer``, ``glm52``, ``glm5_next``,
+       ``ripple_65b``
      - Text chat (streaming + non-streaming). Qwen3-Omni can also emit speech, in
        ``audio.format`` ``wav`` (default), ``pcm16``, or ``mp3`` / ``flac`` / ``opus`` with
-       the ``audio`` extra; streamed audio is ``pcm16``. ``n`` or
-       ``best_of`` above 1, ``stop``, ``stop_token_ids``, ``logprobs``, ``top_logprobs``,
+       the ``audio`` extra; streamed audio is ``pcm16``. ``logprobs: true`` returns each
+       sampled token's log-prob in ``choices[].logprobs.content`` (stop token included, no
+       ``top_logprobs`` alternatives) on a deployment and model that report them (see the
+       Qwen3.5 notes in :doc:`models`); vLLM's ``return_token_ids: true`` adds the sampled
+       ids (``choices[].token_ids``) and the prompt's (``prompt_token_ids``, in a stream
+       on the first chunk that carries tokens; for BAGEL and Qwen3-Omni, whose prompt is not
+       one id per position, ``null`` in a whole reply and left out of a stream). ``n`` or
+       ``best_of`` above 1, ``stop``, ``stop_token_ids``, ``top_logprobs`` above 0,
        ``logit_bias``, ``presence_penalty`` / ``frequency_penalty`` and a ``response_format``
-       other than text are refused. ``stream_options``, ``parallel_tool_calls``, ``user``,
-       ``store``, ``metadata`` and ``service_tier`` are accepted and have no effect; a stream
-       sends no usage chunk.
+       other than text are refused. ``stream_options.include_usage`` ends a stream with a
+       usage chunk; ``parallel_tool_calls``, ``user``, ``store``, ``metadata`` and
+       ``service_tier`` are accepted and have no effect.
    * - ``POST /v1/load_lora_adapter``, ``POST /v1/unload_lora_adapter``
      - any LoRA model whose ``resources: lora:`` block sets ``runtime_updates: true``;
        404 otherwise

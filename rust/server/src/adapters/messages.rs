@@ -252,8 +252,8 @@ pub(super) fn text_only_chat(req: &ChatCompletionRequest, upload_dir: &Path) -> 
 
 /// Fields no chat adapter serves, refused when on (`best_of` and
 /// `response_format` have their own off values).
-const UNSERVED_CHAT_FIELDS: [&str; 6] =
-    ["logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty", "stop_token_ids"];
+const UNSERVED_CHAT_FIELDS: [&str; 5] =
+    ["top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty", "stop_token_ids"];
 
 /// OpenAI request bookkeeping that changes no reply, dropped from a chat's
 /// passthrough: `CHAT_ENVELOPE_KEYS` in `api_server/openai/adapters.py`.
@@ -261,8 +261,8 @@ const CHAT_ENVELOPE_FIELDS: [&str; 6] =
     ["stream_options", "parallel_tool_calls", "user", "store", "metadata", "service_tier"];
 
 /// Refuse a chat that asks for more than one plain reply: more choices, stop
-/// sequences, log probs, sampling penalties, a response format, or a tool
-/// call. The rules are `_refuse_unserved_chat` in
+/// sequences, top log-prob alternatives, sampling penalties, a response format,
+/// or a tool call; `logprobs` becomes `return_logprobs`. The rules are `_refuse_unserved_chat` in
 /// `api_server/openai/adapters.py`. `mk` is the request's passthrough; an off
 /// value of one of these fields (`logprobs: false`, `tools: []`) is dropped
 /// from it, before any `chat_template_kwargs` key is merged in.
@@ -274,6 +274,10 @@ pub(super) fn refuse_unserved_chat(req: &ChatCompletionRequest, mk: &mut BTreeMa
         return Err(
             "stop sequences are not supported; the reply ends at a stop token or max_tokens".to_string(),
         );
+    }
+    if mk.remove("logprobs").is_some_and(|v| truthy(&v)) {
+        // the sampled token's log-prob; its top alternatives (top_logprobs) are not served
+        mk.insert("return_logprobs".to_string(), Value::Bool(true));
     }
     if let Some(name) = UNSERVED_CHAT_FIELDS.iter().find(|&&f| mk.get(f).is_some_and(truthy)) {
         return Err(format!("{name} is not supported"));

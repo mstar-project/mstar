@@ -246,7 +246,7 @@ def test_a_chat_that_asks_for_a_tool_call_is_refused(tmp_path, adapter, fields):
 @pytest.mark.parametrize("adapter", _CHAT_ADAPTERS, ids=lambda a: a.__name__)
 @pytest.mark.parametrize(("fields", "error"), [
     ({"n": 2}, "n=2"), ({"stop": "."}, "stop sequences"), ({"stop": ["END"]}, "stop sequences"),
-    ({"logprobs": True}, "logprobs"), ({"presence_penalty": 1.5}, "presence_penalty"),
+    ({"logprobs": True, "top_logprobs": 2}, "top_logprobs"), ({"presence_penalty": 1.5}, "presence_penalty"),
     ({"best_of": 3}, "best_of"), ({"response_format": {"type": "json_object"}}, "response_format"),
 ], ids=lambda f: str(f) if isinstance(f, dict) else "")
 def test_a_chat_asking_for_more_than_one_plain_reply_is_refused(tmp_path, adapter, fields, error):
@@ -368,7 +368,7 @@ def test_text_chat_coerces_numeric_extra_body(tmp_path):
 
 
 @pytest.mark.parametrize("field", [
-    {"n": 2}, {"stop": "\n"}, {"stop": ["END"]}, {"logprobs": True}, {"top_logprobs": 5},
+    {"n": 2}, {"stop": "\n"}, {"stop": ["END"]}, {"top_logprobs": 5},
     {"logit_bias": {"100": -100}}, {"presence_penalty": 1.5}, {"frequency_penalty": 0.5},
     {"best_of": 2}, {"response_format": {"type": "json_object"}}, {"stop_token_ids": [2]},
 ])
@@ -376,6 +376,22 @@ def test_text_chat_refuses_what_it_would_ignore(field, tmp_path):
     req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **field)
     with pytest.raises(ValueError, match=next(iter(field))):
         adapters.TextChatAdapter().chat_to_request(req, tmp_path)
+
+
+@pytest.mark.parametrize("adapter", _CHAT_ADAPTERS, ids=lambda a: a.__name__)
+@pytest.mark.parametrize(("fields", "kwargs"), [
+    ({"logprobs": True}, {"return_logprobs": True}),
+    ({"logprobs": True, "top_logprobs": 0}, {"return_logprobs": True}),
+    ({"logprobs": False, "top_logprobs": None}, {}),
+    ({"return_token_ids": True}, {"return_token_ids": True}),
+], ids=lambda f: ",".join(f"{k}={v}" for k, v in f.items()))
+def test_a_chat_asking_for_its_tokens_asks_the_sampler(tmp_path, adapter, fields, kwargs):
+    """OpenAI's ``logprobs`` is the sampled token's log-prob (``return_logprobs``);
+    vLLM's ``return_token_ids`` passes through as the model kwarg of that name."""
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
+    mk = adapter().chat_to_request(req, tmp_path).model_kwargs
+    assert {k: v for k, v in mk.items() if k in ("return_logprobs", "return_token_ids", "logprobs",
+                                                  "top_logprobs")} == kwargs
 
 
 def test_text_chat_passes_those_fields_off(tmp_path):

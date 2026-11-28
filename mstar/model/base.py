@@ -1124,6 +1124,16 @@ class Model(ABC):
         that splits ``text_inputs`` around its attachments adds theirs."""
         return sum(ids.numel() for ids in tensors.get("text_inputs", ()))
 
+    def prompt_token_ids(self, tensors: NameToTensorList) -> list[int] | None:
+        """The prompt's token ids, one per position ``prompt_tokens`` counts, for a
+        request that set ``return_token_ids``. By default the ids in ``text_inputs``,
+        attachments as their placeholder tokens. A model that overrides
+        ``prompt_tokens`` lays its prompt out otherwise, so it gets None unless it
+        overrides this too."""
+        if type(self).prompt_tokens is not Model.prompt_tokens:
+            return None
+        return [i for ids in tensors.get("text_inputs", ()) for i in ids.reshape(-1).tolist()]
+
     def prompt_lora_adapters(self) -> frozenset[str]:
         """The LoRA adapters ``process_prompt`` may run a prompt on
         (``ProcessPromptOutput.lora_adapter``). The API server refuses, at startup, a

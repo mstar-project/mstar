@@ -332,7 +332,7 @@ class Glm5NextModel(ByteLevelTextOutput, Model):
         self.get_max_output_tokens(**kwargs)
         if kwargs.get("return_logprobs"):
             # the sampler configs carry none, which the conductor refuses too
-            raise ValueError("GLM-5.3 does not report logprobs; leave return_logprobs unset")
+            raise ValueError("GLM-5.3 does not report logprobs; leave logprobs (return_logprobs) unset")
 
         if self.config.mtp_num_draft_tokens > 0:
             # MTP verifies by argmax; refused here, it is the client's 400 rather than a

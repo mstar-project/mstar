@@ -146,7 +146,10 @@ You must implement these abstract methods:
    after raw media tensors are loaded. It can therefore read ``tensors`` (for example
    ``image_inputs``, ``audio_inputs`` or ``video_inputs``) to compute derived tensors
    such as ``pixel_values``. The returned dict is merged into the request's tensors.
-   See `Layouts`_ for what it returns about the request's state.
+   See `Layouts`_ for what it returns about the request's state. A request that sets
+   ``return_token_ids`` gets the prompt's ids from ``Model.prompt_token_ids``: by default
+   the ids in ``text_inputs``, and None for a model that overrides ``prompt_tokens``.
+   Override it when ``text_inputs`` is not the prompt one id per position.
 
    ``input_modalities`` is the request layout: one entry per prompt element in the
    order written, so ``["image", "text", "image"]`` is a distinct request from

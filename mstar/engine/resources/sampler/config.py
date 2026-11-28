@@ -199,7 +199,7 @@ class SamplingReqConfig(ResourceReqConfig):
         if self.min_p and not spec.enable_min_p:
             raise ValueError("this model does not support min_p; send 0 or leave it unset")
         if self.return_logprobs and not spec.enable_logprobs:
-            raise ValueError("this deployment does not report logprobs; leave return_logprobs unset")
+            raise ValueError("this deployment does not report logprobs; leave logprobs (return_logprobs) unset")
         if self.return_logprobs and self.logprobs_mode == "processed" and not spec.enable_processed_logprobs:
             raise ValueError("this deployment does not report processed logprobs; use logprobs_mode 'raw'")
         # a windowed penalty counts the generation history, not the seen-token mask

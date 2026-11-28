@@ -179,7 +179,8 @@ CHAT_ENVELOPE_KEYS = ("stream_options", "parallel_tool_calls", "user", "store", 
 
 def _refuse_unserved_chat(req, mk: dict) -> None:
     """Refuse a chat that asks for more than one plain reply: more choices, stop
-    sequences, log probs, sampling penalties, a response format, or a tool call.
+    sequences, top log-prob alternatives, sampling penalties, a response format,
+    or a tool call. ``logprobs`` becomes ``return_logprobs``.
     ``mk`` is the request's :func:`_passthrough`; an off value of one of these
     fields (``logprobs: false``, ``tools: []``) is dropped from it, before any
     ``chat_template_kwargs`` key is merged in.
@@ -198,8 +199,10 @@ def _refuse_unserved_chat(req, mk: dict) -> None:
         raise ValueError(f"n={req.n}: this model returns one choice")
     if req.stop:
         raise ValueError("stop sequences are not supported; the reply ends at a stop token or max_tokens")
-    for name in ("logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty",
-                 "stop_token_ids"):
+    if mk.pop("logprobs", None):
+        # the sampled token's log-prob; its top alternatives (top_logprobs) are not served
+        mk["return_logprobs"] = True
+    for name in ("top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty", "stop_token_ids"):
         if mk.pop(name, None):
             raise ValueError(f"{name} is not supported")
     if mk.pop("best_of", None) not in (None, 1):
