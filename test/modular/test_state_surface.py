@@ -58,6 +58,7 @@ SNAPSHOT = {
     "Bidirectional": [],
     "Block": [],
     "Causal": [],
+    "CausalBlock": [],
     "CausalConv": [
         ["activation", "KEYWORD_ONLY", "'silu'"],
     ],

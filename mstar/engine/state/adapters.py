@@ -76,6 +76,7 @@ from mstar.engine.state.contract import (
     Bidirectional,
     Block,
     Causal,
+    CausalBlock,
     CausalConv,
     Entry,
     GatedDeltaNet,
@@ -841,8 +842,9 @@ class WithinStepAttend(OpBinding, ABC):
     plans: ClassVar[bool]
 
     def check(self, array: Array, key: str, read: Read) -> None:
-        if not isinstance(read.mask, Block):
-            raise _no_layout(array, f"reads[{key!r}].mask must be Block, the only mask a read within a step takes")
+        if not isinstance(read.mask, Block | CausalBlock):
+            raise _no_layout(array, f"reads[{key!r}].mask must be Block or CausalBlock, the masks a read within a step "
+                                    "takes")
         if read.walks is not None:
             raise _no_layout(array, f"reads[{key!r}].walks must be None, since a read within a step has no walk")
 
@@ -874,6 +876,8 @@ class SdpaAttend(WithinStepAttend):
 
     def check(self, array: Array, key: str, read: Read) -> None:
         super().check(array, key, read)
+        if isinstance(read.mask, CausalBlock):
+            raise _no_layout(array, f"reads[{key!r}] runs SDPA, which attends both ways, and its mask is CausalBlock")
         if read.packed:
             raise _no_layout(array, f"reads[{key!r}] runs SDPA, which can't tell one segment of packed queries from "
                                     "the next, and a read of rows of one length declares packed=False")
@@ -1642,6 +1646,11 @@ class OwnQueries(Queries):
 
     spec_class = RaggedAttentionSpec
 
+    def __init__(self, array: Array, causal: bool):
+        super().__init__(array)
+        # whether the read's mask is causal, which the step plans once for every read on the resource
+        self.causal = causal
+
     def plan_label(self, keys: Array) -> str:
         return _plan_label(keys, keys)
 
@@ -1649,7 +1658,7 @@ class OwnQueries(Queries):
         steps._label(handle.resource_key, handle.array, segments)
 
     def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
-        return AttentionStep(segments=segments, causal=False, fixed_layout=fixed)
+        return AttentionStep(segments=segments, causal=self.causal, fixed_layout=fixed)
 
 
 class CrossQueries(OtherArrayQueries, Queries):
@@ -2127,9 +2136,9 @@ class WithinStepStorage(Storage):
         return WithinStepSteps()
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
-        """A ragged spec per read, a `RaggedCrossAttentionSpec` for a read with ``queries``. Reads of one kind, on one
-        node set and with one config share the spec of the first of them, under its key, so each read is a plan on that
-        resource rather than a resource of its own."""
+        """A ragged spec per read, a `RaggedCrossAttentionSpec` for a read with ``queries``. Reads of one kind and mask,
+        on one node set and with one config share the spec of the first of them, under its key, so each read is a plan
+        on that resource rather than a resource of its own."""
         by_name = {array.name: array for array in declared}
         resolved = Resolved({}, {}, {}, {})
         shared: dict[tuple, NodeResourceSpec] = {}
@@ -2137,8 +2146,9 @@ class WithinStepStorage(Storage):
             bound, heads, head_dim, dtype = _within_step_read(array, setup)
             resolved.bound[array.name] = (bound,)
             key, read = bound.key, bound.declared
-            queries = resolved.queries[key] = (OwnQueries if read.queries is None else CrossQueries)(
-                query_array(array, read, by_name),
+            queries = resolved.queries[key] = (
+                OwnQueries(array, read.mask.uses_query_position) if read.queries is None
+                else CrossQueries(query_array(array, read, by_name))
             )
             # refuses either side's second label at resolve, which validation and `build_specs` run before any handle
             queries.plan_label(array)
@@ -2146,7 +2156,8 @@ class WithinStepStorage(Storage):
                 num_qo_heads=read.op.q_heads, num_kv_heads=heads, head_dim=head_dim, dtype=dtype,
             )
             spec = queries.spec_class(resource_key=key, nodes=array.nodes, config=config)
-            spec = shared.setdefault((queries.spec_class, array.nodes, astuple(config)), spec)
+            # a step plans one mask per resource, so a Block and a CausalBlock read never share one
+            spec = shared.setdefault((queries.spec_class, type(read.mask), array.nodes, astuple(config)), spec)
             resolved.resource_of[key] = spec.resource_key
             if bound.binding.plans and isinstance(spec, RaggedAttentionSpec):
                 # the labels the node's sequence shard may split (`RaggedAttentionSpec.derive`)

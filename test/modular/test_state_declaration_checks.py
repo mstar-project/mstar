@@ -26,6 +26,7 @@ from mstar.engine.state import (
     Bidirectional,
     Block,
     Causal,
+    CausalBlock,
     CausalConv,
     Entry,
     GatedDeltaNet,
@@ -243,9 +244,10 @@ def test_a_sequence_shard_cuts_its_label_on_one_axis():
     assert problem.startswith("SeqShard 'shard'.labels: reads on nodes ['LLM'] take queries on ['main'] both as rows")
 
 
-def test_a_block_read_needs_max_len_zero():
-    problem = _one_problem(_array(reads={"r": _read(mask=Block())}))
-    assert problem.startswith("Array 'kv'.reads['r'].mask") and "Block needs max_len 0" in problem
+@pytest.mark.parametrize("mask", [Block(), CausalBlock()], ids=["block", "causal_block"])
+def test_a_block_read_needs_max_len_zero(mask):
+    problem = _one_problem(_array(reads={"r": _read(mask=mask)}))
+    assert problem.startswith(f"Array 'kv'.reads['r'].mask: {type(mask).__name__} needs max_len 0"), problem
 
 
 def test_every_read_of_an_array_with_max_len_zero_is_a_block_read():
@@ -253,8 +255,9 @@ def test_every_read_of_an_array_with_max_len_zero_is_a_block_read():
     assert problem.startswith("Array 'kv'.reads['r'].mask") and "is Causal" in problem
 
 
-def test_a_block_read_on_max_len_zero_has_no_problem():
-    assert state_declaration_problems(_StubModel(_array(max_len=0, reads={"r": _read(mask=Block())}))) == []
+@pytest.mark.parametrize("mask", [Block(), CausalBlock()], ids=["block", "causal_block"])
+def test_a_block_read_on_max_len_zero_has_no_problem(mask):
+    assert state_declaration_problems(_StubModel(_array(max_len=0, reads={"r": _read(mask=mask)}))) == []
 
 
 @pytest.mark.parametrize("array", [
@@ -364,7 +367,8 @@ def test_a_kept_cross_read_over_an_array_that_keeps_entries_has_no_problems():
 
 def test_a_bidirectional_read_needs_an_array_that_keeps_entries():
     problem = _one_problem(_within("vision", reads={"r": _read(mask=Bidirectional())}))
-    assert "every read of an array with max_len 0 is a Block read, and this one is Bidirectional" in problem
+    assert ("every read of an array with max_len 0 is a Block or CausalBlock read, "
+            "and this one is Bidirectional") in problem
 
 
 def _chunked(*arrays, chunkable=True) -> _StubModel:
@@ -376,7 +380,8 @@ def _chunked(*arrays, chunkable=True) -> _StubModel:
 @pytest.mark.parametrize("array, mask", [
     (_array(reads={"r": _read(mask=Bidirectional())}), "Bidirectional"),
     (_within("vision", reads={"r": _read(mask=Block())}), "Block"),
-], ids=["kept", "within_step"])
+    (_within("vision", reads={"r": _read(mask=CausalBlock())}), "CausalBlock"),
+], ids=["kept", "within_step", "within_step_causal"])
 def test_a_chunked_walk_cant_read_this_steps_adds_as_a_whole(array, mask):
     """Splitting a row's adds across steps changes what they see, with no error from any kernel."""
     problems = state_declaration_problems(_chunked(array))

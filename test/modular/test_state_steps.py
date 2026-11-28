@@ -37,6 +37,7 @@ from mstar.engine.state import (
     Attend,
     Block,
     Causal,
+    CausalBlock,
     CausalConv,
     Entry,
     Fork,
@@ -98,9 +99,9 @@ def _value() -> Array:
     return Value("gdn", nodes={"LLM"}, layers={2}, entry=entry, updates=updates)
 
 
-def _within() -> Array:
+def _within(mask=Block()) -> Array:
     return Array("vision", nodes={"vit"}, layers={0}, entry=KVEntry(heads=4, head_dim=8), max_len=0,
-                 reads={"vision_attn": Read(mask=Block(), op=Attend(q_heads=4))})
+                 reads={"vision_attn": Read(mask=mask, op=Attend(q_heads=4))})
 
 
 class _StubModel:
@@ -216,6 +217,12 @@ def test_an_array_with_max_len_zero_has_no_pool_and_a_non_causal_read():
     assert _expanded({"vision": ArrayStep()}, _within(), node="vit") == {
         "vision_attn": AttentionStep(segments=SEGMENTS, causal=False),
     }
+
+
+@pytest.mark.parametrize("fixed", [False, True])
+def test_a_causal_block_read_plans_a_causal_step_on_its_resource(fixed):
+    steps = _expanded({"vision": ArrayStep(fixed_layout=fixed)}, _within(CausalBlock()), node="vit")
+    assert steps == {"vision_attn": AttentionStep(segments=SEGMENTS, causal=True, fixed_layout=fixed)}
 
 
 def test_a_sampler_step_reaches_todays_fields():
@@ -556,6 +563,17 @@ def test_a_block_read_becomes_a_ragged_spec_with_the_default_compile_op():
     assert build_specs([_within()]) == [RaggedAttentionSpec(
         resource_key="vision_attn", nodes={"vit"}, labels={"main"},
         config=RaggedAttentionConfig(num_qo_heads=4, num_kv_heads=4, head_dim=8),
+    )]
+
+
+def test_a_causal_block_read_builds_the_ragged_spec_a_block_read_would():
+    t = TensorType((8, 128), dtype=torch.bfloat16, shard=0)
+    entry = Entry({"k": t, "v": t})
+    llm = Array("llm", nodes={"LLM"}, layers={0, 1}, entry=entry, max_len=0,
+                reads={"llm_attn": Read(mask=CausalBlock(), op=Attend(q_heads=16))})
+    assert build_specs([llm]) == [RaggedAttentionSpec(
+        resource_key="llm_attn", nodes={"LLM"}, labels={"main"},
+        config=RaggedAttentionConfig(num_qo_heads=16, num_kv_heads=8, head_dim=128, dtype=torch.bfloat16),
     )]
 
 

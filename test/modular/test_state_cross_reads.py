@@ -29,7 +29,18 @@ from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.sequence_shard import SeqShardSpec
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import ResourceStep, Segment, StepContext, SubmoduleStep
-from mstar.engine.state import Array, ArrayStep, Attend, Block, Causal, KVEntry, Read, TensorType, adapters
+from mstar.engine.state import (
+    Array,
+    ArrayStep,
+    Attend,
+    Block,
+    Causal,
+    CausalBlock,
+    KVEntry,
+    Read,
+    TensorType,
+    adapters,
+)
 from mstar.engine.state.adapters import (
     SDPA,
     WITHIN_STEP,
@@ -60,12 +71,12 @@ def _entry(heads=HEADS, dtype=None) -> Entry:
 
 
 def _array(
-    name, read=None, *, queries=None, label=None, heads=HEADS, nodes=("dit",), dtype=None, packed=False,
+    name, read=None, *, queries=None, label=None, heads=HEADS, nodes=("dit",), dtype=None, packed=False, mask=Block(),
 ) -> Array:
     return Array(
         name, nodes=set(nodes), layers={0, 1}, entry=_entry(heads, dtype), max_len=0,
         labels={label or name},
-        reads={read or f"{name}_read": Read(mask=Block(), op=Attend(q_heads=heads), queries=queries, packed=packed)},
+        reads={read or f"{name}_read": Read(mask=mask, op=Attend(q_heads=heads), queries=queries, packed=packed)},
     )
 
 
@@ -256,6 +267,17 @@ def test_arrays_sharing_a_resource_plan_each_label_once():
     assert _by_label(expanded.steps["image_read"]) == {
         "image": (Segment(1, "image", 4),), "caption": (Segment(1, "caption", 2),), "joint": (Segment(1, "joint", 6),),
     }
+
+
+def test_a_block_and_a_causal_block_read_of_one_geometry_plan_their_own_causal_flag():
+    """A step plans one causal flag per resource, so a shared one would run one read with the other's mask."""
+    arrays = [_array("image"), _array("caption"), _array("prompt", mask=CausalBlock())]
+    assert [spec.resource_key for spec in build_specs(arrays)] == ["image_read", "prompt_read"]
+    step = SubmoduleStep(state={
+        name: ArrayStep(segments=(Segment(1, name, 4),)) for name in ("image", "caption", "prompt")
+    })
+    steps = state_steps(step, _handles(arrays)).steps
+    assert (steps["image_read"].causal, steps["prompt_read"].causal) == (False, True)
 
 
 def test_two_arrays_with_one_label_and_other_segments_on_one_resource_are_refused():
@@ -491,6 +513,14 @@ def test_a_bad_setting_is_refused_naming_the_cause(config, cause):
     assert problem.startswith(cause), problem
 
 
+def test_sdpa_on_a_causal_block_read_is_refused_at_load():
+    setup, problems = state_setup(_sdpa_config("a_read"), [_array("a", mask=CausalBlock())])
+    assert problems == [
+        "resources.a_read: backend sdpa: Array 'a': no layout yet: reads['a_read'] runs SDPA, which attends both ways, "
+        "and its mask is CausalBlock",
+    ] and setup.by_read == {}, "SDPA would attend every query to the keys after it"
+
+
 def test_sdpa_on_a_read_that_keeps_entries_is_refused_at_load():
     array = Array("kv", nodes={"llm"}, layers={0}, entry=KVEntry(heads=HEADS, head_dim=DIM), max_len=8,
                   reads={"r": Read(mask=Causal(), op=Attend(q_heads=HEADS))})
@@ -534,7 +564,7 @@ def _segmented_on_sdpa() -> WithinStepHandle:
     return node_handles(_Model(array), "dit", {}, setup=_on_sdpa("a_read"))["a"]
 
 
-@pytest.mark.parametrize("field", [{"packed": True}, {"queries": "b"}, {"mask": Causal()}])
+@pytest.mark.parametrize("field", [{"packed": True}, {"queries": "b"}, {"mask": Causal()}, {"mask": CausalBlock()}])
 def test_a_segmented_read_takes_block_rows_and_no_queries(field):
     read = {"mask": Block(), "op": Attend(q_heads=HEADS), "packed": False, "segmented": True}
     Read(**read)
