@@ -2475,7 +2475,10 @@ class PiecewiseAcceleratorGraphRunner:
         label_seq_lens: dict[str, list[int]] | None = None,
     ) -> PiecewiseOutput:
         """The region's callable run eagerly, through the same step a replay
-        declares (``_declare``), so its resources hold a plan for exactly these rows."""
+        declares (``_declare``), so its resources hold a plan for exactly these rows.
+        A handle that sets the open step's calls aside answers for that step while
+        it runs (``StepHandle.begin_region``), so two regions in one step each
+        answer for their own calls, as two replays would."""
         is_packed = self._config.get_config_type() == PiecewiseConfigType.PACKED
         step = None
         if request_ids is not None:
@@ -2490,15 +2493,22 @@ class PiecewiseAcceleratorGraphRunner:
             if not outcome.ok:
                 raise RuntimeError(f"piecewise {self._label!r} eager admit failed: {outcome.reason}")
             self._step_runner.plan(step)
+            step.begin_region_calls()
         ids = list(request_ids) if request_ids is not None else []
-        out = self._normalize_output(self._config.capture_fn(PiecewiseCallInputs(
-            static_inputs=static_inputs,
-            engine_inputs=ModelInputsFromEngine(
-                request_ids=ids, per_request_info=dummy_metadata(ids, PIECEWISE_WALK),
-                resources=dict(self._resources),
-            ),
-            kwargs=self._config.forward_kwargs,
-        )))
+        ran = False
+        try:
+            out = self._normalize_output(self._config.capture_fn(PiecewiseCallInputs(
+                static_inputs=static_inputs,
+                engine_inputs=ModelInputsFromEngine(
+                    request_ids=ids, per_request_info=dummy_metadata(ids, PIECEWISE_WALK),
+                    resources=dict(self._resources),
+                ),
+                kwargs=self._config.forward_kwargs,
+            )))
+            ran = True
+        finally:
+            if step is not None:
+                step.end_region_calls(ran)
         if step is not None:
             self._step_runner.commit(step)
         return PiecewiseOutput(out, real_total_tokens if is_packed else real_bs)

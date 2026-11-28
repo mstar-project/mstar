@@ -334,6 +334,16 @@ class RaggedBlockCausalAttentionSpec(_RaggedSpecBase):
 
     block_size: int
 
+    def split_step_refusals(
+        self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, "NodeResourceSpec"],
+    ) -> list[str]:
+        # RaggedBlockCausalAttnManager sets no supports_split_steps, which the engine refuses at build; this says so
+        # from the spec, at validation
+        return [
+            f"ragged block-causal attention {self.resource_key!r} takes no split steps, since its builder sets no "
+            f"sequence shard, so node {node!r} can't split them: run it on TP ranks alone"
+        ]
+
     @property
     def resource_class(self) -> "type[Resource]":
         from mstar.engine.resources.attn.ragged.base import RaggedBlockCausalAttnManager

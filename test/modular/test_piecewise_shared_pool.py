@@ -174,3 +174,40 @@ def test_run_without_a_graph_declares_each_labeled_layout():
     labels = {"windows": [4, 4], "frames": [2, 6]}
     runner.run(static_inputs={"x": torch.ones(8, 4)}, request_ids=[7, 8], seq_lens=[3, 5], label_seq_lens=labels)
     assert seen["labels"] == labels
+
+
+@pytest.mark.parametrize("fails", [False, True], ids=["ran", "raised"])
+def test_an_eager_run_opens_the_region_s_step_around_its_callable(fails):
+    """Handles that set the open step's calls aside answer for the region's step while it runs, and hand the open step
+    back after, checking the region's calls only when its callable returned."""
+    from unittest import mock
+
+    from mstar.engine.accelerator_graph_config import PiecewiseBatchedConfig
+    from mstar.engine.resources.step import ADMIT_OK
+
+    step_runner = mock.Mock()
+    step_runner.admit.return_value = ADMIT_OK
+    seen = {}
+
+    def region(call):
+        step = step_runner.admit.call_args.args[0]
+        seen["inside"] = (step.begin_region_calls.called, step.end_region_calls.called)
+        if fails:
+            raise RuntimeError("the region failed")
+        return {"y": call.static_inputs["x"]}
+
+    runner = PiecewiseAcceleratorGraphRunner(
+        label="r", config=PiecewiseBatchedConfig(
+            capture_fn=region, make_static_inputs=lambda shape: {},
+            declare_step=lambda request_ids, seq_lens: mock.Mock(state=None), seq_len=4, capture_batch_sizes=[],
+            eager_fallback=True,
+        ),
+        resources={}, step_runner=step_runner, device=torch.device("cpu"), autocast_dtype=None, num_slots=1,
+    )
+    if fails:
+        with pytest.raises(RuntimeError, match="the region failed"):
+            runner.run(static_inputs={"x": torch.ones(1, 4)}, request_ids=[7], seq_lens=[2])
+    else:
+        runner.run(static_inputs={"x": torch.ones(1, 4)}, request_ids=[7], seq_lens=[2])
+    assert seen["inside"] == (True, False), "the region's calls would count as the open step's"
+    step_runner.admit.call_args.args[0].end_region_calls.assert_called_once_with(not fails)

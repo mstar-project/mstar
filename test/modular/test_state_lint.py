@@ -36,13 +36,13 @@ PORTED = (
     "mstar/model/components/wan_vae.py",
     "mstar/model/bagel", "mstar/model/chatterbox", "mstar/model/whisper", "mstar/model/phi4mm",
     "mstar/model/nemotron_duplex", "mstar/model/components/fastconformer.py",
-    "mstar/model/components/fastconformer_stream.py",
-    "mstar/model/waypoint", "mstar/model/lingbot_world",
+    "mstar/model/components/fastconformer_stream.py", "mstar/model/components/token2wav",
+    "mstar/model/waypoint", "mstar/model/lingbot_world", "mstar/model/minicpm_o",
 )
 # The list only shrinks: a package leaves it when its port lands, and nothing is added to it.
 UNPORTED = (
     "mstar/model/cosmos3", "mstar/model/cosyvoice3", "mstar/model/glm52", "mstar/model/glm5_next",
-    "mstar/model/minicpm_o", "mstar/model/muse", "mstar/model/ripple",
+    "mstar/model/muse", "mstar/model/ripple",
 )
 # shared code under mstar/model/ that holds no model
 SHARED = ("mstar/model/components", "mstar/model/loader")
@@ -118,6 +118,8 @@ ALLOWED_IN_FUNCTION = {
         "the ViT's eager varlen attention, flash-attn or a masked SDPA, which keeps no state",
     ("mstar/model/bagel/submodules.py", "ViTEncoderSubmodule._replay_block_loop", "disable"):
         "the ViT region's replay, which runs its captured graph; no state call sits behind it",
+    ("mstar/model/minicpm_o/submodules.py", "AudioEncoderSubmodule._replay_block_loop", "disable"):
+        "the audio block loop's replay, which runs its captured graph; no state call sits behind it",
 }
 # what a module defines to be handed the node's built resources, rather than its handles (`bind_state`)
 RESOURCE_BINDS = {"bind_resources", "bind_node_resources"}

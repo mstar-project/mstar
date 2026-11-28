@@ -234,6 +234,15 @@ class StepHandle(ABC):
     def commit_step(self, step: "SubmoduleStep") -> None:
         """Apply what the handle itself holds of a step the resources just committed."""
 
+    def begin_region(self, step: "SubmoduleStep") -> None:
+        """Answer for ``step``, a region's step run eagerly inside the open step, until `end_region`, as a replay of
+        it would. By default the region's calls count as the open step's own."""
+        return
+
+    def end_region(self, step: "SubmoduleStep", ran: bool) -> None:
+        """Answer for the open step again, once the region's calls are refused as a whole if its forward ``ran``."""
+        return
+
 
 @dataclass(frozen=True)
 class SubmoduleStep:
@@ -309,6 +318,14 @@ class SubmoduleStep:
     def end_calls(self) -> None:
         for handle in self.state_handles:
             handle.end_step(self)
+
+    def begin_region_calls(self) -> None:
+        for handle in self.state_handles:
+            handle.begin_region(self)
+
+    def end_region_calls(self, ran: bool) -> None:
+        for handle in self.state_handles:
+            handle.end_region(self, ran)
 
     def get(self, key: str) -> ResourceStep | None:
         return self.steps.get(key)

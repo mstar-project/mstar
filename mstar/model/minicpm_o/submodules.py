@@ -4,8 +4,8 @@ reply's TTS and vocoder (token2wav).
 The LLM's prompt is the whole rendered chat, placeholders included; a
 multimodal prefill embeds it and overwrites each placeholder row with the
 encoder output that belongs there, at positions ``process_prompt`` read off
-the prompt. RoPE is plain 1D over that sequence, so the position resource
-advances by the token count with no special casing.
+the prompt. RoPE is plain 1D over that sequence, so the LLM's positions
+advance by the token count with no special casing.
 """
 from __future__ import annotations
 
@@ -26,46 +26,42 @@ from mstar.engine.accelerator_graph_config import (
     PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import (
-    AttentionStep,
-    KVStep,
-    PositionStep,
-    RaggedCrossAttentionStep,
-    SamplerStep,
+from mstar.engine.state import (
+    ArrayStep,
+    SampleStep,
     Segment,
     SlotLease,
     SubmoduleStep,
+    at_last_token,
+    kernel_setting,
+    sample,
 )
-from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.components.qwen3_lm import Qwen3DenseLM
 from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
 from mstar.model.minicpm_o.components.vision import MiniCPMOVision, slice_layout
 from mstar.model.minicpm_o.config import (
     AUDIO_ATTN,
     AUDIO_FEATURE_LENS,
+    AUDIO_TOKENS,
     DECODE,
     DECODE_LOOP,
     DECODE_MIXED,
     DECODE_SPOKEN,
     DECODE_WALKS,
     IMAGE_TGT_SIZES,
-    LLM_ATTN,
     LLM_KV,
-    LLM_POS,
     LLM_SAMPLER,
     PATCHES,
     PREFILL_WALKS,
     QUERIES,
-    RESAMPLER_ATTN,
-    TTS_ATTN,
+    RESAMPLER_KV,
+    RESAMPLER_QUERIES,
     TTS_DECODE,
     TTS_DECODE_LOOP,
     TTS_KV,
-    TTS_POS,
     TTS_PREFILL,
     TTS_SAMPLER,
-    VISION_ATTN,
+    VISION_TOKENS,
     MiniCPMOConfig,
 )
 from mstar.model.submodule_base import (
@@ -114,6 +110,10 @@ class LLMSubmodule(ARNodeSubmodule):
         self.device_loopback = DeviceLoopback(
             walk=DECODE, signal="text_inputs", sampler=LLM_SAMPLER, buffer="new_token",
         )
+
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.kv = handles[LLM_KV]
+        self.sampler = handles[LLM_SAMPLER]
 
     def inline_signals(self, graph_walk: str) -> dict[str, str]:
         # a spoken reply's client token rides inline too; its other outputs go through the host
@@ -224,12 +224,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 Segment(request_id=rid, label="main", span=inp.input_seq_len)
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
-            steps={
-                LLM_KV: KVStep(),
-                LLM_ATTN: AttentionStep(causal=True),
-                LLM_POS: PositionStep(),
-                LLM_SAMPLER: SamplerStep(apply_penalty=True),
-            },
+            state={LLM_KV: ArrayStep(), LLM_SAMPLER: SampleStep()},
         )
 
     # ------------------------------------------------------------------
@@ -243,16 +238,14 @@ class LLMSubmodule(ARNodeSubmodule):
         """``new_token``, and on decode the (``tts_ids``, ``tts_hidden``) pair:
         each row's input token and its post-norm hidden, which a spoken
         reply's TTS reads (a text reply's walk has no edge for them)."""
-        attn: AttentionManager = engine_inputs.resources[LLM_ATTN]
-        sampler: SamplerResource = engine_inputs.resources[LLM_SAMPLER]
-        hidden = self.model(input_embeds, label="main")
+        hidden = self.model(input_embeds)
         out = {}
         if graph_walk in DECODE_WALKS:
             out["tts_ids"] = input_ids
             out["tts_hidden"] = hidden
         else:
-            hidden = attn.select_last_hidden(hidden)
-        out["new_token"] = sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))
+            hidden = at_last_token(self.kv, hidden)
+        out["new_token"] = sample(self.sampler, self.model.logits(hidden))
         return out
 
     def forward(
@@ -346,14 +339,11 @@ class VisionEncoderSubmodule(NodeSubmodule):
             for span in inp.kwargs["seq_lengths"]:
                 patches.append(Segment(request_id=rid, label=PATCHES, span=span))
                 queries.append(Segment(request_id=rid, label=QUERIES, span=self.config.resampler.num_queries))
-        return SubmoduleStep(
-            steps={
-                VISION_ATTN: AttentionStep(segments=tuple(patches), causal=False),
-                RESAMPLER_ATTN: RaggedCrossAttentionStep(
-                    segments=tuple(patches + queries), pairs=((QUERIES, PATCHES),),
-                ),
-            },
-        )
+        return SubmoduleStep(state={
+            VISION_TOKENS: ArrayStep(segments=tuple(patches)),
+            RESAMPLER_KV: ArrayStep(segments=tuple(patches)),
+            RESAMPLER_QUERIES: ArrayStep(segments=tuple(queries)),
+        })
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return True
@@ -455,7 +445,7 @@ class AudioEncoderSubmodule(NodeSubmodule):
                 for rid, inp in zip(request_ids, inputs, strict=True)
                 for n in inp.kwargs["frames"]
             ],
-            steps={AUDIO_ATTN: AttentionStep(causal=False)},
+            state={AUDIO_TOKENS: ArrayStep()},
         )
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
@@ -477,7 +467,7 @@ class AudioEncoderSubmodule(NodeSubmodule):
             (rid,) = request_ids
             return SubmoduleStep(
                 segments=[Segment(request_id=rid, label="main", span=n) for n in seq_lens],
-                steps={AUDIO_ATTN: AttentionStep(causal=False)},
+                state={AUDIO_TOKENS: ArrayStep()},
             )
 
         return {
@@ -494,8 +484,8 @@ class AudioEncoderSubmodule(NodeSubmodule):
 
     def _fits_block_loop(self, inputs: list[NodeInputs]) -> bool:
         """Whether the request's pieces fit a replay's attention plan: the
-        resource's per-request ceiling, read from it so a YAML override holds."""
-        per_request = self.node_resources[AUDIO_ATTN].max_segments_per_request
+        read's per-request ceiling, read back so a YAML override holds."""
+        per_request = kernel_setting(self.state_handles[AUDIO_TOKENS], AUDIO_ATTN, "max_segments_per_request")
         return sum(len(inp.kwargs["frames"]) for inp in inputs) <= per_request * len(inputs)
 
     @torch.compiler.disable
@@ -586,6 +576,10 @@ class TTSSubmodule(ARNodeSubmodule):
             walk=TTS_DECODE, signal="tts_code", sampler=TTS_SAMPLER, buffer="tts_code",
         )
 
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.kv = handles[TTS_KV]
+        self.sampler = handles[TTS_SAMPLER]
+
     def inline_signals(self, graph_walk: str) -> dict[str, str]:
         # The prefill's code too, not only the loop-back's: then every item of a
         # reply's stream goes by value, and no window mixes in a stored one.
@@ -670,13 +664,11 @@ class TTSSubmodule(ARNodeSubmodule):
                 Segment(request_id=rid, label="main", span=inp.input_seq_len)
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
-            steps={
-                TTS_KV: KVStep(),
-                TTS_ATTN: AttentionStep(causal=True),
-                TTS_POS: PositionStep(),
+            state={
+                TTS_KV: ArrayStep(),
                 # the windowed penalty is the sampler's own history, not the
                 # presence mask `apply_penalty` drives
-                TTS_SAMPLER: SamplerStep(apply_penalty=False, apply_filters=graph_walk != TTS_PREFILL),
+                TTS_SAMPLER: SampleStep(apply_penalty=False, apply_filters=graph_walk != TTS_PREFILL),
             },
         )
 
@@ -687,12 +679,10 @@ class TTSSubmodule(ARNodeSubmodule):
     def _forward(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        attn: AttentionManager = engine_inputs.resources[TTS_ATTN]
-        sampler: SamplerResource = engine_inputs.resources[TTS_SAMPLER]
-        hidden = self.model.model(input_embeds, label="main")
+        hidden = self.model.model(input_embeds)
         if graph_walk != TTS_DECODE:
-            hidden = attn.select_last_hidden(hidden)
-        return {"tts_code": sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))}
+            hidden = at_last_token(self.kv, hidden)
+        return {"tts_code": sample(self.sampler, self.model.logits(hidden))}
 
     def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs) -> NameToTensorList:
         return {k: [v] for k, v in self._forward(graph_walk, engine_inputs, **kwargs).items()}

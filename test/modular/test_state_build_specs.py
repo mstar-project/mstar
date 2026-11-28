@@ -21,6 +21,7 @@ from test_startup_graph_validation import _prefill_decode, _ToyModel, _validate
 from test_state_ports import QWEN3_5, _qwen3_5
 
 from mstar.engine.resources.attn.config import AttentionSpec
+from mstar.engine.resources.attn.ragged.config import RaggedBlockCausalAttentionSpec
 from mstar.engine.resources.kv.bounded.config import BoundedKVSpec, SinkWindow
 from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
 from mstar.engine.resources.kv.config import KVSpec
@@ -28,22 +29,31 @@ from mstar.engine.resources.linear_attn.config import LinearAttnSpec, LinearAttn
 from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateSpec
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.sampler.config import SamplerSpec
-from mstar.engine.resources.spec import CombinedSplit, apply_yaml_overrides, spec_dependency_problems
+from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
+from mstar.engine.resources.spec import (
+    CombinedSplit,
+    apply_yaml_overrides,
+    resolve_spec_dependencies,
+    spec_dependency_problems,
+)
 from mstar.engine.state import (
     Array,
     Attend,
     Bidirectional,
     Block,
+    BlockCausal,
     Causal,
     CausalConv,
     Entry,
     GatedDeltaNet,
+    KeptWindow,
     KVEntry,
     Mamba2,
     Positions,
     Read,
     Rope,
     Sampler,
+    SeqShard,
     TensorType,
     Value,
     Window,
@@ -848,6 +858,46 @@ def test_decode_tensor_cores_on_a_within_step_read_is_refused():
         build_specs([array], kernel_settings={"r": {"decode_tensor_cores": False}})
 
 
+def test_a_samplers_window_and_top_p_first_reach_its_spec():
+    (spec,) = build_specs([Sampler("tts_sampler", nodes={"tts"}, vocab_size=8, repetition_window=16, top_p_first=True)])
+    assert spec.max_repetition_window == 16 and spec.enable_top_p_first, "the sampler would refuse the request's window"
+
+
+def test_a_block_causal_read_within_a_step_builds_a_ragged_block_causal_spec():
+    (spec,) = build_specs(
+        [_within(reads={"vision_attn": _read(mask=BlockCausal(50))})],
+        kernel_settings={"vision_attn": {"max_segments_per_request": 4}},
+    )
+    assert type(spec) is RaggedBlockCausalAttentionSpec and spec.block_size == 50, spec
+    assert spec.config.max_segments_per_request == 4, "the ragged kernel's settings reach the block-causal spec too"
+
+
+def test_block_causal_reads_of_two_sizes_keep_two_specs():
+    audio = Array("audio", nodes={"llm"}, layers={0}, entry=KVEntry(heads=4, head_dim=16), max_len=0,
+                  reads={"audio_attn": _read(mask=BlockCausal(25))})
+    specs = build_specs([_within(reads={"vision_attn": _read(mask=BlockCausal(50))}), audio])
+    assert sorted(spec.block_size for spec in specs) == [25, 50], "one shared spec would plan one block size for both"
+
+
+def test_sdpa_refuses_a_block_causal_read():
+    array = _within(reads={"vision_attn": _read(mask=BlockCausal(4), packed=False)})
+    setup, problems = state_setup({"resources": {"vision_attn": {"backend": "sdpa"}}}, [array])
+    assert "vision_attn" not in setup.by_read, "a worker would attend each row whole"
+    assert len(problems) == 1 and "mask must be Block, the mask SdpaAttend runs within a step" in problems[0], problems
+
+
+def test_a_block_causal_read_within_a_step_is_refused_on_a_node_that_splits_its_steps():
+    """Its resource takes no split steps, which the engine would otherwise refuse only once it builds the resource."""
+    audio = Array("audio", nodes={"llm"}, layers={0}, entry=KVEntry(heads=4, head_dim=16), max_len=0,
+                  reads={"audio_attn": _read(mask=BlockCausal(25))})
+    shard = SeqShard("shard", nodes={"llm"}, labels={"vision"})
+    specs = resolve_spec_dependencies(build_specs([_within(labels={"vision"}), audio, shard]))
+    refusals = sequence_parallel_refusals(specs.values(), "llm", 1, 2)
+    assert any("'audio_attn' takes no split steps" in refusal for refusal in refusals), (
+        "the node would load, and its SP ranks would each attend a share of the audio as if it were whole"
+    )
+
+
 _EXTRA = {"extra": TensorType((2,), dtype=None)}
 
 
@@ -945,8 +995,8 @@ def test_an_unbounded_array_is_one_bounded_kv_holding_its_window():
     ({}, []),
 ], ids=["causal", "two reads", "no read"])
 def test_an_unbounded_array_reads_through_one_window(reads, masks):
-    _no_layout(f"an unbounded array reads through one Window read, whose window the bounded KV keeps, and its reads "
-               f"have masks {masks}", _unbounded(reads=reads))
+    _no_layout(f"an unbounded array reads through one Window or kept-window read, whose window the bounded KV keeps, "
+               f"and its reads have masks {masks}", _unbounded(reads=reads))
 
 
 def test_an_unbounded_array_has_no_reach_read_yet():
@@ -990,11 +1040,9 @@ def test_a_bounded_array_takes_no_rope():
                _unbounded(positions=Positions(rope=Rope())))
 
 
-def test_the_bounded_read_takes_no_kernel_settings():
-    with pytest.raises(ValueError, match=re.escape(
-        "kernel_settings['enc_attn'] names no read or update of the declarations that takes kernel settings, and no "
-        "array, of ['enc']",
-    )):
+def test_the_bounded_read_takes_only_its_precision_as_a_kernel_setting():
+    with pytest.raises(ValueError, match=re.escape("kernel_settings['enc_attn'] sets ['max_slots']; it may set only "
+                                                   "['ieee']")):
         build_specs([_unbounded()], kernel_settings={"enc_attn": {"max_slots": 4}})
 
 
@@ -1037,3 +1085,66 @@ def test_node_handles_build_a_bounded_handle():
     assert isinstance(h, BoundedHandle) and list(h.reads) == ["enc_attn"], "the handle takes its read by its key"
     assert [bound.key for bound in h._bindings] == ["enc_attn", "rope"], "the read, then the positions entry"
     assert position(h, 1, "main") == 9 and h.written(1) == 9, "position() and the step builder read one count"
+
+
+def _kept(grows="sink", **overrides) -> Array:
+    """An unbounded array whose rows begin from starts of 2 to 4 entries, read through a kept window."""
+    return _unbounded(**{
+        "reads": {"enc_attn": _window(mask=Bidirectional(kept_window=True))}, "start_lengths": range(2, 5),
+        "kept_windows": {"enc_attn": KeptWindow(3, window=1, grows=grows)}, **overrides,
+    })
+
+
+@pytest.mark.parametrize("grows, kept", [
+    ("sink", lambda n: SinkWindow(3 + n, 1)),
+    ("window", lambda n: SinkWindow(3, 1 + n)),
+    (None, lambda n: SinkWindow(3, 1)),
+], ids=["sink", "window", "neither"])
+def test_a_kept_window_read_on_an_unbounded_array_builds_a_bounded_kv_over_its_starts(grows, kept):
+    (spec,) = build_specs([_kept(grows)])
+    config = spec.config
+    assert isinstance(spec, BoundedKVSpec) and (config.min_source_len, config.max_source_len) == (2, 4)
+    assert config.query_window is None and config.rows_per_request == 1, "every query of a step sees the same keys"
+    assert [config.retention_for(n) for n in range(2, 5)] == [kept(n) for n in range(2, 5)], (
+        "the side grows names gains the start's length, as upstream truncates"
+    )
+
+
+def test_an_unbounded_kept_window_read_without_start_lengths_is_refused():
+    _no_layout("reads['enc_attn'] keeps a window whose sizes grow from each row's start, and start_lengths is None",
+               _kept(start_lengths=None))
+
+
+def test_an_unbounded_kept_window_read_without_a_base_is_refused():
+    _no_layout("kept_windows gives no base for the kept-window read 'enc_attn'", _kept(kept_windows={}))
+
+
+def test_start_lengths_beside_a_window_read_are_refused():
+    _no_layout("start_lengths or kept_windows beside the Window read 'enc_attn', whose size is its own",
+               _unbounded(start_lengths=range(2, 5)))
+
+
+def test_a_base_for_no_kept_window_read_is_refused():
+    _no_layout("kept_windows names ['other'], which aren't kept-window reads of the array",
+               _kept(kept_windows={"enc_attn": KeptWindow(3, window=1), "other": KeptWindow(1, window=1)}))
+
+
+def test_last_first_reaches_the_bounded_kvs_reverse_order():
+    (spec,) = build_specs([_kept(reads={"enc_attn": _window(mask=Bidirectional(kept_window=True, last_first=True))})])
+    assert spec.config.reverse_step_order, "the window would cut each step's adds in order, keeping the last longest"
+
+
+_FP32_KV = TensorType((4, 16), dtype=torch.float32, shard=0)
+
+
+def test_a_float32_bounded_read_attends_in_ieee_fp32_by_default():
+    """TF32 would change a float32 cache's attention, so only a kernel setting asks for it."""
+    (fp32,) = build_specs([_kept(entry=Entry({"k": _FP32_KV, "v": _FP32_KV}))])
+    (compute,) = build_specs([_kept()])
+    assert fp32.config.ieee and not compute.config.ieee, "only a float32 entry attends in IEEE fp32 by default"
+
+
+def test_a_bounded_reads_ieee_is_a_kernel_setting():
+    (spec,) = build_specs([_kept(entry=Entry({"k": _FP32_KV, "v": _FP32_KV}))],
+                          kernel_settings={"enc_attn": {"ieee": False}})
+    assert spec.config.ieee is False, "the read's setting under its key would not reach its bounded KV"

@@ -40,6 +40,8 @@ SNAPSHOT = {
         ["rewritable", "KEYWORD_ONLY", 'False'],
         ["labels", "KEYWORD_ONLY", "frozenset({'main'})"],
         ["positions", "KEYWORD_ONLY", 'None'],
+        ["start_lengths", "KEYWORD_ONLY", 'None'],
+        ["kept_windows", "KEYWORD_ONLY", '{}'],
         ["largest", "KEYWORD_ONLY", '{}'],
     ],
     "ArrayStep": [
@@ -52,14 +54,19 @@ SNAPSHOT = {
         ["advance", "KEYWORD_ONLY", 'None'],
         ["position_ids", "KEYWORD_ONLY", 'None'],
         ["host", "KEYWORD_ONLY", '{}'],
+        ["starts", "KEYWORD_ONLY", '{}'],
     ],
     "Attend": [
         ["q_heads", "POSITIONAL_OR_KEYWORD", None],
     ],
     "Bidirectional": [
         ["kept_window", "KEYWORD_ONLY", 'False'],
+        ["last_first", "KEYWORD_ONLY", 'False'],
     ],
     "Block": [],
+    "BlockCausal": [
+        ["size", "POSITIONAL_OR_KEYWORD", None],
+    ],
     "Causal": [],
     "CausalConv": [
         ["activation", "KEYWORD_ONLY", "'silu'"],
@@ -90,6 +97,7 @@ SNAPSHOT = {
     "KeptWindow": [
         ["sink", "POSITIONAL_OR_KEYWORD", None],
         ["window", "KEYWORD_ONLY", None],
+        ["grows", "KEYWORD_ONLY", 'None'],
     ],
     "Layout": [
         ["spans", "KEYWORD_ONLY", '()'],
@@ -178,6 +186,8 @@ SNAPSHOT = {
         ["min_p", "KEYWORD_ONLY", 'False'],
         ["eos_ids", "KEYWORD_ONLY", '()'],
         ["draws", "KEYWORD_ONLY", '1'],
+        ["repetition_window", "KEYWORD_ONLY", '0'],
+        ["top_p_first", "KEYWORD_ONLY", 'False'],
     ],
     "Segment": [
         ["request_id", "POSITIONAL_OR_KEYWORD", None],

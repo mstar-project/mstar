@@ -41,6 +41,13 @@ def pool_layers(array: Array) -> dict[int, int]:
     return {layer: i for i, layer in enumerate(sorted(array.layers))}
 
 
+# what an array handle holds of the open step's calls
+STEP_CALLS = (
+    "_step", "_region_rows", "_segments", "label", "_keep", "_capturing", "_held", "_held_layer", "_kept", "_scratch",
+    "_read", "_updated",
+)
+
+
 class ArrayHandle(StepHandle):
     """The calls on one declared array. Each kind of storage has a handle that implements the calls it runs, and
     this class refuses the rest as having no layout yet.
@@ -61,6 +68,9 @@ class ArrayHandle(StepHandle):
     rope_dtype: torch.dtype | None = None
     # the cause `write` is refused with on an append-only array's handle; None leaves it "no layout yet"
     _write_refused: str | None = None
+    # what a region run eagerly inside the open step sets aside while its own calls answer to its step
+    # (`begin_region`); None where they count as the open step's
+    _step_calls: tuple[str, ...] | None = None
 
     def __init__(self, array: Array, resources: Mapping[str, Any]):
         self.array = array
@@ -88,6 +98,7 @@ class ArrayHandle(StepHandle):
         self._scratch: set[int] = set()
         self._read: set[int] = set()
         self._updated: set[tuple[str, int]] = set()
+        self._outer: dict[str, Any] | None = None
 
     def _refusal(self, cause: str) -> ValueError:
         return ValueError(f"Array {self.name!r}: {cause}")
@@ -176,6 +187,32 @@ class ArrayHandle(StepHandle):
         self._step = None
         self._held = self._held_layer = None
 
+    def begin_region(self, step) -> None:
+        if self._step_calls is None or not self._open:
+            return
+        self._outer = {
+            name: value.copy() if isinstance(value, set | dict) else value
+            for name in self._step_calls for value in (getattr(self, name),)
+        }
+        self._open = False
+        self.begin_step(step)
+
+    def end_region(self, step, ran: bool) -> None:
+        """Back to the open step, which counts the rows the region listed at span 1 or more as given entries, as it
+        counts a replay's."""
+        if self._outer is None:
+            return
+        try:
+            if ran:
+                self.check_step(step)
+            rows = {(segment.request_id, segment.label) for segment in self._segments if segment.span}
+        finally:
+            self.end_step(step)
+            for name, value in self._outer.items():
+                setattr(self, name, value)
+            self._outer, self._open = None, True
+        self._region_rows |= rows
+
     def _check_host_writes(self, declared: ArrayStep, ctx) -> None:
         raise self._refusal("a host write, and the array declares no host fields")
 
@@ -193,6 +230,8 @@ class ArrayHandle(StepHandle):
                                 f"{sorted(declared_labels)}")
         if declared.advance is not None or declared.position_ids is not None:
             _positions(self, "a step sets advance or position_ids, and the array declares no positions")
+        if declared.starts and self.array.start_lengths is None:
+            raise self._refusal("a step names starts, and the array declares no start_lengths")
         self._check_storage(declared, segments, ctx)
 
     def _check_labels(self, labels: set[str], segments) -> None:
@@ -308,6 +347,12 @@ class ArrayHandle(StepHandle):
         (`NodeSubmodule.resident_walks`). The tensors are made at load and never written, since a captured read keeps
         their address."""
         raise self._unsupported("set_start")
+
+    def set_starts(self, starts: Sequence[Mapping[str, torch.Tensor]]) -> None:
+        """The starts an unbounded array's rows may begin from, each giving every entry field its entries, (layers, n,
+        *shape) with n one of ``start_lengths``. Called once at bind; a step names each row's by its index in
+        ``starts`` (`ArrayStep.starts`)."""
+        raise self._unsupported("set_starts")
 
     def block(self, field: str, layer: int) -> torch.Tensor:
         """``layer``'s view of the entry field ``field``, for an update's op."""
