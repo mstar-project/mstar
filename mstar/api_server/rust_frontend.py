@@ -754,6 +754,24 @@ class RustFrontendBridge:
 
         self.loop.create_task(run())
 
+    def _generation_admin(self, msg: dict) -> None:
+        """Forward Rust HTTP control through the same admin as Python HTTP."""
+        reply = {"t": "generation_admin", "rid": msg.get("rid"), "sub": msg.get("sub"), "data": b"", "metadata": {}}
+
+        async def run() -> None:
+            try:
+                admin = getattr(self.server, "generation_admin", None)
+                if admin is None:
+                    raise RuntimeError("this API server has no generation admin")
+                body = {key: msg[key] for key in ("mode", "model_path", "weight_version") if key in msg}
+                reply["metadata"] = {"result": await admin.call(msg.get("op"), body)}
+            except Exception as exc:  # noqa: BLE001 — the bridge must answer even on a refusal
+                status, message = exception_status_text(exc, "generation admin", log=logger)
+                reply["metadata"] = {"error": {"status": status, "message": message}}
+            self._send(reply)
+
+        self.loop.create_task(run())
+
     def _end_of_turn(self, msg: dict) -> None:
         """``semantic_vad``'s end-of-turn probability of a turn's last audio
         (float32), by this side's Smart Turn: its int8 model moves by tenths
@@ -899,6 +917,8 @@ class RustFrontendBridge:
             self._live(msg)
         elif t == "lora":
             self._lora(msg)
+        elif t == "generation_admin":
+            self._generation_admin(msg)
         elif t == "end_of_turn":
             self._end_of_turn(msg)
         else:

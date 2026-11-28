@@ -16,7 +16,9 @@ from mstar.api_server import entrypoint
 @pytest.fixture
 def real_server(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        entrypoint, "PreprocessWorker", lambda **kwargs: SimpleNamespace(),
+        entrypoint,
+        "PreprocessWorker",
+        lambda **kwargs: SimpleNamespace(send_to_conductor=lambda message: None),
     )
     monkeypatch.setattr(entrypoint, "make_communicator", lambda **kwargs: object())
     return entrypoint.APIServer(upload_dir=str(tmp_path / "uploads"))

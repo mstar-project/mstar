@@ -67,6 +67,7 @@ from mstar.worker.speculation import (
 from mstar.worker.step_executor import StepExecutor
 from mstar.worker.step_pipeline import StepPipeline
 from mstar.worker.stream_buffers import StreamBufferManager
+from mstar.worker.weight_ops import WeightOps
 from mstar.worker.worker_metrics import WorkerMetrics
 
 logger = logging.getLogger(__name__)
@@ -406,10 +407,12 @@ class Worker:
 
         if status_interval_s is not None:
             self._metrics = self._start_metrics(status_interval_s)
+        self.weight_ops = WeightOps(services, self.lifecycle, self.lockstep)
         self.ingest = InputIngest(
             services=services, layout=layout, lifecycle=self.lifecycle, lockstep=self.lockstep,
             wakeup_event=self.wakeup_event, metrics=self._metrics, enable_nvtx=self.enable_nvtx,
             set_rebuildable=self._set_rebuildable,
+            weight_ops=self.weight_ops,
         )
         self.executor = StepExecutor(
             services=services, layout=layout, timer=self.timer, lockstep=self.lockstep,
@@ -430,6 +433,7 @@ class Worker:
             executor=self.executor, ingest=self.ingest, speculator=self.speculator, preemption=self.preemption,
             metrics=self._metrics,
             profile_info=self.profile_info, launch_wait_s=launch_wait_s, enable_nvtx=self.enable_nvtx,
+            weight_ops=self.weight_ops,
         )
 
     def _start_metrics(self, interval_s: float) -> WorkerMetrics:
