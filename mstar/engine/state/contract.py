@@ -451,6 +451,51 @@ class SeqShard:
             raise ValueError(f"{where}.exchange must be one of auto, {', '.join(SP_EXCHANGES)}; got {self.exchange!r}")
 
 
+@dataclass(frozen=True)
+class Draft:
+    """Speculative decoding on one node. A step of ``walk`` runs each row's last token and ``num_draft_tokens`` drafts,
+    ``k + 1`` entries on ``array``, and keeps the run ``sampler`` verifies; a step of ``mixed_walk`` also carries
+    prompt rows, after its verify rows. The drafter's layers join ``array``'s pool after the target's, as a layer set
+    the target never reads.
+
+    The drafter is named by its draft-block key (``method``) and checkpoint (``model``, and ``checkpoint``, the
+    directory it resolves to), and the model builds it from them (`Model.drafter`). The target's geometry is the
+    array's entry, the sampler's vocabulary, and ``num_layers``, ``hidden_size`` and ``dtype`` here: on a hybrid model
+    the KV array holds only some of the layers, and a drafter's taps are checked against all of them.
+    """
+
+    name: str
+    _: KW_ONLY
+    nodes: frozenset[str]               # the one node that drafts and verifies
+    array: str
+    sampler: str
+    walk: str
+    method: str                         # the draft block's method (`DRAFT_METHODS`)
+    model: str                          # the drafter's checkpoint as the draft block names it
+    checkpoint: str                     # its directory, which a cached prefix's pages also hold
+    num_draft_tokens: int
+    num_layers: int                     # the target's depth
+    hidden_size: int                    # the target's residual width, which a drafter reading it must match
+    dtype: str                          # the target's weight dtype, as its config.json names it
+    mode: Literal["auto", "synchronous", "asynchronous"] = "auto"
+    mixed_walk: str | None = None
+    input_kinds: frozenset[str] = frozenset({"text"})
+
+    def __post_init__(self):
+        object.__setattr__(self, "nodes", frozenset(self.nodes))
+        object.__setattr__(self, "input_kinds", frozenset(self.input_kinds))
+        where = f"Draft {self.name!r}"
+        if len(self.nodes) != 1:
+            raise ValueError(f"{where}.nodes must name one node, got {sorted(self.nodes)}")
+        if self.mixed_walk is not None and self.mixed_walk == self.walk:
+            raise ValueError(f"{where}.mixed_walk names its verify walk {self.walk!r}")
+        for name in ("num_draft_tokens", "num_layers", "hidden_size"):
+            if not _is_positive(getattr(self, name)):
+                raise ValueError(f"{where}.{name} must be a positive int, got {getattr(self, name)!r}")
+        if self.mode not in ("auto", "synchronous", "asynchronous"):
+            raise ValueError(f"{where}.mode must be auto, synchronous or asynchronous, got {self.mode!r}")
+
+
 @dataclass(frozen=True, kw_only=True)
 class SampleSettings:
     """A request's settings for one sampler, keyed by the sampler's name in `get_request_resource_configs`."""

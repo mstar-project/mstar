@@ -105,6 +105,7 @@ class StepPipeline:
         self._launch_wait_s = launch_wait_s
         self.enable_nvtx = enable_nvtx
         self._has_side_lane = bool(layout.side_keys)
+        self._verifying_nodes = layout.verifying_nodes
 
         # step N, on the chain, and the side lane's step
         self.pending: PendingBatch | None = None
@@ -721,6 +722,8 @@ class StepPipeline:
         self._teardown(self.in_flight_rids.union(referenced_rids))
         node, walk = batch.node_name, batch.graph_walk
         batch_ids = set(batch.request_to_worker_graph)
+        if not self.lockstep.follows(node):
+            self._refuse_unrecorded_victims()
         if not self.lockstep.follows(node) and self.preemption.preempt(node_batch):
             return
         self.admission.relieve(
@@ -728,6 +731,16 @@ class StepPipeline:
             last_in_line=partial(self.scheduler.last_in_line, node, walk),
             could_refill=partial(self.scheduler.could_refill, node, walk, batch_ids),
         )
+
+    def _refuse_unrecorded_victims(self) -> None:
+        """No row of a verifying node holds an unrecorded verify step when rank 0 picks victims: the refused
+        step never committed, and the pass before postprocessed the one before it. A victim with one would leave
+        nothing on the host that knows its length, so this is checked once here, ahead of every choice the pools
+        and the fallback eviction make."""
+        for node in self._verifying_nodes:
+            rows = self.engine_manager.get_engine(node).unrecorded_verify_rows(node)
+            if rows:
+                raise RuntimeError(f"preemption on {node} with unrecorded verify results: {rows}")
 
     def _step_result(self, pending: PendingBatch) -> BatchedModelOutput:
         """N's outputs. A forward that raised becomes N's verdict instead: no
@@ -857,6 +870,12 @@ class StepPipeline:
                     "Worker %s discarding failed batch for node %s",
                     self.worker_id, stale.node_name,
                 )
+        if self._verifying_nodes:
+            for stale in in_flight:
+                if stale is not None and stale.node_name in self._verifying_nodes:
+                    # drained above: a verify step it committed and never recorded is
+                    # voided, so no later admit waits on its result
+                    self.engine_manager.get_engine(stale.node_name).void_verify(stale.node_batch)
         if batch is not None:
             failed_rids.update(batch.request_to_worker_graph)
             self.executor.clear_in_flight(batch)

@@ -248,9 +248,11 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``model``
      - Registry key of the model (see :doc:`models`).
    * - ``max_seq_len``
-     - Required, but nothing reads it: it neither sizes the KV cache nor caps context.
-       A KV cache's length limit is its own ``max_seq_len``, set by the model or under
-       ``resources: <kv>:`` (see the resource overrides below).
+     - Required. It neither sizes the KV cache nor caps context: a KV cache's length limit
+       is its own ``max_seq_len``, set by the model or under ``resources: <kv>:`` (see the
+       resource overrides below). On a node that verifies drafts that override is still the
+       client's limit (the pool holds the verify slack past it), and startup reads the
+       top-level value only to refuse a verifying pool whose limit is below it.
    * - ``node_groups``
      - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
        scoped to specific ``graph_walks`` and/or parallelized with ``tp_size``,
@@ -452,7 +454,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        this, since it also holds the ids of requests the first rank has torn down until it tears them down too.
        A non-negative int, and 0 sets no pool aside, so no request is dropped there and the node preempts as
        one with no rebuild policy does. The pool is rounded up to a power of two, as the pinned allocator would
-       round it anyway.
+       round it anyway. A node that verifies drafts never drops a request, so it keeps no
+       ids there.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
@@ -982,6 +985,41 @@ of an openpi ``norm_stats.json``. Without it, ``robot_state`` must already be no
 [-1, 1]. Either way it is a list of 1 to ``state_dim`` finite numbers (the checkpoint's
 ``max_state_dim``, 32 when it sets none); anything else is a 400.
 
+A model that supports speculative decoding (drafting several tokens and verifying them in
+one target pass) turns it on with a ``draft`` block; without one it decodes as usual. No shipped
+model declares a drafter yet; a block looks like this:
+
+.. code-block:: yaml
+
+   model_kwargs:
+     draft:
+       method: <method>                            # the drafter
+       model: <checkpoint>                         # its checkpoint, for a method that loads one
+       num_draft_tokens: 7
+       mode: auto                                  # auto | synchronous | asynchronous
+
+``mode: auto`` runs asynchronously (the next step planned while one runs) where every rank
+can, which needs FlashAttention-3 on Hopper (see :doc:`installation`), and synchronously
+otherwise, logging why; ``asynchronous`` refuses to start where it can't run. The engine
+refuses unknown keys, and a block on a model that serves none. Requests on such a
+deployment can't ask for ``repetition_penalty`` other than 1, ``repetition_window``,
+``min_tokens``, ``return_logprobs`` or ``penalize_prompt: false`` (see :doc:`clients`).
+
+A drafting node can run arriving prompts inside its verify steps (a mixed step; the model
+declares it). Run asynchronously, a mixed step runs only on a capture, so at startup the
+engine caps the mixed walk's rows and token budget at the widest captured mixed bucket that
+holds the worst step: every verify row's block plus a prompt chunk of ``min_chunk_tokens``.
+It logs the cap when it lowers either. The cap covers every step under that combined walk,
+prompt-only ones included, and a node-level ``max_batch_tokens`` override above it. Startup
+refuses an asynchronous mixed walk with no token budget, or with a prompt walk in it whose
+chunking the serving config turned off (a null ``max_batch_tokens``), since either way a
+prompt runs whole, past every capture. It refuses one no captured bucket holds: the message
+gives the floor no kept bucket holds, ``min_chunk_tokens`` capped at the budget and rounded up
+to the node's chunk alignment, and the ways to start, ``mode: synchronous`` and, where they
+apply, a lower ``min_chunk_tokens`` or memory for a bucket capture left out that would hold the
+step. In either mode, it also refuses a mixed walk over a KV pool the model writes under more
+than one label, since a mixed step plans one.
+
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
 client instead — see :doc:`clients`, and :ref:`generation-parameters` for what each
 sampling knob means.
@@ -994,7 +1032,10 @@ log-probs enabled on its node, on eager and captured steps alike. Every other sa
 text LLM, and Fish S2 Pro's 4,097-token semantic head) draws through FlashInfer, which
 reads the first row's seed for the whole batch and folds each row's batch position into
 its random stream, so there the same seed and settings sample the same tokens only in the
-same batch, such as a request sent alone.
+same batch, such as a request sent alone. On a node that drafts (``model_kwargs.draft``),
+every token, the first included, is drawn from a stream keyed by the request's seed and its
+own row, so a seed fixes the reply whatever the request is batched with, up to rounding
+differences in the target's and drafter's logits between batch shapes.
 
 Restarts and the compile cache
 ------------------------------

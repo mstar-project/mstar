@@ -110,6 +110,7 @@ class Lockstep:
         self._is_follower = layout.is_tp_follower
         self._streaming_edge_names = layout.streaming_edge_names
         self._async_sched, self._async_nodes = async_sched
+        self._synchronous_verify_nodes = layout.synchronous_verify_nodes
 
         # -- leader --
         # monotonic seq stamped on every ScheduleTPNode it sends
@@ -180,8 +181,13 @@ class Lockstep:
         return node_name in self._followed_nodes
 
     def async_for(self, node_name: str) -> bool:
-        """TP async scheduling applies to this node (flag, narrowed by node list)."""
-        return self._async_sched and (self._async_nodes is None or node_name in self._async_nodes)
+        """TP async scheduling applies to this node (flag, narrowed by node list).
+        A node that verifies drafts in synchronous mode takes the serial path on
+        every rank: its leader never speculates, so no follower waits on a head
+        or a marker for it."""
+        return self._async_sched and (
+            self._async_nodes is None or node_name in self._async_nodes
+        ) and node_name not in self._synchronous_verify_nodes
 
     def leads_async(self, node_name: str) -> bool:
         """``node_name`` is a parallel node this worker leads under TP async."""

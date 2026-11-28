@@ -265,6 +265,9 @@ The GPU model families depend on:
   to a CUDA 12 torch install ``fa3-fwd==0.0.2``. A mismatched wheel fails to import, and every
   ``dense`` attention then runs on FlashInfer with a warning at startup; check with
   ``python -c "import fa3_fwd_interface"``.
+- **flash_attn_3** — FlashAttention-3's paged kernel for speculative decoding's verify steps
+  in asynchronous mode, on Hopper. **Not installed by any extra**; install it separately (see
+  `flash_attn_3 (speculative decoding, sm90)`_).
 - **mooncake-transfer-engine** (0.3.13.post1 or newer) — RDMA tensor transport for
   multi-GPU, disaggregated deployments. Single-node deployments can use shared-memory
   (``SHM``) or ``TCP`` transport instead (see :doc:`serving`, which also covers the network
@@ -272,7 +275,8 @@ The GPU model families depend on:
   (``+cu130``) swap in its CUDA 13 build, as the Docker images do (see
   :ref:`mooncake-cuda13`).
 
-Apart from ``flash-attn`` and ``flash-attn-4``, these are installed by the extras above. Your
+Apart from ``flash-attn``, ``flash-attn-4`` and ``flash_attn_3``, these are installed by the
+extras above. Your
 installed ``torch`` must match your system CUDA toolkit — ``--torch-backend=auto`` handles
 that for you (next section).
 
@@ -431,6 +435,27 @@ logs a warning and falls back to the previous Triton flex kernel. It is correct
 but slower — about 1.8x per attention call at 720p. Set
 ``MSTAR_FLEX_BACKEND=TRITON`` to choose it explicitly, or
 ``MSTAR_FLEX_BACKEND=FLASH`` to fail at startup instead of falling back.
+
+flash_attn_3 (speculative decoding, sm90)
+-----------------------------------------
+
+A node that drafts and verifies tokens runs its verify steps in asynchronous mode only on
+FlashAttention-3's paged kernel, which reads each request's KV length on the device. Without
+it (or off SM90) the node runs in synchronous mode on FlashInfer, which is correct and plans
+each verify step after the one before it was post-processed. ``fa3-fwd``, which
+``.[cosmos3]`` and ``.[all]`` install, is built without paged KV, so it can't serve them.
+
+PyTorch's index hosts the official wheel, one per CUDA build, built against torch's stable
+ABI. Install the one matching your torch's CUDA (the command below is ``cu129``'s):
+
+.. code-block:: bash
+
+   uv pip install --no-deps flash_attn_3==3.0.1 --index-url https://download.pytorch.org/whl/cu129
+   python -c "from flash_attn_3.flash_attn_interface import flash_attn_with_kvcache"
+
+It is a wheel of prebuilt kernels (about 400 MB); nothing compiles. The attention resource's
+``verify_backend`` pins a kernel: ``fa3`` refuses to load where the wheel or the GPU can't run
+it, ``flashinfer`` keeps the node synchronous.
 
 Matching your CUDA toolkit
 --------------------------

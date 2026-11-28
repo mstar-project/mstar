@@ -140,10 +140,11 @@ def _applying_chunking(build):
     return get_graph_walk_graphs
 
 if TYPE_CHECKING:
+    from mstar.engine.resources.draft.drafter import VerifyNode
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
 if TYPE_CHECKING:
-    from mstar.engine.state import Array, Layout, Sampler, SampleSettings, SeqShard
+    from mstar.engine.state import Array, Draft, Layout, Sampler, SampleSettings, SeqShard
     from mstar.engine.state.adapters import StateSetup
     from mstar.model.components.lora.modules import LoraRoot
     from mstar.worker.scheduling_policy import WalkPriority
@@ -843,7 +844,7 @@ class Model(ABC):
         request picks one by its kwargs."""
         return ()
 
-    def declare_state(self) -> "list[Array | Sampler | SeqShard]":
+    def declare_state(self) -> "list[Array | Sampler | SeqShard | Draft]":
         """The state the model keeps between steps, from which the engine builds the specs for it.
 
         A pure function of the model's config and the deployment's settings, since each process calls it.
@@ -1038,6 +1039,40 @@ class Model(ABC):
     @abstractmethod
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         pass
+
+    def verify_nodes(self) -> "list[VerifyNode]":
+        """The nodes that draft and verify tokens (speculative decoding), from
+        the deployment's ``model_kwargs.draft`` (`DraftConfig.from_model_kwargs`).
+        Empty, the default, leaves speculative decoding off. Raises
+        ``ValueError`` on a block the model can't serve. A model on the state
+        contract that drafts returns `declared_verify_nodes` when its block is
+        given."""
+        return []
+
+    def declared_verify_nodes(self) -> "list[VerifyNode]":
+        """One verify node per `Draft` the model declares, its drafter from `drafter`."""
+        from mstar.engine.state import Draft
+
+        declarations = self.declare_state()
+        drafts = [declared for declared in declarations if isinstance(declared, Draft)]
+        if not drafts:
+            return []
+        from mstar.engine.state.adapters import verify_node
+
+        return [
+            verify_node(draft, declarations, self.drafter(draft), **self.draft_node_fields(draft)) for draft in drafts
+        ]
+
+    def drafter(self, draft: "Draft") -> Any:
+        """The drafter's own declaration (a draft-package `DrafterDecl`) that ``draft`` names: built by the model,
+        whose family's code it needs (its config's refusals, its tokenizer, its taps), from ``draft`` alone."""
+        raise NotImplementedError(f"{type(self).__name__} declares a Draft but builds no drafter")
+
+    def draft_node_fields(self, draft: "Draft") -> dict:
+        """What ``draft``'s node declares of itself before any submodule exists:
+        its ``token_stop`` and ``device_loopback`` (`VerifyNode`), which
+        validation reads."""
+        return {}
 
     @abstractmethod
     def walk_plan(

@@ -270,6 +270,18 @@ class RopeManager(PositionManager):
         counters = self._counters.setdefault(rid, {})
         counters[label] = max(0, counters.get(label, 0) + delta)
 
+    def take_back(self, rids, counts, label: str) -> None:
+        """A verify step's rejected tokens off each stream's counter, by the
+        amounts its KV cache takes back, so a position stays its KV length
+        plus a fixed offset (the offset a resident row holds)."""
+        counters = self._counters
+        for rid, n in zip(rids, counts, strict=True):
+            if n:
+                stream = counters[rid]
+                if stream.get(label, 0) < n or n < 0:
+                    raise RuntimeError(f"positions: take-back of {n} from {rid}/{label} at {stream.get(label, 0)}")
+                stream[label] -= n
+
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs,
         prefix: CachedPrefix | None,
@@ -367,8 +379,10 @@ class RopeManager(PositionManager):
             "position preplan is already pending; clear_preplan before "
             "planning a different step ahead"
         )
-        if ctx.resident is not None:
-            # the replay fills the slot's buffer from the tables itself
+        mixed_walks = getattr(ctx.resident, "mixed_walks", ())
+        if ctx.resident is not None and ctx.slot_lease.bucket.graph_walk not in mixed_walks:
+            # the replay fills the slot's buffer from the tables itself; a verifying node's mixed step stages
+            # every row, and the replay rewrites its verify rows' (`ResidentBuffers.mixed`)
             return self._current_pos_ids
         if self._preplanned:
             # staged a step early against this same step's KV plan
@@ -489,13 +503,20 @@ class RopeManager(PositionManager):
                 f"positions on stream {own.label!r} over {self._kv_cache_name!r}'s {pool.label!r}: "
                 "a resident step's positions advance with the stream their KV cache appends to"
             )
+        if own.span != pool.span:
+            raise ValueError(
+                f"positions on stream {own.label!r} advance {own.span} a row, "
+                f"{self._kv_cache_name!r}'s {pool.span}"
+            )
         return own.label
 
     def _gather_offset(self, step: "CapturedResidentStep", table, out: torch.Tensor) -> None:
-        """``out[i]``: row ``i``'s cell of ``table`` plus its stored length."""
+        """``out[i]``: row ``i``'s cell of ``table`` plus its stored length; a verify
+        step's row runs its span from there on."""
         gather_column(
             self._resident_store.store, step.slots, table.stride, table.col,
             out, plus=step.buffers.kv_len[self._kv_cache_name],
+            span=step.streams[self._resident_key].span, skip_trash=getattr(step.buffers, "mixed", False),
         )
 
     def commit(self, step: PositionStep, ctx: StepContext):

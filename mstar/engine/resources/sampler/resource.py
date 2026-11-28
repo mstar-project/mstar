@@ -1,6 +1,7 @@
 import logging
 from collections.abc import Mapping
 from dataclasses import asdict
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
@@ -19,12 +20,14 @@ from mstar.engine.resources.sampler.resident import SamplerCells
 from mstar.engine.resources.sampler.utils import (
     FUSED_SAMPLE_MAX_VOCAB,
     AcceleratorGraphableSampler,
+    FilterOrder,
     FusedDrawArgs,
     GenerationHistory,
     Sampler,
     SamplerBuffers,
     SamplingConfig,
     _rng_offset_stride,
+    greedy_tokens,
     samples_greedy,
 )
 from mstar.engine.resources.step import ASKS, AdmitOutcome, SlotLease, StepContext
@@ -33,7 +36,23 @@ from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter
 from mstar.utils.profiler import PhaseLaps
 
+if TYPE_CHECKING:
+    from mstar.engine.resources.draft.drafter import VerifyResult
+
 logger = logging.getLogger(__name__)
+
+
+class _VerifyParams(NamedTuple):
+    """A verify draw's per-row settings and offsets (`SamplerResource._verify_params`); ``slots`` are the eager
+    step's slots when it draws at their counters, else None."""
+    temperature: torch.Tensor
+    top_k: torch.Tensor
+    top_p: torch.Tensor
+    min_p: "torch.Tensor | None"
+    seed: torch.Tensor
+    offset: torch.Tensor
+    order: "FilterOrder | None"
+    slots: "torch.Tensor | None"
 
 
 class SamplerResource(Resource):
@@ -433,7 +452,8 @@ class SamplerResource(Resource):
 
     def lean_captures(self, config_type) -> bool:
         """Batched captures only: there a row is a token, and the sampler a
-        sizeable share of the step."""
+        sizeable share of the step. On a verifying node the twin is the verify
+        step's that reads only the target's argmax (`verify`)."""
         from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType
 
         return config_type == AcceleratorGraphConfigType.BASIC_BATCHED
@@ -513,7 +533,8 @@ class SamplerResource(Resource):
         self._cells.stage(plan)
 
     def resident_gather(self, step: CapturedResidentStep) -> None:
-        if self._cells is None or self._cg_buffers is None:
+        if self._cells is None or self._cg_buffers is None or getattr(step.buffers, "mixed", False):
+            # a verifying node's mixed step stages its rows on the host (`_resident_rows`)
             return
         self._cells.gather(step)
         # what the capture's sample reads
@@ -531,6 +552,10 @@ class SamplerResource(Resource):
     def _resident_rows(self, ctx: StepContext) -> tuple | None:
         """(bucket, cg slot) of a resident step, which reads its scalars off the cells."""
         if self._cells is None or ctx.resident is None:
+            return None
+        if ctx.slot_lease.bucket.graph_walk in getattr(ctx.resident, "mixed_walks", ()):
+            # a verifying node's mixed step: its prompt rows hold no slot, and every row's scalars,
+            # offset and loop-back slot are the host's to stage
             return None
         return ctx.slot_lease.bucket, ctx.slot_lease.slot
 
@@ -757,6 +782,9 @@ class SamplerResource(Resource):
         which is what the graph sampler's per-row params were gathered for.
         The eager sampler keys off request ids and sees the real batch only.
         """
+        if self.verify_draft_tokens:
+            # a verifying node refuses log-probs, penalties and min-tokens, so nothing below applies
+            return self._first_draw(request_ids, logits)
         if self._enable_logprobs:
             # under capture this fires once, at capture; a replay never calls in
             if self._sampled_this_step:
@@ -786,16 +814,160 @@ class SamplerResource(Resource):
             rand_offset=offsets, greedy=self._greedy_this_step,
         )
         if by_slot:
-            kept = self._kept_rids
-            bufs.advance_eager_offsets(
-                slots, offsets, _rng_offset_stride(logits.device.type, logits.shape[-1]),
-                keep=None if kept is None else bufs.keep_mask([rid in kept for rid in request_ids]),
-            )
-        # An eager step has no per-step row to scatter from: write the masters
-        # by request, so the next step can still read its token on the device.
-        if self._keep_last_token and by_slot:
-            bufs.write_last_tokens(request_ids, tokens, kept_rids=self._kept_rids)
+            self._advance_eager(request_ids, slots, offsets, _rng_offset_stride(logits.device.type, logits.shape[-1]),
+                                tokens)
         return tokens
+
+    def _advance_eager(self, request_ids, slots, offsets, stride: int, tokens: torch.Tensor) -> None:
+        """After an eager draw at the slots' counters: the step's kept rows
+        (``SamplerStep.kept_rids``) move their offsets by ``stride``, and with
+        no per-step row to scatter from, the masters take ``tokens`` by
+        request, so the next step can still read its token on the device."""
+        bufs, kept = self._cg_buffers, self._kept_rids
+        bufs.advance_eager_offsets(
+            slots, offsets, stride, keep=None if kept is None else bufs.keep_mask([rid in kept for rid in request_ids]),
+        )
+        if self._keep_last_token:
+            bufs.write_last_tokens(request_ids, tokens, kept_rids=kept)
+
+    # Speculative decoding: set by the engine on a node that verifies drafts.
+    # ``k`` is fixed per node, so every rank strides its offsets alike.
+    verify_draft_tokens: int = 0
+
+    def bind_verify(self, num_draft_tokens: int) -> None:
+        self.verify_draft_tokens = num_draft_tokens
+
+    @torch.compiler.disable
+    def agree(self, values: torch.Tensor) -> torch.Tensor:
+        """Rank 0's ``values`` on every rank of the lockstep instance (a
+        verify step's drafts, before the target writes KV for them)."""
+        group = self._comm_group
+        if group is None or group.world_size == 1:
+            return values
+        return group.broadcast(values.contiguous())
+
+    def debug_fingerprint(self, rid: str) -> "dict[str, bytes | torch.Tensor]":
+        """``rid``'s loop-back rows (its last token and every declared state): they
+        stay on device across a KV offload."""
+        from mstar.engine.resources.base import tensor_digest
+
+        bufs = self._cg_buffers
+        if bufs is None or not bufs.has_slot(rid):
+            return {}
+        slot = bufs._rid_to_slot[rid]
+        out = {"sampler/last_token": tensor_digest(bufs.last_token.master[slot])}
+        for name, buf in bufs.loopback.items():
+            out[f"sampler/{name}"] = tensor_digest(buf.master[slot])
+        return out
+
+    @torch.compiler.disable
+    def verify(
+        self, request_ids: list[str], logits: torch.Tensor, drafts: torch.Tensor, refuse: torch.Tensor | None = None,
+    ) -> "VerifyResult":
+        """Verify ``drafts`` ``[n, k]`` against the target's ``logits``
+        ``[n, k + 1, V]`` with each request's own settings, as `sample` would
+        draw from them (`sampler.verify`). Every rank returns rank 0's
+        result. The bonus token goes where `sample` puts its token (the
+        loop-back slot), and the offsets move by a fixed stride. ``refuse`` ``[n]``: rows that test no draft and
+        sample their one token from their first position (`chain_verify_rows`)."""
+        from mstar.engine.resources.draft.drafter import VerifyResult
+        from mstar.engine.resources.sampler.verify import (
+            chain_verify_rows,
+            greedy_verify,
+            verify_probs,
+        )
+
+        n, block, vocab = logits.shape
+        k = block - 1
+        if drafts.shape != (n, k):
+            raise ValueError(f"verify got {tuple(drafts.shape)} drafts for a block of {block} over {n} rows")
+        params = self._verify_params(request_ids, n, logits.device)
+
+        def rows(t: torch.Tensor) -> torch.Tensor:
+            return t.repeat_interleave(block)
+
+        if self._greedy_this_step:
+            # every row samples greedily (`lean_for`, from configs alike on every rank), so its
+            # distribution is a one-hot at the argmax: the same result without the vocabulary's probs
+            tokens, accepted = greedy_verify(logits.reshape(n * block, vocab), drafts, refuse)
+        else:
+            min_p, order = params.min_p, params.order
+            dist = verify_probs(
+                logits.reshape(n * block, vocab), rows(params.temperature), rows(params.top_k), rows(params.top_p),
+                None if min_p is None else rows(min_p),
+                None if order is None else type(order)(rows(order.top_p_first), rows(order.min_keep)),
+            )
+            tokens, accepted = chain_verify_rows(dist, n, drafts, params.seed, params.offset, refuse)
+        # one broadcast for the whole result, as `sample` broadcasts its token
+        packed = self.agree(torch.cat([tokens, accepted[:, None]], dim=1))
+        tokens, accepted = packed[:, :block], packed[:, block]
+        bonus = tokens.gather(1, accepted[:, None]).squeeze(1)
+        self._land(request_ids, bonus, k, vocab, params)
+        return VerifyResult(tokens, accepted)
+
+    def _verify_params(self, request_ids: list[str], n: int, device: torch.device) -> "_VerifyParams":
+        """A verify draw's per-row settings, its offsets and, on an eager step over slots, the slots: off the
+        graph sampler's buffers under capture, else off the eager sampler's rows."""
+        cg, bufs, slots = self._cg_sampler, self._cg_buffers, None
+        if cg is not None:
+            if cg.ingraph_scatter:
+                cg.gather_in_graph()
+            temperature, top_k, top_p = cg.temperature_buf[:n], cg.top_k_buf[:n], cg.top_p_buf[:n]
+            seed, offset = cg.seed_buf[:n], cg.offset_buf[:n]
+            min_p = None if cg.min_p_buf is None else cg.min_p_buf[:n]
+            order = cg.order
+        else:
+            temperature, top_k, top_p, min_p, seed, order = self._sampler.row_settings(
+                request_ids, device, self._apply_filters_this_step,
+            )
+            if bufs is not None and all(bufs.has_slot(rid) for rid in request_ids):
+                # the counter captured steps draw at, so mixing the two never redraws an offset
+                slots, offset = bufs.eager_offsets(request_ids)
+            else:
+                offset = torch.tensor(
+                    [self._sampler._step_offset.get(rid, 0) for rid in request_ids], device=device, dtype=torch.long,
+                )
+        if not self._apply_filters_this_step:
+            top_k, top_p = torch.zeros_like(top_k), torch.ones_like(top_p)
+        return _VerifyParams(temperature, top_k, top_p, min_p, seed, offset, order, slots)
+
+    def _land(self, request_ids: list[str], token: torch.Tensor, k: int, vocab: int, params: "_VerifyParams") -> None:
+        """After a verify draw (agreed across the instance): each row's token goes where `sample` puts its token
+        (the loop-back slot), and its offset moves by the fixed verify stride, on every path `sample` has."""
+        from mstar.engine.resources.sampler.verify import verify_stride
+
+        stride = max(verify_stride(k), _rng_offset_stride(token.device.type, vocab))
+        cg, n = self._cg_sampler, token.shape[0]
+        if cg is not None:
+            cg.offset_buf.add_(stride)
+            if cg.last_token_buf is not None:
+                cg.last_token_buf[:n].copy_(token)
+            if cg.ingraph_scatter:
+                cg.scatter_in_graph(token)
+        elif params.slots is not None:
+            self._advance_eager(request_ids, params.slots, params.offset, stride, token)
+        else:
+            kept = self._kept_rids
+            for rid in request_ids:
+                if kept is None or rid in kept:
+                    self._sampler._step_offset[rid] = self._sampler._step_offset.get(rid, 0) + stride
+
+    def _first_draw(self, request_ids: list[str], logits: torch.Tensor) -> torch.Tensor:
+        """A verifying node's prompt-step token: drawn and landed exactly as a mixed step's prompt row (a verify
+        row that tests no draft), so a seeded reply doesn't depend on which of the two its prompt rode."""
+        from mstar.engine.resources.sampler.verify import first_draw, verify_probs
+
+        n, vocab = logits.shape
+        k = self.verify_draft_tokens
+        params = self._verify_params(request_ids, n, logits.device)
+        if self._greedy_this_step:
+            token = greedy_tokens(logits)
+        else:
+            dist = verify_probs(logits, params.temperature, params.top_k, params.top_p, params.min_p, params.order)
+            token = first_draw(dist, params.seed, params.offset, k)
+        token = self.agree(token)
+        self._land(request_ids, token, k, vocab, params)
+        return token
 
     def step_host_rows(self) -> dict[str, torch.Tensor]:
         """The step's log-prob rows. They assume one ``sample`` per step whose
@@ -830,7 +1002,8 @@ class SamplerResource(Resource):
         step, the penalty, a kept last token, or a filter, write or broadcast besides the draw. The vocabulary isn't
         checked here: the caller holds it to ``FUSED_DRAW_MAX_VOCAB``. The kernel's caller advances the offsets with
         `advance_offsets`."""
-        if self._cg_sampler is None or self._apply_penalty_this_step or self._keep_last_token:
+        if self._cg_sampler is None or self._apply_penalty_this_step or self._keep_last_token \
+                or self.verify_draft_tokens:
             return None
         return self._cg_sampler.fused_draw_args(self._apply_filters_this_step)
 

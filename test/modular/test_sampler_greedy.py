@@ -266,6 +266,17 @@ def test_only_batched_buckets_get_a_greedy_twin(wide):
                               ("prefill", frozenset({"lora"}))}
 
 
+@pytest.mark.parametrize("make", [_sampler, lambda: _sampler(V, greedy_capture=True)], ids=["wide", "opted_in"])
+def test_a_verifying_sampler_gets_its_greedy_twin(make):
+    """A verify step whose rows all sample greedily verifies by the argmax (`greedy_verify`), so
+    its bucket gets the sampler's twin, as a decode bucket does, keyed apart from the plain one."""
+    plain = {(WALK, frozenset()), ("prefill", frozenset())}
+    assert _listed({"sampler": make()}) == plain | {(WALK, GREEDY)}
+    verifying = make()
+    verifying.bind_verify(3)
+    assert _listed({"sampler": verifying}) == plain | {(WALK, GREEDY)}
+
+
 # ---- the plan's check, and the eager step ----
 
 def test_the_plan_refuses_a_greedy_step_over_a_sampled_row(wide):

@@ -347,6 +347,7 @@ class StepExecutor:
         self.streams = services.streams
         self._rebuilds = services.rebuilds
         self._layout = layout
+        self._verifying_nodes = layout.verifying_nodes
         self.timer = timer
         self.lockstep = lockstep
         self.lifecycle = lifecycle
@@ -746,6 +747,12 @@ class StepExecutor:
         node_batch.cached_rids -= rebuild
         node_batch.request_ids = [rid for rid in node_batch.request_ids if rid not in rebuild]
 
+    def _record_verify(self, batch_N: PendingBatch, outputs: BatchedModelOutput) -> None:
+        """A verify step that leaves postprocess early still hands its result
+        to the take-back."""
+        if self._verifying_nodes and batch_N.node_name in self._verifying_nodes:
+            self.engine_manager.get_engine(batch_N.node_name).record_verify(batch_N.node_batch, outputs)
+
     def postprocess(
         self, batch_N: PendingBatch,
         outputs: BatchedModelOutput,
@@ -810,6 +817,7 @@ class StepExecutor:
             # no outputs leave, but the step's kernels may still be running
             # in the slot a later step reuses
             self.wait_for_step(batch_N)
+            self._record_verify(batch_N, outputs)
             if self.enable_nvtx:
                 range_pop(synchronize=False)
             return
@@ -837,6 +845,7 @@ class StepExecutor:
                     # no outputs leave, but the step's kernels may still be
                     # running in the capture slot a later step reuses
                     self.wait_for_step(batch_N)
+                    self._record_verify(batch_N, outputs)
                     if self.enable_nvtx:
                         range_pop(synchronize=False)
                     return
@@ -886,6 +895,10 @@ class StepExecutor:
         self._rebuilds.record(batch_N.node_batch, {
             rid: self.request_state.get_fwd_info(rid, batch_N.partition) for rid in batch_N.node_batch.cached_rids
         })
+        if self._verifying_nodes and batch_N.node_name in self._verifying_nodes:
+            # a verify step's runs, cut at stops and the budget before the
+            # prefix chains, the stop check or the store read them
+            engine.cut_verify_step(batch_N.node_batch, outputs, host_rows)
         # Until its last chunk a row's sampled token is not a real sample, so it
         # keys no prefix and decides no stop (`_check_stops`).
         engine.step_finished(

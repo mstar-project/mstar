@@ -68,6 +68,9 @@ class ChunkingManagement:
         self._walk_caps: dict[tuple[str, str], dict[str, int] | None] = {}
         # (node, walk) -> steps that ran over the budget they were scheduled under
         self._overruns: dict[tuple[str, str], int] = {}
+        # (node, walk) -> the most tokens capture lets a step of the walk carry (`cap_budget`);
+        # empty except on an asynchronous verifying node with a mixed walk
+        self._capture_caps: dict[tuple[str, str], int] = {}
         # nodes the worker chunks nowhere, whatever the model declares
         self._no_chunking: frozenset[str] = frozenset()
         self._min_chunk_tokens = DEFAULT_MIN_CHUNK_TOKENS
@@ -101,12 +104,19 @@ class ChunkingManagement:
         if node_name in self._no_chunking:
             return None
         budget = self.policy(node_name, graph_walk).max_batch_tokens
-        if budget is None or not self._overrides:
-            return budget
-        for key in ((node_name, graph_walk), node_name):
-            if key in self._overrides:
-                return self._overrides[key]
+        if budget is not None and self._overrides:
+            for key in ((node_name, graph_walk), node_name):
+                if key in self._overrides:
+                    budget = self._overrides[key]
+                    break
+        if budget is not None and self._capture_caps:
+            budget = min(budget, self._capture_caps.get((node_name, graph_walk), budget))
         return budget
+
+    def cap_budget(self, node_name: str, graph_walk: str, tokens: int) -> None:
+        """Hold the walk's budget, the serving config's override included, to ``tokens``: the
+        widest step capture kept for it (`Engine._fit_mixed_steps_to_captures`)."""
+        self._capture_caps[(node_name, graph_walk)] = tokens
 
     def max_step_tokens(self, node_name: str, graph_walk: str, max_rows: int) -> int | None:
         """The most tokens the scheduler gives a step of ``graph_walk`` of at

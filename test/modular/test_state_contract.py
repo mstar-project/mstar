@@ -23,6 +23,7 @@ from mstar.engine.state import (
     Block,
     Causal,
     CausalConv,
+    Draft,
     Entry,
     Fork,
     GatedDeltaNet,
@@ -241,6 +242,10 @@ def test_a_new_op_brings_its_own_check():
     lambda: _array(labels={"main", "cfg"}, positions=Positions(rope=Rope(theta=5.0, dtype=torch.bfloat16))),
     lambda: _array(max_len=0, reads={"r": _read(mask=Block())}),
     lambda: Sampler("s", nodes={"LLM"}, vocab_size=8, eos_ids=(1, 2), draws=15),
+    lambda: Draft(
+        "draft", nodes={"LLM"}, array="kv", sampler="s", walk="decode", method="dspark", model="m", checkpoint="/m",
+        num_draft_tokens=3, num_layers=4, hidden_size=8, dtype="bfloat16", mixed_walk="mixed",
+    ),
 ])
 def test_a_declaration_hashes_and_equals_one_built_the_same(build):
     assert hash(build()) == hash(build())

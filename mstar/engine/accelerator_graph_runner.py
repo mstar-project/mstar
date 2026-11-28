@@ -896,8 +896,10 @@ class AcceleratorGraphRunner:
             # of their kernels; `prepare_for_capture` keeps those whose step drives them.
             # A twin shares its bucket's compiled forward, static buffers and padding rows.
             config_type = config.get_config_type()
+            # a verifying node's mixed capture twins as a batched one (`MixedVerifyGraphConfig`)
+            verify_twins = getattr(config, "verify_lean_twins", False)
             leans = (frozenset(), *lean_subsets(
-                [key for key in lean_keys if self._resources[key].lean_captures(config_type)]
+                [key for key in lean_keys if verify_twins or self._resources[key].lean_captures(config_type)]
             ))
             for bs in self._batch_sizes(config):
                 for num_tokens in config.get_total_tokens(bs):
@@ -1352,6 +1354,9 @@ class AcceleratorGraphRunner:
                 else None
             )
 
+            # a verify step writes the rows' KV advance into it, in the graph
+            engine_inputs.resident = resident
+
             def run_forward():
                 if resident is not None:
                     planner.gather(resident)
@@ -1572,6 +1577,21 @@ class AcceleratorGraphRunner:
             graph_walk in config.replay_graph_walks
             for config in self._capture_configs
         )
+
+    def captured_buckets(self, graph_walk: str) -> list[BucketKey]:
+        """The buckets of ``graph_walk`` captured with a slot to replay.
+        Captures are agreed across the ranks of an instance
+        (`_buckets_captured_everywhere`), so every rank answers alike."""
+        return [key for key, bucket in self._buckets.items() if key.graph_walk == graph_walk and bucket.slots]
+
+    def token_capacity(self, key: BucketKey) -> int:
+        """The most input tokens a step replaying ``key`` may carry: `select_bucket` scales a
+        step's tokens by its config's multiplier."""
+        return key.num_tokens // self._buckets[key].config.total_tokens_multiplier
+
+    def max_captured_bs(self, graph_walk: str) -> int:
+        """The widest of `captured_buckets`, 0 when none was captured."""
+        return max((key.bs for key in self.captured_buckets(graph_walk)), default=0)
 
     def max_batch_size_for(self, graph_walk: str) -> int | None:
         """Largest batch this walk was captured for, or None for no cap.

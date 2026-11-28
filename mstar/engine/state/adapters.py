@@ -28,6 +28,8 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedCrossAttentionStep,
     cross_label,
 )
+from mstar.engine.resources.draft.config import DraftConfig
+from mstar.engine.resources.draft.drafter import drafter_resources
 from mstar.engine.resources.kv.bounded.config import (
     BoundedKVConfig,
     BoundedKVSpec,
@@ -77,6 +79,7 @@ from mstar.engine.state.contract import (
     Block,
     Causal,
     CausalConv,
+    Draft,
     Entry,
     GatedDeltaNet,
     KVEntry,
@@ -100,19 +103,50 @@ from mstar.engine.state.host_fields import HostFields, is_host_value
 from mstar.model.components.diffusion.attention import FrameSDPA, joint_attention, sdpa_attention
 
 if TYPE_CHECKING:
+    from mstar.engine.resources.draft.drafter import VerifyNode
     from mstar.engine.state.state_op import StateOp
     from mstar.model.base import LabelLayout, Model
 
 
 def node_resources(model: "Model", *, setup: "StateSetup | None" = None) -> list[NodeResourceSpec]:
-    """The specs ``model`` declares through `declare_state`, then the ones it writes by hand."""
+    """The specs ``model`` declares through `declare_state`, then the ones it writes by hand, then each `Draft`'s
+    drafter joined to them as the draft package joins one (`drafter_resources`)."""
     declarations = model.declare_state()
     setup = _with_walks(model, declarations, setup or StateSetup())
     specs = build_specs(
         declarations, kernel_settings=model.kernel_settings(), setup=setup,
         combined_walks=model.get_combined_graph_walks(),
     )
-    return specs + list(model.get_node_resources() or [])
+    specs += list(model.get_node_resources() or [])
+    for draft in (declared for declared in declarations if isinstance(declared, Draft)):
+        specs = drafter_resources(specs, model.drafter(draft), set(draft.nodes), draft_config(draft))
+    return specs
+
+
+def draft_config(draft: Draft) -> DraftConfig:
+    """``draft``'s settings as the draft package's `DraftConfig`, checked as a serving config's draft block is."""
+    return DraftConfig.parse(
+        {"method": draft.method, "model": draft.model, "num_draft_tokens": draft.num_draft_tokens, "mode": draft.mode},
+    )
+
+
+def verify_node(draft: Draft, declarations: Sequence[Any], decl: Any, **node_fields: Any) -> "VerifyNode":
+    """The draft package's `VerifyNode` for ``draft`` and its drafter's declaration ``decl`` (`Model.drafter`), the
+    target's `ModelGeometry` read off ``draft`` and ``declarations``. ``node_fields`` are what the node's class
+    declares (its ``token_stop``, ``device_loopback``)."""
+    from mstar.engine.resources.draft.drafter import ModelGeometry, VerifyNode
+
+    by_name = {declared.name: declared for declared in declarations}
+    heads, head_dim = _kv_shape(by_name[draft.array])
+    target = ModelGeometry(
+        num_layers=draft.num_layers, num_kv_heads=heads, head_dim=head_dim, hidden_size=draft.hidden_size,
+        vocab_size=by_name[draft.sampler].vocab_size, dtype=draft.dtype,
+    )
+    return VerifyNode(
+        next(iter(draft.nodes)), draft.walk, draft_config(draft), decl.needs, input_kinds=draft.input_kinds,
+        target=target, checkpoint=draft.checkpoint, prefill_steps=decl.prefill_steps(),
+        verify_steps=decl.verify_steps(), mixed_walk=draft.mixed_walk, **node_fields,
+    )
 
 
 def _with_walks(model: "Model", declarations: Sequence[Array | Sampler], setup: "StateSetup") -> "StateSetup":
@@ -361,10 +395,12 @@ def node_handles(
         resolved = resolved._replace(walk_reads={
             array.name: _walk_reads(array, resolved.resource_of, combined_walks(array, combined)) for array in by_walk
         })
-    for declared in declarations:
-        if node in declared.nodes and declared.name not in built:
+    # a Draft has no handle: its drafter reaches the node's resources itself
+    held = [declared for declared in declarations if node in declared.nodes and not isinstance(declared, Draft)]
+    for declared in held:
+        if declared.name not in built:
             built[declared.name] = build_handle(declared, resources, resolved, setup)
-    return {declared.name: built[declared.name] for declared in declarations if node in declared.nodes}
+    return {declared.name: built[declared.name] for declared in held}
 
 
 def build_handle(

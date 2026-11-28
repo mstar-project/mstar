@@ -79,6 +79,17 @@ class Histogram:
         counts[bisect_left(self._bounds, value)] += 1
         self._sums[labels] += value
 
+    def observe_n(self, labels: Labels, value: float, n: int) -> None:
+        """``observe(labels, value)`` ``n`` times, in one go."""
+        if n <= 0:
+            return
+        counts = self._counts.get(labels)
+        if counts is None:
+            counts = self._counts[labels] = [0] * (len(self._bounds) + 1)
+            self._sums[labels] = 0.0
+        counts[bisect_left(self._bounds, value)] += n
+        self._sums[labels] += value * n
+
     def snapshot(self) -> MetricSnapshot:
         return MetricSnapshot(
             self.family.name,
