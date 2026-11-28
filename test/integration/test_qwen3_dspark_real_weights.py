@@ -1,4 +1,5 @@
-"""Qwen3-8B with the DSpark drafter, served from real weights (GPU).
+"""Qwen3-8B with each of its drafters, served from real weights (GPU): DSpark, a separate draft model (Qwen3-0.6B, at
+k = 3 and 4) and EAGLE-3. Each test runs against each drafter (the module-scoped ``drafter`` fixture).
 
 Serves configs/qwen3_8b.yaml and variants of each drafter's config (``DRAFTERS``) with
 ``test/e2e``'s server harness, collecting greedy token ids (``return_token_ids``)
@@ -34,14 +35,17 @@ checkpoint and the target's is in a standard Hugging Face cache, and serves with
 cases need two GPUs, the margin rule needs transformers and the screen scipy too.
 
     pytest test/integration/test_qwen3_dspark_real_weights.py -q
+    pytest test/integration/test_qwen3_dspark_real_weights.py -q -k "draft_model"   # one drafter
 """
 from __future__ import annotations
 
 import base64
 import importlib.util
 import json
+import math
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -57,28 +61,53 @@ TARGET = "Qwen/Qwen3-8B"
 
 
 class Drafter(NamedTuple):
-    """A drafter under test: its method, serving config, checkpoint and its own attention binding."""
+    """A drafter under test: its method, serving config, checkpoint, its own attention binding if it has one,
+    and a k other than its config's."""
 
     id: str
     method: str
     config: str
     checkpoint: str
     attn_key: str | None
+    k: int | None = None
 
 
 DRAFTERS = [
     Drafter("dspark", "dspark", "configs/qwen3_8b_dspark.yaml", "deepseek-ai/dspark_qwen3_8b_block7", "dspark_attn"),
+    Drafter("draft_model", "draft_model", "configs/qwen3_8b_draft_model.yaml", "Qwen/Qwen3-0.6B", "draft_model_attn"),
+    Drafter("draft_model_k4", "draft_model", "configs/qwen3_8b_draft_model.yaml", "Qwen/Qwen3-0.6B",
+            "draft_model_attn", k=4),
+    Drafter("eagle3", "eagle3", "configs/qwen3_8b_eagle3.yaml", "RedHatAI/Qwen3-8B-speculator.eagle3", None),
 ]
 MARGIN = 0.25
 PAGE = 16
+# copies of PROMPTS sent at once to outgrow the sampler's loop-back masters, which start at the largest decode
+# capture's rows and, above one rank, take a row per request at ingest. The scaffold's ladder runs to 128, so the
+# crowd runs pin it at 64 (CROWD_BUCKETS) and 80 requests outgrow it.
+CROWD = 10
+CROWD_BUCKETS = "1,2,4,8,16,32,64"
+
+
+def _crowd(drafter: Drafter) -> int:
+    """Copies of PROMPTS that outgrow the masters: a node that runs mixed steps also captures the scaffold's mixed
+    ladder, which nothing pins, so the masters start at its largest rows."""
+    if drafter.method not in ("dspark", "eagle3"):
+        return CROWD
+    from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+
+    return max(CROWD, max(SampledTokenDecoder.MIXED_CAPTURE_BATCH_SIZES) // len(PROMPTS) + 1)
 # the pressure group's rounds, each in its own seeded arrival order
 ROUNDS = 4
-# a pool of 16-token pages too small for 32 requests at once
+# a pool of 16-token pages too small for 32 requests at once: ~190 pages at their peak at k = 3 (prompt pages
+# shared, short replies done early), so 192 was never short for a k = 3 drafter
 PRESSURE_PAGES = 128
 # the drafters whose pressure rounds also run on TP2
-TP2_PRESSURE = ("dspark",)
+TP2_PRESSURE = ("dspark", "eagle3")
 # requests preempted for pages, and those of them dropped (main's `Preemption` counts)
 PREEMPTION_COUNTERS = ("mstar_kv_preemptions_total", "mstar_kv_drops_total")
+# a host pool far below the pages the pressure rounds set aside at their peak (~60), so it fills and requests
+# turn guaranteed: they lend what they haven't written, the verify slack included, and take it back
+LENDING_HOST_PAGES = 16
 
 TOKENS = 128
 
@@ -94,7 +123,8 @@ def _sibling(name: str):
 
 
 fp32_screen = _sibling("fp32_screen")
-# the deficit tripwire is uncalibrated for Qwen3-8B, so the rank tripwire alone
+# the gates as calibrated on a served Qwen3.5 MTP run (#1323); the deficit tripwire is uncalibrated for Qwen3-8B,
+# so the rank tripwire alone
 GATES = fp32_screen.Gates(p_fail=1e-3, trip_rank=5, trip_deficit=None, burst=(3, 16))
 spec_served = _sibling("spec_served")
 _snapshot, _server_module, _totals, _counters, _tau = (
@@ -120,7 +150,8 @@ needs_two = pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two 
 
 @pytest.fixture(scope="module", params=DRAFTERS, ids=lambda d: d.id)
 def drafter(request) -> Drafter:
-    """Every test runs against each drafter; one whose checkpoint isn't fully cached is skipped."""
+    """Every test runs against each drafter in turn (``-k "[eagle3]"`` picks one); one whose checkpoint isn't
+    fully cached is skipped."""
     if not _snapshot(request.param.checkpoint):
         pytest.skip(f"{request.param.checkpoint} is not fully cached")
     return request.param
@@ -131,12 +162,15 @@ def drafter(request) -> Drafter:
 
 def _config(tmp: Path, name: str, drafter: Drafter, *, draft_mode: str | None, verify_backend: str | None = None,
             tp: int = 1,
-            captured: bool = True, max_num_pages: int | None = None, max_batch_tokens: int | None = None) -> Path:
+            captured: bool = True, max_num_pages: int | None = None,
+            max_batch_tokens: int | dict | None = None, cpu_offload_pages: int | None = None) -> Path:
     base = drafter.config if draft_mode else "configs/qwen3_8b.yaml"
     config = yaml.safe_load((REPO / base).read_text())
     resources = config.setdefault("resources", {})
     if draft_mode:
         config["model_kwargs"]["draft"]["mode"] = draft_mode
+        if drafter.k is not None:
+            config["model_kwargs"]["draft"]["num_draft_tokens"] = drafter.k
     if verify_backend:
         resources.update({key: {"verify_backend": verify_backend} for key in ("attn", drafter.attn_key) if key})
     if not captured:
@@ -148,7 +182,8 @@ def _config(tmp: Path, name: str, drafter: Drafter, *, draft_mode: str | None, v
     kv["page_size"] = PAGE
     if max_num_pages:
         # pages run out under load: requests are offloaded and reloaded
-        kv.update(max_num_pages=max_num_pages, cpu_offload_pages=4 * max_num_pages)
+        host = 4 * max_num_pages if cpu_offload_pages is None else cpu_offload_pages
+        kv.update(max_num_pages=max_num_pages, cpu_offload_pages=host)
     if max_batch_tokens is not None:
         config["max_batch_tokens"] = {"LLM": max_batch_tokens}
     if tp > 1:
@@ -159,7 +194,7 @@ def _config(tmp: Path, name: str, drafter: Drafter, *, draft_mode: str | None, v
 
 
 def _serve(tmp_path_factory, name: str, drafter: Drafter, compile_level: int | None = None,
-           debug_asserts: bool = False, **kw):
+           debug_asserts: bool = False, decode_buckets: str | None = None, **kw):
     tmp = tmp_path_factory.mktemp(name)
     server = _server_module()
     command = [
@@ -174,6 +209,8 @@ def _serve(tmp_path_factory, name: str, drafter: Drafter, compile_level: int | N
     if debug_asserts:
         # the KV debug checks: page trails across ranks, offload/reload fingerprints, preemption victims
         env["MSTAR_KV_DEBUG_ASSERTS"] = "1"
+    if decode_buckets is not None:
+        env["MSTAR_DECODE_BUCKETS"] = decode_buckets
     return server.Server(REPO, tmp / "config.yaml", tmp / "server.log", command=command, env=env)
 
 
@@ -209,11 +246,53 @@ def _all_at_once(url: str, prompts: list[str], sampled: bool = False) -> list[li
         return list(pool.map(lambda p: _ids(url, p, sampled), prompts))
 
 
+# seconds between staggered arrivals: a few verify steps, so each prompt lands while earlier replies decode
+STAGGER = 0.15
+
+
+def _staggered(url: str, prompts: list[str]) -> list[list[int]]:
+    """The prompts sent one every ``STAGGER`` seconds, each while the earlier ones still decode: a
+    synchronous node that runs mixed prompt-plus-verify steps takes them inside its verify steps."""
+    with ThreadPoolExecutor(len(prompts)) as pool:
+        futures = []
+        for prompt in prompts:
+            futures.append(pool.submit(_ids, url, prompt))
+            time.sleep(STAGGER)
+        return [future.result() for future in futures]
+
+
+def _walk_steps(url: str) -> dict[str, float]:
+    """The LLM node's steps by walk so far (`mstar_step_seconds`' counts), once the reports settle."""
+    pattern = re.compile(r'^mstar_step_seconds_count{([^}]*)} ([0-9.e+]+)$', re.M)
+    last = None
+    for _ in range(20):
+        steps: dict[str, float] = {}
+        for labels, value in pattern.findall(requests.get(url + "/metrics", timeout=30).text):
+            fields = dict(re.findall(r'(\w+)="([^"]*)"', labels))
+            if fields.get("component") == "LLM":
+                steps[fields["graph_walk"]] = steps.get(fields["graph_walk"], 0.0) + float(value)
+        if steps == last:
+            return steps
+        last = steps
+        time.sleep(1.5)
+    return last
+
+
 RUNS: dict[str, dict] = {}
 
 
+def _gauge_peak(url: str, name: str, stop: threading.Event, peak: list[float]) -> None:
+    """The highest total of gauge ``name`` at ``/metrics``, polled until ``stop``."""
+    while not stop.wait(0.5):
+        try:
+            text = requests.get(url + "/metrics", timeout=30).text
+        except requests.RequestException:
+            continue
+        peak[0] = max(peak[0], sum(float(v) for v in re.findall(rf"^{name}(?:{{[^}}]*}})? ([0-9.e+]+)$", text, re.M)))
+
+
 def _run(tmp_path_factory, drafter: Drafter, name: str, *, sampled_too: bool = False, repeat: bool = False,
-         pressure: bool = False, **kw) -> dict:
+         pressure: bool = False, crowd: int = 0, staggered: bool = False, lending: bool = False, **kw) -> dict:
     """Serve ``name`` once and keep what every test reads of it."""
     # a plain run is every drafter's baseline; a speculative one is its drafter's
     name = f"{drafter.id}_{name}" if kw.get("draft_mode") else name
@@ -223,10 +302,45 @@ def _run(tmp_path_factory, drafter: Drafter, name: str, *, sampled_too: bool = F
     server = _serve(tmp_path_factory, name, drafter, **kw)
     with server as url:
         speculative = bool(kw.get("draft_mode"))
-        if pressure:
+        if staggered:
+            # staggered arrivals, then the same again, each now a prefix-cache hit; the steps each walk ran, and
+            # the prompt tokens computed (looked up less held)
+            before, start = _walk_steps(url), _counters(url, wait=False)
+            looked = _totals(url, "mstar_prefix_cache_query_tokens_total", "mstar_prefix_cache_hit_tokens_total")
+            run["staggered"] = _staggered(url, PROMPTS)
+            run["tau"] = _tau(start, _counters(url))
+            (hits,) = _totals(url, "mstar_prefix_cache_hit_tokens_total")
+            run["cached"] = _staggered(url, PROMPTS)
+            run["hit_tokens"] = _totals(url, "mstar_prefix_cache_hit_tokens_total")[0] - hits
+            after = _walk_steps(url)
+            run["steps"] = {walk: after[walk] - before.get(walk, 0.0) for walk in after}
+            queried, held = _totals(url, "mstar_prefix_cache_query_tokens_total", "mstar_prefix_cache_hit_tokens_total")
+            run["computed_tokens"] = (queried - looked[0]) - (held - looked[1])
+        elif crowd:
+            # ``crowd`` copies of PROMPTS at once, and whether the sampler's loop-back masters grew meanwhile
+            start = _counters(url, wait=False)
+            run["concurrent"] = _all_at_once(url, PROMPTS * crowd)
+            run["tau"] = _tau(start, _counters(url))
+            run["masters_grew"] = Path(server.log_path).read_text().count("sampler masters grew")
+        elif pressure:
             start = _counters(url, wait=False) if speculative else None
             moved = _totals(url, *PREEMPTION_COUNTERS)
-            run["rounds"] = fp32_screen.rounds(_reply, url, name, PROMPTS, 4, ROUNDS)
+            if lending:
+                # the pool's take-backs, and the most pages lent and borrowed at once: a gauge the workers report
+                # each second, so a borrow shorter than that can come and go between two reports
+                (take_backs,) = _totals(url, "mstar_kv_take_backs_total")
+                stop, peak = threading.Event(), [0.0]
+                poller = threading.Thread(target=_gauge_peak, args=(url, "mstar_kv_pages_lent", stop, peak))
+                poller.start()
+            try:
+                run["rounds"] = fp32_screen.rounds(_reply, url, name, PROMPTS, 4, ROUNDS)
+            finally:
+                if lending:
+                    stop.set()
+                    poller.join()
+            if lending:
+                run["lent_peak"] = peak[0]
+                run["take_backs"] = _totals(url, "mstar_kv_take_backs_total")[0] - take_backs
             if speculative:
                 run["tau"] = _tau(start, _counters(url))
             # the requests preempted for pages (`Preemption`), and those dropped rather than moved to the host;
@@ -406,6 +520,83 @@ def test_prompts_prefilled_in_chunks_reply_and_draft_as_whole_ones(tmp_path_fact
     assert chunked["tau"] == pytest.approx(whole["tau"], rel=0.1)
 
 
+def _block(drafter: Drafter) -> int:
+    if drafter.k is not None:
+        return drafter.k + 1
+    config = yaml.safe_load((REPO / drafter.config).read_text())
+    return config["model_kwargs"]["draft"]["num_draft_tokens"] + 1
+
+
+def test_synchronous_arrivals_ride_in_mixed_steps_and_reply_plain_greedy(tmp_path_factory, drafter, margin_of):
+    """A synchronous node runs staggered arrivals inside its verify steps (mixed prompt-plus-verify steps,
+    `VerifyNode.mixed_walk`), cold and as prefix-cache hits: the replies hold to plain greedy and the
+    acceptance to the asynchronous node's. Under a mixed-step budget that leaves a prompt a page a step past
+    the verify rows' blocks (the combined walk's budget, which its prompt walk's steps run under too), each
+    prompt is chunked across steps, mixed ones among them. A draft model lags its target and declares no
+    mixed walk (`test_qwen3_mixed`), so it has no case here."""
+    from mstar.model.keys import MIXED, PREFILL_TEXT
+
+    if drafter.method not in ("dspark", "eagle3"):
+        pytest.skip(f"a {drafter.method} node declares no mixed walk")
+    plain = _run(tmp_path_factory, drafter, "plain", draft_mode=None)
+    async_ = _run(tmp_path_factory, drafter, "async", draft_mode="asynchronous", repeat=True, sampled_too=True)
+    chunks = {MIXED: _block(drafter) * len(PROMPTS) + PAGE}
+    for name, budget in (("sync_staggered", None), ("sync_staggered_chunked", chunks)):
+        run = _run(tmp_path_factory, drafter, name, draft_mode="synchronous", staggered=True, max_batch_tokens=budget)
+        _check_margins(plain["sequential"], run["staggered"], margin_of, f"{name} staggered")
+        _check_margins(plain["sequential"], run["cached"], margin_of, f"{name} cached")
+        assert run["hit_tokens"] > 0, "the cached round hit no page"
+        assert run["steps"].get(MIXED, 0) > 0, run["steps"]
+        assert run["tau"] == pytest.approx(async_["tau_concurrent"], rel=0.1)
+        if budget is not None:
+            # no step carries more prompt tokens than the budget, however the arrivals share steps; how many a
+            # prompt gets past the verify rows' blocks depends on how many rows decode when it arrives
+            prompt_steps = run["steps"].get(MIXED, 0) + run["steps"].get(PREFILL_TEXT, 0)
+            least = math.ceil(run["computed_tokens"] / budget[MIXED])
+            assert run["computed_tokens"] > 0 and prompt_steps >= least, (run["steps"], run["computed_tokens"])
+
+
+def test_asynchronous_arrivals_ride_in_mixed_steps_and_reply_plain_greedy(tmp_path_factory, drafter, margin_of):
+    """An asynchronous node runs staggered arrivals inside its verify steps too: the mixed step's verify rows on
+    the resident tables, its prompt rows on the host plan (`ResidentPlanner.mixed_walks`), the worker
+    speculating prompt rows into a verify chain. Cold and as prefix-cache hits the replies hold to plain
+    greedy, mixed steps ran, and acceptance holds to the node's at once."""
+    from mstar.model.keys import MIXED
+
+    if drafter.method not in ("dspark", "eagle3"):
+        pytest.skip(f"a {drafter.method} node declares no mixed walk")
+    plain = _run(tmp_path_factory, drafter, "plain", draft_mode=None)
+    async_ = _run(tmp_path_factory, drafter, "async", draft_mode="asynchronous", repeat=True, sampled_too=True)
+    run = _run(tmp_path_factory, drafter, "async_staggered", draft_mode="asynchronous", staggered=True)
+    _check_margins(plain["sequential"], run["staggered"], margin_of, "async staggered")
+    _check_margins(plain["sequential"], run["cached"], margin_of, "async cached")
+    assert run["hit_tokens"] > 0, "the cached round hit no page"
+    assert run["steps"].get(MIXED, 0) > 0, run["steps"]
+    assert run["tau"] == pytest.approx(async_["tau_concurrent"], rel=0.1)
+
+
+@needs_two
+def test_tp2_asynchronous_arrivals_ride_in_mixed_steps(tmp_path_factory, drafter, fp32):
+    """The same on a TP2 node: every rank takes the mixed step the scheduler broadcast, its verify rows on each
+    rank's own tables, and the replies pass the fp32 screen against plain, with mixed steps run and acceptance
+    within 10% of one GPU's."""
+    from mstar.model.keys import MIXED
+
+    if drafter.id not in TP2_PRESSURE:
+        pytest.skip(f"the TP2 mixed rounds run for {', '.join(TP2_PRESSURE)}")
+    plain = _run(tmp_path_factory, drafter, "plain", draft_mode=None)
+    one = _run(tmp_path_factory, drafter, "async_staggered", draft_mode="asynchronous", staggered=True)
+    tp = _run(tmp_path_factory, drafter, "tp2_async_staggered", draft_mode="asynchronous", tp=2, staggered=True)
+    assert tp["steps"].get(MIXED, 0) > 0, tp["steps"]
+    try:
+        failed = fp32_screen.screen(f"{drafter.id} tp2 async staggered", [
+            (_pairs(plain["sequential"], tp["staggered"], "staggered"), None, None),
+            (_pairs(plain["sequential"], tp["cached"], "cached"), None, None)], fp32, GATES)
+    finally:
+        fp32.release()
+    assert not failed, "\n".join(failed)
+    assert tp["tau"] == pytest.approx(one["tau"], rel=0.1), (tp["tau"], one["tau"])
+
 def test_a_repeated_prompt_hits_the_prefix_cache_and_drafts_as_well(tmp_path_factory, drafter, margin_of):
     """The repeat's prompt pages come from the cache, the drafter's KV layers with
     them: the hit counter grows, and the replies and acceptance hold."""
@@ -443,6 +634,23 @@ def test_tp2_kv_pressure_offloads_and_completes(tmp_path_factory, drafter, fp32)
     _check_pressure(f"{drafter.id} tp2 pressure", plain, run, fp32)
 
 
+def test_kv_pressure_with_a_small_host_lends_and_takes_back(tmp_path_factory, drafter, fp32):
+    """The pressure rounds with a host pool too small to take every request it would move (``LENDING_HOST_PAGES``):
+    requests turn guaranteed and lend what they haven't written of their reservations, the verify slack included,
+    and preemptible requests borrow it. A guaranteed request whose grant runs short takes the pages back by moving
+    a borrower. Pages are lent and taken back, nothing is dropped, and the replies pass the fp32 screen against
+    plain under the same pressure."""
+    if drafter.id != "dspark":
+        pytest.skip("the lending rounds run for DSpark")
+    pages = dict(max_num_pages=PRESSURE_PAGES, cpu_offload_pages=LENDING_HOST_PAGES, pressure=True, lending=True)
+    plain = _run(tmp_path_factory, drafter, "plain_lending", draft_mode=None, **pages)
+    run = _run(tmp_path_factory, drafter, "async_lending", draft_mode="asynchronous", **pages)
+    print(f"{drafter.id} lending: peak pages lent {run['lent_peak']:.0f}, take-backs {run['take_backs']:.0f}")
+    # each take-back moves a request that borrowed pages a guaranteed one lent, so it counts lending too
+    assert run["take_backs"] > 0, "no guaranteed request took back a page it lent"
+    _check_pressure(f"{drafter.id} lending", plain, run, fp32)
+
+
 def _check_pressure(label: str, plain: dict, run: dict, fp32) -> None:
     """A pressure run's checks against plain's under the same pressure: requests were preempted, none dropped,
     some reloaded; the fp32 screen; and acceptance."""
@@ -462,6 +670,23 @@ def _check_pressure(label: str, plain: dict, run: dict, fp32) -> None:
     assert run["tau"] > 2.0
 
 
+@needs_two
+def test_tp2_drafts_as_well_while_the_loopback_masters_grow(tmp_path_factory, drafter):
+    """Copies of the prompts at once on a TP2 node (`_crowd`), where each request takes a row of the sampler's
+    loop-back masters at ingest: they outgrow the rows the masters start with (decode captures pinned at 64 rows,
+    ``CROWD_BUCKETS``, and a mixed walk's ladder), so the masters grow into new tensors mid-run (the log says so).
+    A captured verify step that read a carry off a master would read the old tensor from then on; one that reads
+    its staged rows drafts as well as one GPU under the same load (tau within 10%)."""
+    crowd = _crowd(drafter)
+    tp = _run(tmp_path_factory, drafter, "tp2_crowd", draft_mode="asynchronous", tp=2, crowd=crowd,
+              decode_buckets=CROWD_BUCKETS)
+    one = _run(tmp_path_factory, drafter, "crowd", draft_mode="asynchronous", crowd=crowd, decode_buckets=CROWD_BUCKETS)
+    print(f"{drafter.id} crowd: tau tp2 {tp['tau']:.3f} vs one GPU {one['tau']:.3f}; masters grew "
+          f"{tp['masters_grew']} times on TP2")
+    assert tp["masters_grew"] > 0, "the sampler's masters never grew"
+    assert tp["tau"] == pytest.approx(one["tau"], rel=0.1), (tp["tau"], one["tau"])
+
+
 def _pairs(plain: list[list[int]], other: list[list[int]], label: str) -> list:
     """The screen's pairs of two runs' replies to PROMPTS, one at a time or at once (ids only)."""
     return [fp32_screen.Pair(PROMPTS[i % len(PROMPTS)], False, {"ids": a, "rid": None, "chunks": []},
@@ -471,9 +696,11 @@ def _pairs(plain: list[list[int]], other: list[list[int]], label: str) -> list:
 
 @needs_two
 def test_tp2_verifies_as_one_gpu_does(tmp_path_factory, drafter, fp32):
-    """On a TP2 node, at compile level 0, synchronous and asynchronous verify agree exactly one request at a time
-    (level 0 for near-ties, as on one GPU: a hypothesis, not measured on TP2). At the default level, both pass the
-    fp32 screen against plain one request at a time and at once, and acceptance is within 10% of one GPU."""
+    """Each drafter on a TP2 node, a carrying one reading its carry from rows the sampler stages off its
+    loop-back masters (which grow above one rank): at compile level 0, synchronous and asynchronous verify agree
+    exactly one request at a time (level 0 for near-ties, as on one GPU: a hypothesis, not measured on TP2). At the
+    default level, both pass the fp32 screen against plain one request at a time and at once, and acceptance is
+    within 10% of one GPU (a drafter broken only under TP still verifies exactly, at tau near 1)."""
     exact_sync = _run(tmp_path_factory, drafter, "tp2_sync_o0", draft_mode="synchronous", tp=2, compile_level=0)
     exact_async = _run(tmp_path_factory, drafter, "tp2_async_o0", draft_mode="asynchronous", tp=2, compile_level=0)
     assert exact_sync["sequential"] == exact_async["sequential"]

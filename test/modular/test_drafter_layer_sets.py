@@ -6,6 +6,8 @@ prefix identity.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from qwen3_cpu import draft_block, engine, make_model, patch_cpu, write_checkpoints
@@ -124,6 +126,37 @@ def test_drafter_resources_needs_the_paged_pool_it_names():
     paged = KVSpec(resource_key="kv", nodes={"LLM"}, config=_pool())
     (out,) = drafter_resources([paged], _Decl(), {"LLM"}, config)
     assert out.config.layer_sets["draft"] == (3, 1)
+
+
+def test_a_drafter_reading_each_rows_following_token_names_the_pools_pages_a_page_ahead():
+    """`ChunkBoundary.FOLLOWING`: the drafter's K/V at a page's last slot reads the next page's first token, so
+    the prefix index names each page by the next page's key (`PagedKVConfig.names_ahead`). A recurrent pool's
+    snapshots, keyed by page, don't follow that naming: refused."""
+    from mstar.engine.resources.draft.config import DraftConfig
+    from mstar.engine.resources.draft.drafter import ChunkBoundary
+    from mstar.engine.resources.recurrent.config import (
+        RecurrentBlockConfig,
+        RecurrentStateConfig,
+        RecurrentStateSpec,
+    )
+
+    def decl(boundary):
+        return SimpleNamespace(
+            needs=DrafterNeeds(kv=KVLayerSet("kv", "draft", 1, 2, 16), chunk_boundary=boundary),
+            node_resources=lambda nodes: [],
+        )
+
+    config = DraftConfig.parse({"method": "dspark", "model": "m", "num_draft_tokens": 3})
+    for boundary, ahead in ((ChunkBoundary.FOLLOWING, 1), (ChunkBoundary.NONE, 0)):
+        paged = KVSpec(resource_key="kv", nodes={"LLM"}, config=_pool())
+        (out,) = drafter_resources([paged], decl(boundary), {"LLM"}, config)
+        assert out.config.names_ahead == ahead
+    pool = RecurrentStateSpec(resource_key="state", nodes={"LLM"}, config=RecurrentStateConfig(
+        num_layers=1, blocks={"state": RecurrentBlockConfig(shape=(3,), dtype=None)}, prefix_slots=1, kv_cache="kv",
+    ))
+    paged = KVSpec(resource_key="kv", nodes={"LLM"}, config=_pool())
+    with pytest.raises(ValueError, match="recurrent pool"):
+        drafter_resources([paged, pool], decl(ChunkBoundary.FOLLOWING), {"LLM"}, config)
 
 
 def test_a_drafter_whose_layers_name_no_layer_set_is_refused_at_load(tmp_path, monkeypatch):

@@ -7,6 +7,7 @@ as the engine runs it (`engine_step`): the node's declaration expanded, then the
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -20,6 +21,7 @@ import yaml
 pytest.importorskip("triton")
 
 from qwen3_cpu import build_submodule, draft_block, make_model, write_checkpoints  # noqa: E402
+from test_drafter_share import DRAFT_MODEL, EAGLE3  # noqa: E402
 
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep  # noqa: E402
 from mstar.engine.resources.draft.drafter import ModelGeometry, VerifyNode, drafter_resources  # noqa: E402
@@ -42,10 +44,21 @@ K = 3
 DSPARK_CONFIG = Path(__file__).parents[2] / "configs" / "qwen3_8b_dspark.yaml"
 
 
-@pytest.fixture
-def model(tmp_path):
+@pytest.fixture(params=["dspark", "eagle3", "draft_model", "draft_model_own_kv"])
+def model(tmp_path, request):
+    """A drafting Qwen3 of each method, its drafter's checkpoint config-only."""
     target, dspark = write_checkpoints(tmp_path)
-    return make_model(target, draft_block(dspark, K))
+    if request.param == "dspark":
+        return make_model(target, draft_block(dspark, K))
+    method = request.param.removesuffix("_own_kv")
+    config = {"draft_model": DRAFT_MODEL, "eagle3": EAGLE3}[method]
+    if request.param.endswith("_own_kv"):
+        # a drafter of another KV geometry than the target's, whose layers get a storage of their own
+        config = {**config, "num_key_value_heads": 1, "head_dim": 8}
+    draft = tmp_path / request.param
+    draft.mkdir()
+    (draft / "config.json").write_text(json.dumps(config))
+    return make_model(target, {"method": method, "model": str(draft), "num_draft_tokens": K})
 
 
 def _reference_specs(model) -> list:
