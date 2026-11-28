@@ -14,6 +14,8 @@ re-noising between steps, then one t=0 pass over the clean chunk to commit its K
 
 from dataclasses import dataclass
 
+from mstar.engine.state import KeptWindow
+
 LINGBOT_VARIANT_1_3B = "1.3b_causal_fast"
 
 LINGBOT_HF_REPOS = {
@@ -93,10 +95,50 @@ class LingBotWorldConfig:
     # (-O2), but each server process picks its own kernels, so one seed gives
     # a different rollout per process. No effect under reference_numerics.
     dit_compile_autotune: bool = False
+    # Add each chunk's x0 latents, float frames and I2V condition to its outputs (``CHUNK_OUTPUTS``), for the parity
+    # harnesses.
+    keep_chunk_outputs: bool = False
 
     @property
     def head_dim(self) -> int:
         return self.dim // self.num_heads
+
+    def frame_tokens(self, lat_h: int, lat_w: int) -> int:
+        """A latent frame's tokens at a ``lat_h`` by ``lat_w`` latent: one per DiT patch."""
+        return lat_h * lat_w // (self.patch_size[1] * self.patch_size[2])
+
+    @property
+    def max_frame_tokens(self) -> int:
+        """The most tokens a frame has at any aspect: ``max_area`` holds that many DiT patches of pixels."""
+        return self.max_area // (self.vae_stride[1] * self.vae_stride[2] * self.patch_size[1] * self.patch_size[2])
+
+    def kept_window(self, frame_tokens: int) -> KeptWindow:
+        """What a chunk's queries attend before its own frames, at ``frame_tokens`` a frame: the sink, then the latest
+        frames up to ``local_attn_size``. Without a window, every frame of the longest rollout."""
+        if self.local_attn_size == -1:
+            return KeptWindow(0, window=self.max_chunks * self.chunk_size * frame_tokens)
+        frames = self.local_attn_size - self.sink_size - self.chunk_size
+        if frames < 1:
+            raise ValueError(
+                f"LingBotWorldConfig.local_attn_size is {self.local_attn_size}, and the sink's {self.sink_size} frames "
+                f"and a chunk's {self.chunk_size} leave its window no frame; make it at least "
+                f"{self.sink_size + self.chunk_size + 1}, or -1 to attend every frame")
+        return KeptWindow(self.sink_size * frame_tokens, window=frames * frame_tokens)
+
+    def window_tokens(self, frame_tokens: int) -> int:
+        """The tokens a layer a rollout at ``frame_tokens`` a frame keeps in the rolling store: its sink, its window and
+        the chunk a step adds, which the store sizes each request by from its layout and the model can't import."""
+        kept = self.kept_window(frame_tokens)
+        return kept.sink + kept.window + self.chunk_size * frame_tokens
+
+    def largest_latent(self) -> dict[str, int]:
+        """The sizes of the request whose VAE caches take the most bytes: every cache scales with the latent's area,
+        and ``max_area`` holds that many latent pixels at any aspect."""
+        return {"lat_h": 1, "lat_w": self.max_area // (self.vae_stride[1] * self.vae_stride[2])}
+
+    def max_rollout_tokens(self) -> int:
+        """The self-attention entries of the longest rollout at the largest area."""
+        return self.max_chunks * self.chunk_size * self.max_frame_tokens
 
 
 def lingbot_world_1_3b() -> LingBotWorldConfig:

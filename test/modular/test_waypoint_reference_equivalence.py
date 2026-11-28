@@ -51,21 +51,15 @@ from torch.nn.attention.flex_attention import BlockMask
 
 sys.path.insert(0, ".")
 
-from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.attn.config import (
-    AttentionConfig,
-    AttentionSpec,
-    AttentionStep,
-    AttnBackend,
-)
 from mstar.engine.resources.attn.flex import _MASK_MOD, flex_attention_masked
-from mstar.engine.resources.base import EngineResourceInfo
-from mstar.engine.resources.kv.config import KVSpec, RingKVConfig, RingKVLayerConfig, RingKVStep
-from mstar.engine.resources.kv.ring import RingKVManager
-from mstar.engine.resources.step import StepContext
+from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
+from mstar.engine.state import ArrayStep
+from mstar.engine.state.adapters import node_handles, node_resources, state_steps
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.waypoint.components.layers import bf16_roundtrip
 from mstar.model.waypoint.config import waypoint_1_5_1b_720p
+from mstar.model.waypoint.waypoint_model import WaypointModel
 from mstar.model.waypoint.weight_loader import build_waypoint_dit
 
 _ROOT = Path("/mnt/storage/garv901/waypoint-1.5-1B")
@@ -213,44 +207,23 @@ def _build_port(config, checkpoint: Path = CHECKPOINT, *, num_sessions: int = 1)
     second resident session to run two rows in one DiT call.
     """
     dit = build_waypoint_dit(config, str(checkpoint), device=DEVICE)
-    spec = KVSpec(
-        resource_key="kv",
-        nodes={"dit"},
-        config=RingKVConfig(
-            num_layers=config.n_layers,
-            num_kv_heads=config.n_kv_heads,
-            head_dim=config.d_head,
-            num_qo_heads=config.n_heads,
-            tokens_per_frame=config.tokens_per_frame,
-            num_sessions=num_sessions,
-            layers=tuple(
-                RingKVLayerConfig(
-                    ring_frames=config.ring_frames(i),
-                    ring_buckets=config.ring_buckets(i),
-                    pinned_dilation=config.pinned_dilation(i),
-                )
-                for i in range(config.n_layers)
-            ),
-        ),
-    )
-    info = EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE)
-    kv = RingKVManager.build(spec, info)
-    attn = AttentionManager.build(
-        AttentionSpec(
-            resource_key="attn",
-            nodes={"dit"},
-            config=AttentionConfig(kv_cache="kv", backend=AttnBackend.FLEX),
-        ),
-        EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE, dependencies={"kv": spec}),
-    )
-    _DitNode(dit).bind_node_resources({"kv": kv, "attn": attn})
+    model = WaypointModel(skip_weight_loading=True)
+    model.config = config
+    ring, flex, decoder = node_resources(model)
+    ring.apply_yaml_overrides(num_sessions=num_sessions)
+    info = EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE, dependencies={"kv": ring})
+    resources = {spec.resource_key: build_resource(spec, info) for spec in (ring, flex, decoder)}
+    handles = node_handles(model, "dit", resources)
+    _DitNode(dit).bind_node_state(handles)
     assert not dit._regions_compiled
     return {
         "config": config,
         "dit": dit,
-        "kv": kv,
-        "attn": attn,
+        "kv": resources["kv"],
+        "attn": resources[flex.resource_key],
+        "state": handles["kv"],
         "rid": None,
+        "step": None,
         "seq": 0,
     }
 
@@ -362,7 +335,7 @@ def _port_frame(port, noise, ctx, frame_pos: int):
     outputs = []
     dit = port["dit"]
     handle = dit.register_forward_hook(lambda mod, inputs, output: outputs.append(output.clone()))
-    _admit(port, frame_pos)
+    _admit(port)
     try:
         with torch.inference_mode():
             x0 = dit.generate_frame(
@@ -374,15 +347,18 @@ def _port_frame(port, noise, ctx, frame_pos: int):
             )
     finally:
         handle.remove()
-    _commit(port, frame_pos)
+    _commit(port)
     return x0, outputs
 
 
 def _new_request(port) -> None:
-    """A fresh request id per test. The manager enforces ``frame == last + 1``, so a
-    test that replays frame 0 or starts at frame 21 needs its own clock; the old
-    request has to hand its world back first."""
+    """A fresh request id per test. The ring counts each request's frames, so a
+    test that replays frame 0 needs its own count; the old request has to hand
+    its world back first, and close the step of a test that never committed it."""
     kv = port["kv"]
+    if port["step"] is not None:
+        port["step"].end_calls()
+        port["step"] = None
     if port["rid"] is not None:
         kv.reset_request(port["rid"], free=True)
         kv.remove_request(port["rid"])
@@ -391,50 +367,40 @@ def _new_request(port) -> None:
     kv.ingest_request(port["rid"])
 
 
-def _step_and_context(port, frame: int):
-    rid = port["rid"]
-    return (
-        RingKVStep(frames=((rid, frame),)),
-        StepContext(request_ids=(rid,), graph_walk="rollout", slot=0, capture=False),
+def _step(port, rids: tuple[str, ...]) -> SubmoduleStep:
+    """One frame for each of ``rids``, in the row order a batched forward's inputs
+    use, expanded as the engine expands the dit's step. Only the batching test
+    below drives more than one row per step."""
+    segments = [Segment(rid, "main", port["config"].tokens_per_frame) for rid in rids]
+    step = state_steps(
+        SubmoduleStep(segments=segments, state={"kv": ArrayStep()}), {"kv": port["state"]}, graph_walk="rollout",
     )
+    step.set_ctx(StepContext(request_ids=rids, graph_walk="rollout", slot=0, capture=False))
+    return step
 
 
-def _admit(port, frame: int) -> None:
-    """Stage the fixed-address world index and local/global attention masks."""
-    step, context = _step_and_context(port, frame)
-    outcome = port["kv"].admit(step, context)
-    assert outcome.ok, f"refused at frame {frame}: {outcome.reason}"
-    context.plan_results["kv"] = port["kv"].plan(step, context)
-    port["attn"].plan(AttentionStep(), context)
-    assert not port["attn"].needs_token_visibility
+def _admit(port) -> None:
+    """Stage the fixed-address world index and local/global attention masks, and
+    open the step's calls."""
+    _admit_batch(port, (port["rid"],))
 
 
-def _commit(port, frame: int) -> None:
-    port["kv"].commit(*_step_and_context(port, frame))
+def _commit(port) -> None:
+    step = port["step"]
+    step.check_calls()
+    port["kv"].commit(step.steps["kv"], step.ctx)
+    step.end_calls()
+    port["step"] = None
 
 
-def _batch_step_and_context(frames: list[tuple[str, int]]):
-    """``_step_and_context``'s multi-row form: one step naming every ``(rid,
-    frame)`` pair, in the row order a batched forward's inputs use. Only the
-    batching test below drives more than one row per step."""
-    rids = tuple(rid for rid, _ in frames)
-    return (
-        RingKVStep(frames=tuple(frames)),
-        StepContext(request_ids=rids, graph_walk="rollout", slot=0, capture=False),
-    )
-
-
-def _admit_batch(port, frames: list[tuple[str, int]]) -> None:
-    step, context = _batch_step_and_context(frames)
-    outcome = port["kv"].admit(step, context)
-    assert outcome.ok, f"batch {frames} refused: {outcome.reason}"
-    context.plan_results["kv"] = port["kv"].plan(step, context)
-    port["attn"].plan(AttentionStep(), context)
-    assert not port["attn"].needs_token_visibility
-
-
-def _commit_batch(port, frames: list[tuple[str, int]]) -> None:
-    port["kv"].commit(*_batch_step_and_context(frames))
+def _admit_batch(port, rids: tuple[str, ...]) -> None:
+    step = _step(port, rids)
+    outcome = port["kv"].admit(step.steps["kv"], step.ctx)
+    assert outcome.ok, f"{rids} refused: {outcome.reason}"
+    step.ctx.plan_results["kv"] = port["kv"].plan(step.steps["kv"], step.ctx)
+    port["attn"].plan(step.steps[port["state"].flex_key], step.ctx)
+    step.begin_calls()
+    port["step"] = step
 
 
 # ---------------------------------------------------------------------------
@@ -695,7 +661,7 @@ def test_the_cond_head_cache_matches_the_live_projection(ports, oracle):
     x = frame["latent"].to(DEVICE)
 
     _new_request(port)
-    _admit(port, 0)
+    _admit(port)
     cached_out = _port_forward(port, x, 1.0, ctx, 0, commit=False)
 
     caches = [block.cond_head._cache for block in dit.blocks]
@@ -726,10 +692,10 @@ def test_one_forward_matches_the_reference_on_an_empty_ring(ports, reference, or
     with _stage_capture(_stage_modules(reference["model"], is_port=False), reference_stages):
         reference_out = _reference_forward(reference, x, 0.0, ctx, commit=True)
     port_stages: dict[str, torch.Tensor] = {}
-    _admit(port, 0)
+    _admit(port)
     with _stage_capture(_stage_modules(port["dit"], is_port=True), port_stages):
         port_out = _port_forward(port, x, 0.0, ctx, 0, commit=True)
-    _commit(port, 0)
+    _commit(port)
 
     names = [name for name, _ in _stage_modules(port["dit"], is_port=True)]
     divergent = _divergent_stages(reference_stages, port_stages, names)
@@ -770,7 +736,7 @@ def test_one_forward_matches_the_reference_on_a_wrapped_ring(ports, reference, o
 
     _load_snapshot(port, reference, oracle, 20)
     reference_out = _reference_forward(reference, x, 1.0, ctx, commit=False)
-    _admit(port, 21)
+    _admit(port)
     port_out = _port_forward(port, x, 1.0, ctx, 21, commit=False)
 
     gap, relative = _deviation(reference_out, port_out)
@@ -803,7 +769,7 @@ def test_every_stage_is_bit_exact_under_reference_compat(ports, reference, oracl
             reference_out = _reference_forward(reference, x, sigma_value, ctx, commit=commit)
 
         port_stages: dict[str, torch.Tensor] = {}
-        _admit(port, 0)
+        _admit(port)
         with _stage_capture(_stage_modules(port["dit"], is_port=True), port_stages):
             port_out = _port_forward(port, x, sigma_value, ctx, 0, commit=commit)
 
@@ -878,14 +844,16 @@ def _load_snapshot(port, reference, oracle, frame_index: int) -> None:
     for layer, saved in zip(reference["kv"].layers, snapshot, strict=True):
         layer.kv.copy_(saved["kv"].to(DEVICE))
         layer.written.copy_(saved["written"].to(DEVICE))
-    # ``_new_request`` above only registers the rid; ``admit`` (called later, by
-    # the caller's own ``_admit``/``_port_frame``) is what actually claims a
-    # session. Slot 0 is the only one it can claim -- these ports are all
-    # ``num_sessions=1`` -- so this hardcodes it exactly as ``_reset`` does.
-    for reference_layer, port_layer in zip(reference["kv"].layers, port["kv"].layers, strict=True):
-        (ref_kv, ref_written), (port_kv, port_written) = _comparable_ring(reference_layer, port_layer, 0)
+    kv, rid = port["kv"], port["rid"]
+    step = _step(port, (rid,))
+    outcome = kv.admit(step.steps["kv"], step.ctx)
+    assert outcome.ok, f"{rid} refused: {outcome.reason}"
+    session = kv.session_of(rid)
+    for reference_layer, port_layer in zip(reference["kv"].layers, kv.layers, strict=True):
+        (ref_kv, ref_written), (port_kv, port_written) = _comparable_ring(reference_layer, port_layer, session)
         port_kv.copy_(ref_kv)
         port_written.copy_(ref_written)
+    kv.load_state(rid, {**kv.get_state(rid), "committed_frames": frame_index + 1})
 
 
 def _rollout(port, reference, oracle, frames: int):
@@ -902,9 +870,9 @@ def _rollout(port, reference, oracle, frames: int):
             # are handed the same latent, so the velocity is what is compared.
             latent = frame["latent"].to(DEVICE)
             left = _reference_forward(reference, latent, 0.0, ctx, commit=True)
-            _admit(port, index)
+            _admit(port)
             right = _port_forward(port, latent, 0.0, ctx, index, commit=True)
-            _commit(port, index)
+            _commit(port)
         else:
             noise = frame["noise_bf16"].to(DEVICE)
             left, _ = _reference_frame(reference, noise, ctx, sigmas)
@@ -1000,8 +968,7 @@ def _roll(port, rows: list[tuple[str, list[dict]]], frames: int) -> dict[str, li
     outputs: dict[str, list[torch.Tensor]] = {rid: [] for rid, _ in rows}
     with torch.inference_mode():
         for j in range(frames):
-            step = [(rid, j) for rid, _ in rows]
-            _admit_batch(port, step)
+            _admit_batch(port, tuple(rid for rid, _ in rows))
             frames_j = [per_frame[j] for _, per_frame in rows]
             ctx_cat = {key: torch.cat([f["ctx"][key] for f in frames_j], dim=0) for key in frames_j[0]["ctx"]}
             if j == 0:
@@ -1016,7 +983,7 @@ def _roll(port, rows: list[tuple[str, list[dict]]], frames: int) -> dict[str, li
                     button=ctx_cat["button"],
                     scroll=ctx_cat["scroll"],
                 )
-            _commit_batch(port, step)
+            _commit(port)
             for i, (rid, _) in enumerate(rows):
                 outputs[rid].append(out[i : i + 1].clone())
     return outputs

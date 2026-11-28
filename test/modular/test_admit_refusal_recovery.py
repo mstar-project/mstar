@@ -18,6 +18,7 @@ Drives the real ``StepPipeline`` over a stub engine and a real
 from __future__ import annotations
 
 from concurrent.futures import Future
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -25,6 +26,7 @@ import pytest
 pytest.importorskip("torch")
 
 from mstar.engine.engine import ExecutingBatch  # noqa: E402
+from mstar.engine.resources.kv.config import RingKVStep  # noqa: E402
 from mstar.engine.resources.step import (  # noqa: E402
     AdmitRuntimeError,
     AllocationFailed,
@@ -246,13 +248,13 @@ def test_a_tp_follower_leaves_the_failure_to_rank_0():
 def _ring_refusal(num_sessions, held, wanted):
     """A real RingKVManager with ``held`` rids holding every session, asked to
     admit ``wanted``: returns the refused (batch, node_batch)."""
-    from test_ring_kv_resource import _ctx, _manager, _open, _ring_config, _step
+    from test_ring_kv_resource import _ctx, _manager, _open, _ring_config
 
     kv = _manager(_ring_config(num_sessions=num_sessions))
     _open(kv, *held)
     for rid in wanted:
         kv.ingest_request(rid)
-    outcome = kv.admit(_step(*wanted), _ctx(*wanted))
+    outcome = kv.admit(RingKVStep(), _ctx(*wanted))
     assert not outcome.ok
     return _refused(list(wanted), outcome.reason)
 
@@ -273,13 +275,13 @@ def test_a_full_ring_pool_holds_the_request_that_waits_and_runs_the_rest():
     assert sorted(w._graph_runtime.pushed) == ["a", "b"]
 
 
-def test_a_ring_clock_skip_fails_only_that_request():
-    from test_ring_kv_resource import _ctx, _drive, _manager, _step
+def test_a_ring_past_its_frames_fails_only_that_request():
+    from test_ring_kv_resource import _ctx, _drive, _manager, _ring_config
 
-    kv = _manager()
+    kv = _manager(replace(_ring_config(), max_frames=1))
     kv.ingest_request("a")
-    _drive(kv, "a", 0)
-    outcome = kv.admit(_step("a", frame=2), _ctx("a"))
+    _drive(kv, "a", 1)
+    outcome = kv.admit(RingKVStep(), _ctx("a"))
     batch, node_batch = _refused(["a"], outcome.reason)
     w = _worker()
 

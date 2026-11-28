@@ -1,0 +1,684 @@
+"""LingBot World declares its state, and the engine builds the pool, the reads and the draws' state from it.
+
+`main` declared LingBot's rolling store and one ragged resource for both pairs, and held the text K/V, the generator,
+the noise and the VAE caches in the submodule's per-request state. Now the dit declares an array whose kept-window read
+reaches the sink and the latest window, which the engine keeps in that rolling store, a text array whose queries are the
+chunk's, and a Value of the draws' state, and a sized Value of the VAE caches. The hand-written specs and
+draws below are `main`'s, copied from the model as it stood before the port.
+"""
+
+from __future__ import annotations
+
+import sys
+import weakref
+from dataclasses import replace
+from types import SimpleNamespace
+
+sys.path.insert(0, ".")
+
+import numpy as np
+import pytest
+import torch
+import torch.nn.functional as F
+
+from mstar.conductor.conductor import Conductor
+from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.resources import RaggedAttentionConfig, cross_label
+from mstar.engine.resources.attn.ragged.config import RaggedCrossAttentionSpec
+from mstar.engine.resources.kv.config import RetentionPolicy, refuse_undeclared_labels
+from mstar.engine.resources.kv.rolling import RollingKVReqConfig, RollingKVSpec
+from mstar.engine.resources.kv.rolling.manager import RollingKVManager
+from mstar.engine.resources.sized import SizedValueSpec
+from mstar.engine.resources.sized.store import SizedValueStore
+from mstar.engine.resources.step import StepContext
+from mstar.engine.state import Bidirectional
+from mstar.engine.state.adapters import StateSetup, build_specs, kv_layouts, node_handles, state_sizes, state_steps
+from mstar.model.base import serving_resources
+from mstar.model.components import wan_vae
+from mstar.model.lingbot_world import submodules
+from mstar.model.lingbot_world.components.dit import LingBotCausalDiT
+from mstar.model.lingbot_world.config import LingBotWorldConfig
+from mstar.model.lingbot_world.lingbot_world_model import REFERENCE_MODEL_KWARGS, LingBotWorldModel
+from mstar.model.lingbot_world.submodules import (
+    DECODER,
+    DIT_KV,
+    ENCODER,
+    PROGRESS,
+    ROLLOUT_LOOP_NAME,
+    ROLLOUT_WALK,
+    SELF_ATTN,
+    STEADY,
+    TEXT,
+    TEXT_ATTN,
+    VAE_CACHES,
+    EncoderStream,
+    LingBotDitSubmodule,
+    vae_cache_entry,
+)
+
+# `main`'s ragged attention over both pairs, and its labels (`submodules.py` at the port's base)
+MAIN_ATTN = RaggedAttentionConfig(num_qo_heads=12, num_kv_heads=12, head_dim=128, dtype=torch.bfloat16)
+MAIN_CHUNK, MAIN_WINDOW, MAIN_TEXT = "chunk", "window", "text"
+
+
+def _model(**kwargs) -> LingBotWorldModel:
+    return LingBotWorldModel(skip_weight_loading=True, **kwargs)
+
+
+def _tiny(**fields) -> LingBotWorldConfig:
+    """Two blocks of two heads, a 2-frame sink and 10 frames attended: a chunk reaches past the window at chunk 2."""
+    return LingBotWorldConfig(**{
+        "dim": 32, "ffn_dim": 64, "num_heads": 2, "num_layers": 2, "freq_dim": 16, "text_dim": 8, "text_len": 8,
+        "rope_max_frames": 64, "local_attn_size": 10, "sink_size": 2, "max_chunks": 8, **fields,
+    })
+
+
+def _main_attended_frames(cfg: LingBotWorldConfig, chunk: int) -> int:
+    """`main`'s ``attended_frames``: the chunk's own frames and what its store kept."""
+    frames = (chunk + 1) * cfg.chunk_size
+    return min(frames, cfg.local_attn_size) if cfg.local_attn_size > -1 else frames
+
+
+class _Sdpa:
+    """A ragged kernel on the CPU: each call attends all of k and v, as a step of one row does, and records it."""
+
+    force_double_buffer = False
+
+    def __init__(self):
+        self.calls, self.steps = [], []
+
+    def plan(self, step, ctx):
+        self.steps.append(step)
+
+    # a kernel, which a compiled block calls behind a break
+    @torch.compiler.disable
+    def run(self, q, k, v, label=None):
+        self.calls.append(SimpleNamespace(label=label, q=q.shape, k=k.shape, dtype=q.dtype, keys=k.clone()))
+        return F.scaled_dot_product_attention(q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)).transpose(0, 1)
+
+
+class _Rollout:
+    """The dit node on the CPU over its declared state: the rolling store, the kept-window read and the text read on
+    SDPA stand-ins for the ragged kernel, the VAE caches' store and the engine's host fields. A chunk runs as the engine
+    steps it."""
+
+    LAT = (4, 4)
+
+    def __init__(self, cfg: LingBotWorldConfig, pool_tokens: int | None = None):
+        self.cfg = cfg
+        model = _model()
+        model.config = cfg
+        self.model = model
+        self.setup = StateSetup()
+        specs = build_specs(model.declare_state(), kernel_settings=model.kernel_settings())
+        self.spec = next(spec for spec in specs if spec.resource_key == DIT_KV)
+        if pool_tokens is not None:
+            self.spec.config.pool_tokens = pool_tokens
+        self.pool = RollingKVManager(self.spec.config, torch.device("cpu"), name=DIT_KV)
+        self.cache_spec = next(spec for spec in specs if spec.resource_key == VAE_CACHES)
+        self.caches = SizedValueStore(self.cache_spec.config, torch.device("cpu"), name=VAE_CACHES)
+        self.window, self.text = _Sdpa(), _Sdpa()
+        # reference numerics build the store alone
+        self.planned = {} if cfg.reference_numerics else {SELF_ATTN: self.window, TEXT_ATTN: self.text}
+        self.handles = node_handles(
+            model, "dit", {DIT_KV: self.pool, VAE_CACHES: self.caches, **self.planned}, setup=self.setup,
+        )
+        torch.manual_seed(0)
+        self.dit = LingBotCausalDiT(cfg).eval()
+        self.sub = LingBotDitSubmodule(None, None, cfg)
+        self.sub.dit = self.dit
+        self.sub.bind_node_state(self.handles)
+        self.chunks: dict[int, int] = {}
+
+    def open(self, rid: int):
+        """Take ``rid`` in, as intake and the engine's queue do: None once the store sets its room aside, else the room
+        it waits on."""
+        (row,) = kv_layouts(self.model.declare_state(), self.model.state_layout(*self.LAT), {})[DIT_KV].values()
+        self.pool.ingest_request(rid, overrides=self.spec.request_config({"kv_layout": {DIT_KV: {"main": row.row()}}}))
+        sizes = state_sizes(self.model.declare_state(), self.model.state_layout(*self.LAT))
+        self.caches.ingest_request(rid, overrides=self.cache_spec.request_config({"state_sizes": sizes}))
+        assert self.caches.reserve(rid, "dit", ROLLOUT_WALK, None) is None
+        self.setup.host_fields.open(rid)
+        self.chunks[rid] = 0
+        self.pool.ask(rid, "dit", ROLLOUT_WALK)
+        return self.pool.reserve(rid, "dit", ROLLOUT_WALK, None)
+
+    def info(self, rid: int, seed: int = 7) -> CurrentForwardPassInfo:
+        info = CurrentForwardPassInfo(
+            request_id=str(rid), graph_walk=ROLLOUT_WALK, fwd_index=0, random_seed=seed, max_tokens=0,
+            step_metadata={"num_latent_frames": self.cfg.max_chunks * self.cfg.chunk_size}, rid_handle=rid,
+        )
+        info.dynamic_loop_iter_counts[ROLLOUT_LOOP_NAME] = self.chunks[rid]
+        return info
+
+    def inputs(self, rid: int):
+        lat_h, lat_w = self.LAT
+        return self.sub.prepare_inputs(ROLLOUT_WALK, self.info(rid), {
+            "image_inputs": [torch.zeros(3, 8 * lat_h, 8 * lat_w)], "text_embeds_pos": [torch.randn(3, 8)],
+            "camera_poses": [torch.zeros(1)], "intrinsics": [torch.zeros(4)],
+        })
+
+    def admit(self, rid: int, inputs):
+        """The chunk's step, admitted and planned, or None where the pool refused it."""
+        step = state_steps(self.sub.declare_step(ROLLOUT_WALK, [rid], [inputs]), self.handles, graph_walk=ROLLOUT_WALK)
+        ctx = StepContext(request_ids=(rid,), graph_walk=ROLLOUT_WALK, slot=0, capture=False)
+        step.set_ctx(ctx)
+        outcome = self.pool.admit(step.steps[DIT_KV], ctx)
+        if not outcome.ok:
+            return outcome
+        self.pool.plan(step.steps[DIT_KV], ctx)
+        for key, resource in self.planned.items():
+            resource.plan(step.steps[key], ctx)
+        return step
+
+    def chunk(self, rid: int) -> list[torch.Tensor]:
+        """One chunk of ``rid``: two denoise passes and the commit pass, then the commits. Returns each pass's flow."""
+        inputs = self.inputs(rid)
+        step = self.admit(rid, inputs)
+        cs, (lat_h, lat_w) = self.cfg.chunk_size, self.LAT
+        generator = torch.Generator().manual_seed(self.chunks[rid])
+        step.begin_calls()
+        with torch.inference_mode():
+            text_kv = self.dit.text_kv(torch.randn(3, 8, generator=generator))
+            conditioning = self.dit.chunk_conditioning(torch.zeros(1, 384, cs, lat_h, lat_w), self.chunks[rid] * cs)
+            y = torch.randn(20, cs, lat_h, lat_w, generator=generator)
+            latent, t = inputs.tensor_inputs["latent"], torch.tensor([500.0])
+            flows = [self.dit(latent, t, text_kv, y, conditioning, keep=keep) for keep in (False, False, True)]
+        step.check_calls()
+        self.pool.commit(step.steps[DIT_KV], step.ctx)
+        step.commit_calls()
+        step.end_calls()
+        self.chunks[rid] += 1
+        return flows
+
+
+# The declaration
+
+
+def test_the_specs_are_main_s_resources_but_three():
+    """`main` built a rolling store and one ragged resource for both pairs. The declaration builds the same store under
+    the same key, of the same size, a ragged resource for the chunk's pair over it, and a second for the text pair, each
+    with `main`'s attention geometry. `main` set each spec's dtype to bf16. Here the specs leave it unset, and the build
+    takes the model's, which is bf16. The fourth is the store of the VAE caches, which `main` kept in the request's
+    state, outside any resource."""
+    model = _model()
+    kv, window, caches, text = serving_resources(model, {"resources": {}})
+    assert isinstance(caches, SizedValueSpec) and (caches.resource_key, caches.nodes) == (VAE_CACHES, {"dit"})
+    assert isinstance(kv, RollingKVSpec) and (kv.resource_key, kv.nodes) == (DIT_KV, {"dit"})
+    assert (kv.config.num_layers, kv.config.num_heads, kv.config.head_dim, kv.config.dtype) == (30, 12, 128, None)
+    assert kv.config.pool_tokens == 64800, "the pool should hold one rollout's window at 720x1280, as main's did"
+    assert isinstance(window, RaggedCrossAttentionSpec) and window.resource_key == SELF_ATTN
+    assert isinstance(text, RaggedCrossAttentionSpec) and text.resource_key == TEXT_ATTN
+    for spec in (window, text):
+        assert spec.nodes == {"dit"}
+        assert spec.config.dtype is None
+        assert replace(spec.config, dtype=MAIN_ATTN.dtype) == MAIN_ATTN, f"{spec.resource_key}: main's geometry"
+    assert model.get_autocast_dtype() is torch.bfloat16
+
+
+def test_neither_node_runs_under_the_model_s_bf16(monkeypatch):
+    """The model's dtype sizes the pool and the kernels. The DiT enters the reference's autocast contexts itself and
+    the text encoder runs as it loads, so each node opts out and keeps `main`'s numerics."""
+    import transformers
+
+    from mstar.engine.node_dtype import resolve_node_dtype
+
+    monkeypatch.setattr(transformers.UMT5EncoderModel, "from_pretrained", lambda *args, **kwargs: torch.nn.Module())
+    model = LingBotWorldModel()
+    text_encoder = model.get_submodule("text_encoder")
+    for node in (text_encoder, LingBotDitSubmodule(None, None, model.config)):
+        assert resolve_node_dtype(node, model.get_autocast_dtype()) is None, type(node).__name__
+
+
+@pytest.mark.parametrize("dtype", ["float16", "float32", None])
+def test_a_config_can_t_change_the_pool_s_dtype(dtype):
+    """A YAML ``autocast_dtype`` sets the pool's dtype, and the DiT writes bf16 K/V into it."""
+    config = {"max_concurrent_requests": 1, "autocast_dtype": "bfloat16"}
+    _model().validate_config_yaml(config, "lingbot.yaml")
+    with pytest.raises(ValueError, match="takes no `autocast_dtype` but bfloat16"):
+        _model().validate_config_yaml({**config, "autocast_dtype": dtype}, "lingbot.yaml")
+
+
+def test_the_reference_numerics_read_with_no_op_and_declare_no_text():
+    """FA2 attends what the read reaches and the step's own text K/V, so the pool and the VAE caches' store are the only
+    resources."""
+    model = _model(**REFERENCE_MODEL_KWARGS)
+    kv, progress, caches = model.declare_state()
+    assert {a.name for a in model.declare_state()} == {DIT_KV, PROGRESS, VAE_CACHES}
+    (read,) = kv.reads.values()
+    assert read.op is None and read.mask == Bidirectional(kept_window=True)
+    assert [spec.resource_key for spec in serving_resources(model, {"resources": {}})] == [DIT_KV, VAE_CACHES]
+
+
+@pytest.mark.parametrize(("image_hw", "frame"), [((464, 832), 1508), ((720, 1280), 3600)])
+def test_the_layout_keeps_the_sink_and_the_window(image_hw, frame):
+    """A chunk's tokens an iteration of the rollout loop, of which the pool keeps a 6-frame sink and an 8-frame window
+    exactly, and the read reaches the chunk's 4 frames past them: `main`'s 18 attended frames."""
+    model = _model()
+    lat_h, lat_w = image_hw[0] // 8, image_hw[1] // 8
+    assert model.config.frame_tokens(lat_h, lat_w) == frame
+    (layout,) = kv_layouts(model.declare_state(), model.state_layout(lat_h, lat_w), {})[DIT_KV].values()
+    assert layout.growth == ((ROLLOUT_LOOP_NAME, 4 * frame),)
+    assert layout.retention == RetentionPolicy(context_budget=8 * frame, protected_prefix=6 * frame, exact=True)
+
+
+def test_a_window_with_no_frame_is_refused_when_the_model_sizes_its_pool():
+    """``local_attn_size`` counts the sink's frames and the chunk's too. At their sum the window holds no frame,
+    which the pool can't keep, so the model refuses where it sizes its pool, before any request."""
+    model = _model()
+    model.config.local_attn_size = model.config.sink_size + model.config.chunk_size
+    with pytest.raises(ValueError, match="LingBotWorldConfig.local_attn_size is 10, and the sink's 6 frames and a "
+                                         "chunk's 4 leave its window no frame; make it at least 11, or -1"):
+        model.kernel_settings()
+
+
+@pytest.mark.parametrize(("image_hw", "tokens"), [((464, 832), 27144), ((720, 1280), 64800)])
+def test_a_rollout_keeps_main_s_rolling_extent(image_hw, tokens):
+    """The store's spec reads a request's sizes from its layout's row, as intake opens it: `main`'s 6-frame sink and 12
+    trailing frames, the chunk's own included. The model restates the count, which it can't import, and the pool holds
+    one rollout at the largest area."""
+    model = _model()
+    cfg = model.config
+    lat_h, lat_w = image_hw[0] // 8, image_hw[1] // 8
+    (layout,) = kv_layouts(model.declare_state(), model.state_layout(lat_h, lat_w), {})[DIT_KV].values()
+    (kv, *_) = serving_resources(model, {"resources": {}})
+    frame = cfg.frame_tokens(lat_h, lat_w)
+    request = kv.request_config({"kv_layout": {DIT_KV: {"main": layout.row()}}})
+    assert request == RollingKVReqConfig(tokens=tokens, sink=6 * frame)
+    assert cfg.window_tokens(frame) == tokens
+    if image_hw == (720, 1280):
+        assert model.kernel_settings() == {DIT_KV: {"pool_tokens": tokens}}
+
+
+def test_a_request_s_configs_pass_the_conductor_s_label_check():
+    """The dit's array lays out a row and declares no paged label. The conductor's check read every row as a paged
+    label's, which would fail each request with a 500, and a paged config under the store's key would open it with no
+    tokens."""
+    model = _model()
+    rows = kv_layouts(model.declare_state(), model.state_layout(58, 104), {})
+    layout = {key: {label: row.row() for label, row in labels.items()} for key, labels in rows.items()}
+    conductor = SimpleNamespace(
+        model=model, _declarations=model.declare_state,
+        _node_resources=lambda: serving_resources(model, {"resources": {}}),
+        _kv_labels={key: tuple(labels) for key, labels in model.kv_labels().items()},
+    )
+    configs = Conductor._get_resource_configs(conductor, ["image", "text"], ["video"], {"kv_layout": layout})
+    refuse_undeclared_labels("LingBotWorldModel", conductor._kv_labels, layout, configs)
+    assert configs[DIT_KV] == RollingKVReqConfig(tokens=27144, sink=9048), "a 464x832 rollout's sink, window and chunk"
+
+
+def test_the_largest_area_bounds_a_frame_at_any_aspect():
+    model = _model()
+    for image_hw in [(720, 1280), (1280, 720), (960, 960), (408, 2256), (2256, 408), (480, 832)]:
+        assert model.config.frame_tokens(*model.geometry(image_hw, 720, 1280)) <= model.config.max_frame_tokens
+
+
+@pytest.mark.parametrize("image_hw", [(464, 832), (720, 1280)])
+def test_a_rollout_past_the_pool_is_refused_at_intake(image_hw):
+    """A deployment that serves the default size sets 27144 tokens, and a larger rollout is a 400 before any step."""
+    model = _model()
+    (layout,) = kv_layouts(model.declare_state(), model.state_layout(image_hw[0] // 8, image_hw[1] // 8), {})[
+        DIT_KV].values()
+    (kv, *_) = serving_resources(model, {"resources": {DIT_KV: {"pool_tokens": 27144}}})
+    request = kv.request_config({"kv_layout": {DIT_KV: {"main": layout.row()}}})
+    if image_hw == (464, 832):
+        request.validate(kv)
+    else:
+        with pytest.raises(ValueError, match="resources: dit_kv: pool_tokens"):
+            request.validate(kv)
+
+
+def test_a_rollout_that_fits_waits_for_the_room_another_holds():
+    """Two rollouts on a pool of one's window: the engine's queue holds the second until the first is removed."""
+    rollout = _Rollout(_tiny(), pool_tokens=_tiny().window_tokens(4))
+    assert rollout.open(1) is None
+    assert rollout.open(2) is not None, "the second rollout should wait for the first's room"
+    for _ in range(3):
+        rollout.chunk(1)
+    rollout.pool.remove_request(1)
+    assert rollout.pool.reserve(2, "dit", ROLLOUT_WALK, None) is None
+    rollout.chunk(2)
+
+
+# The steps and the reads
+
+
+def test_a_chunk_s_step_declares_its_tokens_its_text_and_its_draws():
+    rollout = _Rollout(_tiny())
+    rollout.open(1)
+    inputs = rollout.inputs(1)
+    declared = rollout.sub.declare_step(ROLLOUT_WALK, [1], [inputs])
+    assert [(s.label, s.span) for s in declared.segments] == [("main", 4 * 4)]
+    assert [(s.label, s.span) for s in declared.state[TEXT].segments] == [("text", 8)]
+    assert set(declared.state[PROGRESS].host[(1, "main", 0)]) == {"rng"}
+    step = state_steps(declared, rollout.handles, graph_walk=ROLLOUT_WALK)
+    assert set(step.steps) == {DIT_KV, SELF_ATTN, TEXT_ATTN, VAE_CACHES}
+    assert step.steps[TEXT_ATTN].pairs == (("main", "text"),)
+    reference = _Rollout(_tiny(reference_numerics=True))
+    assert TEXT not in reference.sub.declare_step(ROLLOUT_WALK, [1], [inputs]).state
+
+
+def test_the_reads_call_their_kernels_as_main_s_one_resource_did():
+    """`main` ran both pairs on one ragged resource: the chunk's queries over its window, and over the text. Each read
+    calls its own resource's kernel with `main`'s shapes, dtype and segment lengths, under labels of its own."""
+    cfg = _tiny()
+    rollout = _Rollout(cfg)
+    rollout.open(1)
+    frame, heads, dim = 4, cfg.num_heads, cfg.head_dim
+    for _ in range(4):
+        rollout.chunk(1)
+    rollout.window.calls.clear()
+    rollout.text.calls.clear()
+    rollout.chunk(1)
+    attended = _main_attended_frames(cfg, 4) * frame
+    main_calls = {
+        cross_label(MAIN_CHUNK, MAIN_WINDOW): ((4 * frame, heads, dim), (attended, heads, dim)),
+        cross_label(MAIN_CHUNK, MAIN_TEXT): ((4 * frame, heads, dim), (cfg.text_len, heads, dim)),
+    }
+    port = {"window": rollout.window.calls, "text": rollout.text.calls}
+    for (main_label, (q, k)), calls in zip(main_calls.items(), port.values(), strict=True):
+        assert len(calls) == 3 * cfg.num_layers, f"each pass of each layer should call the kernel once ({main_label})"
+        assert {(tuple(c.q), tuple(c.k), c.dtype) for c in calls} == {(q, k, torch.float32)}, main_label
+    (window_plan, text_plan) = rollout.window.steps[-1], rollout.text.steps[-1]
+    assert [s.span for s in window_plan.segments] == [4 * frame, attended]
+    assert [s.span for s in text_plan.segments] == [4 * frame, cfg.text_len]
+
+
+@pytest.mark.parametrize("local_attn_size", [10, -1])
+def test_the_read_reaches_the_sink_and_the_latest_window(local_attn_size):
+    """The frames each chunk's read reaches, in order: `main`'s store kept the sink and the latest frames up to
+    ``local_attn_size``, and every frame without a window."""
+    cfg = _tiny(local_attn_size=local_attn_size)
+    rollout = _Rollout(cfg)
+    rollout.open(1)
+    tags = []
+    for chunk in range(6):
+        rollout.window.calls.clear()
+        rollout.chunk(1)
+        tags.append(rollout.window.calls[-1].k[0] // 4)
+        end = (chunk + 1) * cfg.chunk_size
+        if local_attn_size == -1 or end <= local_attn_size:
+            assert tags[-1] == end
+        else:
+            assert tags[-1] == local_attn_size
+    if local_attn_size != -1:
+        assert rollout.pool._requests[1].capacity == local_attn_size * 4, "the store should keep the window alone"
+
+
+def test_the_reference_numerics_attend_what_the_kept_window_read_attends(monkeypatch):
+    """Under ``reference_numerics`` the read returns the entries it reaches, and FA2 attends them and the step's own
+    text K/V. With SDPA standing in for FA2, each pass's flow equals the one the two reads give, past the window."""
+    from mstar.model.lingbot_world.components import dit
+
+    monkeypatch.setattr(dit, "_flash_attention", lambda q, k, v: F.scaled_dot_product_attention(
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2))
+    fast, reference = _Rollout(_tiny()), _Rollout(_tiny(reference_numerics=True))
+    reference.dit.load_state_dict(fast.dit.state_dict())
+    for rollout in (fast, reference):
+        rollout.open(1)
+    for chunk in range(4):
+        for i, (ours, theirs) in enumerate(zip(fast.chunk(1), reference.chunk(1), strict=True)):
+            torch.testing.assert_close(theirs, ours, msg=f"chunk {chunk}, pass {i}")
+
+
+def test_a_node_without_the_text_array_fails_at_bind():
+    """Off reference numerics both attentions bind their arrays, so a node that lacks one fails at load rather than
+    attending the text with the reference's kernel."""
+    rollout = _Rollout(_tiny())
+    with pytest.raises(KeyError, match="text"):
+        rollout.sub.bind_node_state({name: handle for name, handle in rollout.handles.items() if name != TEXT})
+
+
+# The draws and the caches
+
+
+def _main_draws(cfg: LingBotWorldConfig, seed: int, lat_f: int, lat_hw, chunks: int):
+    """`main`'s draws: the rollout's noise in one call from the seeded generator, then each chunk's re-noise draws
+    from the same generator, in order."""
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    noise = torch.randn(cfg.out_dim, lat_f, *lat_hw, dtype=torch.float32, generator=generator)
+    draws = []
+    for chunk in range(chunks):
+        latent = noise[:, chunk * cfg.chunk_size:(chunk + 1) * cfg.chunk_size]
+        renoise = [torch.randn(latent.shape, generator=generator, dtype=torch.float32) for _ in range(3)]
+        draws.append((latent, renoise))
+    return draws
+
+
+def test_the_draws_are_main_s_for_three_chunks():
+    """Each chunk draws the rollout's noise again from the seed and keeps its own frames, and goes on from the
+    generator state the last chunk wrote to ``PROGRESS``, so its draws are `main`'s bit for bit."""
+    cfg = _tiny()
+    rollout = _Rollout(cfg)
+    rollout.open(1)
+    lat_f = cfg.max_chunks * cfg.chunk_size
+    for chunk, (latent, renoise) in enumerate(_main_draws(cfg, 7, lat_f, _Rollout.LAT, 3)):
+        inputs = rollout.inputs(1)
+        assert torch.equal(inputs.tensor_inputs["latent"], latent), f"chunk {chunk}'s initial noise"
+        assert all(torch.equal(a, b) for a, b in zip(inputs.kwargs["renoise"], renoise, strict=True)), chunk
+        rollout.chunk(1)
+
+
+def test_a_chunk_prepared_again_draws_the_same_noise():
+    """A step refused at admit is prepared again, and reads the state the last commit left."""
+    rollout = _Rollout(_tiny())
+    rollout.open(1)
+    rollout.chunk(1)
+    first, again = rollout.inputs(1), rollout.inputs(1)
+    assert all(torch.equal(a, b) for a, b in zip(first.kwargs["renoise"], again.kwargs["renoise"], strict=True))
+    assert first.kwargs["rng"] == again.kwargs["rng"]
+
+
+def test_a_decoder_cache_comes_back_from_its_fields_slot_for_slot():
+    """The compiled decode guards on each slot's strides, so the tensors come back themselves, where they were."""
+    slots = wan_vae.FeatCache([None, torch.arange(6.0).view(1, 2, 3), None])
+    back = wan_vae.cache_from_fields(3, wan_vae.cache_fields(slots, "dec"), "dec")
+    assert back[0] is None and back[1] is slots[1] and back[2] is None
+
+
+def test_a_cache_slot_that_holds_no_tensor_is_refused():
+    """diffusers leaves ``"Rep"`` in a temporal upsample's slot after a chunk of one latent. Dropped from the write,
+    the slot would come back empty and the next decode would start the stream over."""
+    with pytest.raises(RuntimeError, match="slot 1 of the VAE's dec cache holds 'Rep'"):
+        wan_vae.cache_fields([None, "Rep"], "dec")
+
+
+def test_the_encoder_stream_comes_back_from_its_fields():
+    vae = SimpleNamespace(_cached_conv_counts={"encoder": 3})
+    stream = EncoderStream(vae)
+    stream.cache = [None, torch.ones(2), torch.zeros(1, 2)]
+    back = EncoderStream(vae, stream.fields())
+    assert back.cache[0] is None and back.cache[1] is stream.cache[1] and back.steady is None
+    stream.cache, stream.steady = None, torch.full((1, 4), 2.0)
+    settled = EncoderStream(vae, stream.fields())
+    assert settled.cache is None and settled.steady is stream.steady
+
+
+def _cached_rollout(monkeypatch):
+    """A `_Rollout` whose forward runs the tiny DiT and stands in for the VAE: an encode that fills two of three slots
+    at chunk 0 and settles at chunk 1, and a decode that replaces its three slots each call. Returns it with what each
+    call was handed."""
+    rollout = _Rollout(_tiny())
+    sub, (lat_h, lat_w) = rollout.sub, rollout.LAT
+    sub.encoder_vae = SimpleNamespace(_cached_conv_counts={"encoder": 3})
+    sub._decoder_slots = 3
+    seen = SimpleNamespace(encoder=[], written=[], decoder=[], freed=[])
+
+    def encode(vae, image, stream, first_latent, num_latents, config):
+        seen.encoder.append((stream.steady, stream.cache and list(stream.cache)))
+        if first_latent:
+            stream.steady, stream.cache, stream.settled = torch.zeros(1, 32, 1, lat_h, lat_w), None, True
+        else:
+            stream.cache = [torch.zeros(1, channels, 2, 8 * lat_h, 8 * lat_w) for channels in (3, 96)] + [None]
+            seen.written.append(list(stream.cache))
+        return torch.zeros(20, num_latents, lat_h, lat_w)
+
+    def decode(x0, feat_cache, clip_start):
+        seen.decoder.append((type(feat_cache), [slot if slot is None else slot.data_ptr() for slot in feat_cache]))
+        old = feat_cache[0] if feat_cache[0] is None else weakref.ref(feat_cache[0])
+        for i in range(3):
+            feat_cache[i] = torch.zeros(1, 384 if i else 16, 2, lat_h, lat_w, dtype=torch.bfloat16)
+        seen.freed.append(old is None or old() is None)
+        return torch.zeros(1, 3, 4 * x0.shape[1], 8 * lat_h, 8 * lat_w)
+
+    monkeypatch.setattr(submodules, "encode_condition_chunk", encode)
+    monkeypatch.setattr(submodules, "plucker_embedding", lambda *args: SimpleNamespace(
+        to=lambda dtype: torch.zeros(1, 384, rollout.cfg.chunk_size, lat_h, lat_w),
+    ))
+    sub._decode = decode
+    return rollout, seen
+
+
+def _forward(rollout: _Rollout, rid: int) -> dict:
+    """One chunk of ``rid`` through the submodule's forward, stepped as the engine steps it."""
+    inputs = rollout.inputs(rid)
+    step = rollout.admit(rid, inputs)
+    step.begin_calls()
+    out = rollout.sub.forward(ROLLOUT_WALK, None, **inputs.tensor_inputs, **inputs.kwargs)
+    step.check_calls()
+    rollout.pool.commit(step.steps[DIT_KV], step.ctx)
+    step.commit_calls()
+    step.end_calls()
+    rollout.chunks[rid] += 1
+    return out
+
+
+def test_the_vae_caches_continue_through_their_sized_value_off_the_rollout_loop(monkeypatch):
+    """`main` kept the encoder's stream and the decoder's cache with the request and handed each chunk the same
+    tensors. On the rollout loop's edges every chunk copied them to the host and back, 3.8 GB at 464x832. Through the
+    sized Value a chunk gets the tensors the last one wrote, another request starts empty, and no output carries a
+    cache."""
+    rollout, seen = _cached_rollout(monkeypatch)
+    rollout.open(1)
+    rollout.open(2)
+    out = _forward(rollout, 1)
+    wrote = sorted((key, t.data_ptr()) for key, t in rollout.caches._requests[1].tensors.items() if DECODER in key[2])
+    _forward(rollout, 2)
+    _forward(rollout, 1)
+    assert set(out) == {"clock", "video_output"}, "a cache on an output is copied to the host every chunk"
+    assert seen.decoder[0] == seen.decoder[1] == (wan_vae.FeatCache, [None] * 3), "each stream should start empty"
+    assert seen.decoder[2] == (wan_vae.FeatCache, [ptr for _, ptr in wrote]), "the decode guards on the slots it wrote"
+    steady, slots = seen.encoder[2]
+    assert steady is None and all(a is b for a, b in zip(slots, seen.written[0], strict=True))
+
+
+def test_a_slot_the_decode_replaces_is_freed_there(monkeypatch):
+    """The read hands the caches over, so nothing but the decode's own list holds a slot. A forward that kept what it
+    read would hold the whole old cache through the chunk, 3.8 GB at 464x832."""
+    rollout, seen = _cached_rollout(monkeypatch)
+    rollout.open(1)
+    _forward(rollout, 1)
+    _forward(rollout, 1)
+    assert seen.freed == [True, True], "the old slot outlived its replacement"
+
+
+def test_a_settled_encoder_gives_its_slots_back(monkeypatch):
+    """Once black frames stop changing the encoder's cache, one output stands for every later call, and the slots'
+    bytes, 359,424 a latent pixel, are free for a waiting rollout."""
+    rollout, _ = _cached_rollout(monkeypatch)
+    rollout.open(1)
+    _forward(rollout, 1)
+    held = rollout.caches._used
+    _forward(rollout, 1)
+    names = {name for _, _, name in rollout.caches._requests[1].tensors}
+    assert STEADY in names and not names & set(rollout.sub._encoder_fields)
+    assert rollout.caches._used == held - 359424 * 4 * 4, "the settled stream still holds its slots' bytes"
+
+
+def test_a_chunk_past_the_first_refuses_an_empty_decoder_cache(monkeypatch):
+    """A chunk whose forward failed after its read leaves nothing behind, which is what chunk 0 finds."""
+    rollout, _ = _cached_rollout(monkeypatch)
+    rollout.open(1)
+    rollout.chunks[1] = 1
+    with pytest.raises(RuntimeError, match="chunk 1 found no decoder cache in 'vae_caches'"):
+        _forward(rollout, 1)
+
+
+@pytest.mark.parametrize("lat_hw", [(2, 3), (3, 5)])
+def test_the_declared_caches_are_the_vae_s_at_any_latent_size(lat_hw):
+    """Every process declares the caches from the VAE's config, without loading it. Against the Wan2.1 VAE itself, at
+    random weights: each slot a stream holds between calls has its field's shape, and owns its bytes."""
+    from diffusers import AutoencoderKLWan
+
+    vae = AutoencoderKLWan().eval()
+    fields = vae_cache_entry(_tiny(reference_numerics=True)).tensors
+    encoder = [None] * sum(isinstance(m, wan_vae.WanCausalConv3d) for m in vae.encoder.modules())
+    decoder = wan_vae.new_feat_cache(vae)
+    with torch.inference_mode():
+        vae.encoder(torch.zeros(1, 3, 1, 8 * lat_hw[0], 8 * lat_hw[1]), feat_cache=encoder, feat_idx=[0])
+        steady = vae.encoder(torch.zeros(1, 3, 4, 8 * lat_hw[0], 8 * lat_hw[1]), feat_cache=encoder, feat_idx=[0])
+        wan_vae.FastDecoder(vae, channels_last=False, compile=False).decode_stream(
+            torch.zeros(1, 16, 4, *lat_hw), decoder, clip_start=True,
+        )
+    wan_vae.check_stream_cache(encoder, fields, ENCODER, lat_hw)
+    wan_vae.check_stream_cache(decoder, fields, DECODER, lat_hw)
+    assert tuple(steady.shape) == (*fields[STEADY].shape[:3], *lat_hw)
+    held = [slot for slot in (*encoder, *decoder, steady) if torch.is_tensor(slot)]
+    assert len(held) == len(fields) and all(
+        slot.untyped_storage().nbytes() == slot.numel() * slot.element_size() for slot in held
+    ), "a slot that is a view of a larger buffer would be refused at its write"
+
+
+def test_a_rollout_reserves_662208_bytes_a_latent_pixel():
+    """Every cache scales with the latent's area, so a rollout reserves its own, 4.0 GB at 464x832. A Value of fixed
+    shapes would hold each request at 720x1280."""
+    (caches,) = (spec for spec in serving_resources(_model(), {"resources": {}}) if spec.resource_key == VAE_CACHES)
+    assert caches.config.bytes_at({"lat_h": 58, "lat_w": 104}) == 662208 * 58 * 104
+    assert caches.config.budget == 662208 * 90 * 160, "the default budget should hold one rollout at 720x1280"
+
+
+def test_a_chunk_of_one_latent_is_refused_at_declaration():
+    with pytest.raises(ValueError, match="a chunk of one latent ends with diffusers' 'Rep' marker"):
+        vae_cache_entry(_tiny(chunk_size=1))
+
+
+# Compile
+
+
+def _compiled_rollout_graphs(num_layers: int, chunks: int) -> int:
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    rollout = _Rollout(_tiny(num_layers=num_layers))
+    rollout.dit.compile_blocks(backend="eager", fullgraph=False, dynamic=False)
+    rollout.open(1)
+    for _ in range(chunks):
+        rollout.chunk(1)
+    return torch._dynamo.utils.counters["stats"]["unique_graphs"]
+
+
+def test_compiled_blocks_trace_once_per_kind_of_pass():
+    """The layer and the pool's plan stay out of the compiled blocks, so a rollout compiles them once for each value of
+    ``keep``, not once per layer or per chunk: five chunks run past the window's fill."""
+    one_chunk = _compiled_rollout_graphs(num_layers=2, chunks=1)
+    assert one_chunk > 0
+    assert _compiled_rollout_graphs(num_layers=4, chunks=5) == one_chunk
+
+
+# The warm-up
+
+
+def test_the_warmup_is_a_two_chunk_rollout_at_the_default_size(monkeypatch):
+    """The shipped warm-up's image, the model repo's 1868x1040 teaser, comes out at 464x832, the size the decode warms
+    at load, and its poses make two chunks."""
+    from pathlib import Path
+
+    import yaml
+
+    from mstar.api_server.entrypoint import WarmupRequest
+
+    model = _model()
+    monkeypatch.setattr(model, "_ensure_tokenizer", lambda: None)
+    monkeypatch.setattr(model, "tokenizer", lambda text, **kwargs: SimpleNamespace(input_ids=[0, 1]))
+    configs = Path(__file__).parents[2] / "configs"
+    for name in ("lingbot_world_1_3b.yaml", "lingbot_world_1_3b_fast.yaml"):
+        (spec,) = yaml.safe_load((configs / name).read_text())["warmup_requests"]
+        warmup = WarmupRequest.from_config(spec)
+        ((media,),) = [warmup.files]
+        assert media.modality == "image" and media.path.endswith("lingbot-world-v2-1.3b-causal-fast/assets/teaser.png")
+        out = model.process_prompt(warmup.text, ["image", "text"], warmup.output_modalities,
+                                   tensors={"image_inputs": [torch.zeros(3, 1040, 1868, dtype=torch.uint8)]},
+                                   **warmup.model_kwargs)
+        assert tuple(out.new_input_tensors["image_inputs"][0].shape[1:]) == (464, 832)
+        assert model.get_loop_caps(**warmup.model_kwargs) == {ROLLOUT_LOOP_NAME: 2}
+        assert np.allclose(np.asarray(warmup.model_kwargs["camera_poses"])[:, :, :3], np.eye(4)[:3, :3])

@@ -666,6 +666,9 @@ class KVManager(AttentionResource):
             )
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
+        # Each request whose layout holds an exact retention, with each such label's policy. Its commit applies the
+        # policy from the layout, where other requests' come from the step.
+        self._exact: dict[str, dict[str, RetentionPolicy]] = {}
         # dropped request -> what it returns with, until its rebuild lands
         self._dropped: dict[str, Dropped] = {}
         # rebuilt request -> the tokens it had written when its rebuild landed
@@ -811,6 +814,9 @@ class KVManager(AttentionResource):
         self._empty_locations: torch.Tensor | None = None
         # (label, group) -> its write addressing
         self._current_plan_states: dict[tuple[str, int], KVPlanState] = {}
+        # The plan output of the step the forward runs, which a pre-plan of the next step leaves in place. Its commit
+        # drops it, so the plan goes with its last reference.
+        self._live_outputs: KVPlanOutputs | None = None
         self.reset_default_cursors()
 
         self._preplan_states: dict[tuple[str, int], KVPlanState] = {}
@@ -1870,6 +1876,12 @@ class KVManager(AttentionResource):
             if rid not in self._streams:
                 self._streams[rid] = {"main": self._new_stream()}
             self._overrides.setdefault(rid, overrides)
+            exact = {
+                label: layout.retention for label, layout in (self._overrides[rid].kv_layout or {}).items()
+                if layout.retention is not None and layout.retention.exact
+            }
+            if exact:
+                self._exact[rid] = exact
             for label, stream in self._streams[rid].items():
                 if stream.span_cursor is None:
                     self._lay_out(rid, label, stream)
@@ -2492,6 +2504,7 @@ class KVManager(AttentionResource):
                 length=length,
                 to_compute=s.span,
                 generation=generation,
+                retention=self._exact.get(s.request_id, {}).get(s.label),
             ))
         return views
 
@@ -2750,7 +2763,7 @@ class KVManager(AttentionResource):
             return [
                 SequenceView(
                     s.request_id, s.label, indices[bounds[i]:bounds[i + 1]].tolist(),
-                    lens[i], s.span, 0, gens[i],
+                    lens[i], s.span, 0, gens[i], self._exact.get(s.request_id, {}).get(s.label),
                 )
                 for i, s in enumerate(segments)
             ]
@@ -2795,7 +2808,7 @@ class KVManager(AttentionResource):
             return [
                 SequenceView(
                     s.request_id, s.label, indices[bounds[i]:bounds[i + 1]].tolist(),
-                    lg[i], s.span, 0, lg[n + i],
+                    lg[i], s.span, 0, lg[n + i], self._exact.get(s.request_id, {}).get(s.label),
                 )
                 for i, s in enumerate(segments)
             ]
@@ -2855,6 +2868,8 @@ class KVManager(AttentionResource):
             for g, outputs in enumerate(res.groups):
                 self._setup_plan_states(outputs, ctx, lease, g, eager_write=step.eager_write)
         self._mark_preplanned(step, ctx, res)
+        if not ctx.is_preplan:
+            self._live_outputs = res
         return res
 
     def _drop_readonly_plans(self) -> None:
@@ -2972,6 +2987,7 @@ class KVManager(AttentionResource):
                 self._preplan_new_labels = []
                 # the promoted step runs, so no stream changed under the plans
                 self.clear_preplan(promoted=True)
+                self._live_outputs = res
                 laps.lap("promote")
                 return res
             # A different step reached the GPU thread before the one planned
@@ -3037,7 +3053,16 @@ class KVManager(AttentionResource):
         if readonly:
             self._readonly_plans[slot] = (key, epoch, res)
         self._mark_preplanned(step, ctx, res)
+        if not ctx.is_preplan:
+            self._live_outputs = res
         return res
+
+    def views(self, label: str) -> list[SequenceView]:
+        """The views of ``label`` in the step the forward runs, one per row: a pre-plan of the next step doesn't
+        replace them."""
+        if self._live_outputs is None:
+            raise RuntimeError(f"KV {self.name}: views of {label!r} outside a step's forward, where no plan is live")
+        return self._live_outputs[label].views
 
     def _mark_preplanned(self, step: KVStep, ctx: StepContext, res: "KVPlanOutputs") -> None:
         if ctx.is_preplan:
@@ -3163,8 +3188,10 @@ class KVManager(AttentionResource):
         self._recount(rid)
 
     def commit(self, step: KVStep, ctx: StepContext):
+        self._live_outputs = None
         streams = self._streams
         retention = step.retention
+        exact = self._exact
         if not step.commit:
             self._readonly_epoch += 1
         rows = self._readonly_rows
@@ -3190,7 +3217,10 @@ class KVManager(AttentionResource):
             if repeats != 1:
                 # a repeated step's stored spans are `repeats` of what it declared (see `_run_lag`)
                 self._run_lag = max(self._run_lag, 2 * (repeats - 1))
-            if rows and repeats == 1 and self._index is None and not retention and not windows and not _DEBUG_ASSERTS:
+            if (
+                rows and repeats == 1 and self._index is None and not retention and not windows and not _DEBUG_ASSERTS
+                and not (exact and any(segment.request_id in exact for segment in rows))
+            ):
                 # nothing to index, adopt, retain or check: the arena moves
                 # every row's counts in one call, and hands back the ones it can't
                 slow = self._arena.commit_rows(streams, rows, ctx.real_rows(), sink or None, step.commit)
@@ -3228,6 +3258,11 @@ class KVManager(AttentionResource):
                         retention.get((segment.request_id, segment.label))
                         if retention else None
                     )
+                    if policy is None and exact and segment.request_id in exact:
+                        policy = exact[segment.request_id].get(segment.label)
+                        # adopted at the first commit that reaches the prefix, before which nothing past it exists
+                        if policy is not None and stream.stored_len < policy.protected_prefix:
+                            policy = None
                     if policy is not None:
                         self._adopt_retention(stream, policy, segment)
                     touched = []
@@ -3354,7 +3389,8 @@ class KVManager(AttentionResource):
     ) -> int:
         """Release what ``policy`` no longer keeps of the stream's pages in group ``group``: the
         step's policy, or a group's. ``touch`` runs `_touch_plan_cache`. Under the lock."""
-        excess = stream.group(group).stored_len - policy.protected_prefix - policy.context_budget
+        kept = policy.kept_prefix(self._groups[group].page_size)
+        excess = stream.group(group).stored_len - kept - policy.context_budget
         if excess <= 0:
             return 0
         if touch:
@@ -4257,6 +4293,7 @@ class KVManager(AttentionResource):
             self._streams.pop(rid, None)
             self._looked_up.discard(rid)
             self._overrides.pop(rid, None)
+            self._exact.pop(rid, None)
             self._classify(rid, guaranteed=False)
             self._footprints.pop(rid, None)
             self._dropped.pop(rid, None)

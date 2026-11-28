@@ -1,10 +1,13 @@
-"""Waypoint self-attention: fused QKV, value residual, OrthoRoPE, ring cache.
+"""Waypoint self-attention: fused QKV, value residual, OrthoRoPE, the ring of frames.
 
 The served reference is the fused ``patch_model.MergedQKVAttn``, not three
 separate GEMMs, so that fused form is the parity target. ``qkv_proj.weight``
 is ``cat([q, k, v], dim=0)``; GQA makes the K/V slabs unequal, so swapping
 them loads cleanly but serves wrong video.
 """
+
+from collections.abc import Mapping
+from typing import Any
 
 import torch
 from torch import Tensor, nn
@@ -17,7 +20,7 @@ __all__ = ["WaypointAttention"]
 
 
 class WaypointAttention(nn.Module):
-    """One layer of causal frame attention over the ring KV cache.
+    """One layer of causal frame attention over the world's ring of frames.
 
     ``x`` is ``[B, N*T, D]`` (N frames of T tokens, flattened; N is 1 for every
     served call) and the head layout inside is ``[B, H, N*T, d_head]``, 32 query
@@ -41,7 +44,6 @@ class WaypointAttention(nn.Module):
         self.n_heads = config.n_heads
         self.n_kv_heads = config.n_kv_heads
         self.d_head = config.d_head
-        self.enable_gqa = config.enable_gqa
 
         # Split widths in the concat order baked into the weight: Q | K | V.
         self.q_out = self.n_heads * self.d_head
@@ -59,24 +61,15 @@ class WaypointAttention(nn.Module):
         # are built once per forward at the DiT root.
         self.rope = OrthoRoPE(config)
 
-        # Bound at load by NodeSubmodule.bind_node_resources.
-        self.kv = None
-        self.attn = None
+        # Bound at load by NodeSubmodule.bind_node_state.
+        self.state = None
 
-    def bind_resources(self, resources: dict) -> None:
-        """Resolve the two resources this layer calls.
-
-        ``NodeSubmodule.bind_node_resources`` walks ``self.modules()``, so one
-        bind on the submodule reaches all 24 layers. ``.get``: a layer may be
-        bound on a node that owns only some of them.
-        """
-        self.kv = resources.get("kv")
-        self.attn = resources.get("attn")
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.state = handles["kv"]
 
     def forward(
         self,
         x: Tensor,
-        frame_pos: Tensor,
         rope_angles: tuple[Tensor, Tensor],
         v1: Tensor | None,
         *,
@@ -84,10 +77,8 @@ class WaypointAttention(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         """``x`` ``[B, N*T, D]`` -> ``(out [B, N*T, D], v1 [B, H_kv, N*T, d_head])``.
 
-        ``frame_pos`` is the ``[B]`` int64 ring clock; ``v1`` is ``None`` at
-        layer 0 and layer 0's pre-lerp V thereafter. Both stay arguments rather
-        than cursors the KV resource keeps: a cursor that drifts from the
-        caller does not raise, it rewrites history.
+        ``v1`` is ``None`` at layer 0 and layer 0's pre-lerp V thereafter.
+        ``commit`` keeps this pass's K/V in the ring.
         """
         B, T = x.shape[:2]
 
@@ -109,29 +100,8 @@ class WaypointAttention(nn.Module):
         q, k = rms_norm(q), rms_norm(k)
         q, k = self.rope(q, rope_angles), self.rope(k, rope_angles)
 
-        # Argument order is (k, v, layer_idx, frame_pos), NOT the reference's
-        # (k, v, pos_ids, layer_idx). `k` goes in post-RoPE.
-        if getattr(self.attn, "needs_token_visibility", True):
-            k, v, visible = self.kv.upsert(
-                k, v, self.layer_idx, frame_pos, commit=commit
-            )
-        else:
-            k, v, visible = self.kv.upsert(
-                k,
-                v,
-                self.layer_idx,
-                frame_pos,
-                commit=commit,
-                build_visibility=False,
-            )
-
-        # No `if self.attn.requires_kv_write` guard: the upsert above IS the
-        # write, and it has to happen on frozen passes too — the scratch slot
-        # is what makes this frame visible to itself.
-        y = self.attn.attend(
-            q, k, v, visible,
-            enable_gqa=self.enable_gqa,
-            layer_idx=self.layer_idx,
-        )
-        y = y.transpose(1, 2).reshape(B, T, -1)
-        return self.out_proj(y), v1
+        # `k` goes in post-RoPE. The add runs on frozen passes too: its scratch
+        # write is what makes this frame visible to itself.
+        self.state.add(self.layer_idx, keep=commit, k=k.transpose(1, 2), v=v.transpose(1, 2))
+        y = self.state.read(self.layer_idx, q.transpose(1, 2))
+        return self.out_proj(y.reshape(B, T, -1)), v1
