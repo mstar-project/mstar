@@ -41,7 +41,8 @@ class Preemption:
         self._rid_str = rid_str
         # `_keys`: node -> the keys of its paged KV caches, and `_caches`: key -> its cache.
         # `_preempted`: handle -> its `Preempted`. `counts`: node -> its counts for the metrics.
-        # `_waits_logged`: (node, walk) -> when its last wait was logged, and the waits since.
+        # `_waits_logged`: (node, walk) -> when its last wait for pages was logged, and the waits since.
+        # `_flip_waits_logged`: the same for a wait for no page, to turn guaranteed, so neither line hides the other.
         # `_moves_logged`: node -> when its last move was logged, and the moves since.
         # `_walked`: what the last walk of `make_room` that moved nothing read, or None.
         self._keys: dict[str, list[str]] = defaultdict(list)
@@ -55,6 +56,7 @@ class Preemption:
         self._preempted: dict[int, Preempted] = {}
         self.counts: dict[str, PreemptionCounts] = defaultdict(PreemptionCounts)
         self._waits_logged: dict[tuple[str, str], tuple[float, int]] = {}
+        self._flip_waits_logged: dict[tuple[str, str], tuple[float, int]] = {}
         self._moves_logged: dict[str, tuple[float, int]] = {}
         self._walked: tuple | None = None
 
@@ -73,17 +75,25 @@ class Preemption:
         victims = kv.cache.preempt(reason.request_id, reason.pages_short, newer, older, self._droppable(kv, engine))
         if victims is None:
             return False
-        if victims.waits:
+        if victims.queued:
             for node in kv.nodes:
                 self._engine_manager.get_engine(node).readmit_request(node, reason.request_id)
             self.counts[node_name].take_back_waits += victims.takes_back
-            self._log(
-                self._waits_logged, (node_name, node_batch.step_context.graph_walk),
-                "KV short on node=%s walk=%s: %s waits for %d pages %s, since moving "
-                "what the pool can move wouldn't cover its shortage of %d (%d earlier waits not logged)",
-                node_name, node_batch.step_context.graph_walk, self._rid_str(reason.request_id), victims.waits,
-                "it lent" if victims.takes_back else "past its allotment", reason.pages_short,
-            )
+            if victims.waits:
+                self._log(
+                    self._waits_logged, (node_name, node_batch.step_context.graph_walk),
+                    "KV short on node=%s walk=%s: %s waits for %d pages %s, since moving "
+                    "what the pool can move wouldn't cover its shortage of %d (%d earlier waits not logged)",
+                    node_name, node_batch.step_context.graph_walk, self._rid_str(reason.request_id), victims.waits,
+                    "it lent" if victims.takes_back else "past its allotment", reason.pages_short,
+                )
+            else:
+                self._log(
+                    self._flip_waits_logged, (node_name, node_batch.step_context.graph_walk),
+                    "KV short on node=%s walk=%s: %s waits to turn guaranteed until borrowers give back the room "
+                    "(%d earlier waits not logged)",
+                    node_name, node_batch.step_context.graph_walk, self._rid_str(reason.request_id),
+                )
         self._move(kv, self.counts[node_name], victims, reason.request_id)
         return True
 
