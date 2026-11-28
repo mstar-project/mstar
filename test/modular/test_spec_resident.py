@@ -22,7 +22,7 @@ from test_resident_planning import _stub_transfer  # noqa: E402,F401
 
 from mstar.engine.resources.base import CGSlotKey  # noqa: E402
 from mstar.engine.resources.draft.ledger import VerifyLedger  # noqa: E402
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig  # noqa: E402
+from mstar.engine.resources.kv.config import KVLayerSet, KVReqConfig, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
 from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs  # noqa: E402
 from mstar.engine.resources.position.config import (  # noqa: E402
@@ -33,7 +33,7 @@ from mstar.engine.resources.position.config import (  # noqa: E402
 )
 from mstar.engine.resources.position.manager import LongRopeManager, RopeManager  # noqa: E402
 from mstar.engine.resources.resident import ResidentPlanner  # noqa: E402
-from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext, SubmoduleStep  # noqa: E402
+from mstar.engine.resources.step import BucketKey, Lag, Segment, SlotLease, StepContext, SubmoduleStep  # noqa: E402
 
 PAGE = 4
 K = 3
@@ -46,11 +46,14 @@ LONGROPE = LongRoPE(short_factor=(1.0,) * 4, long_factor=(2.0,) * 4,
 LONG = PositionReqConfig(max_position=100)
 
 
-def _resources(max_num_pages: int = 128, max_seq_len: int = 512, longrope: bool = False):
+def _resources(max_num_pages: int = 128, max_seq_len: int = 512, lagged: bool = False, longrope: bool = False):
     cfg = PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=max_seq_len,
         max_num_pages=max_num_pages, page_size=PAGE,
     )
+    if lagged:
+        # a draft model's layer, which a verify step writes one position back (`KVStep.lag`)
+        cfg.join(KVLayerSet("kv", "draft", 1, 1, 8))
     kv = KVManager(
         cfg=cfg,
         name="kv", joint_comm_group=None, transfer_engine_info=None, device=CPU, dtype=torch.float32,
@@ -83,8 +86,11 @@ class _Node:
     """One verifying node: resources, planner, ledger, and each row's true length."""
 
     def __init__(self, prompts: dict[int, int], synchronous: bool = False, max_bs: int = 4, max_seq_len: int = 512,
-                 long_rids: frozenset[int] | None = None):
-        self.res = _resources(max_seq_len=max_seq_len, longrope=long_rids is not None)
+                 lag: int = 0, long_rids: frozenset[int] | None = None):
+        self.res = _resources(max_seq_len=max_seq_len, lagged=bool(lag), longrope=long_rids is not None)
+        # a draft model one row behind: ``[prev, bonus]``, then a row a pass
+        self.layout = Lag(lag, (2,) + (1,) * (SPAN - 2)) if lag else None
+        self.lag = {"draft": self.layout} if lag else {}
         self.planner = ResidentPlanner("n", {WALK}, self.res, CPU, max_bs=max_bs, max_span=SPAN)
         self.ledger = VerifyLedger("n", synchronous=synchronous)
         self.planner.pending = self.ledger.pending
@@ -121,8 +127,8 @@ class _Node:
         ctx = StepContext(request_ids=tuple(rids), graph_walk=WALK, slot=slot, capture=False, slot_lease=lease)
         ctx.set_padded_rids(padded)
         segments = tuple(Segment(r, "main", SPAN) for r in padded)
-        kv = KVStep(segments=segments)
-        rope = PositionStep(segments=segments)
+        kv = KVStep(segments=segments, lag=self.lag)
+        rope = PositionStep(segments=segments, lag=self.layout)
         step = SubmoduleStep(steps={"kv": kv}, segments=list(segments))
         assert res["kv"].admit(kv, ctx).ok
         if (bucket, slot) not in self.captured:
@@ -152,6 +158,14 @@ class _Node:
             positions=positions[: bs * SPAN].tolist(),
             table_ids=table_ids,
         )
+        if self.lag:
+            # per pass: each row's tokens of that pass
+            out.lagged = []
+            for p, n in enumerate(self.layout.passes):
+                state = res["kv"]._static_plan_state(slot, ("main", ("lag", "draft", p)), bs * n)
+                key = CGSlotKey(bucket=bucket, slot=slot, label=("main", "lag", p))
+                out.lagged.append((state.token_to_page.tolist(), state.token_to_cache.tolist(),
+                                   res["rope"]._static_pos_ids[key].tolist()))
         # what the verify writes in the graph
         captured.buffers.advance.copy_(torch.tensor([accepted[r] + 1 for r in rids] + [1] * (bs - len(rids))))
         planner.commit_in_graph(captured)
@@ -385,6 +399,8 @@ def test_a_take_back_lowers_every_copy_that_holds_the_stream():
     stream.stored_len = 0
     kv.take_back([1], [1], "main")
     assert stream.stored_len == 0 and host.groups[0].stored_len == before - 2
+
+
 def test_a_span_a_commit_drops_counts_as_nothing_committed_for_that_row():
     """A stream offloaded mid-step: its host copy predates the span, so commit drops it, and the row's take-back
     has nothing to take."""
@@ -523,3 +539,180 @@ def test_flashinfers_resident_gather_fills_a_real_fa3_paged_wrapper_off_the_tabl
     assert wrapper._page_table.tolist() == columns.index_select(0, captured.slots).tolist()
     kv_len = captured.buffers.kv_len["kv"]
     assert wrapper._seqused.tolist() == (kv_len + SPAN - hide_last).clamp(min=1).tolist()
+
+
+def test_a_lagged_fa3_binding_plans_each_pass_and_its_gather_fills_them_off_the_tables():
+    """A lagged binding on FA3 (`AttentionStep.lag`): `_plan_lagged` builds a wrapper a pass over the
+    verify block's KV plan (``plan_span`` the block, ``kv_extent`` the pass's), and the replay's gather
+    fills every pass's page table and lengths off the tables, so the step keeps no host plan. A step
+    whose stream reads keys planned on the host falls back to them."""
+    from mstar.engine.resources.attn.config import AttentionStep
+    from mstar.engine.resources.attn.flashinfer import FlashInferManager
+    from mstar.engine.resources.resident import ResidentStream
+
+    bs = 2
+    node = _Node({1: 5, 2: 9}, max_bs=bs, lag=1)
+    res, planner, layout = node.res, node.planner, node.layout
+    bucket = BucketKey(graph_walk=WALK, bs=bs, num_tokens=bs * SPAN)
+    manager = FlashInferManager.__new__(FlashInferManager)
+    manager._kv_cache_name, manager._cg_plan_states, manager._lagged_cg = "kv", {}, {}
+    manager._verify_wrappers, manager._verify_fa3, manager._window_left = {}, True, -1
+    manager._group, manager._kv_config = SimpleNamespace(page_size=PAGE), res["kv"].config
+    manager._device, manager._dtype = CPU, torch.float32
+
+    rids = (1, 2)
+    lease = SlotLease(slot=0, bucket=bucket)
+    segments = tuple(Segment(r, "main", SPAN) for r in rids)
+    kv, rope = KVStep(segments=segments, lag=node.lag), PositionStep(segments=segments, lag=layout)
+    step = SubmoduleStep(steps={"kv": kv}, segments=list(segments))
+    ctx = StepContext(request_ids=rids, graph_walk=WALK, slot=0, capture=False, slot_lease=lease)
+    ctx.set_padded_rids(rids)
+    assert res["kv"].admit(kv, ctx).ok
+    first = StepContext(request_ids=rids, graph_walk=WALK, slot=0, capture=True, slot_lease=lease)
+    first.plan_results["kv"] = res["kv"].plan(kv, first)
+    res["rope"].plan(rope, first)
+    captured = planner.capture_step(bucket, 0, step)
+    ctx.resident = planner
+    planner.plan(step, ctx)
+    ctx.plan_results["kv"] = res["kv"].plan(kv, ctx)
+    res["rope"].plan(rope, ctx)
+    states = {}
+    manager._plan_lagged(AttentionStep(verify=True, lag=layout), ctx, ctx.plan_results["kv"], states)
+    wrappers = manager._lagged_cg[(bucket, 0)]
+    assert [states[("main", "lag", p)] for p in range(len(layout.passes))] == wrappers
+    assert [(w.span, w.plan_span, w.kv_extent) for w in wrappers] == [
+        (n, SPAN, layout.extent(p)) for p, n in enumerate(layout.passes)]
+    # the host plan: each row's stored length, then through the pass's extent
+    stored = [5, 9]
+    for p, w in enumerate(wrappers):
+        assert w._seqused.tolist() == [n + layout.extent(p) for n in stored]
+    planner.flush(ctx.resident_plan)
+    planner.gather(captured)
+    for w in wrappers:
+        w._seqused.zero_()
+        w._page_table.zero_()
+
+    manager.resident_gather(captured)
+
+    assert captured.reads_tables and not captured.host_planned
+    table = captured.block_tables["kv"]
+    columns = captured.store.view(-1, table.stride)[:, table.col: table.col + table.width]
+    kv_len = captured.buffers.kv_len["kv"]
+    for p, w in enumerate(wrappers):
+        assert w.width == table.width
+        assert w._page_table.tolist() == columns.index_select(0, captured.slots).tolist()
+        assert w._seqused.tolist() == (kv_len + layout.extent(p)).clamp(min=1).tolist()
+
+    captured.reads_tables = False
+    stream = captured.streams["kv"]
+    captured.streams = {**captured.streams, "kv": ResidentStream(stream.label, True, stream.span)}
+    manager.resident_gather(captured)
+    assert captured.host_planned and not captured.reads_tables
+
+
+def test_a_lagged_fa3_pass_attends_past_its_queries_never_past_the_plans_rows():
+    from mstar.engine.resources.attn.fa3_paged import FA3PagedWrapper
+
+    def wrapper(kv_extent):
+        return FA3PagedWrapper(page_size=PAGE, table_width=8, device=CPU, span=1, plan_span=4, kv_extent=kv_extent)
+
+    assert wrapper(4).kv_extent == 4
+    with pytest.raises(ValueError, match="kv_extent 5 outside a plan span of 4"):
+        wrapper(5)
+
+
+def test_a_lagged_flashinfer_binding_keeps_its_host_plans():
+    """On FlashInfer a lagged binding's passes have no wrapper that reads the tables
+    (`_plan_lagged` collects only FA3's), so a replay's gather keeps the host plans rather than
+    reading tables nothing fills from."""
+    from mstar.engine.resources.attn.flashinfer import FlashInferManager
+
+    bs = 2
+    node = _Node({1: 5, 2: 9}, max_bs=bs, lag=1)
+    res, planner, layout = node.res, node.planner, node.layout
+    bucket = BucketKey(graph_walk=WALK, bs=bs, num_tokens=bs * SPAN)
+    manager = FlashInferManager.__new__(FlashInferManager)
+    # what `_plan_lagged` stores for a FlashInfer verify binding
+    manager._kv_cache_name, manager._cg_plan_states, manager._lagged_cg = "kv", {}, {(bucket, 0): []}
+
+    rids = (1, 2)
+    lease = SlotLease(slot=0, bucket=bucket)
+    segments = tuple(Segment(r, "main", SPAN) for r in rids)
+    kv, rope = KVStep(segments=segments, lag=node.lag), PositionStep(segments=segments, lag=layout)
+    step = SubmoduleStep(steps={"kv": kv}, segments=list(segments))
+    ctx = StepContext(request_ids=rids, graph_walk=WALK, slot=0, capture=False, slot_lease=lease)
+    ctx.set_padded_rids(rids)
+    assert res["kv"].admit(kv, ctx).ok
+    first = StepContext(request_ids=rids, graph_walk=WALK, slot=0, capture=True, slot_lease=lease)
+    first.plan_results["kv"] = res["kv"].plan(kv, first)
+    res["rope"].plan(rope, first)
+    captured = planner.capture_step(bucket, 0, step)
+    ctx.resident = planner
+    planner.plan(step, ctx)
+    ctx.plan_results["kv"] = res["kv"].plan(kv, ctx)
+    res["rope"].plan(rope, ctx)
+    planner.flush(ctx.resident_plan)
+    planner.gather(captured)
+    assert not captured.streams["kv"].reads
+
+    manager.resident_gather(captured)
+
+    assert captured.host_planned and not captured.reads_tables
+
+
+def test_a_lagged_set_writes_one_position_behind_the_device_length():
+    """A draft model's layer set lagged one row in passes (`KVStep.lag`, `PositionStep.lag`): under
+    random acceptance, each replay's gather puts each pass's writes and positions at the row's true
+    length - 1 + its rows, from the device's length cell as the target's are; a padding row's floor at
+    its sink page and position 0."""
+    node = _Node({1: 9, 2: 14, 3: 4}, lag=1)
+    gen = random.Random(0)
+    rids = [1, 2, 3]
+    pending = []
+    for step in range(12):
+        accepted = {rid: gen.randint(0, K) for rid in rids}
+        out = node.step(rids, accepted, slot=step % 2, bs=4)
+        _check_step(node, out, rids)
+        for p, (start, n) in enumerate(zip(node.layout.starts, node.layout.passes, strict=True)):
+            pages, offsets, positions = out.lagged[p]
+            for i, rid in enumerate(rids):
+                held = node.stream(rid).page_indices
+                for j in range(n):
+                    at, t = node.true_len[rid] - 1 + start + j, i * n + j
+                    assert (pages[t], offsets[t], positions[t]) == (held[at // PAGE], at % PAGE, at), (p, rid, j)
+            pad = len(rids) * n
+            assert set(pages[pad:]) == {0} and min(positions[pad:]) >= 0
+        pending.append(out)
+        if len(pending) == 2:
+            node.record(pending.pop(0))
+        for rid in rids:
+            node.true_len[rid] += accepted[rid] + 1
+
+
+def test_lagged_positions_are_each_passs_rows_less_the_lag_and_only_that_steps():
+    """Host-planned (eager): `PositionStep.lag` keeps each pass's positions less the lag for a lagged
+    reader, which reads them in a pass; a later unlagged step keeps none."""
+    res = _resources(lagged=True)
+    _prefill(res, 1, 6)
+    layout = Lag(1, (2, 1, 1))
+
+    def plan(lag):
+        segments = (Segment(1, "main", SPAN),)
+        ctx = StepContext(request_ids=(1,), graph_walk=WALK, slot=0, capture=False)
+        kv = KVStep(segments=segments, lag={"draft": lag} if lag else {})
+        assert res["kv"].admit(kv, ctx).ok
+        ctx.plan_results["kv"] = res["kv"].plan(kv, ctx)
+        res["rope"].plan(PositionStep(segments=segments, lag=lag), ctx)
+
+    plan(layout)
+    assert res["rope"].pos_ids("main").tolist() == [6, 7, 8, 9]
+    got = []
+    for p in range(3):
+        res["rope"].select_pass(p)
+        got.append(res["rope"].pos_ids("main").tolist())
+    assert got == [[5, 6], [7], [8]]
+    res["rope"].select_pass(None)
+    assert res["rope"].pos_ids("main").tolist() == [6, 7, 8, 9]
+    plan(None)
+    res["rope"].select_pass(0)
+    assert res["rope"].pos_ids("main").tolist() == [6, 7, 8, 9]

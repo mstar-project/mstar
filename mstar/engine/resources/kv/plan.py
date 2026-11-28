@@ -159,6 +159,20 @@ def hide_tail_views(
     return out
 
 
+def lagged_pass_views(
+    views: list[SequenceView], block: int, extent: int, queries: int, page_size: int,
+) -> list[SequenceView]:
+    """A lagged pass's views of a verify step's (`Lag`): each row's keys through ``extent`` tokens past its
+    stored length (its block of ``block`` new tokens in the step's views), the pages past them dropped,
+    and ``queries`` queries a row. A padding row on the sink keeps at least one key."""
+    out = []
+    for view in views:
+        length = max(view.length - block + extent, 1)
+        pages = -(-(view.start + length) // page_size)
+        out.append(view._replace(page_idxs=view.page_idxs[:pages], length=length, to_compute=queries))
+    return out
+
+
 def build_paged_indptrs(
     segments: list[SequenceView],
     page_size: int,
