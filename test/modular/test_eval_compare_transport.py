@@ -18,20 +18,55 @@ from argparse import Namespace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 sys.path.insert(0, ".")
 
 pytest.importorskip("aiohttp")
 
-from test_eval_compare import RUN, chat_model, fake_cargo, fake_tree, finish, write_arm  # noqa: E402,F401
+from test_eval_compare import RUN, case, chat_model, fake_cargo, fake_tree, finish, write_arm  # noqa: E402,F401
 
+from benchmark.eval.audio import write_wav  # noqa: E402
 from benchmark.eval.e2e import arm, checks, compare, hosts, report, request_path, stress, trees  # noqa: E402
 from benchmark.eval.e2e import manifest as mf  # noqa: E402
 
 pytestmark = pytest.mark.usefixtures("no_host_gpus", "fake_cargo")
 
 CONFIGS = ("qwen3tts_1p7b_split", "orpheus_pd_disaggregated", "qwen3omni_pd_disaggregated")
+
+
+def test_dropped_final_audio_chunk_fails_even_when_transcript_matches(tmp_path):
+    """A transfer can drop the last chunk after all spoken words; WER then stays unchanged."""
+    root = tmp_path / "m"
+    for arm_name, nframes in (("base", 24000), ("head", 18000)):
+        d = root / arm_name / "s0" / "tts"
+        audio = d / "audio" / "x-c1" / "r0"
+        audio.mkdir(parents=True)
+        samples = np.arange(nframes, dtype=np.int16)
+        write_wav(audio / "item.wav", samples.tobytes(), 24000)
+        result = {"schema": "mstar-eval/1", "suite": "tts", "label": "x", "config": {}, "meta": {},
+                  "summary": {"wer": {"mean": 0.0}},
+                  "repeats": [{"index": 0, "metrics": {}, "requests": [
+                      {"id": "item", "ok": True, "hyp": "all words spoken", "audio_s": nframes / 24000}]}]}
+        (d / "x-c1.json").write_text(json.dumps(result))
+
+    base = root / "base" / "s0" / "tts"
+    head = root / "head" / "s0" / "tts"
+    facts = checks.suite_facts(base, head, 1)
+    assert facts["wer_base"] == facts["wer_head"] == 0.0
+    assert facts["audio_truncated"] == ["item"]
+    assert report.judge_correct(case("wer", max_increase=2.0),
+                                [{k: v for k, v in facts.items() if k != "audio_truncated"}], {})[0] == "pass"
+    verdict, detail = report.judge_correct(case("wer", max_increase=2.0), [facts], {})
+    assert verdict == "FAIL" and "audio" in detail
+
+    # Sampled speech may have a different duration without dropping a transfer chunk.
+    changed = np.arange(18000, dtype=np.int16) + 1
+    write_wav(head / "audio" / "x-c1" / "r0" / "item.wav", changed.tobytes(), 24000)
+    facts = checks.suite_facts(base, head, 1)
+    assert facts["audio_truncated"] == []
+    assert report.judge_correct(case("wer", max_increase=2.0), [facts], {})[0] == "pass"
 
 
 def test_each_multi_worker_config_runs_over_shm_tcp_and_rdma_with_the_multi_gpu_cases():
@@ -183,6 +218,33 @@ def test_timeout_case_times_out_the_long_request_and_a_server_that_dies_after_it
     assert results["head"]["serves_after_timeout"] == {"status": "ConnectionError", "identical": False}
     verdict, detail = judge(tmp_path, results)
     assert verdict == "FAIL" and "serves_after_timeout 200 to ConnectionError" in detail
+
+
+def test_timeout_speech_disables_sentence_chunking_for_long_request(tmp_path, monkeypatch):
+    """Multi-sentence speech inputs are split per sentence by default, giving each sentence a fresh --timeout budget."""
+    monkeypatch.setattr(request_path, "TIMEOUT_SETTLE_S", 0.05)
+    seen: list[dict] = []
+
+    class Record(Speech):
+        cut = threading.Event()
+        timeout_s = 1.0
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.append(body)
+            if len(body["input"]) > 200:
+                self._reply(500, b"Request timed out")
+            else:
+                self._reply(200, b"RIFF" + body["input"].encode())
+
+    srv, url = serve(Record)
+    try:
+        res = request_path.timeout_speech(url, tmp_path, tmp_path)
+    finally:
+        srv.shutdown()
+    assert res["times_out"] == {"status": 500, "ok": True}
+    long_bodies = [b for b in seen if len(b["input"]) > 200]
+    assert len(long_bodies) == 1 and long_bodies[0].get("sentence_chunking") is False
 
 
 @pytest.mark.parametrize("handler", [

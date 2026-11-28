@@ -12,6 +12,7 @@ import json
 import math
 import os
 import statistics
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -128,6 +129,28 @@ def eval_file(d: Path, conc: int) -> dict | None:
     return None
 
 
+def truncated_audio(a: Path | None, b: Path | None) -> list[str]:
+    """Saved head clips that are exact, shorter prefixes of the matching base clip."""
+    if a is None or b is None:
+        return []
+    cut = []
+    for base in a.glob("*.wav"):
+        head = b / base.name
+        if not head.is_file():
+            continue
+        try:
+            with wave.open(str(base), "rb") as x, wave.open(str(head), "rb") as y:
+                same_format = (x.getnchannels(), x.getsampwidth(), x.getframerate()) == (
+                    y.getnchannels(), y.getsampwidth(), y.getframerate())
+                if not same_format or not 0 < y.getnframes() < x.getnframes():
+                    continue
+                if x.readframes(y.getnframes()) == y.readframes(y.getnframes()):
+                    cut.append(base.stem)
+        except (OSError, EOFError, wave.Error):
+            continue
+    return sorted(cut)
+
+
 def suite_facts(a: Path, b: Path, conc: int) -> dict:
     ja, jb = eval_file(a, conc), eval_file(b, conc)
     if not ja or not jb:
@@ -142,6 +165,8 @@ def suite_facts(a: Path, b: Path, conc: int) -> dict:
     ids = sorted(set(ha) & set(hb))
     if ids and any(ha[i] is not None for i in ids):
         out.update(text_facts([(ha[i] or "", hb[i] or "") for i in ids]))
+    if ja.get("suite") == jb.get("suite") == "tts":
+        out["audio_truncated"] = truncated_audio(saved_dir(a, conc), saved_dir(b, conc))
     return out
 
 
