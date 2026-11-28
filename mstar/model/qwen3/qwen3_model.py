@@ -1,6 +1,12 @@
 """Dense Qwen3 (Qwen3-8B and its siblings): text in, text out on one ``LLM``
 node of the shared decoder scaffold, on the shared Qwen3 decoder, its state
-declared on the state contract."""
+declared on the state contract.
+
+``model_kwargs.draft`` turns on speculative decoding with a DSpark drafter
+(`mstar.model.components.dspark`): the drafter's layers join the target's KV
+pool, and every decode step drafts and verifies ``num_draft_tokens`` tokens.
+Without the block the model is plain Qwen3.
+"""
 from __future__ import annotations
 
 import functools
@@ -12,13 +18,15 @@ from typing import Any
 import torch
 from jinja2 import TemplateError
 
-from mstar.engine.state import Array, Attend, Causal, KVEntry, Positions, Read, Rope, Sampler
-from mstar.model.keys import KV_CACHE, SAMPLER
+from mstar.engine.state import Array, Attend, Causal, Draft, KVEntry, Positions, Read, Rope, Sampler
+from mstar.model.hf_config import hf_weight_dtype
+from mstar.model.keys import KV_CACHE, MIXED, PREFILL_TEXT, ROPE, SAMPLER
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns
-from mstar.model.multimodal_decoder import MIXED_SPLIT, DeclaredDecoderModel
+from mstar.model.multimodal_decoder import DeclaredDecoderModel
 from mstar.model.qwen3.config import ATTN, LLM_NODE, qwen3_lm_config
-from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.utils.fast_tokenize import encode_ids
+from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
 
@@ -31,11 +39,43 @@ class Qwen3Model(DeclaredDecoderModel):
         "config.json", "tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt", "chat_template.jinja",
     )
 
-    def __init__(self, model_path_hf: str, cache_dir: str | None = None):
+    def __init__(
+        self, model_path_hf: str, cache_dir: str | None = None, draft: dict | None = None,
+        accelerator_graph: bool = True,
+    ):
+        """``draft``: the speculative-decoding block (``method: dspark``).
+        ``accelerator_graph: false`` runs the LLM node uncaptured (no resident
+        planning, so a draft block verifies synchronously)."""
         super().__init__(model_path_hf, cache_dir)
-        hf = json.loads((Path(self.local_dir) / "config.json").read_text())
+        self.accelerator_graph = bool(accelerator_graph)
+        self.hf_config = hf = json.loads((Path(self.local_dir) / "config.json").read_text())
         self.config = qwen3_lm_config(hf)
         self.config.stop_token_ids = self._stop_token_ids(hf)
+        self.draft = self.draft_config(draft)
+        self.drafter_decl = None if self.draft is None else self._drafter(self.draft)
+
+    def _drafter(self, draft):
+        """The drafter's declaration, from its checkpoint's config alone."""
+        from mstar.model.components.dspark import DSpark, DSparkConfig
+
+        if draft.method != "dspark":
+            raise ValueError(f"Qwen3 drafts with method dspark, not {draft.method!r}")
+        directory = self._drafter_dir = resolve_snapshot_dir(
+            draft.model, cache_dir=self.cache_dir, allow_patterns=["*.json"],
+        )
+        dspark = DSparkConfig.from_hf(json.loads((directory / "config.json").read_text()))
+        if max(dspark.taps) >= self.config.num_hidden_layers:
+            # its checkpoint names the last layer's output, HF's hidden_states[L], which is after
+            # the final norm; the tap hook hands over the stream before it
+            raise ValueError(
+                f"the DSpark drafter reads target layer {max(dspark.taps) - 1}'s output, the last layer's, "
+                "which it was trained on after the final norm; the target's taps read the stream before it"
+            )
+        # its query heads and RoPE base are checked at startup (`geometry_problems`)
+        return DSpark(
+            dspark, draft.num_draft_tokens, kv_key=KV_CACHE, pos_key=ROPE, checkpoint=draft.model,
+            cache_dir=self.cache_dir,
+        )
 
     @functools.cached_property
     def tokenizer(self):
@@ -63,9 +103,9 @@ class Qwen3Model(DeclaredDecoderModel):
         # /generate may nest enable_thinking as OpenAI clients send it
         return super().request_kwargs() | {"chat_template_kwargs"}
 
-    def declare_state(self) -> list[Array | Sampler]:
+    def declare_state(self) -> list[Array | Sampler | Draft]:
         cfg, nodes = self.config, {LLM_NODE}
-        return [
+        state = [
             Array(
                 KV_CACHE, nodes=nodes, layers=frozenset(range(cfg.num_hidden_layers)),
                 entry=KVEntry(heads=cfg.num_key_value_heads, head_dim=cfg.head_dim),
@@ -77,9 +117,42 @@ class Qwen3Model(DeclaredDecoderModel):
                 min_p=self._sampler_spec(cfg.vocab_size).enable_min_p,
             ),
         ]
+        if self.drafter_decl is not None:
+            # the drafter's layers join the array's pool after the target's, with the verify slack past the context
+            state.append(Draft(
+                "draft", nodes=nodes, array=KV_CACHE, sampler=SAMPLER, walk=self.llm_node_class().DECODE_WALK,
+                method=self.draft.method, model=self.draft.model, checkpoint=str(self._drafter_dir),
+                num_draft_tokens=self.draft.num_draft_tokens, mode=self.draft.mode.value,
+                num_layers=cfg.num_hidden_layers, hidden_size=cfg.hidden_size,
+                dtype=hf_weight_dtype(self.hf_config), mixed_walk=MIXED if self.mixes_verify else None,
+                input_kinds={TEXT},
+            ))
+        return state
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
-        return {ATTN: {"splits": (MIXED_SPLIT,)}}
+        return {ATTN: {"splits": self.mixed_splits()}}
+
+    def llm_node_class(self) -> type:
+        from mstar.model.qwen3.submodules import Qwen3LMSubmodule
+
+        return Qwen3LMSubmodule
+
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        """A drafting node's prompts prefill in chunks of its budget where its drafter declares how its state
+        at a chunk's last row is built (`drafts_chunked_prompts`); under one that doesn't, each prompt
+        prefills whole, as on a plain node."""
+        if not self.drafts_chunked_prompts:
+            return {}
+        from mstar.model.qwen3.submodules import Qwen3LMSubmodule
+
+        budget = Qwen3LMSubmodule.MAX_BATCH_TOKENS
+        policies = (ChunkingPolicy(walks=(PREFILL_TEXT,), chunkable=True, max_batch_tokens=budget),)
+        if self.mixes_verify:
+            # a mixed step's tokens, up to its captures' top rung: the verify rows' blocks, then a prompt chunk
+            block, node = self.draft.num_draft_tokens + 1, Qwen3LMSubmodule
+            mixed = node.MIXED_VERIFY_BATCH_SIZES[-1] * block + node.MIXED_VERIFY_PROMPT_TOKENS[-1]
+            policies += (ChunkingPolicy(walks=(MIXED,), max_batch_tokens=mixed),)
+        return {LLM_NODE: policies}
 
     def _prompt_ids(
         self, parts: list[PromptPart], raw: dict[str, list[torch.Tensor]], **kwargs,
@@ -120,7 +193,6 @@ class Qwen3Model(DeclaredDecoderModel):
             logger.info("Qwen3: no weights in %s, dummy mode", weights)
             return None
         from mstar.model.loader.iterators import iter_safetensors_shards
-        from mstar.model.qwen3.submodules import Qwen3LMSubmodule
 
         lm = self.build_lm(device, tp_group, dtype)
         lm.load_weights(
@@ -128,12 +200,21 @@ class Qwen3Model(DeclaredDecoderModel):
             if key.startswith(("model.", "lm_head."))
         )
         lm.requires_grad_(False).eval()
-        return Qwen3LMSubmodule(lm, self.config)
+        return self.make_submodule(lm, device, tp_group, dtype)
 
     def build_lm(self, device, tp_group=None, dtype: torch.dtype = torch.bfloat16):
-        """The decoder on ``device``, weights unset."""
+        """The target's module on ``device``, weights unset."""
         from mstar.model.components.qwen3_lm import Qwen3DenseLM
 
         with torch.device("meta"):
             lm = Qwen3DenseLM(self.config, array=KV_CACHE, comm_group=tp_group)
         return lm.to(dtype).to_empty(device=device)
+
+    def make_submodule(self, lm, device, tp_group=None, dtype: torch.dtype = torch.bfloat16) -> NodeSubmodule:
+        """The node around a loaded target, with the drafter the deployment names."""
+        from mstar.model.qwen3.submodules import Qwen3LMSubmodule
+
+        drafter = None
+        if self.drafter_decl is not None:
+            drafter = self.drafter_decl.build(device=device, comm_group=tp_group, dtype=dtype, target=lm)
+        return Qwen3LMSubmodule(lm, self.config, drafter=drafter, accelerator_graph=self.accelerator_graph)

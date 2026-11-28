@@ -152,13 +152,21 @@ class Qwen3DenseLM(nn.Module):
         pos_key: str | None = None,
         array: str | None = None,
         comm_group: CommGroup | None = None,
+        kv_layer_set: str | None = None,
     ):
         """``array`` is what the layers attend through on a model on the state contract, and the keys are the resources
-        a model still on resources names."""
+        a model still on resources names. ``kv_layer_set``, on resources only: the layer set this stack joined its KV
+        pool as, for a stack whose layers follow another's in one pool (a drafter's after its target's); the pool
+        places them, and the stack addresses its own 0..n-1."""
         super().__init__()
         self.config = config
         comm_group = comm_group or CommGroup.trivial()
-        keys = {"attn_key": attn_key, "kv_key": kv_key, "pos_key": pos_key} if array is None else {"kv_key": array}
+        if array is not None and kv_layer_set is not None:
+            raise ValueError("kv_layer_set names a layer set of a KV resource; a stack on the state contract has none")
+        keys = (
+            {"attn_key": attn_key, "kv_key": kv_key, "pos_key": pos_key, "kv_layer_set": kv_layer_set}
+            if array is None else {"kv_key": array}
+        )
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -227,20 +235,29 @@ class Qwen3DenseLM(nn.Module):
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    def forward(self, input_embeds: torch.Tensor, *, label: str | None = None) -> torch.Tensor:
+    def forward(self, input_embeds: torch.Tensor, *, label: str | None = None, taps=None) -> torch.Tensor:
         """``(tokens, hidden)`` -> ``(tokens, hidden)`` after the final norm.
 
         On resources, the label and layer index are cursors on the shared
         resources: bind the label once, advance the index per layer. Passing
         them as arguments instead would make inductor specialize on the int.
         On the state contract each row's label comes from the step's segments,
-        and ``label`` goes unread.
+        and ``label`` goes unread. ``taps``: a drafter's `TapResource`, which
+        ``run_layers`` hands the residual stream entering its layers.
         """
         attention = self.layers[0].self_attn
         if attention.state is not None:
-            return run_layers(self.layers, input_embeds, self.norm, no_cursor)
+            return run_layers(self.layers, input_embeds, self.norm, no_cursor, taps=taps)
         attention.attend.bind_step(label)
-        return run_layers(self.layers, input_embeds, self.norm)
+        return run_layers(self.layers, input_embeds, self.norm, taps=taps)
+
+    def write_kv(self, hidden_states: torch.Tensor, *, label: str) -> None:
+        """Every layer's K/V of the same ``hidden_states``, under ``label``, without
+        running the stack (`ParallelAttention.write_kv`, the unfused path)."""
+        self.layers[0].self_attn.attend.bind_step(label)
+        for i, layer in enumerate(self.layers):
+            layer.self_attn.attend.set_layer_idx(i)
+            layer.self_attn.write_kv(hidden_states)
 
     def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)

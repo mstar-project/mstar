@@ -527,6 +527,17 @@ def fused_draw_args(s: SamplerHandle) -> FusedDrawArgs | None:
 
 
 @torch.compiler.disable
+def verified(s: SamplerHandle) -> None:
+    """Not frozen: count a verify step's verify of the drafts (`SamplerResource.verify`, which advances each row's
+    sampling state as a draw does) as the step's draw. The engine's verify step calls it, not a model."""
+    if not s._open:
+        raise s._refusal("verified in a step that doesn't list the sampler")
+    s._drawn += 1
+    if s._drawn > s.sampler.draws:
+        raise s._refusal(f"a verify after {s._drawn - 1} draws in one step, and draws is {s.sampler.draws}")
+
+
+@torch.compiler.disable
 def drew(s: SamplerHandle, n: int) -> None:
     """Not frozen yet, like the rest of the fused draw. Count ``n`` draws a kernel made from `fused_draw_args`, and
     advance each row's sampling state as ``n`` `sample` calls would. Called after the launch, so the advance is ordered
